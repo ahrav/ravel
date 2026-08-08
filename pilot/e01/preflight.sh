@@ -143,7 +143,7 @@ check "change targets >= 36" "$((tc < 36))" "count=$tc"
 
 # --- trusted evaluators (predeclared verdicts; all PASS) -----------------------
 EVAL_TIMEOUT=1800 # seconds per evaluator; a hang must become a verdict, not a stall
-run_eval() { # run_eval <command...> — expected PASS
+run_eval() {      # run_eval <command...> — expected PASS
 	local name="$*"
 	local log rc=0
 	log="$(mktemp /tmp/e01-eval.XXXXXX.log)" || {

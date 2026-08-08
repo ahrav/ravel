@@ -1,0 +1,105 @@
+# E01 pilot environment — PRIVATE, UNSTABLE FORMAT.
+# Hand-maintained for the E01 pilot only. No schema, no loader, no registry,
+# no compatibility promise. Fields are fixed scalars, fixed enums, and explicit
+# allowlists. Do not build tooling against this file.
+#
+# Identity below is FROZEN: clean-checkout preflight, both provider smokes,
+# the safe-branch smoke, and both viability gates passed before check-in.
+# Evidence: pilot/e01/preflight.md.
+
+format: e01-environment/private-unstable
+
+subject:
+  code_host: github
+  upstream_repository: sharkdp/hyperfine
+  repository: ahrav/hyperfine            # personal fork; all campaign work here
+  starting_revision: f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7  # immutable pin
+
+branch_policy:
+  campaign_branch_pattern: campaign/e01/*   # on fork ahrav/hyperfine only
+  integration_target: campaign_branch_only  # all Change integration lands here
+  production_branches_excluded:             # never pushed, never targeted
+    - ahrav/hyperfine master
+    - sharkdp/hyperfine (all branches)
+
+providers:
+  bedrock-claude:
+    kind: aws-bedrock-converse
+    aws_profile: bw-bedrock               # credential reference only; no secrets
+    region: us-west-2
+    model_id: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  bedrock-gpt:
+    kind: aws-bedrock-converse
+    aws_profile: bw-bedrock
+    region: us-west-2
+    model_id: openai.gpt-oss-120b-1:0
+    # Deviation from plan: Bedrock Mantle OpenAI endpoint
+    # (bedrock-mantle.us-west-2.api.aws/openai/v1) is IAM-denied for role
+    # bedrock-full-access (bedrock-mantle:CreateInference). Same GPT model
+    # family invoked via the standard bedrock-runtime Converse API instead.
+    # Evidence: pilot/e01/preflight.md §3 (provider smokes).
+
+role_profiles:                            # all six fixed; sampling params fixed
+  generator:research:
+    provider: bedrock-claude
+    temperature: 0.3
+    max_tokens: 4096
+  generator:code:
+    provider: bedrock-claude
+    temperature: 0.2
+    max_tokens: 4096
+  judge:semantic:
+    provider: bedrock-gpt
+    temperature: 0.0
+    max_tokens: 2048
+  judge:critic:
+    provider: bedrock-gpt
+    temperature: 0.0
+    max_tokens: 2048
+  judge:adjudicator:
+    provider: bedrock-claude
+    temperature: 0.0
+    max_tokens: 2048
+  synthesizer:
+    provider: bedrock-claude
+    temperature: 0.2
+    max_tokens: 4096
+
+trusted_evaluators:                       # run at starting_revision; verdicts predeclared
+  - command: cargo build --locked
+    expected: PASS
+  - command: cargo test --locked
+    expected: PASS
+  - command: cargo fmt --check
+    expected: PASS
+  - command: cargo clippy --all-targets --locked
+    expected: PASS
+
+s3:
+  account: "255653206584"
+  bucket: ravel-e01-255653206584
+  region: us-east-1
+  prefix: e01/
+  credential_reference: aws_profile personal   # named profile only; no secrets here
+
+authority:
+  default: autonomous
+  human_only:                             # complete allowlist; everything else autonomous
+    - push to any production branch (fork master, anything upstream)
+    - open or update pull requests against sharkdp/hyperfine
+    - change budgets or spending limits
+    # Routine Research decisions and Change integration to campaign/e01/*
+    # are autonomous by default and intentionally NOT listed above.
+
+trust_roots:                              # never candidate-writable
+  - pilot/                                # this repo: pilot + preflight config
+  - .github/                              # subject repo: CI / workflow config
+  - Cargo.toml                            # subject repo: evaluator inputs (--locked)
+  - Cargo.lock
+
+repository_limits:                        # measured at pin: 66 files, 474,732 bytes,
+  max_file_count: 2000                    # max file 88,282 B, path len <= 41, depth <= 3
+  max_file_bytes: 1048576
+  max_total_bytes: 33554432
+  max_path_length: 180
+  max_path_depth: 10

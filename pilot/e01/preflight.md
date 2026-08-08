@@ -178,7 +178,7 @@ action required at any step:
 1. Research: pick next question from the contract → autonomous
    (`authority.default: autonomous`; not in `human_only`).
 2. Research: read evidence files, record findings to
-   `s3://ravel-e01-255653206584/e01/…` → autonomous.
+   `s3://ravel-e01-907331366707/e01/…` → autonomous.
 3. Change: pick next `.unwrap()` target, edit on `campaign/e01/<topic>` branch
    of the fork → autonomous.
 4. Change: run trusted evaluators, integrate to the campaign branch →
@@ -192,11 +192,11 @@ Human-only boundary (complete list, matches `authority.human_only`):
 
 ## 8. S3 environment
 
-- Account `255653206584`, bucket `ravel-e01-255653206584` (created — no
+- Account `907331366707`, bucket `ravel-e01-907331366707` (created — no
   suitable existing bucket; account has no alias, so the account id is used),
   region `us-east-1`, prefix `e01/`.
 - Credential reference: AWS profile `personal` (rewired to an ada
-  `credential_process` for account `255653206584`; the stale static session
+  `credential_process` for account `907331366707`; the stale static session
   token previously stored under `[personal]` was removed). Verified via
   `sts get-caller-identity` + `s3api create-bucket`/`head-bucket`.
 - S3 conditional-write behavior: out of scope for this task (untested).

@@ -25,17 +25,20 @@ SUBJECT_TRUST_ROOTS=(".github/" "Cargo.toml" "Cargo.lock" "pilot/")
 
 FAILURES=0
 check() { # check <name> <0|1 ok> <detail>
-  if [ "$2" -eq 0 ]; then
-    echo "PASS  $1${3:+ — $3}"
-  else
-    echo "FAIL  $1${3:+ — $3}"
-    FAILURES=$((FAILURES + 1))
-  fi
+	if [ "$2" -eq 0 ]; then
+		echo "PASS  $1${3:+ — $3}"
+	else
+		echo "FAIL  $1${3:+ — $3}"
+		FAILURES=$((FAILURES + 1))
+	fi
 }
 
 echo "== E01 preflight receipt =="
 for tool in git rg python3 stat cargo rustc; do
-  command -v "$tool" >/dev/null || { echo "FAIL required tool missing: $tool"; exit 1; }
+	command -v "$tool" >/dev/null || {
+		echo "FAIL required tool missing: $tool"
+		exit 1
+	}
 done
 echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "host: $(uname -sr)"
@@ -44,29 +47,40 @@ echo "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 
 # --- checkout ---------------------------------------------------------------
 if [ $# -ge 1 ]; then
-  DIR="$1"
+	DIR="$1"
 else
-  DIR="$(mktemp -d /tmp/e01-preflight.XXXXXX)/hyperfine"
-  echo "cloning $REPO_URL -> $DIR"
-  git clone --quiet "$REPO_URL" "$DIR" || { echo "FAIL clone"; exit 1; }
+	DIR="$(mktemp -d /tmp/e01-preflight.XXXXXX)/hyperfine"
+	echo "cloning $REPO_URL -> $DIR"
+	git clone --quiet "$REPO_URL" "$DIR" || {
+		echo "FAIL clone"
+		exit 1
+	}
 fi
-cd "$DIR" || { echo "FAIL cd $DIR"; exit 1; }
+cd "$DIR" || {
+	echo "FAIL cd $DIR"
+	exit 1
+}
 git checkout --quiet "$FROZEN_SHA" 2>/dev/null
 head_sha=$(git rev-parse HEAD)
 check "frozen revision" "$([ "$head_sha" = "$FROZEN_SHA" ] && echo 0 || echo 1)" "$head_sha"
 check "clean worktree" "$([ -z "$(git status --porcelain)" ] && echo 0 || echo 1)"
 
 # --- repository hygiene (all counts must be zero) ---------------------------
-n=$(git ls-files -s | awk '$1==160000' | wc -l);  check "no submodules" "$((n != 0))" "count=$n"
-n=$(git ls-files -s | awk '$1==120000' | wc -l);  check "no symlinks" "$((n != 0))" "count=$n"
-n=$(git ls-files -s | awk '$1!~/^100(644|755)$/' | wc -l); check "no special modes" "$((n != 0))" "count=$n"
-n=$(git grep -l 'version https://git-lfs' -- . 2>/dev/null | wc -l); check "no LFS pointers" "$((n != 0))" "count=$n"
+n=$(git ls-files -s | awk '$1==160000' | wc -l)
+check "no submodules" "$((n != 0))" "count=$n"
+n=$(git ls-files -s | awk '$1==120000' | wc -l)
+check "no symlinks" "$((n != 0))" "count=$n"
+n=$(git ls-files -s | awk '$1!~/^100(644|755)$/' | wc -l)
+check "no special modes" "$((n != 0))" "count=$n"
+n=$(git grep -l 'version https://git-lfs' -- . 2>/dev/null | wc -l)
+check "no LFS pointers" "$((n != 0))" "count=$n"
 # target/ pruned: the evaluators below create hardlinked artifacts there.
 n=$(find . -path ./.git -prune -o -path ./target -prune -o \( -type p -o -type s -o -type b -o -type c \) -print | wc -l)
 check "no special files on disk" "$((n != 0))" "count=$n"
 n=$(git ls-files -z | xargs -0 stat -c%h | awk '$1>1' | wc -l)
 check "no hardlinks (tracked files)" "$((n != 0))" "count=$n"
-n=$(git ls-files | tr '[:upper:]' '[:lower:]' | sort | uniq -d | wc -l); check "no case collisions" "$((n != 0))" "count=$n"
+n=$(git ls-files | tr '[:upper:]' '[:lower:]' | sort | uniq -d | wc -l)
+check "no case collisions" "$((n != 0))" "count=$n"
 n=$(git ls-files -z | python3 -c '
 import sys, unicodedata
 fs = [x for x in sys.stdin.buffer.read().decode().split("\0") if x]
@@ -94,9 +108,9 @@ check "max path depth <= $MAX_PATH_DEPTH" "$((pd > MAX_PATH_DEPTH))" "deepest=$p
 GATE_TARGETS=$(rg -l '\.unwrap\(\)' --type rust -g '!tests/**' -g '!benches/**' | sort)
 overlap=0
 for f in $GATE_TARGETS; do
-  for root in "${SUBJECT_TRUST_ROOTS[@]}"; do
-    case "$f" in "$root"*) overlap=$((overlap + 1));; esac
-  done
+	for root in "${SUBJECT_TRUST_ROOTS[@]}"; do
+		case "$f" in "$root"*) overlap=$((overlap + 1)) ;; esac
+	done
 done
 check "trust roots disjoint from change targets" "$((overlap != 0))" "overlaps=$overlap"
 
@@ -108,14 +122,14 @@ check "change targets >= 36" "$((tc < 36))" "count=$tc"
 
 # --- trusted evaluators (predeclared verdicts; all PASS) -----------------------
 run_eval() { # run_eval <command...> — expected PASS
-  local name="$*"
-  local log
-  log="/tmp/e01-eval-$(echo "$name" | tr -cs 'a-zA-Z0-9' '-').log"
-  if "$@" > "$log" 2>&1; then
-    check "evaluator: $name" 0 "expected=PASS got=PASS"
-  else
-    check "evaluator: $name" 1 "expected=PASS got=FAIL (see $log)"
-  fi
+	local name="$*"
+	local log
+	log="/tmp/e01-eval-$(echo "$name" | tr -cs 'a-zA-Z0-9' '-').log"
+	if "$@" >"$log" 2>&1; then
+		check "evaluator: $name" 0 "expected=PASS got=PASS"
+	else
+		check "evaluator: $name" 1 "expected=PASS got=FAIL (see $log)"
+	fi
 }
 run_eval cargo build --locked
 run_eval cargo test --locked

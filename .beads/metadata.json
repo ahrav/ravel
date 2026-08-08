@@ -1,7 +1,7 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "embedded",
+  "dolt_mode": "server",
   "dolt_database": "ravel",
   "project_id": "5891eb39-0353-4655-ae96-e579ab167bda"
 }

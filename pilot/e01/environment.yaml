@@ -28,6 +28,7 @@ providers:
     aws_profile: claude-code-DO-NOT-DELETE # credential reference only; no secrets
     region: us-west-2
     model_id: global.anthropic.claude-opus-5
+    request_fields_rejected: [temperature, reasoning_effort]
   bedrock-gpt:
     kind: bedrock-mantle-openai-responses # OpenAI /v1/responses API only
     endpoint: https://bedrock-mantle.us-east-2.api.aws/openai/v1
@@ -36,7 +37,6 @@ providers:
     # Credential reference only; no secrets.
     credential_reference: bearer token from ~/.local/bin/bedrock-mantle-token (aws_profile codex-DO-NOT-DELETE)
 
-# temperature omitted everywhere: opus-5 rejects the parameter as deprecated.
 role_profiles: # all six fixed
   generator:research:
     provider: bedrock-claude

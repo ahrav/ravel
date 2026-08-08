@@ -44,6 +44,17 @@ bd prime              # Refresh Beads context
 - Update status as you work (in_progress → closed)
 - The `beads` skill at `.agents/skills/beads/SKILL.md` (project) or `~/.agents/skills/beads/SKILL.md` (global) has further workflow guidance
 
+## Troubleshooting
+
+- **`bd list` suddenly shows zero issues** (no error, just "No issues found"): `.beads/metadata.json` likely lost its `"dolt_database": "ravel"` field — bd then silently opens an empty default "beads" DB. Restore the field; the data is safe in the Dolt server. Verify with:
+
+  ```bash
+  dolt --host 127.0.0.1 --port $(cat .beads/dolt-server.port) --no-tls --use-db ravel \
+    sql -q "select count(*) from issues"
+  ```
+
+- For scripting/parsing, prefer `bd list --json` over scraping `bd show` output.
+
 ## Session Completion
 
 Subordinate to explicit user, repository, and orchestrator instructions.

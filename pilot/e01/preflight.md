@@ -87,41 +87,43 @@ containing `.git/`, so no separate check exists.
 
 ### bedrock-claude — PASS
 
-One minimal Converse request, profile `bw-bedrock` (role redacted to name
-only: `bedrock-full-access`, account `144571874263`), region `us-west-2`,
-model `us.anthropic.claude-sonnet-4-5-20250929-v1:0`:
+One minimal Converse request, profile `claude-code-DO-NOT-DELETE`
+(account `144571874263`), region `us-west-2`,
+model `global.anthropic.claude-opus-5`:
 
 ```text
 prompt:   "Reply with exactly: SMOKE-OK"
 response: "SMOKE-OK"
-usage:    inputTokens=15 outputTokens=7 totalTokens=22
+usage:    inputTokens=22 outputTokens=10 totalTokens=32
 ```
 
-### bedrock-gpt — PASS (with transport deviation)
+Note: opus-5 rejects `temperature` ("ValidationException: `temperature` is
+deprecated for this model"), so role profiles carry no temperature field.
 
-**Plan deviation — Mantle endpoint unavailable.** The planned Bedrock Mantle
-OpenAI endpoint `bedrock-mantle.us-west-2.api.aws/openai/v1` is reachable and
-accepts SigV4, but the account's role is hard-denied by IAM:
+### bedrock-gpt — PASS
+
+One minimal request to the Bedrock Mantle OpenAI-compatible endpoint
+`https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses`
+(`/v1/responses` only — the model rejects `/v1/chat/completions`),
+model `openai.gpt-5.6-sol`, auth = bearer token minted by
+`~/.local/bin/bedrock-mantle-token` (aws_bedrock_token_generator over profile
+`codex-DO-NOT-DELETE`, account `979667333375`) — the same mechanism the local
+pi/codex/opencode harnesses use:
 
 ```text
-401 access_denied: User arn:aws:sts::144571874263:assumed-role/bedrock-full-access/<user>
-is not authorized to perform: bedrock-mantle:CreateInference on resource:
-arn:aws:bedrock-mantle:us-west-2:144571874263:project/default
-(no identity-based policy allows the action)
+prompt:    "Reply with exactly: SMOKE-OK"
+reasoning: {"effort": "xhigh"}   (frozen role-profile value; accepted)
+response:  "SMOKE-OK"
+usage:     input_tokens=14 output_tokens=8
 ```
 
-The same GPT model family is invocable through the standard `bedrock-runtime`
-Converse API, so the second provider was frozen as Converse instead:
+Earlier attempts against `bedrock-mantle.us-west-2.api.aws` with SigV4 from
+profile `bw-bedrock` failed with `bedrock-mantle:CreateInference` denials;
+the working path above (us-east-2, bearer token, `codex-DO-NOT-DELETE`)
+matches the other harnesses' configuration and is the frozen one.
 
-```text
-model:    openai.gpt-oss-120b-1:0   (region us-west-2, profile bw-bedrock)
-prompt:   "Reply with exactly: SMOKE-OK"
-response: reasoning + "SMOKE-OK"
-usage:    inputTokens=75 outputTokens=64 totalTokens=139
-```
-
-Both frozen model IDs were read from the live account
-(`bedrock list-foundation-models` / `list-inference-profiles`), not guessed.
+Both frozen model IDs match the locally configured harness models
+(pi `defaultModel`, claude code, codex, opencode), verified invocable live.
 
 ## 4. Safe-branch smoke — PASS
 
@@ -207,13 +209,10 @@ All freeze conditions passed: clean-checkout preflight (§2), both provider
 smokes (§3), safe-branch smoke (§4), Research viability (§5), Change
 viability (§6). Identity in `environment.yaml` is frozen.
 
-Recorded deviations from the plan (both evidence-driven, neither blocking):
+Recorded deviation from the plan (evidence-driven, not blocking):
 
 1. Provisional Change-discovery rule substituted (§1) — original rule had no
    passing candidate.
-2. Second provider transport is Converse, not the Mantle OpenAI endpoint
-   (§3) — IAM denial, verbatim error recorded.
 
 Residue: an unused fork `ahrav/bat` was created before bat failed the
-submodule gate; the token lacks `delete_repo` scope, so it is left in place
-and may be deleted manually.
+submodule gate; deletion requires the `delete_repo` token scope.

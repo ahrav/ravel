@@ -25,45 +25,43 @@ branch_policy:
 providers:
   bedrock-claude:
     kind: aws-bedrock-converse
-    aws_profile: bw-bedrock # credential reference only; no secrets
+    aws_profile: claude-code-DO-NOT-DELETE # credential reference only; no secrets
     region: us-west-2
-    model_id: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    model_id: global.anthropic.claude-opus-5
   bedrock-gpt:
-    kind: aws-bedrock-converse
-    aws_profile: bw-bedrock
-    region: us-west-2
-    model_id: openai.gpt-oss-120b-1:0
-    # Deviation from plan: Bedrock Mantle OpenAI endpoint
-    # (bedrock-mantle.us-west-2.api.aws/openai/v1) is IAM-denied for role
-    # bedrock-full-access (bedrock-mantle:CreateInference). Same GPT model
-    # family invoked via the standard bedrock-runtime Converse API instead.
-    # Evidence: pilot/e01/preflight.md §3 (provider smokes).
+    kind: bedrock-mantle-openai-responses # OpenAI /v1/responses API only
+    endpoint: https://bedrock-mantle.us-east-2.api.aws/openai/v1
+    region: us-east-2
+    model_id: openai.gpt-5.6-sol
+    # Credential reference only; no secrets.
+    credential_reference: bearer token from ~/.local/bin/bedrock-mantle-token (aws_profile codex-DO-NOT-DELETE)
 
-role_profiles: # all six fixed; sampling params fixed
+# temperature omitted everywhere: opus-5 rejects the parameter as deprecated.
+role_profiles: # all six fixed
   generator:research:
     provider: bedrock-claude
-    temperature: 0.3
-    max_tokens: 4096
+    reasoning_effort: xhigh
+    max_tokens: 8192
   generator:code:
     provider: bedrock-claude
-    temperature: 0.2
-    max_tokens: 4096
+    reasoning_effort: high
+    max_tokens: 8192
   judge:semantic:
     provider: bedrock-gpt
-    temperature: 0.0
-    max_tokens: 2048
+    reasoning_effort: xhigh
+    max_output_tokens: 8192
   judge:critic:
     provider: bedrock-gpt
-    temperature: 0.0
-    max_tokens: 2048
+    reasoning_effort: xhigh
+    max_output_tokens: 8192
   judge:adjudicator:
     provider: bedrock-claude
-    temperature: 0.0
-    max_tokens: 2048
+    reasoning_effort: xhigh
+    max_tokens: 8192
   synthesizer:
     provider: bedrock-claude
-    temperature: 0.2
-    max_tokens: 4096
+    reasoning_effort: high
+    max_tokens: 8192
 
 trusted_evaluators: # run at starting_revision; verdicts predeclared
   - command: cargo build --locked

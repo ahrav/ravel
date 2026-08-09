@@ -38,8 +38,7 @@ pub(crate) async fn reconcile(
     let mut found = false;
 
     for _ in 0..hop_count {
-        // Validated parents decrement sequence by one, and keys include sequence;
-        // digest tracking therefore detects repeated links without a second key set.
+        // `Event::new` makes repeated digests unreachable under sequence descent; this set is a corruption backstop. commentlint: allow(JUDGE)
         if !seen_digests.insert(current_ref.digest().to_owned()) {
             return HeadCommitOutcome::Unresolved(transition);
         }
@@ -66,6 +65,7 @@ pub(crate) async fn reconcile(
             }
             found = true;
         } else if current_ref == *transition.candidate().tail() {
+            // `event::decode` binds bytes to this key; exact comparison is a collision backstop. commentlint: allow(JUDGE)
             return HeadCommitOutcome::Unresolved(transition);
         }
 
@@ -189,6 +189,10 @@ mod tests {
             .expect("transition is valid")
     }
 
+    fn sentinel() -> http::Response<SdkBody> {
+        response(500, &[], SdkBody::empty())
+    }
+
     fn assert_gets(
         client: &aws_smithy_runtime::client::http::test_util::StaticReplayClient,
         keys: &[&str],
@@ -220,6 +224,7 @@ mod tests {
                 current_bytes.stored_bytes(),
             ),
             response(200, &[("etag", "\"event-2\"")], CHILD_BYTES),
+            sentinel(),
         ]);
 
         assert!(matches!(
@@ -241,11 +246,14 @@ mod tests {
         );
         let competitor_bytes = event::encode(&competitor).expect("event encodes");
         let current = observed(event_ref(&competitor), "current-head-operation").await;
-        let (store, client) = replay_store(vec![response(
-            200,
-            &[("etag", "\"competitor\"")],
-            competitor_bytes.stored_bytes(),
-        )]);
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"competitor\"")],
+                competitor_bytes.stored_bytes(),
+            ),
+            sentinel(),
+        ]);
 
         assert!(matches!(
             reconcile(&store, transition, current).await,
@@ -259,11 +267,10 @@ mod tests {
         let candidate = fixture_event(GENESIS_BYTES, GENESIS_KEY);
         let transition = genesis_transition(&candidate).await;
         let current = observed(event_ref(&candidate), "other-head-operation").await;
-        let (store, client) = replay_store(vec![response(
-            200,
-            &[("etag", "\"genesis\"")],
-            GENESIS_BYTES,
-        )]);
+        let (store, client) = replay_store(vec![
+            response(200, &[("etag", "\"genesis\"")], GENESIS_BYTES),
+            sentinel(),
+        ]);
         assert!(matches!(
             reconcile(&store, transition, current).await,
             HeadCommitOutcome::CommittedSuperseded
@@ -281,11 +288,14 @@ mod tests {
         .expect("competitor is valid");
         let competitor_bytes = event::encode(&competitor).expect("event encodes");
         let current = observed(event_ref(&competitor), "other-head-operation").await;
-        let (store, client) = replay_store(vec![response(
-            200,
-            &[("etag", "\"competitor\"")],
-            competitor_bytes.stored_bytes(),
-        )]);
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"competitor\"")],
+                competitor_bytes.stored_bytes(),
+            ),
+            sentinel(),
+        ]);
         assert!(matches!(
             reconcile(&store, transition, current).await,
             HeadCommitOutcome::ProvenNotCommitted
@@ -310,7 +320,7 @@ mod tests {
                 ),
                 _ => response(200, &[("etag", "\"corrupt\"")], b"bad".to_vec()),
             };
-            let (store, client) = replay_store(vec![object_response]);
+            let (store, client) = replay_store(vec![object_response, sentinel()]);
             assert!(matches!(
                 reconcile(&store, transition, current).await,
                 HeadCommitOutcome::Unresolved(_)
@@ -357,6 +367,7 @@ mod tests {
                 &[("etag", "\"wrong-parent\"")],
                 wrong_parent_bytes.stored_bytes(),
             ),
+            sentinel(),
         ]);
 
         assert!(matches!(
@@ -380,11 +391,14 @@ mod tests {
         .expect("conflicting event is valid");
         let conflicting_bytes = event::encode(&conflicting).expect("event encodes");
         let current = observed(event_ref(&conflicting), "other-head-operation").await;
-        let (store, client) = replay_store(vec![response(
-            200,
-            &[("etag", "\"conflict\"")],
-            conflicting_bytes.stored_bytes(),
-        )]);
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"conflict\"")],
+                conflicting_bytes.stored_bytes(),
+            ),
+            sentinel(),
+        ]);
 
         assert!(matches!(
             reconcile(&store, transition, current).await,
@@ -400,7 +414,7 @@ mod tests {
 
         let transition = existing_transition(&genesis, &candidate).await;
         let current = observed(event_ref(&genesis), "changed-head-operation").await;
-        let (store, client) = replay_store(Vec::new());
+        let (store, client) = replay_store(vec![sentinel()]);
         assert!(matches!(
             reconcile(&store, transition, current).await,
             HeadCommitOutcome::Unresolved(_)
@@ -415,7 +429,7 @@ mod tests {
         );
         let transition = existing_transition(&parent, &successor).await;
         let current = observed(event_ref(&genesis), "regressed-head-operation").await;
-        let (store, client) = replay_store(Vec::new());
+        let (store, client) = replay_store(vec![sentinel()]);
         assert!(matches!(
             reconcile(&store, transition, current).await,
             HeadCommitOutcome::Unresolved(_)

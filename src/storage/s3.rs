@@ -1,28 +1,28 @@
+//! Concrete Amazon S3 boundary for bounded reads and conditional writes.
+//!
+//! Mutation outcomes preserve ambiguity when request dispatch cannot be ruled out.
+
 use std::{error::Error, fmt, time::Duration};
 
 use aws_sdk_s3::{
     config::{Builder, Region, retry::RetryConfig, timeout::TimeoutConfig},
     error::SdkError,
-    operation::{
-        get_object::GetObjectError,
-        put_object::{PutObjectError, PutObjectOutput, builders::PutObjectFluentBuilder},
-    },
+    operation::put_object::{PutObjectError, PutObjectOutput, builders::PutObjectFluentBuilder},
     primitives::ByteStream,
 };
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Eq, PartialEq)]
+#[derive(PartialEq)]
 pub struct ETag(String);
 
-#[derive(Eq, PartialEq)]
 pub enum GetOutcome {
     Found { bytes: Vec<u8>, etag: ETag },
     NotFound,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum GetError {
     TooLarge,
     MissingETag,
@@ -41,7 +41,7 @@ impl fmt::Display for GetError {
 
 impl Error for GetError {}
 
-#[derive(Eq, PartialEq)]
+#[derive(PartialEq)]
 pub enum MutationOutcome {
     Committed { etag: Option<ETag> },
     NotFound,
@@ -52,6 +52,10 @@ pub enum MutationOutcome {
     ProvenNotSent,
 }
 
+/// Dispatch history for one logical publication across all resubmissions.
+///
+/// Replacing this value between attempts discards evidence that an earlier
+/// request may have been sent.
 #[derive(Default)]
 pub struct AttemptHistory {
     may_have_been_sent: bool,
@@ -80,7 +84,9 @@ impl S3Store {
             .await
         {
             Ok(output) => output,
-            Err(error) if service_status(&error) == Some(404) => return Ok(GetOutcome::NotFound),
+            Err(SdkError::ServiceError(error)) if error.raw().status().as_u16() == 404 => {
+                return Ok(GetOutcome::NotFound);
+            }
             Err(_) => return Err(GetError::Transport),
         };
 
@@ -98,7 +104,7 @@ impl S3Store {
         let mut body = output.body;
         let mut bytes = Vec::with_capacity(declared_length);
         while let Some(chunk) = body.try_next().await.map_err(|_| GetError::Transport)? {
-            if chunk.len() > max_bytes - bytes.len() {
+            if bytes.len() + chunk.len() > max_bytes {
                 return Err(GetError::TooLarge);
             }
             bytes.extend_from_slice(&chunk);
@@ -172,9 +178,10 @@ fn configured(region: Region, builder: Builder) -> aws_sdk_s3::Config {
         .build()
 }
 
-type PutResult = Result<PutObjectOutput, SdkError<PutObjectError>>;
-
-fn classify_mutation_result(result: PutResult, prior_unknown: bool) -> MutationOutcome {
+fn classify_mutation_result(
+    result: Result<PutObjectOutput, SdkError<PutObjectError>>,
+    prior_unknown: bool,
+) -> MutationOutcome {
     match result {
         Ok(output) => MutationOutcome::Committed {
             etag: output.e_tag().map(|value| ETag(value.to_owned())),
@@ -191,26 +198,25 @@ fn classify_mutation_result(result: PutResult, prior_unknown: bool) -> MutationO
     }
 }
 
-fn service_status(error: &SdkError<GetObjectError>) -> Option<u16> {
-    error
-        .raw_response()
-        .map(|response| response.status().as_u16())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     use aws_sdk_s3::{
         config::{Credentials, HttpClient},
         error::ConnectorError,
     };
-    #[allow(deprecated)]
     use aws_smithy_runtime::client::http::test_util::{
         NeverClient, ReplayEvent, StaticReplayClient,
     };
     use aws_smithy_types::body::SdkBody;
+    use bytes::Bytes;
+    use http_body::{Body, Frame};
 
     const TEST_ETAG: &str = "\"opaque-token:part-7\"";
 
@@ -251,10 +257,26 @@ mod tests {
         classify_mutation_result(Err(error), prior_unknown)
     }
 
-    fn raw_response(status: u16) -> aws_sdk_s3::config::http::HttpResponse {
-        response(status, &[], SdkBody::empty())
-            .try_into()
-            .expect("valid SDK response")
+    struct ChunkedBody(Vec<&'static [u8]>);
+
+    impl Body for ChunkedBody {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(
+                self.0
+                    .pop()
+                    .map(|chunk| Ok(Frame::data(Bytes::from_static(chunk)))),
+            )
+        }
+    }
+
+    fn chunked_body() -> SdkBody {
+        SdkBody::from_body_1_x(ChunkedBody(vec![b"def", b"abc"]))
     }
 
     #[tokio::test]
@@ -268,7 +290,12 @@ mod tests {
         let outcome = create_store
             .put_if_absent("events/event.cbor.zst", b"event".to_vec(), &mut history)
             .await;
-        assert!(matches!(outcome, MutationOutcome::Committed { .. }));
+        assert!(
+            outcome
+                == MutationOutcome::Committed {
+                    etag: Some(ETag("\"created\"".to_owned())),
+                }
+        );
         let create_header = create_client
             .actual_requests()
             .next()
@@ -306,6 +333,7 @@ mod tests {
             }
             GetOutcome::NotFound => panic!("object should exist"),
         };
+        let mut history = AttemptHistory::default();
         let outcome = store
             .put_if_match("head.json", b"next".to_vec(), &etag, &mut history)
             .await;
@@ -375,6 +403,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_bounds_accumulated_stream_chunks() {
+        let (store, _) = replay_store(vec![response(200, &[("etag", TEST_ETAG)], chunked_body())]);
+        assert!(matches!(
+            store.get_object("chunked", 5).await,
+            Err(GetError::TooLarge)
+        ));
+
+        let (store, _) = replay_store(vec![response(200, &[("etag", TEST_ETAG)], chunked_body())]);
+        match store.get_object("chunked", 6).await.expect("get succeeds") {
+            GetOutcome::Found { bytes, .. } => assert_eq!(bytes, b"abcdef"),
+            GetOutcome::NotFound => panic!("object should exist"),
+        }
+    }
+
+    #[tokio::test]
     async fn get_returns_exact_bytes_and_requires_an_etag() {
         let (store, _) = replay_store(vec![response(
             200,
@@ -434,7 +477,9 @@ mod tests {
 
         let lost_response = SdkError::response_error(
             io::Error::new(io::ErrorKind::UnexpectedEof, "lost response"),
-            raw_response(200),
+            response(200, &[], SdkBody::empty())
+                .try_into()
+                .expect("valid SDK response"),
         );
         assert!(classify(lost_response, false) == MutationOutcome::Unknown);
     }
@@ -490,8 +535,19 @@ mod tests {
     }
 
     #[test]
-    fn client_configuration_enforces_one_attempt_and_timeouts() {
-        let config = configured(Region::new("us-east-1"), aws_sdk_s3::Config::builder());
+    fn store_configuration_overrides_caller_retry_and_timeouts() {
+        let hostile_timeouts = TimeoutConfig::builder()
+            .operation_timeout(Duration::from_secs(600))
+            .operation_attempt_timeout(Duration::from_secs(600))
+            .build();
+        let store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new())
+                .retry_config(RetryConfig::standard())
+                .timeout_config(hostile_timeouts),
+        );
+        let config = store.client.config();
         assert_eq!(
             config.retry_config().expect("retry config").max_attempts(),
             1

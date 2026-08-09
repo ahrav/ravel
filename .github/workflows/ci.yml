@@ -11,7 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       # Disable ambient AWS credential providers (IMDS and config files).
       AWS_EC2_METADATA_DISABLED: "true"

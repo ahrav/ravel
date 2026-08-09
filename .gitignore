@@ -4,3 +4,4 @@
 # beads/bv per-machine runtime files (bd rewrites .beads/.gitignore, so pin here)
 .beads/.bv.lock
 .beads/daemon-error
+.pi-subagents/

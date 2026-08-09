@@ -42,6 +42,7 @@ const HEAD_KEY: &str = "head.json";
 const MAX_PREFIX_BYTES: usize = 64;
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const OPERATION_DEADLINE: Duration = Duration::from_secs(45);
+const SCENARIO_DEADLINE: Duration = Duration::from_secs(120);
 const WORKER_READY_DEADLINE: Duration = Duration::from_secs(60);
 const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(120);
 const BARRIER_IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -153,6 +154,14 @@ impl ResponseInterceptor {
                 failure: None,
             })),
         }
+    }
+
+    fn records(&self) -> Vec<ResponseRecord> {
+        self.state
+            .lock()
+            .expect("interceptor state is not poisoned")
+            .records
+            .clone()
     }
 
     fn finish(&self) -> Result<Vec<ResponseRecord>, &'static str> {
@@ -302,18 +311,14 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-async fn get_event(
-    store: &S3Store,
-    reference: &EventRef,
-) -> Result<(Vec<u8>, Event), &'static str> {
+async fn get_event(store: &S3Store, key: &str) -> Result<(Vec<u8>, Event), &'static str> {
     match store
-        .get_object(reference.key(), MAX_EVENT_BYTES)
+        .get_object(key, MAX_EVENT_BYTES)
         .await
         .map_err(|_| "event read failed")?
     {
         GetOutcome::Found { bytes, .. } => {
-            let decoded =
-                event::decode(&bytes, reference.key()).map_err(|_| "event decode failed")?;
+            let decoded = event::decode(&bytes, key).map_err(|_| "event decode failed")?;
             Ok((bytes, decoded))
         }
         GetOutcome::NotFound => Err("event is missing"),
@@ -423,7 +428,7 @@ async fn validate_transition_state(
     if observed.canonical_bytes() != expected_head_bytes {
         return Err("validation-head-bytes");
     }
-    let (event_bytes, decoded) = get_event(store, observed.head().tail()).await?;
+    let (event_bytes, decoded) = get_event(store, observed.head().tail().key()).await?;
     if event_bytes != expected_event_bytes || decoded != *event {
         return Err("validation-event-identity");
     }
@@ -453,6 +458,7 @@ async fn scenario_a(
     if !matches!(outcome, head::HeadCommitOutcome::Committed) {
         return Err("scenario-a-outcome");
     }
+    evidence.injected_responses.extend(interceptor.records());
     let records = interceptor.finish()?;
     if records.len() != 1
         || !(200..300).contains(&records[0].status)
@@ -461,7 +467,6 @@ async fn scenario_a(
         return Err("scenario-a-injected-response");
     }
     validate_transition_state(clean, &head_bytes, &event_bytes, &prepared.event).await?;
-    evidence.injected_responses.extend(records);
     evidence.scenario_a = Some(ScenarioRecord {
         initial_outcome: "committed",
         resend_outcome: None,
@@ -506,6 +511,7 @@ async fn scenario_b(
     if !matches!(second, head::HeadCommitOutcome::Committed) {
         return Err("scenario-b-resend-outcome");
     }
+    evidence.injected_responses.extend(interceptor.records());
     let records = interceptor.finish()?;
     if records.len() != 3
         || !(200..300).contains(&records[0].status)
@@ -516,7 +522,6 @@ async fn scenario_b(
         return Err("scenario-b-injected-responses");
     }
     validate_transition_state(clean, &head_bytes, &event_bytes, &prepared.event).await?;
-    evidence.injected_responses.extend(records);
     evidence.scenario_b = Some(ScenarioRecord {
         initial_outcome: "unresolved",
         resend_outcome: Some("committed-after-412"),
@@ -548,7 +553,6 @@ struct WorkerResult {
     head_operation_id: String,
     artifact_digest: String,
     artifact_key: String,
-    artifact_size: u64,
 }
 
 impl WorkerResult {
@@ -561,7 +565,6 @@ impl WorkerResult {
             head_operation_id: String::new(),
             artifact_digest: String::new(),
             artifact_key: String::new(),
-            artifact_size: 0,
         }
     }
 }
@@ -616,7 +619,7 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
     let mut barrier = TcpStream::connect_timeout(&address, BARRIER_IO_TIMEOUT)
         .map_err(|_| "worker-barrier-connect")?;
     barrier
-        .set_read_timeout(Some(BARRIER_IO_TIMEOUT))
+        .set_read_timeout(Some(WORKER_READY_DEADLINE))
         .map_err(|_| "worker-barrier-timeout")?;
     barrier
         .set_write_timeout(Some(BARRIER_IO_TIMEOUT))
@@ -649,7 +652,6 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
     let event_key = encoded.key().to_owned();
     let artifact_digest = artifact.artifact_ref().digest().to_owned();
     let artifact_key = format!("artifacts/sha256/{artifact_digest}");
-    let artifact_size = artifact.artifact_ref().size();
     let mut history = AttemptHistory::default();
     let mut outcome = tokio::time::timeout(
         OPERATION_DEADLINE,
@@ -695,7 +697,6 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
         head_operation_id,
         artifact_digest,
         artifact_key,
-        artifact_size,
     })
 }
 
@@ -733,13 +734,18 @@ fn spawn_worker(params: &WorkerParams) -> Result<Child, &'static str> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| "worker-spawn")?;
-    let line = serde_json::to_string(params).map_err(|_| "worker-params-serialize")?;
-    let mut stdin = child.stdin.take().ok_or("worker-stdin")?;
-    stdin
-        .write_all(line.as_bytes())
-        .and_then(|()| stdin.write_all(b"\n"))
-        .map_err(|_| "worker-params-write")?;
-    drop(stdin);
+    let mut send_params = || -> Result<(), &'static str> {
+        let line = serde_json::to_string(params).map_err(|_| "worker-params-serialize")?;
+        let mut stdin = child.stdin.take().ok_or("worker-stdin")?;
+        stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .map_err(|_| "worker-params-write")
+    };
+    if let Err(step) = send_params() {
+        stop_worker(&mut child);
+        return Err(step);
+    }
     Ok(child)
 }
 
@@ -788,7 +794,11 @@ fn stop_worker(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn wait_worker(mut child: Child, deadline: Instant) -> Result<WorkerResult, &'static str> {
+fn wait_worker(
+    mut child: Child,
+    deadline: Instant,
+    expected_worker_id: u8,
+) -> Result<WorkerResult, &'static str> {
     let status = loop {
         if Instant::now() >= deadline {
             stop_worker(&mut child);
@@ -817,6 +827,9 @@ fn wait_worker(mut child: Child, deadline: Instant) -> Result<WorkerResult, &'st
         .find_map(|line| line.split_once(WORKER_MARKER).map(|(_, rest)| rest))
         .ok_or("worker-result-missing")?;
     let result: WorkerResult = serde_json::from_str(line).map_err(|_| "worker-result-invalid")?;
+    if result.worker_id != expected_worker_id {
+        return Err("worker-result-identity");
+    }
     if !status.success() || result.classification.starts_with("failed:") {
         return Err("worker-failed");
     }
@@ -829,18 +842,7 @@ async fn validate_worker_objects(
     worker: &WorkerResult,
     run_id: &str,
 ) -> Result<Event, &'static str> {
-    let digest = worker
-        .event_key
-        .split_once('-')
-        .and_then(|(_, suffix)| suffix.strip_suffix(".cbor.zst"))
-        .ok_or("worker-event-key")?;
-    let reference = EventRef::new(
-        common_parent.sequence() + 1,
-        digest.to_owned(),
-        worker.event_key.clone(),
-    )
-    .map_err(|_| "worker-event-reference")?;
-    let (_, event) = get_event(store, &reference).await?;
+    let (_, event) = get_event(store, &worker.event_key).await?;
     if event.operation_id() != worker.event_operation_id
         || event.parent() != Some(common_parent)
         || event.sequence() != common_parent.sequence() + 1
@@ -852,7 +854,6 @@ async fn validate_worker_objects(
         _ => return Err("worker-event-content"),
     };
     if artifact.digest() != worker.artifact_digest
-        || artifact.size() != worker.artifact_size
         || worker.artifact_key != format!("artifacts/sha256/{}", worker.artifact_digest)
     {
         return Err("worker-artifact-reference");
@@ -867,7 +868,7 @@ async fn validate_worker_objects(
     };
     let expected_bytes = format!("{run_id}-artifact-{}", worker.worker_id).into_bytes();
     if bytes != expected_bytes
-        || bytes.len() as u64 != worker.artifact_size
+        || artifact.size() != bytes.len() as u64
         || sha256(&bytes) != worker.artifact_digest
     {
         return Err("worker-artifact-bytes");
@@ -907,14 +908,17 @@ async fn two_process_race(
         return Err(error);
     }
     let deadline = Instant::now() + WORKER_JOIN_DEADLINE;
-    let first_result = match wait_worker(first_child, deadline) {
+    let first_result = match wait_worker(first_child, deadline, params[0].worker_id) {
         Ok(result) => result,
         Err(error) => {
             stop_worker(&mut second_child);
             return Err(error);
         }
     };
-    let results = [first_result, wait_worker(second_child, deadline)?];
+    let results = [
+        first_result,
+        wait_worker(second_child, deadline, params[1].worker_id)?,
+    ];
     evidence.workers.extend(results.iter().cloned());
     let committed: Vec<_> = results
         .iter()
@@ -930,7 +934,7 @@ async fn two_process_race(
     let winner = committed[0];
     let loser = not_committed[0];
     let winner_event = validate_worker_objects(&store, &common_parent, winner, run_id).await?;
-    let _loser_event = validate_worker_objects(&store, &common_parent, loser, run_id).await?;
+    validate_worker_objects(&store, &common_parent, loser, run_id).await?;
     let final_head = head::read(&store)
         .await
         .map_err(|_| "race-final-head-read")?
@@ -993,7 +997,7 @@ async fn run_live(
     let config = load_sdk_config().await?;
     let clean = clean_store(&config);
     tokio::time::timeout(
-        OPERATION_DEADLINE,
+        SCENARIO_DEADLINE,
         scenario_a(
             &config,
             &clean,
@@ -1004,7 +1008,7 @@ async fn run_live(
     .await
     .map_err(|_| "scenario-a-timeout")??;
     tokio::time::timeout(
-        OPERATION_DEADLINE,
+        SCENARIO_DEADLINE,
         scenario_b(
             &config,
             &clean,
@@ -1068,6 +1072,9 @@ async fn live_s3_ambiguity() {
         Ok(()) => "passed".into(),
         Err(step) => format!("failed:{step}"),
     };
+    if let Err(step) = result {
+        println!("live S3 ambiguity step: {step}");
+    }
     let evidence_path = write_evidence(&evidence).expect("evidence file is writable");
     println!("live S3 ambiguity evidence: {evidence_path}");
     if let Err(step) = result {

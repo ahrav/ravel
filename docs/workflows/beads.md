@@ -62,7 +62,7 @@ Subordinate to explicit user, repository, and orchestrator instructions.
 1. **File issues for remaining work** — create beads for anything needing follow-up
 2. **Run quality gates** (if code changed) — tests, linters, builds
 3. **Update issue status** — close finished work, update in-progress items
-4. **Git**: follow the git policy in `AGENTS.md` — feature branch, PR; never push main. Report status and proposed commands; wait for approval before committing/pushing.
+4. **Git**: follow the git policy in `AGENTS.md` — commit and push to a feature branch and open a PR without waiting for approval; never push `main`.
 5. **Hand off** — summarize changes, validation, issue status, and any blocked sync/commit/push step
 
 If a required sync or push is blocked, stop and report the exact command and error.

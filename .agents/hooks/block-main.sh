@@ -41,9 +41,20 @@ deny() {
 }
 
 current_branch() {
-  # $1: directory from a `git -C <dir>` in the checked command, if any
+  # An earlier `git switch`/`git checkout` segment in the same compound
+  # command sets assumed_branch; it overrides the on-disk state because the
+  # hook inspects the command before the shell executes any segment.
+  if [ -n "$assumed_branch" ]; then printf '%s\n' "$assumed_branch"; return; fi
   git -C "${1:-${cwd:-.}}" symbolic-ref --quiet --short HEAD 2>/dev/null
 }
+
+push_dest() {
+  # Effective destination of a bare `git push` (covers push.default=upstream
+  # and remote.<name>.push mappings), e.g. "origin/main". Empty if unset.
+  git -C "${1:-${cwd:-.}}" rev-parse --abbrev-ref --symbolic-full-name '@{push}' 2>/dev/null
+}
+
+assumed_branch=""
 
 reason=""
 
@@ -85,6 +96,24 @@ check_segment() {
   done
 
   case "$sub" in
+    switch | checkout)
+      # Record the target branch so segments after `git switch main` are
+      # evaluated against main, not the pre-switch branch. `checkout -- <path>`
+      # and detach forms do not switch branches.
+      local tgt=""
+      for ((i = j + 1; i < n; i++)); do
+        case "${toks[$i]}" in
+          --) break ;;
+          --detach | --orphan) return 0 ;;
+          -*) ;;
+          *) tgt="${toks[$i]}"; break ;;
+        esac
+      done
+      # `checkout <branch> -- <path>` restores paths without switching.
+      [ "${toks[$((i + 1))]:-}" = "--" ] && return 0
+      [ -n "$tgt" ] && assumed_branch="$tgt"
+      return 0
+      ;;
     commit)
       if [ "$(current_branch "$cdir")" = "main" ]; then
         reason="'$seg' commits while on main"
@@ -123,8 +152,15 @@ check_segment() {
     reason="'$seg' uses --all/--mirror, which would update main"; return 0
   fi
 
-  if ((${#refspecs[@]} == 0)) && [ "$(current_branch "$cdir")" = "main" ]; then
-    reason="'$seg' is a bare push while on main"; return 0
+  if ((${#refspecs[@]} == 0)); then
+    if [ "$(current_branch "$cdir")" = "main" ]; then
+      reason="'$seg' is a bare push while on main"; return 0
+    fi
+    # ponytail: resolves only mappings visible via @{push}; a bare push to an
+    # explicit remote arg with a remote.<name>.push mapping is not resolved.
+    case "$(push_dest "$cdir")" in
+      */main) reason="'$seg' is a bare push whose configured destination is main"; return 0 ;;
+    esac
   fi
 }
 

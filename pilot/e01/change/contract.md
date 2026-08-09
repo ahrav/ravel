@@ -28,9 +28,21 @@ message argument do not satisfy the treatment. No alternate treatments exist.
 Inline `#[test]`/`#[cfg(test)]` sites inside matched files receive the same
 treatment (the scope is path-based; see §2).
 
-**Objective resolved condition (per target):** the target's `.unwrap()`
-token no longer exists at its site; rediscovery (§2) at the candidate
-revision emits no record for it.
+**Objective resolved condition (per target):** all three, checked by the
+trusted side:
+
+1. the target's `.unwrap()` token no longer exists at its site;
+2. rediscovery (§2) at the candidate revision emits no record for it;
+3. **rewrite reconciliation (per file):** the count of `.expect(` calls
+   with a non-empty string-literal argument in the target's file, measured
+   by the fixed command
+   `tr -d '[:space:]' < <file> | grep -o '\.expect("[^"]' | wc -l`,
+   exceeds the frozen-revision count for that file by exactly the number
+   of the file's resolved inventory targets. A target whose site was
+   changed any other way (`?`, `unwrap_or_default()`, deletion, …) breaks
+   this reconciliation, and every target in a file that fails it counts as
+   **unresolved** regardless of rediscovery — the precommitted treatment
+   is the `.expect` rewrite, not mere `.unwrap()` removal.
 
 **Objective resolved condition (campaign):** rediscovery at the candidate
 revision, under the rule digest in §2, emits zero records that are not

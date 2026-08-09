@@ -168,7 +168,7 @@ cells):** one single synthesized answer per run, recorded with provenance.
 | Communication | None (single agent) | None — independent agents, no coordination, no shared workspace view (§32 Experiment A treatment B) | Only controller-mediated messages/artifacts; no direct agent-to-agent channels |
 | Integration | The agent's findings become the single answer via the run's one `synthesizer` call (same single synthesis step as B/C) | One `synthesizer` profile call merges the four independent thread reports into the single answer; no cross-agent iteration | Controller-directed synthesis via the run's one `synthesizer` call |
 | Follow-ups / depth | Within `budgets.yaml` caps | Within `budgets.yaml` caps | Controller-created follow-ups, bounded by `generated_followups_per_run` and `workflow_depth_levels` |
-| Failover evidence | n/a | n/a | Required once per run: kill the active controller mid-run; record takeover by another host (§43 invariant 20) |
+| Failover evidence | n/a | n/a | Required once per run at a fixed injection point: kill the active controller immediately after it records the second completed work item of the run (deterministic work-progress event, not a free choice); record takeover by another host (§43 invariant 20) |
 | Isolation / reset | §5 | §5 | §5 |
 | Run count | 5 | 5 | 5 |
 | Budget reference | `budgets.yaml`, `deadline_run_ab_hours` | `budgets.yaml`, `deadline_run_ab_hours` | `budgets.yaml`, `deadline_run_c_hours` |
@@ -232,7 +232,7 @@ from treatment self-report (§43 invariant 3).
 | Communication | None (single agent) | None — no coordination, no shared workspace view | Only controller-mediated messages/artifacts; no direct agent-to-agent channels |
 | Integration | Autonomous safe integration to the run's `campaign/e01/*` branch per `environment.yaml` authority (no approval gate) | Each agent works an independent branch; branches integrate to the campaign branch autonomously in fixed target-ID order; a merge conflict counts as an integration-conflict outcome for every target in the conflicting candidate | Controller-directed integration to the campaign branch through the judge/evaluator path in `change/contract.md`; conflicts count as integration-conflict outcomes |
 | Follow-ups / depth | Within `budgets.yaml` caps | Within `budgets.yaml` caps | Controller-created follow-ups, bounded by `generated_followups_per_run` and `workflow_depth_levels` |
-| Failover evidence | n/a | n/a | Required once per run: kill the active controller mid-run; record takeover by another host (§43 invariant 20) |
+| Failover evidence | n/a | n/a | Required once per run at a fixed injection point: kill the active controller immediately after it records the second completed work item of the run (deterministic work-progress event, not a free choice); record takeover by another host (§43 invariant 20) |
 | Isolation / reset | §5 | §5 | §5 |
 | Run count | 5 | 5 | 5 |
 | Budget reference | `budgets.yaml`, `deadline_run_ab_hours` | `budgets.yaml`, `deadline_run_ab_hours` | `budgets.yaml`, `deadline_run_c_hours` |

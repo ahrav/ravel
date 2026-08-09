@@ -1394,6 +1394,7 @@ mod tests {
         let (store, client) = replay_store(vec![
             response(500, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
+            sentinel_response(),
         ]);
         let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
@@ -1589,7 +1590,7 @@ mod tests {
             EventContent::ArtifactPublished(artifact),
         )
         .expect("artifact event is valid");
-        let (store, client) = replay_store(Vec::new());
+        let (store, client) = replay_store(vec![sentinel_response()]);
         let mut history = AttemptHistory::default();
         let error = match append(
             &store,

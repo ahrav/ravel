@@ -81,7 +81,7 @@ bwrap --unshare-all --unshare-user --unshare-cgroup --die-with-parent \
   --ro-bind <source_snapshot> /work/src \
   --ro-bind <toolchain_root> /opt/toolchain \
   --bind <attempt_overlay_dir> /work/out \
-  --tmpfs /tmp --proc /proc --dev /dev \
+  --size 2147483648 --tmpfs /tmp --proc /proc --dev /dev \
   --chdir /work/src --new-session --clearenv \
   --setenv PATH /opt/toolchain/bin:/usr/bin \
   --setenv HOME /work/out --setenv TMPDIR /tmp \
@@ -108,8 +108,8 @@ Mounts, exactly:
 | `/usr` (+ `/bin`, `/lib`, `/lib64`, `/sbin` symlinks) | host runtime | read-only |
 | `/work/src` | the run's source snapshot | read-only |
 | `/opt/toolchain` | prefetched toolchain + dependency cache | read-only |
-| `/work/out` | one attempt's private overlay dir | read-write, single attempt |
-| `/tmp` | fresh `tmpfs` | read-write, discarded at exit |
+| `/work/out` | one attempt's private overlay dir, on a runner-mounted size-capped tmpfs | read-write, single attempt, 8 GiB |
+| `/tmp` | fresh `tmpfs` | read-write, discarded at exit, 2 GiB (`--size`) |
 | `/proc`, `/dev` | `bwrap`-managed private `/proc` and minimal `/dev` | as `bwrap` provides |
 
 Nothing else is bound. `--unshare-all` covers the **network** namespace (only
@@ -132,6 +132,17 @@ attempt's delta. In-place edits to the mounted source tree are not part of
 any flow; a payload attempting one fails on the read-only bind, which is the
 intended fail-closed behavior.
 
+**Writable storage is byte-capped at execution time**, not only at
+post-hoc artifact validation: `/tmp` carries the frozen `--size` above, and
+the runner mounts each `<attempt_overlay_dir>` on its own size-capped tmpfs
+(8 GiB, unmounted after the §3.3 reap), so a payload that writes past either
+cap gets `ENOSPC` inside the sandbox instead of filling the runner's disk
+before validation can fail the attempt. Known ceiling: tmpfs is memory/swap
+backed, so the overlay cap also bounds page-cache pressure per attempt; if a
+run's host class cannot carry 8 GiB of tmpfs per concurrent attempt, the
+upgrade path is a loopback-image filesystem with the same byte cap, not a
+soft quota.
+
 **Environment:** `--clearenv` plus exactly `PATH`, `HOME`, `TMPDIR`. The
 ambient process environment is never forwarded and then redacted. Adding a
 variable requires an amendment.
@@ -151,6 +162,8 @@ assumed to be neutralized by the network namespace.
 | CPU time (`RLIMIT_CPU`) | 900 s | `prlimit --cpu` |
 | Open files (`RLIMIT_NOFILE`) | 4096 | `prlimit --nofile` |
 | Wall clock | 1800 s (`SIGTERM`, `SIGKILL` after 60 s) | `timeout --kill-after=60 1800` |
+| `/tmp` bytes | 2 GiB (2147483648 B) | `--size` on the `--tmpfs` mount |
+| Overlay (`/work/out`) bytes | 8 GiB (8589934592 B) | runner-mounted size-capped tmpfs (§3.1) |
 | stdout bytes | 10 MiB | runner byte cap |
 | stderr bytes | 10 MiB | runner byte cap |
 

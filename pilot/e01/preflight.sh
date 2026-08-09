@@ -294,7 +294,7 @@ else
 		--ro-bind "$SMOKE_DIR/src" /work/src \
 		--ro-bind "$SMOKE_DIR/toolchain" /opt/toolchain \
 		--bind "$SMOKE_DIR/out" /work/out \
-		--tmpfs /tmp --proc /proc --dev /dev \
+		--size 2147483648 --tmpfs /tmp --proc /proc --dev /dev \
 		--chdir /work/src --new-session --clearenv \
 		--setenv PATH /opt/toolchain/bin:/usr/bin \
 		--setenv HOME /work/out --setenv TMPDIR /tmp \

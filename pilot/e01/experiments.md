@@ -370,7 +370,11 @@ defined*.
 **Timing boundaries.** Three UTC boundary timestamps are recorded per run:
 `ts_utc_start` (run-start record), `treatment_end_utc` (Research: the single
 synthesized answer is produced; Change: the last integration to the campaign
-branch), and `measurement_end_utc` (blinded grading complete / final
+branch, or — for a complete run in which no candidate was ever integrated —
+the instant treatment execution stopped: the last `integration_attempt` or
+work-item terminal event, or the cap/stop instant if later; zero-integration
+runs are valid §4/§7 observations and their cap window and
+wall-clock-to-rediscovery measure stay defined), and `measurement_end_utc` (blinded grading complete / final
 rediscovery verdict recorded). Per-run and campaign caps and deadlines bound
 the **treatment-execution window** `ts_utc_start … treatment_end_utc` only;
 trusted measurement is separately timed and separately bounded by
@@ -505,10 +509,17 @@ records, and §7's wasted work counts `attempt` records with no corresponding
 
 ### 9.7 Provider usage and cost — `record: "model_call"`
 
-One record per model call: `call_seq` (1…`model_calls_per_run`),
+One record per model call: `phase` (`treatment` \| `measurement`),
+`call_seq` (1…`model_calls_per_run`),
 `work_item_id`, `agent_id`, `host_id`, `role_profile`, `provider`,
 `model_id`, `input_tokens`, `output_tokens`, `cached_input_tokens`,
-`long_context`, `usd`.
+`long_context`, `usd`. `call_seq` numbering and the `model_calls_per_run`
+cap apply to `phase: treatment` calls only. Trusted blinded-grading judge
+calls are provider calls too: they are recorded with `phase: measurement`,
+`call_seq: null`, null `work_item_id`/`agent_id`, and count against
+`measurement_spend_usd` (§4) — never against per-run treatment caps, so a
+fully measured run cannot look over cap and measurement spend survives for
+budget-stopped analysis.
 
 Token counts are **provider-reported**, never estimated. `input_tokens`
 counts **only uncached** input, so `cached_input_tokens` is disjoint from it

@@ -5,13 +5,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use aws_config::SdkConfig;
 use aws_sdk_s3::{
     Client,
     config::{Builder, Region, retry::RetryConfig, timeout::TimeoutConfig},
     error::{ProvideErrorMetadata, SdkError},
     operation::{
         RequestId, RequestIdExt,
-        get_bucket_lifecycle_configuration::GetBucketLifecycleConfigurationError,
         get_object::GetObjectError,
         put_object::{PutObjectError, PutObjectOutput},
     },
@@ -36,6 +36,7 @@ const REGION_ENV: &str = "RAVEL_LIVE_S3_REGION";
 const EXPECTED_BUCKET: &str = "ravel-e02-4c038b2f";
 const EXPECTED_REGION: &str = "us-east-1";
 const MAX_PREFIX_BYTES: usize = 64;
+// Mirrors the stored-event and canonical-head decode limits in the library.
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_HEAD_BYTES: usize = 4 * 1024;
 const RACE_ROUNDS: usize = 4;
@@ -71,7 +72,7 @@ struct ChainKeys {
 struct OperationRecord {
     step: String,
     client: &'static str,
-    key: Option<String>,
+    key: String,
     condition: Option<&'static str>,
     supplied_etag: Option<String>,
     classification: String,
@@ -158,22 +159,20 @@ struct SelectorDecision {
     reason: &'static str,
 }
 
-fn live_inputs() -> Result<Option<(String, String)>, &'static str> {
+fn live_enabled() -> Result<bool, &'static str> {
     let flag = std::env::var(LIVE_FLAG).ok();
     let bucket = std::env::var(BUCKET_ENV).ok();
     let region = std::env::var(REGION_ENV).ok();
     if flag.as_deref() != Some("1") || bucket.is_none() || region.is_none() {
-        return Ok(None);
+        return Ok(false);
     }
-    let bucket = bucket.expect("checked above");
-    let region = region.expect("checked above");
-    if bucket != EXPECTED_BUCKET {
+    if bucket.as_deref() != Some(EXPECTED_BUCKET) {
         return Err("unexpected live S3 bucket");
     }
-    if region != EXPECTED_REGION {
+    if region.as_deref() != Some(EXPECTED_REGION) {
         return Err("unexpected live S3 region");
     }
-    Ok(Some((bucket, region)))
+    Ok(true)
 }
 
 fn physical(prefix: &str, logical: &str) -> String {
@@ -186,16 +185,16 @@ fn sha256(bytes: &[u8]) -> String {
 
 fn success_record(
     step: &str,
-    key: Option<&str>,
-    condition: Option<&'static str>,
+    key: &str,
+    condition: &'static str,
     supplied_etag: Option<&str>,
     output: &PutObjectOutput,
 ) -> OperationRecord {
     OperationRecord {
         step: step.to_owned(),
         client: "direct-sdk",
-        key: key.map(str::to_owned),
-        condition,
+        key: key.to_owned(),
+        condition: Some(condition),
         supplied_etag: supplied_etag.map(str::to_owned),
         classification: "success".into(),
         status: None,
@@ -206,19 +205,22 @@ fn success_record(
     }
 }
 
-fn put_error_record(
+fn service_error_record<E>(
     step: &str,
     key: &str,
-    condition: &'static str,
+    condition: Option<&'static str>,
     supplied_etag: Option<&str>,
-    error: &SdkError<PutObjectError>,
-) -> OperationRecord {
+    error: &SdkError<E>,
+) -> OperationRecord
+where
+    E: ProvideErrorMetadata + RequestId + RequestIdExt,
+{
     match error {
         SdkError::ServiceError(service) => OperationRecord {
             step: step.to_owned(),
             client: "direct-sdk",
-            key: Some(key.to_owned()),
-            condition: Some(condition),
+            key: key.to_owned(),
+            condition,
             supplied_etag: supplied_etag.map(str::to_owned),
             classification: "service-error".into(),
             status: Some(service.raw().status().as_u16()),
@@ -230,8 +232,8 @@ fn put_error_record(
         _ => OperationRecord {
             step: step.to_owned(),
             client: "direct-sdk",
-            key: Some(key.to_owned()),
-            condition: Some(condition),
+            key: key.to_owned(),
+            condition,
             supplied_etag: supplied_etag.map(str::to_owned),
             classification: "transport-error".into(),
             status: None,
@@ -243,35 +245,37 @@ fn put_error_record(
     }
 }
 
-fn get_error_record(step: &str, key: &str, error: &SdkError<GetObjectError>) -> OperationRecord {
-    match error {
-        SdkError::ServiceError(service) => OperationRecord {
-            step: step.to_owned(),
-            client: "direct-sdk",
-            key: Some(key.to_owned()),
-            condition: None,
-            supplied_etag: None,
-            classification: "service-error".into(),
-            status: Some(service.raw().status().as_u16()),
-            error_code: service.err().code().map(str::to_owned),
-            request_id: service.err().request_id().map(str::to_owned),
-            extended_request_id: service.err().extended_request_id().map(str::to_owned),
-            response_etag: None,
-        },
-        _ => OperationRecord {
-            step: step.to_owned(),
-            client: "direct-sdk",
-            key: Some(key.to_owned()),
-            condition: None,
-            supplied_etag: None,
-            classification: "transport-error".into(),
-            status: None,
-            error_code: None,
-            request_id: None,
-            extended_request_id: None,
-            response_etag: None,
-        },
+async fn conditional_put(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    bytes: Vec<u8>,
+    etag: Option<&str>,
+) -> Result<PutObjectOutput, SdkError<PutObjectError>> {
+    let request = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(bytes));
+    match etag {
+        Some(etag) => request.if_match(etag).send().await,
+        None => request.if_none_match("*").send().await,
     }
+}
+
+fn direct_client(sdk_config: &SdkConfig) -> Client {
+    let timeout = TimeoutConfig::builder()
+        .operation_timeout(OPERATION_TIMEOUT)
+        .operation_attempt_timeout(ATTEMPT_TIMEOUT)
+        .build();
+    Client::from_conf(
+        Builder::from(sdk_config)
+            .region(Region::new(EXPECTED_REGION))
+            .retry_config(RetryConfig::disabled())
+            .timeout_config(timeout)
+            .behavior_version_latest()
+            .build(),
+    )
 }
 
 async fn create_object(
@@ -282,33 +286,25 @@ async fn create_object(
     step: &str,
     evidence: &mut Evidence,
 ) -> Result<String, &'static str> {
-    match client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(bytes.to_vec()))
-        .if_none_match("*")
-        .send()
-        .await
-    {
+    match conditional_put(client, bucket, key, bytes.to_vec(), None).await {
         Ok(output) => {
             let etag = output
                 .e_tag()
                 .ok_or("create response missing ETag")?
                 .to_owned();
-            evidence.operations.push(success_record(
-                step,
-                Some(key),
-                Some("If-None-Match:*"),
-                None,
-                &output,
-            ));
+            evidence
+                .operations
+                .push(success_record(step, key, "If-None-Match:*", None, &output));
             Ok(etag)
         }
         Err(error) => {
-            evidence
-                .operations
-                .push(put_error_record(step, key, "If-None-Match:*", None, &error));
+            evidence.operations.push(service_error_record(
+                step,
+                key,
+                Some("If-None-Match:*"),
+                None,
+                &error,
+            ));
             Err("conditional create failed")
         }
     }
@@ -323,33 +319,25 @@ async fn replace_object(
     step: &str,
     evidence: &mut Evidence,
 ) -> Result<String, &'static str> {
-    match client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(bytes.to_vec()))
-        .if_match(etag)
-        .send()
-        .await
-    {
+    match conditional_put(client, bucket, key, bytes.to_vec(), Some(etag)).await {
         Ok(output) => {
             let next = output
                 .e_tag()
                 .ok_or("replace response missing ETag")?
                 .to_owned();
-            evidence.operations.push(success_record(
-                step,
-                Some(key),
-                Some("If-Match"),
-                Some(etag),
-                &output,
-            ));
+            evidence
+                .operations
+                .push(success_record(step, key, "If-Match", Some(etag), &output));
             Ok(next)
         }
         Err(error) => {
-            evidence
-                .operations
-                .push(put_error_record(step, key, "If-Match", Some(etag), &error));
+            evidence.operations.push(service_error_record(
+                step,
+                key,
+                Some("If-Match"),
+                Some(etag),
+                &error,
+            ));
             Err("conditional replacement failed")
         }
     }
@@ -364,8 +352,8 @@ fn expect_live_412(
     evidence: &mut Evidence,
 ) -> Result<(), &'static str> {
     match result {
-        Err(error @ SdkError::ServiceError(_)) => {
-            let record = put_error_record(step, key, condition, supplied_etag, &error);
+        Err(error) => {
+            let record = service_error_record(step, key, Some(condition), supplied_etag, &error);
             let valid = record.status == Some(412);
             evidence.operations.push(record);
             if valid {
@@ -374,24 +362,10 @@ fn expect_live_412(
                 Err("expected live 412")
             }
         }
-        Err(error) => {
-            evidence.operations.push(put_error_record(
-                step,
-                key,
-                condition,
-                supplied_etag,
-                &error,
-            ));
-            Err("expected live 412")
-        }
         Ok(output) => {
-            evidence.operations.push(success_record(
-                step,
-                Some(key),
-                Some(condition),
-                supplied_etag,
-                &output,
-            ));
+            evidence
+                .operations
+                .push(success_record(step, key, condition, supplied_etag, &output));
             Err("conditional request unexpectedly succeeded")
         }
     }
@@ -411,6 +385,21 @@ fn repository_record(step: &'static str, outcome: &MutationOutcome) -> Repositor
     RepositoryRecord {
         step,
         classification,
+    }
+}
+
+fn expect_repository_412(
+    step: &'static str,
+    outcome: MutationOutcome,
+    evidence: &mut Evidence,
+) -> Result<(), &'static str> {
+    evidence
+        .repository_outcomes
+        .push(repository_record(step, &outcome));
+    if outcome == MutationOutcome::PreconditionFailed {
+        Ok(())
+    } else {
+        Err(step)
     }
 }
 
@@ -608,14 +597,14 @@ fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Ve
             let has_expiration =
                 rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some();
             let safe = enabled == Some(false)
-                || (selector.supported && (!selector.matches || !has_expiration));
-            let reason = if enabled.is_none() {
-                "unknown-status"
-            } else if !selector.supported {
-                selector.reason
-            } else if enabled == Some(false) {
+                || (enabled == Some(true)
+                    && selector.supported
+                    && (!selector.matches || !has_expiration));
+            let reason = if enabled == Some(false) {
                 "disabled"
-            } else if !selector.matches {
+            } else if enabled.is_none() {
+                "unknown-status"
+            } else if !selector.supported || !selector.matches {
                 selector.reason
             } else if has_expiration {
                 "matching-expiration"
@@ -640,6 +629,7 @@ async fn inspect_lifecycle(
     client: &Client,
     bucket: &str,
     objects: &[ObjectFacts<'_>],
+    evidence: &mut Evidence,
 ) -> Result<LifecycleEvidence, &'static str> {
     match client
         .get_bucket_lifecycle_configuration()
@@ -678,7 +668,13 @@ async fn inspect_lifecycle(
             })
         }
         Err(error) => {
-            let _typed: &SdkError<GetBucketLifecycleConfigurationError> = &error;
+            evidence.operations.push(service_error_record(
+                "lifecycle-read",
+                bucket,
+                None,
+                None,
+                &error,
+            ));
             Err("lifecycle read failed")
         }
     }
@@ -688,21 +684,43 @@ async fn get_found_bytes(
     store: &S3Store,
     key: &str,
     limit: usize,
+    step: &'static str,
+    evidence: &mut Evidence,
 ) -> Result<Vec<u8>, &'static str> {
     match store.get_object(key, limit).await {
-        Ok(GetOutcome::Found { bytes, .. }) => Ok(bytes),
-        Ok(GetOutcome::NotFound) => Err("validation object missing"),
-        Err(_) => Err("validation object read failed"),
+        Ok(GetOutcome::Found { bytes, .. }) => {
+            evidence.repository_outcomes.push(RepositoryRecord {
+                step,
+                classification: "found",
+            });
+            Ok(bytes)
+        }
+        Ok(GetOutcome::NotFound) => {
+            evidence.repository_outcomes.push(RepositoryRecord {
+                step,
+                classification: "not-found",
+            });
+            Err(step)
+        }
+        Err(_) => {
+            evidence.repository_outcomes.push(RepositoryRecord {
+                step,
+                classification: "read-error",
+            });
+            Err(step)
+        }
     }
 }
 
 async fn race_for_409(
-    clients: &[Client],
+    sdk_config: &SdkConfig,
     bucket: &str,
     prefix: &str,
     evidence: &mut Evidence,
 ) -> Result<(), &'static str> {
-    debug_assert_eq!(clients.len(), RACE_CONTENDERS);
+    let clients: Vec<Client> = (0..RACE_CONTENDERS)
+        .map(|_| direct_client(sdk_config))
+        .collect();
     for round in 0..RACE_ROUNDS {
         let key = physical(prefix, &format!("race/{round}"));
         let tasks: Vec<_> = (0..RACE_CONTENDERS)
@@ -713,14 +731,7 @@ async fn race_for_409(
                 tokio::spawn(async move {
                     let mut body = vec![contender as u8; RACE_BODY_BYTES];
                     body.extend_from_slice(format!("contender-{contender}").as_bytes());
-                    client
-                        .put_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .body(ByteStream::from(body))
-                        .if_none_match("*")
-                        .send()
-                        .await
+                    conditional_put(&client, &bucket, &key, body, None).await
                 })
             })
             .collect();
@@ -738,67 +749,53 @@ async fn race_for_409(
                     success = true;
                     evidence.operations.push(success_record(
                         &step,
-                        Some(&key),
-                        Some("If-None-Match:*"),
+                        &key,
+                        "If-None-Match:*",
                         None,
                         &output,
                     ));
                 }
                 Err(error) => {
-                    let record = put_error_record(&step, &key, "If-None-Match:*", None, &error);
+                    let record =
+                        service_error_record(&step, &key, Some("If-None-Match:*"), None, &error);
                     found_409 |= record.status == Some(409)
                         && record.error_code.as_deref() == Some("ConditionalRequestConflict");
                     evidence.operations.push(record);
                 }
             }
         }
-        if !success {
-            return Err("race key had no successful writer");
-        }
         if found_409 {
             return Ok(());
+        }
+        if !success {
+            return Err("race key had no successful writer");
         }
     }
     Err("bounded race did not observe live 409")
 }
 
-async fn run_scenario(
-    bucket: &str,
-    region: &str,
-    prefix: &str,
-    evidence: &mut Evidence,
-) -> Result<(), &'static str> {
+async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'static str> {
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(Region::new(region.to_owned()))
+        .region(Region::new(EXPECTED_REGION))
         .load()
         .await;
-    let timeout = TimeoutConfig::builder()
-        .operation_timeout(OPERATION_TIMEOUT)
-        .operation_attempt_timeout(ATTEMPT_TIMEOUT)
-        .build();
-    let direct_config = Builder::from(&sdk_config)
-        .region(Region::new(region.to_owned()))
-        .retry_config(RetryConfig::disabled())
-        .timeout_config(timeout)
-        .behavior_version_latest()
-        .build();
-    let direct = Client::from_conf(direct_config);
+    let direct = direct_client(&sdk_config);
     let store = S3Store::new(
-        bucket,
-        Region::new(region.to_owned()),
+        EXPECTED_BUCKET,
+        Region::new(EXPECTED_REGION),
         Builder::from(&sdk_config),
     );
 
     let head_key = physical(prefix, "head.json");
     match direct
         .get_object()
-        .bucket(bucket)
+        .bucket(EXPECTED_BUCKET)
         .key(&head_key)
         .send()
         .await
     {
         Err(error @ SdkError::ServiceError(_)) => {
-            let record = get_error_record("direct-missing-head", &head_key, &error);
+            let record = service_error_record("direct-missing-head", &head_key, None, None, &error);
             let modeled = match &error {
                 SdkError::ServiceError(service) => {
                     matches!(service.err(), GetObjectError::NoSuchKey(_))
@@ -812,9 +809,13 @@ async fn run_scenario(
             }
         }
         Err(error) => {
-            evidence
-                .operations
-                .push(get_error_record("direct-missing-head", &head_key, &error));
+            evidence.operations.push(service_error_record(
+                "direct-missing-head",
+                &head_key,
+                None,
+                None,
+                &error,
+            ));
             return Err("missing head direct read failed");
         }
         Ok(_) => return Err("live prefix collision"),
@@ -834,7 +835,7 @@ async fn run_scenario(
         artifact_bytes.len() as u64,
         "application/octet-stream".into(),
         "live-preflight-attempt".into(),
-        evidence.epoch_nanos.min(u64::MAX as u128) as u64,
+        (evidence.epoch_nanos / 1_000_000) as u64,
         Some("retain".into()),
     )
     .map_err(|_| "artifact reference construction failed")?;
@@ -888,7 +889,7 @@ async fn run_scenario(
 
     create_object(
         &direct,
-        bucket,
+        EXPECTED_BUCKET,
         &keys.artifact,
         &artifact_bytes,
         "create-artifact",
@@ -897,7 +898,7 @@ async fn run_scenario(
     .await?;
     let event_1_direct_etag = create_object(
         &direct,
-        bucket,
+        EXPECTED_BUCKET,
         &keys.event_1,
         encoded_1.stored_bytes(),
         "create-event-1",
@@ -906,7 +907,7 @@ async fn run_scenario(
     .await?;
     create_object(
         &direct,
-        bucket,
+        EXPECTED_BUCKET,
         &keys.event_2,
         encoded_2.stored_bytes(),
         "create-event-2",
@@ -915,7 +916,7 @@ async fn run_scenario(
     .await?;
     let genesis_direct_etag = create_object(
         &direct,
-        bucket,
+        EXPECTED_BUCKET,
         &keys.head,
         &genesis_head_bytes,
         "create-genesis-head",
@@ -933,7 +934,7 @@ async fn run_scenario(
     };
     let current_direct_etag = replace_object(
         &direct,
-        bucket,
+        EXPECTED_BUCKET,
         &keys.head,
         &successor_head_bytes,
         &genesis_direct_etag,
@@ -945,14 +946,14 @@ async fn run_scenario(
         return Err("wrong ETag unexpectedly equals current head ETag");
     }
 
-    let direct_duplicate = direct
-        .put_object()
-        .bucket(bucket)
-        .key(&keys.event_1)
-        .body(ByteStream::from(encoded_1.stored_bytes().to_vec()))
-        .if_none_match("*")
-        .send()
-        .await;
+    let direct_duplicate = conditional_put(
+        &direct,
+        EXPECTED_BUCKET,
+        &keys.event_1,
+        encoded_1.stored_bytes().to_vec(),
+        None,
+    )
+    .await;
     expect_live_412(
         direct_duplicate,
         "duplicate-create-412",
@@ -969,21 +970,16 @@ async fn run_scenario(
             &mut history,
         )
         .await;
-    evidence
-        .repository_outcomes
-        .push(repository_record("repository-duplicate-create", &duplicate));
-    if duplicate != MutationOutcome::PreconditionFailed {
-        return Err("repository duplicate create was not typed 412");
-    }
+    expect_repository_412("repository-duplicate-create", duplicate, evidence)?;
 
-    let direct_stale = direct
-        .put_object()
-        .bucket(bucket)
-        .key(&keys.head)
-        .body(ByteStream::from(successor_head_bytes.clone()))
-        .if_match(&genesis_direct_etag)
-        .send()
-        .await;
+    let direct_stale = conditional_put(
+        &direct,
+        EXPECTED_BUCKET,
+        &keys.head,
+        successor_head_bytes.clone(),
+        Some(&genesis_direct_etag),
+    )
+    .await;
     expect_live_412(
         direct_stale,
         "stale-if-match-412",
@@ -1001,21 +997,16 @@ async fn run_scenario(
             &mut history,
         )
         .await;
-    evidence
-        .repository_outcomes
-        .push(repository_record("repository-stale-if-match", &stale));
-    if stale != MutationOutcome::PreconditionFailed {
-        return Err("repository stale If-Match was not typed 412");
-    }
+    expect_repository_412("repository-stale-if-match", stale, evidence)?;
 
-    let direct_wrong = direct
-        .put_object()
-        .bucket(bucket)
-        .key(&keys.head)
-        .body(ByteStream::from(successor_head_bytes.clone()))
-        .if_match(&event_1_direct_etag)
-        .send()
-        .await;
+    let direct_wrong = conditional_put(
+        &direct,
+        EXPECTED_BUCKET,
+        &keys.head,
+        successor_head_bytes.clone(),
+        Some(&event_1_direct_etag),
+    )
+    .await;
     expect_live_412(
         direct_wrong,
         "wrong-if-match-412",
@@ -1033,31 +1024,54 @@ async fn run_scenario(
             &mut history,
         )
         .await;
-    evidence
-        .repository_outcomes
-        .push(repository_record("repository-wrong-if-match", &wrong));
-    if wrong != MutationOutcome::PreconditionFailed {
-        return Err("repository wrong If-Match was not typed 412");
-    }
+    expect_repository_412("repository-wrong-if-match", wrong, evidence)?;
 
-    let final_head_bytes = get_found_bytes(&store, &keys.head, MAX_HEAD_BYTES).await?;
+    let final_head_bytes = get_found_bytes(
+        &store,
+        &keys.head,
+        MAX_HEAD_BYTES,
+        "validate-head",
+        evidence,
+    )
+    .await?;
     let final_head = head::decode(&final_head_bytes).map_err(|_| "final head decode failed")?;
     if final_head != successor_head {
         return Err("final head does not match successor");
     }
-    let stored_event_2 = get_found_bytes(&store, &keys.event_2, MAX_EVENT_BYTES).await?;
+    let stored_event_2 = get_found_bytes(
+        &store,
+        &keys.event_2,
+        MAX_EVENT_BYTES,
+        "validate-event-2",
+        evidence,
+    )
+    .await?;
     let decoded_event_2 =
         event::decode(&stored_event_2, encoded_2.key()).map_err(|_| "event 2 validation failed")?;
     if decoded_event_2 != event_2 || decoded_event_2.parent() != Some(&reference_1) {
         return Err("event 2 chain linkage failed");
     }
-    let stored_event_1 = get_found_bytes(&store, &keys.event_1, MAX_EVENT_BYTES).await?;
+    let stored_event_1 = get_found_bytes(
+        &store,
+        &keys.event_1,
+        MAX_EVENT_BYTES,
+        "validate-event-1",
+        evidence,
+    )
+    .await?;
     if event::decode(&stored_event_1, encoded_1.key()).map_err(|_| "event 1 validation failed")?
         != event_1
     {
         return Err("event 1 mismatch");
     }
-    let stored_artifact = get_found_bytes(&store, &keys.artifact, MAX_ARTIFACT_BYTES).await?;
+    let stored_artifact = get_found_bytes(
+        &store,
+        &keys.artifact,
+        MAX_ARTIFACT_BYTES,
+        "validate-artifact",
+        evidence,
+    )
+    .await?;
     if stored_artifact.len() != artifact_bytes.len() || sha256(&stored_artifact) != artifact_digest
     {
         return Err("artifact validation failed");
@@ -1081,30 +1095,14 @@ async fn run_scenario(
             size: stored_artifact.len() as u64,
         },
     ];
-    let lifecycle = inspect_lifecycle(&direct, bucket, &objects).await?;
+    let lifecycle = inspect_lifecycle(&direct, EXPECTED_BUCKET, &objects, evidence).await?;
     let safe = lifecycle.safe;
     evidence.lifecycle = Some(lifecycle);
     if !safe {
         return Err("lifecycle rule can expire retained objects");
     }
 
-    let race_clients: Vec<Client> = (0..RACE_CONTENDERS)
-        .map(|_| {
-            let timeout = TimeoutConfig::builder()
-                .operation_timeout(OPERATION_TIMEOUT)
-                .operation_attempt_timeout(ATTEMPT_TIMEOUT)
-                .build();
-            Client::from_conf(
-                Builder::from(&sdk_config)
-                    .region(Region::new(region.to_owned()))
-                    .retry_config(RetryConfig::disabled())
-                    .timeout_config(timeout)
-                    .behavior_version_latest()
-                    .build(),
-            )
-        })
-        .collect();
-    race_for_409(&race_clients, bucket, prefix, evidence).await?;
+    race_for_409(&sdk_config, EXPECTED_BUCKET, prefix, evidence).await?;
     Ok(())
 }
 
@@ -1125,14 +1123,14 @@ fn write_evidence(evidence: &Evidence) -> Result<String, &'static str> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn live_s3_preflight() {
-    let inputs = match live_inputs() {
-        Ok(Some(inputs)) => inputs,
-        Ok(None) => {
+    match live_enabled() {
+        Ok(true) => {}
+        Ok(false) => {
             println!("live S3 preflight skipped: set RAVEL_LIVE_S3=1, bucket, and region");
             return;
         }
         Err(message) => panic!("{message}"),
-    };
+    }
     let epoch_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after the Unix epoch")
@@ -1158,7 +1156,7 @@ async fn live_s3_preflight() {
         lifecycle: None,
         result: "running".into(),
     };
-    let outcome = run_scenario(&inputs.0, &inputs.1, &prefix, &mut evidence).await;
+    let outcome = run_scenario(&prefix, &mut evidence).await;
     evidence.result = match outcome {
         Ok(()) => "passed".into(),
         Err(step) => format!("failed:{step}"),
@@ -1288,4 +1286,119 @@ fn lifecycle_rule_evaluator_covers_all_selector_forms_and_overlaps() {
     assert!(!report[1].safe);
     assert!(!report[2].safe);
     assert_eq!(report[2].reason, "unknown-status");
+}
+
+#[test]
+fn evaluator_fails_closed_on_noncurrent_and_unsupported_shapes() {
+    let object = ObjectFacts {
+        key: "e02-preflight/run/head.json",
+        size: 100,
+    };
+
+    let mut noncurrent = test_rule("Enabled", None, None);
+    noncurrent.expiration = None;
+    noncurrent.noncurrent_version_expiration = Some(json!({ "noncurrent_days": 1 }));
+    assert!(!lifecycle_report(&[noncurrent], &[object])[0].safe);
+
+    let legacy_and_filter = test_rule(
+        "Enabled",
+        Some(FilterProjection {
+            prefix: Some("other/".into()),
+            ..Default::default()
+        }),
+        Some("other/"),
+    );
+    let decision = selector_matches(&legacy_and_filter, object);
+    assert!(!decision.supported);
+    assert!(!lifecycle_report(&[legacy_and_filter], &[object])[0].safe);
+
+    let ambiguous = test_rule(
+        "Enabled",
+        Some(FilterProjection {
+            prefix: Some("other/".into()),
+            object_size_less_than: Some(1),
+            ..Default::default()
+        }),
+        None,
+    );
+    let decision = selector_matches(&ambiguous, object);
+    assert!(!decision.supported);
+    assert!(decision.matches);
+    assert!(!lifecycle_report(&[ambiguous], &[object])[0].safe);
+
+    let and_with_tag = test_rule(
+        "Enabled",
+        Some(FilterProjection {
+            and: Some(AndProjection {
+                prefix: Some("e02-preflight/".into()),
+                tags: vec![TagProjection {
+                    key: "expire".into(),
+                    value: "yes".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        None,
+    );
+    assert!(!selector_matches(&and_with_tag, object).matches);
+
+    let anchored_prefix = test_rule(
+        "Enabled",
+        Some(FilterProjection {
+            prefix: Some("e02-preflight/".into()),
+            ..Default::default()
+        }),
+        None,
+    );
+    let embedded = ObjectFacts {
+        key: "x/e02-preflight/run/head.json",
+        size: 100,
+    };
+    assert!(!selector_matches(&anchored_prefix, embedded).matches);
+
+    let unknown_status = test_rule("Future", None, None);
+    let report = lifecycle_report(&[unknown_status], &[object]);
+    assert!(!report[0].safe);
+    assert_eq!(report[0].reason, "unknown-status");
+}
+
+#[test]
+fn projects_sdk_lifecycle_rule_fields() {
+    let tag = aws_sdk_s3::types::Tag::builder()
+        .key("expire")
+        .value("yes")
+        .build()
+        .expect("test tag is complete");
+    let and = aws_sdk_s3::types::LifecycleRuleAndOperator::builder()
+        .prefix("e02-preflight/")
+        .tags(tag)
+        .object_size_greater_than(10)
+        .object_size_less_than(1_000)
+        .build();
+    let filter = LifecycleRuleFilter::builder().and(and).build();
+    let rule = LifecycleRule::builder()
+        .id("projected-rule")
+        .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
+        .filter(filter)
+        .noncurrent_version_expiration(
+            aws_sdk_s3::types::NoncurrentVersionExpiration::builder()
+                .noncurrent_days(7)
+                .newer_noncurrent_versions(2)
+                .build(),
+        )
+        .build()
+        .expect("test lifecycle rule is complete");
+
+    let projection = project_rule(&rule);
+    assert_eq!(projection.id.as_deref(), Some("projected-rule"));
+    assert_eq!(projection.status, "Enabled");
+    let filter = projection.filter.expect("filter is projected");
+    let and = filter.and.expect("and is projected");
+    assert_eq!(and.prefix.as_deref(), Some("e02-preflight/"));
+    assert_eq!(and.tags[0].key, "expire");
+    assert_eq!(and.tags[0].value, "yes");
+    assert_eq!(and.object_size_greater_than, Some(10));
+    assert_eq!(and.object_size_less_than, Some(1_000));
+    assert!(projection.noncurrent_version_expiration.is_some());
 }

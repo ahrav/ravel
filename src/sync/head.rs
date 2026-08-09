@@ -7,14 +7,259 @@
 //! Tail contains `sequence`, `digest`, then `key`. The decoder compares input
 //! bytes with the production re-encoding before domain conversion; this rejects
 //! extra fields on internally tagged unowned unit variants.
+//!
+//! Conditional mutation resolution does not walk retained history.
+
+use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::campaign::{Authority, AuthorityState, EventRef, Head};
+use crate::{
+    domain::campaign::{Authority, AuthorityState, Event, EventRef, Head},
+    storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+};
 
-use super::{WIRE_VERSION, WireError};
+use super::{
+    WIRE_VERSION, WireError,
+    event::{self, ResolvedEventPublication},
+};
 
+const HEAD_KEY: &str = "head.json";
 const MAX_HEAD_BYTES: usize = 4 * 1024;
+
+pub struct ObservedHead {
+    head: Head,
+    bytes: Vec<u8>,
+    etag: ETag,
+}
+
+impl ObservedHead {
+    pub fn head(&self) -> &Head {
+        &self.head
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Debug)]
+pub enum HeadReadError {
+    Storage(GetError),
+    Invalid(WireError),
+}
+
+impl fmt::Display for HeadReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Storage(_) => "head read failed",
+            Self::Invalid(_) => "head encoding is invalid",
+        })
+    }
+}
+
+impl Error for HeadReadError {}
+
+pub enum HeadParent {
+    Genesis,
+    Existing(ObservedHead),
+}
+
+pub struct HeadTransition {
+    parent: HeadParent,
+    candidate: Head,
+    head_bytes: Vec<u8>,
+    event_bytes: Vec<u8>,
+}
+
+impl HeadTransition {
+    pub fn new(
+        parent: HeadParent,
+        candidate: Head,
+        tail: &Event,
+        publication: &ResolvedEventPublication,
+    ) -> Result<Self, WireError> {
+        let encoded = event::encode(tail)?;
+        let published = publication.event_ref();
+        if candidate.tail() != published
+            || tail.sequence() != candidate.tail().sequence()
+            || encoded.key() != published.key()
+            || encoded.digest() != published.digest()
+        {
+            return Err(WireError::InvalidValue);
+        }
+
+        match &parent {
+            HeadParent::Genesis => {
+                if tail.sequence() != 1 || tail.parent().is_some() {
+                    return Err(WireError::InvalidValue);
+                }
+            }
+            HeadParent::Existing(observed) => {
+                let expected_sequence = observed
+                    .head
+                    .tail()
+                    .sequence()
+                    .checked_add(1)
+                    .ok_or(WireError::InvalidValue)?;
+                if tail.sequence() != expected_sequence
+                    || tail.parent() != Some(observed.head.tail())
+                    || !fence_permits(&observed.head, &candidate)
+                {
+                    return Err(WireError::InvalidValue);
+                }
+            }
+        }
+
+        let head_bytes = encode(&candidate)?;
+        if head_bytes.len() > MAX_HEAD_BYTES {
+            return Err(WireError::LimitExceeded);
+        }
+        Ok(Self {
+            parent,
+            candidate,
+            head_bytes,
+            event_bytes: encoded.stored_bytes().to_vec(),
+        })
+    }
+
+    pub fn parent(&self) -> &HeadParent {
+        &self.parent
+    }
+
+    pub fn candidate(&self) -> &Head {
+        &self.candidate
+    }
+
+    pub fn canonical_head_bytes(&self) -> &[u8] {
+        &self.head_bytes
+    }
+
+    pub fn canonical_event_bytes(&self) -> &[u8] {
+        &self.event_bytes
+    }
+}
+
+pub enum HeadCommitOutcome {
+    Committed,
+    RetryIdentically(HeadTransition),
+    Advanced {
+        transition: HeadTransition,
+        current: ObservedHead,
+    },
+    Unresolved(HeadTransition),
+}
+
+pub async fn read(store: &S3Store) -> Result<Option<ObservedHead>, HeadReadError> {
+    match store
+        .get_object(HEAD_KEY, MAX_HEAD_BYTES)
+        .await
+        .map_err(HeadReadError::Storage)?
+    {
+        GetOutcome::NotFound => Ok(None),
+        GetOutcome::Found { bytes, etag } => {
+            let head = decode(&bytes).map_err(HeadReadError::Invalid)?;
+            Ok(Some(ObservedHead { head, bytes, etag }))
+        }
+    }
+}
+
+pub async fn commit(
+    store: &S3Store,
+    transition: HeadTransition,
+    history: &mut AttemptHistory,
+) -> HeadCommitOutcome {
+    let outcome = match &transition.parent {
+        HeadParent::Genesis => {
+            store
+                .put_if_absent(HEAD_KEY, transition.head_bytes.clone(), history)
+                .await
+        }
+        HeadParent::Existing(observed) => {
+            store
+                .put_if_match(
+                    HEAD_KEY,
+                    transition.head_bytes.clone(),
+                    &observed.etag,
+                    history,
+                )
+                .await
+        }
+    };
+    match outcome {
+        MutationOutcome::Committed { .. } => HeadCommitOutcome::Committed,
+        MutationOutcome::ProvenNotSent => HeadCommitOutcome::RetryIdentically(transition),
+        MutationOutcome::Conflict
+        | MutationOutcome::PreconditionFailed
+        | MutationOutcome::AmbiguousConflict
+        | MutationOutcome::Unknown
+        | MutationOutcome::NotFound => resolve(store, transition).await,
+        MutationOutcome::TooLarge => HeadCommitOutcome::Unresolved(transition),
+    }
+}
+
+async fn resolve(store: &S3Store, mut transition: HeadTransition) -> HeadCommitOutcome {
+    let current = match read(store).await {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            return match transition.parent {
+                HeadParent::Genesis => HeadCommitOutcome::RetryIdentically(transition),
+                HeadParent::Existing(_) => HeadCommitOutcome::Unresolved(transition),
+            };
+        }
+        Err(_) => return HeadCommitOutcome::Unresolved(transition),
+    };
+
+    if current.head.operation_id() == transition.candidate.operation_id() {
+        if current.bytes != transition.head_bytes {
+            return HeadCommitOutcome::Unresolved(transition);
+        }
+        let tail_key = transition.candidate.tail().key();
+        let tail = store
+            .get_object(tail_key, transition.event_bytes.len())
+            .await;
+        return match tail {
+            Ok(GetOutcome::Found { bytes, .. })
+                if bytes == transition.event_bytes && event::decode(&bytes, tail_key).is_ok() =>
+            {
+                HeadCommitOutcome::Committed
+            }
+            Ok(GetOutcome::Found { .. }) | Ok(GetOutcome::NotFound) | Err(_) => {
+                HeadCommitOutcome::Unresolved(transition)
+            }
+        };
+    }
+
+    let parent_is_current = match &transition.parent {
+        HeadParent::Genesis => false,
+        HeadParent::Existing(parent) => parent.bytes == current.bytes,
+    };
+    if parent_is_current {
+        transition.parent = HeadParent::Existing(current);
+        HeadCommitOutcome::RetryIdentically(transition)
+    } else {
+        HeadCommitOutcome::Advanced {
+            transition,
+            current,
+        }
+    }
+}
+
+fn fence_permits(parent: &Head, candidate: &Head) -> bool {
+    match (parent.authority().state(), candidate.authority().state()) {
+        (
+            AuthorityState::Owned {
+                controller_fence: parent,
+                ..
+            },
+            AuthorityState::Owned {
+                controller_fence: candidate,
+                ..
+            },
+        ) => candidate >= parent,
+        _ => true,
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -134,9 +379,120 @@ impl TryFrom<WireAuthority> for Authority {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::primitives::SdkBody;
+
+    use crate::{
+        domain::campaign::EventContent,
+        storage::s3::test_support::{replay_store, response},
+    };
+
     use super::*;
 
     const OWNED_HEAD: &[u8] = include_bytes!("../../tests/fixtures/v1/head-owned.json");
+    const OLD_ETAG: &str = "\"opaque-old\"";
+    const FRESH_ETAG: &str = "\"opaque-fresh\"";
+
+    fn event_reference(event: &Event) -> EventRef {
+        let encoded = event::encode(event).expect("event encodes");
+        EventRef::new(
+            event.sequence(),
+            encoded.digest().to_owned(),
+            encoded.key().to_owned(),
+        )
+        .expect("encoded event reference is valid")
+    }
+
+    fn genesis_event() -> Event {
+        Event::new(
+            "event-op-1".into(),
+            1,
+            None,
+            7,
+            EventContent::CampaignCreated,
+        )
+        .expect("valid genesis event")
+    }
+
+    fn parent_head(authority: Authority, operation_id: &str) -> Head {
+        Head::new(
+            authority,
+            event_reference(&genesis_event()),
+            operation_id.into(),
+        )
+        .expect("valid parent head")
+    }
+
+    async fn publish_event(event: &Event) -> ResolvedEventPublication {
+        let (store, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        event::publish(&store, event, None)
+            .await
+            .expect("event publication resolves")
+    }
+
+    async fn genesis_transition(authority: Authority, operation_id: &str) -> HeadTransition {
+        let tail = genesis_event();
+        let publication = publish_event(&tail).await;
+        let candidate = Head::new(
+            authority,
+            publication.event_ref().clone(),
+            operation_id.into(),
+        )
+        .expect("valid candidate head");
+        HeadTransition::new(HeadParent::Genesis, candidate, &tail, &publication)
+            .expect("valid genesis transition")
+    }
+
+    async fn read_observed(head: &Head, etag: &str) -> ObservedHead {
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("etag", etag)],
+            encode(head).expect("head encodes"),
+        )]);
+        read(&store)
+            .await
+            .expect("head read succeeds")
+            .expect("head exists")
+    }
+
+    async fn successor_transition(
+        parent: ObservedHead,
+        authority: Authority,
+        operation_id: &str,
+    ) -> HeadTransition {
+        let parent_ref = parent.head().tail().clone();
+        let tail = Event::new(
+            "event-op-2".into(),
+            parent_ref.sequence() + 1,
+            Some(parent_ref),
+            8,
+            EventContent::WorkflowStarted,
+        )
+        .expect("valid successor event");
+        let publication = publish_event(&tail).await;
+        let candidate = Head::new(
+            authority,
+            publication.event_ref().clone(),
+            operation_id.into(),
+        )
+        .expect("valid candidate head");
+        HeadTransition::new(HeadParent::Existing(parent), candidate, &tail, &publication)
+            .expect("valid successor transition")
+    }
+
+    fn request_path(
+        client: &aws_smithy_runtime::client::http::test_util::StaticReplayClient,
+        index: usize,
+    ) -> String {
+        client
+            .actual_requests()
+            .nth(index)
+            .expect("request")
+            .uri()
+            .parse::<http::Uri>()
+            .expect("valid request URI")
+            .path()
+            .to_owned()
+    }
 
     fn digest() -> String {
         "0".repeat(64)
@@ -299,5 +655,424 @@ mod tests {
             decode(&vec![b' '; MAX_HEAD_BYTES + 1]),
             Err(WireError::LimitExceeded)
         );
+    }
+
+    #[tokio::test]
+    async fn read_preserves_not_found_and_rejects_invalid_heads() {
+        let (store, _) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        assert!(read(&store).await.expect("read succeeds").is_none());
+
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("etag", OLD_ETAG)],
+            b"not-json".to_vec(),
+        )]);
+        assert!(matches!(
+            read(&store).await,
+            Err(HeadReadError::Invalid(WireError::InvalidEncoding))
+        ));
+        assert_eq!(
+            HeadReadError::Invalid(WireError::InvalidEncoding).to_string(),
+            "head encoding is invalid"
+        );
+        assert_eq!(
+            HeadReadError::Storage(GetError::Transport).to_string(),
+            "head read failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn genesis_commit_uses_create_only_with_exact_bytes() {
+        let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
+        let expected = transition.canonical_head_bytes().to_vec();
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            commit(&store, transition, &mut history).await,
+            HeadCommitOutcome::Committed
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+        assert_eq!(request_path(&client, 0), "/head.json");
+        let request = client.actual_requests().next().expect("head PUT");
+        assert_eq!(request.headers().get("if-none-match"), Some("*"));
+        assert!(request.headers().get("if-match").is_none());
+        assert_eq!(request.body().bytes(), Some(expected.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn validated_read_couples_exact_etag_to_replacement() {
+        let parent = parent_head(Authority::unowned(), "head-op-1");
+        let parent_bytes = encode(&parent).expect("head encodes");
+        let (store, client) = replay_store(vec![
+            response(200, &[("etag", OLD_ETAG)], parent_bytes),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        let observed = read(&store)
+            .await
+            .expect("read succeeds")
+            .expect("parent exists");
+        let transition = successor_transition(observed, Authority::unowned(), "head-op-2").await;
+        let expected = transition.canonical_head_bytes().to_vec();
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            commit(&store, transition, &mut history).await,
+            HeadCommitOutcome::Committed
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(request_path(&client, 0), "/head.json");
+        assert_eq!(request_path(&client, 1), "/head.json");
+        let request = client.actual_requests().nth(1).expect("replacement PUT");
+        assert_eq!(request.headers().get("if-match"), Some(OLD_ETAG));
+        assert!(request.headers().get("if-none-match").is_none());
+        assert_eq!(request.body().bytes(), Some(expected.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn transition_constructor_rejects_invalid_boundaries_and_lower_fence() {
+        let predecessor = EventRef::new(
+            1,
+            "0".repeat(64),
+            format!("{:016}-{}.cbor.zst", 1, "0".repeat(64)),
+        )
+        .expect("valid predecessor");
+        let sequence_two = Event::new(
+            "event-op-2".into(),
+            2,
+            Some(predecessor),
+            8,
+            EventContent::WorkflowStarted,
+        )
+        .expect("valid event");
+        let publication = publish_event(&sequence_two).await;
+        let candidate = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "head-op-2".into(),
+        )
+        .expect("valid head");
+        assert_eq!(
+            HeadTransition::new(HeadParent::Genesis, candidate, &sequence_two, &publication).err(),
+            Some(WireError::InvalidValue)
+        );
+
+        let genesis = genesis_event();
+        let publication = publish_event(&genesis).await;
+        let different = EventRef::new(
+            1,
+            "f".repeat(64),
+            format!("{:016}-{}.cbor.zst", 1, "f".repeat(64)),
+        )
+        .expect("valid alternate reference");
+        let candidate =
+            Head::new(Authority::unowned(), different, "head-op-1".into()).expect("valid head");
+        assert_eq!(
+            HeadTransition::new(HeadParent::Genesis, candidate, &genesis, &publication).err(),
+            Some(WireError::InvalidValue)
+        );
+
+        let different_tail = Event::new(
+            "different-event-operation".into(),
+            1,
+            None,
+            7,
+            EventContent::CampaignCreated,
+        )
+        .expect("valid alternate event");
+        let candidate = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "head-op-1".into(),
+        )
+        .expect("valid head");
+        assert_eq!(
+            HeadTransition::new(
+                HeadParent::Genesis,
+                candidate,
+                &different_tail,
+                &publication
+            )
+            .err(),
+            Some(WireError::InvalidValue)
+        );
+
+        let parent = parent_head(Authority::unowned(), "parent-op");
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let sequence_two_ref = EventRef::new(
+            2,
+            "1".repeat(64),
+            format!("{:016}-{}.cbor.zst", 2, "1".repeat(64)),
+        )
+        .expect("valid predecessor");
+        let sequence_three = Event::new(
+            "event-op-3".into(),
+            3,
+            Some(sequence_two_ref),
+            9,
+            EventContent::WorkflowStarted,
+        )
+        .expect("valid event");
+        let publication = publish_event(&sequence_three).await;
+        let candidate = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "head-op-3".into(),
+        )
+        .expect("valid head");
+        assert_eq!(
+            HeadTransition::new(
+                HeadParent::Existing(observed),
+                candidate,
+                &sequence_three,
+                &publication
+            )
+            .err(),
+            Some(WireError::InvalidValue)
+        );
+
+        let parent = parent_head(Authority::unowned(), "parent-op");
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let wrong_parent = EventRef::new(
+            1,
+            "2".repeat(64),
+            format!("{:016}-{}.cbor.zst", 1, "2".repeat(64)),
+        )
+        .expect("valid alternate parent");
+        let tail = Event::new(
+            "event-op-2".into(),
+            2,
+            Some(wrong_parent),
+            8,
+            EventContent::WorkflowStarted,
+        )
+        .expect("valid event");
+        let publication = publish_event(&tail).await;
+        let candidate = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "head-op-2".into(),
+        )
+        .expect("valid head");
+        assert_eq!(
+            HeadTransition::new(
+                HeadParent::Existing(observed),
+                candidate,
+                &tail,
+                &publication
+            )
+            .err(),
+            Some(WireError::InvalidValue)
+        );
+
+        let parent = parent_head(
+            Authority::owned("owner".into(), "instance".into(), 1, 2).expect("valid authority"),
+            "parent-op",
+        );
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let parent_ref = parent.tail().clone();
+        let tail = Event::new(
+            "event-op-2".into(),
+            2,
+            Some(parent_ref),
+            8,
+            EventContent::WorkflowStarted,
+        )
+        .expect("valid event");
+        let publication = publish_event(&tail).await;
+        let lower = Head::new(
+            Authority::owned("owner".into(), "instance".into(), 2, 1).expect("valid authority"),
+            publication.event_ref().clone(),
+            "head-op-2".into(),
+        )
+        .expect("valid head");
+        assert_eq!(
+            HeadTransition::new(HeadParent::Existing(observed), lower, &tail, &publication).err(),
+            Some(WireError::InvalidValue)
+        );
+
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let equal = Head::new(
+            Authority::owned("owner".into(), "instance".into(), 2, 2).expect("valid authority"),
+            publication.event_ref().clone(),
+            "head-op-2".into(),
+        )
+        .expect("valid head");
+        assert!(
+            HeadTransition::new(HeadParent::Existing(observed), equal, &tail, &publication).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_create_success_requires_exact_head_and_tail() {
+        let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
+        let head_bytes = transition.canonical_head_bytes().to_vec();
+        let event_bytes = transition.canonical_event_bytes().to_vec();
+        let tail_key = transition.candidate().tail().key().to_owned();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(200, &[("etag", OLD_ETAG)], head_bytes),
+            response(200, &[("etag", "\"tail\"")], event_bytes),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            commit(&store, transition, &mut history).await,
+            HeadCommitOutcome::Committed
+        ));
+        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(request_path(&client, 0), "/head.json");
+        assert_eq!(request_path(&client, 1), "/head.json");
+        assert_eq!(request_path(&client, 2), format!("/{tail_key}"));
+    }
+
+    #[tokio::test]
+    async fn unknown_create_then_conflict_resolves_from_head_and_tail() {
+        for conflict in [409, 412] {
+            let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
+            let head_bytes = transition.canonical_head_bytes().to_vec();
+            let event_bytes = transition.canonical_event_bytes().to_vec();
+            let (store, client) = replay_store(vec![
+                response(500, &[], SdkBody::empty()),
+                response(404, &[], SdkBody::empty()),
+                response(conflict, &[], SdkBody::empty()),
+                response(200, &[("etag", OLD_ETAG)], head_bytes),
+                response(200, &[("etag", "\"tail\"")], event_bytes),
+            ]);
+            let mut history = AttemptHistory::default();
+
+            let transition = match commit(&store, transition, &mut history).await {
+                HeadCommitOutcome::RetryIdentically(transition) => transition,
+                _ => panic!("missing head permits identical retry"),
+            };
+            assert!(matches!(
+                commit(&store, transition, &mut history).await,
+                HeadCommitOutcome::Committed
+            ));
+            assert_eq!(client.actual_requests().count(), 5);
+            for index in [0, 2] {
+                let request = client.actual_requests().nth(index).expect("head PUT");
+                assert_eq!(request.headers().get("if-none-match"), Some("*"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn same_operation_with_changed_head_is_unresolved() {
+        let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
+        let different = Head::new(
+            Authority::owned("owner".into(), "instance".into(), 1, 1).expect("valid authority"),
+            transition.candidate().tail().clone(),
+            transition.candidate().operation_id().to_owned(),
+        )
+        .expect("valid conflicting head");
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", OLD_ETAG)],
+                encode(&different).expect("head encodes"),
+            ),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            commit(&store, transition, &mut history).await,
+            HeadCommitOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_malformed_or_mismatched_tail_is_unresolved() {
+        for tail_case in 0..3 {
+            let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
+            let head_bytes = transition.canonical_head_bytes().to_vec();
+            let tail_response = match tail_case {
+                0 => response(404, &[], SdkBody::empty()),
+                1 => response(200, &[("etag", "\"tail\"")], b"bad".to_vec()),
+                _ => {
+                    let mut bytes = transition.canonical_event_bytes().to_vec();
+                    bytes[0] ^= 1;
+                    response(200, &[("etag", "\"tail\"")], bytes)
+                }
+            };
+            let (store, _) = replay_store(vec![
+                response(500, &[], SdkBody::empty()),
+                response(200, &[("etag", OLD_ETAG)], head_bytes),
+                tail_response,
+            ]);
+            let mut history = AttemptHistory::default();
+
+            assert!(matches!(
+                commit(&store, transition, &mut history).await,
+                HeadCommitOutcome::Unresolved(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn current_parent_refreshes_etag_for_identical_replacement_retry() {
+        for initial_status in [500, 412] {
+            let parent = parent_head(Authority::unowned(), "parent-op");
+            let parent_bytes = encode(&parent).expect("head encodes");
+            let original = read_observed(&parent, OLD_ETAG).await;
+            let transition =
+                successor_transition(original, Authority::unowned(), "head-op-2").await;
+            let candidate_bytes = transition.canonical_head_bytes().to_vec();
+            let (store, client) = replay_store(vec![
+                response(initial_status, &[], SdkBody::empty()),
+                response(200, &[("etag", FRESH_ETAG)], parent_bytes),
+                response(200, &[], SdkBody::empty()),
+            ]);
+            let mut history = AttemptHistory::default();
+
+            let transition = match commit(&store, transition, &mut history).await {
+                HeadCommitOutcome::RetryIdentically(transition) => transition,
+                _ => panic!("current parent permits identical retry"),
+            };
+            assert!(matches!(
+                commit(&store, transition, &mut history).await,
+                HeadCommitOutcome::Committed
+            ));
+            assert_eq!(client.actual_requests().count(), 3);
+            let first = client.actual_requests().next().expect("first PUT");
+            let retried = client.actual_requests().nth(2).expect("retried PUT");
+            assert_eq!(first.headers().get("if-match"), Some(OLD_ETAG));
+            assert_eq!(retried.headers().get("if-match"), Some(FRESH_ETAG));
+            assert_eq!(first.body().bytes(), Some(candidate_bytes.as_slice()));
+            assert_eq!(retried.body().bytes(), Some(candidate_bytes.as_slice()));
+        }
+    }
+
+    #[tokio::test]
+    async fn different_current_head_is_advanced_without_chain_walk() {
+        let parent = parent_head(Authority::unowned(), "parent-op");
+        let original = read_observed(&parent, OLD_ETAG).await;
+        let transition = successor_transition(original, Authority::unowned(), "head-op-2").await;
+        let current = Head::new(
+            Authority::unowned(),
+            transition.candidate().tail().clone(),
+            "other-operation".into(),
+        )
+        .expect("valid current head");
+        let current_bytes = encode(&current).expect("head encodes");
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(200, &[("etag", FRESH_ETAG)], current_bytes),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        match commit(&store, transition, &mut history).await {
+            HeadCommitOutcome::Advanced {
+                transition,
+                current: observed,
+            } => {
+                assert_eq!(transition.candidate().operation_id(), "head-op-2");
+                assert_eq!(observed.head(), &current);
+            }
+            _ => panic!("different current head requires chain reconciliation"),
+        }
+        assert_eq!(client.actual_requests().count(), 2);
     }
 }

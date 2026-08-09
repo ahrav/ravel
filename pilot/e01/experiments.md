@@ -76,6 +76,11 @@ runs within a block execute in the listed order.
   | 4 | C–A–B | C–A–B |
   | 5 | B–C–A | A–B–C |
 
+- **Combined serialized order (fixed):** the two pilots never
+  interleave. All five Research blocks execute first (runs 1–15), then
+  all five Change blocks (runs 16–30), each block in the table order
+  above. This single 30-run sequence is the only valid execution order.
+
 - **Nuisance blocks named:** machine pool composition, time window,
   provider quota/throttle state, and source reset state. Each block runs
   on the same machine pool within one contiguous time window, and the full
@@ -98,6 +103,18 @@ runs within a block execute in the listed order.
   recorded `unresolved` per `budgets.yaml` hard-limit behavior. No
   adaptive stopping, no run-count changes, no extension after peeking at
   results.
+- **`unresolved` aggregation (fixed):** a run is `unresolved` only when
+  a *campaign* hard limit (`deadline_campaign_days`,
+  `campaign_spend_usd`) stops it mid-run or prevents it from starting.
+  A *per-run* cap exhausting mid-run ends the run as a **complete**
+  observation with numeric outcomes — unfinished work counts against it
+  (omissions, zero resolutions, `unresolved` work items). `unresolved`
+  runs carry no numeric outcome values and are never imputed, zeroed,
+  worst-cased, or excluded-by-choice. The §6/§7 decision-rule medians
+  are defined only over exactly 5 complete runs per cell; if any cell of
+  a pilot has fewer than 5 complete runs when the campaign stops, that
+  pilot's precommitted outcome is **Inconclusive (budget-stopped)**,
+  recorded with per-cell complete-run counts.
 - **Failure handling:** crashes, errors, timeouts, and budget exhaustion
   remain **assigned treatment outcomes** of their run. They are never
   discarded, never retried as fresh observations, never silently
@@ -132,11 +149,11 @@ cells):** one single synthesized answer per run, recorded with provenance.
 
 | Attribute | A | B | C |
 | --- | --- | --- | --- |
-| Agents / machines | 1 agent, 1 machine | 4 agents, 1 machine | ≥3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify): multiple researcher agents, multiple judge agents, 1 active controller role |
-| Role profiles used (environment.yaml) | `generator:research`, `synthesizer` | `generator:research` (×4), `synthesizer` | all six fixed profiles |
+| Agents / machines | 1 agent, 1 machine | 4 agents, 1 machine | Exactly 3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify) and exactly 7 agents: 1 active controller + 2 judge agents on host 1; 2 researcher agents on each of hosts 2–3 (4 researchers total). On controller failover the takeover host inherits this layout |
+| Role profiles used (environment.yaml) | `generator:research` (×1); exactly one final `synthesizer` call renders the answer | `generator:research` (×4); exactly one final `synthesizer` call merges the thread reports | `generator:research` (×4 researcher agents); `judge:semantic` (×1) and `judge:critic` (×1) judge agents; `judge:adjudicator` calls only to resolve a semantic/critic disagreement; exactly one final `synthesizer` call. `generator:code` unused; the controller makes model calls only through the calls listed here |
 | Assignment & visibility | Sees everything: whole question, whole frozen tree | Disjoint static partitions = the four separable threads of `research.md` §1 (calibration, subtraction, clamping, warning surfaces), one per agent; each agent may read the whole frozen tree but sees only its own thread and workspace, never other agents' outputs | Controller-directed: agents see only their assigned work item plus controller-provided context |
 | Communication | None (single agent) | None — independent agents, no coordination, no shared workspace view (§32 Experiment A treatment B) | Only controller-mediated messages/artifacts; no direct agent-to-agent channels |
-| Integration | The agent produces the single synthesized answer | One `synthesizer` profile call merges the four independent thread reports into the single answer; no cross-agent iteration | Controller-directed synthesis via the `synthesizer` profile |
+| Integration | The agent's findings become the single answer via the run's one `synthesizer` call (same single synthesis step as B/C) | One `synthesizer` profile call merges the four independent thread reports into the single answer; no cross-agent iteration | Controller-directed synthesis via the run's one `synthesizer` call |
 | Follow-ups / depth | Within `budgets.yaml` caps | Within `budgets.yaml` caps | Controller-created follow-ups, bounded by `generated_followups_per_run` and `workflow_depth_levels` |
 | Failover evidence | n/a | n/a | Required once per run: kill the active controller mid-run; record takeover by another host (§43 invariant 20) |
 | Isolation / reset | §5 | §5 | §5 |
@@ -158,8 +175,15 @@ treatment self-report anywhere (§43 invariant 3):
 | Cost | USD/run | summed provider spend attributed to the run |
 | Model invocations | calls/run | provider calls counted against `model_calls_per_run` |
 | Duplicate work | conclusions/run | §8 duplicate-suppression count for the run |
-| Scaling efficiency | ratio | (per-run supported count ÷ A-cell median supported count) ÷ (agent count ÷ 1) |
+| Scaling efficiency | ratio | (per-run supported count ÷ A-cell median supported count) ÷ (agent count ÷ 1); agent count fixed per cell: A=1, B=4, C=7 |
 | Controller idle/bottleneck time | hours/run | C only: wall-clock with zero in-flight agent work while un-dispatched work exists; 0 by definition for A/B |
+
+**Zero denominators (fixed):** a complete run with zero graded
+conclusions records incorrect conclusion rate = 1 (worst case). Any
+other ratio above whose denominator is 0 (including a zero A-cell
+median in scaling efficiency) is recorded `undefined`; `undefined`
+values are descriptive only, never imputed, and never enter the
+decision rule.
 
 **Primary outcome family (the one per-pilot family):** graded conclusion
 quality — supported count, incorrect rate, omission rate per `research.md`
@@ -186,8 +210,8 @@ from treatment self-report (§43 invariant 3).
 
 | Attribute | A | B | C |
 | --- | --- | --- | --- |
-| Agents / machines | 1 coding agent, 1 machine | 4 independent coding agents, 1 machine | ≥3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify): multiple workers, judge ensemble, 1 active controller role |
-| Role profiles used (environment.yaml) | `generator:code` | `generator:code` (×4) | all six fixed profiles |
+| Agents / machines | 1 coding agent, 1 machine | 4 independent coding agents, 1 machine | Exactly 3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify) and exactly 7 agents: 1 active controller + 2 judge agents on host 1; 2 worker agents on each of hosts 2–3 (4 workers total). On controller failover the takeover host inherits this layout |
+| Role profiles used (environment.yaml) | `generator:code` (×1) | `generator:code` (×4) | `generator:code` (×4 worker agents); `judge:semantic` (×1) and `judge:critic` (×1) judge agents; `judge:adjudicator` calls only to resolve a semantic/critic disagreement. `generator:research` and `synthesizer` unused; the controller makes model calls only through the calls listed here |
 | Assignment & visibility | Sees everything: full inventory, whole workspace | Disjoint static partitions: `targets.jsonl` sorted by target ID, split into 4 contiguous quarters (remainder to the last quarter), one per agent; each agent sees only its own partition and workspace | Controller-directed claiming: workers see only their assigned targets plus controller-provided context |
 | Communication | None (single agent) | None — no coordination, no shared workspace view | Only controller-mediated messages/artifacts; no direct agent-to-agent channels |
 | Integration | Autonomous safe integration to the run's `campaign/e01/*` branch per `environment.yaml` authority (no approval gate) | Each agent works an independent branch; branches integrate to the campaign branch autonomously in fixed target-ID order; a merge conflict counts as an integration-conflict outcome for every target in the conflicting candidate | Controller-directed integration to the campaign branch through the judge/evaluator path in `change/contract.md`; conflicts count as integration-conflict outcomes |
@@ -210,8 +234,15 @@ from treatment self-report (§43 invariant 3).
 | Wasted work | attempts/run | candidate attempts producing no integrated change |
 | Cost per resolved target | USD/target | run provider spend ÷ correctly resolved targets |
 | Worker utilization | fraction/run | agent time on assigned targets ÷ total agent wall-clock |
-| Scaling efficiency | ratio | (per-run resolved targets ÷ A-cell median resolved targets) ÷ (agent count ÷ 1) |
+| Scaling efficiency | ratio | (per-run resolved targets ÷ A-cell median resolved targets) ÷ (agent count ÷ 1); agent count fixed per cell: A=1, B=4, C=7 |
 | Final rediscovery result | pass/fail | trusted `change/discover.sh` rerun at run end reports zero non-exempt unresolved legacy targets (§43 invariant 17) |
+
+**Zero denominators (fixed):** any ratio above whose denominator is 0
+for a run — including cost per resolved target with zero resolved
+targets and scaling efficiency with a zero A-cell median — is recorded
+`undefined`; `undefined` values are descriptive only, never imputed,
+and never enter the decision rule (which uses only raw resolved-target
+counts and the rediscovery pass/fail).
 
 **Primary outcome family:** target resolution — correctly resolved targets
 per trusted evaluators plus the final rediscovery result. All other
@@ -231,5 +262,9 @@ Routine treatment execution — Research decomposition, follow-up creation,
 synthesis, and safe campaign-branch Change integration — has **no human
 approval gate**, per `environment.yaml` `authority.default: autonomous`
 and its unchanged human-only allowlist. Post-hoc grading (`research.md`)
-and trusted evaluation (`change/contract.md`) are measurement only, never
-workflow gates (E01 AC7).
+and final rediscovery are measurement only, never workflow gates, and no
+*human* approval gate exists anywhere in routine execution (E01 AC7).
+Trusted evaluator verdicts, by contrast, do gate candidate integration in
+every Change cell per `change/contract.md` §4: a candidate with any FAIL
+verdict is rejected automatically — a deterministic, non-overridable
+machine check, not a human gate.

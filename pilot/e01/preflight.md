@@ -258,3 +258,117 @@ Recorded deviation from the plan (evidence-driven, not blocking):
 
 Residue: an unused fork `ahrav/bat` was created before bat failed the
 submodule gate; deletion requires the `delete_repo` token scope.
+
+## Amendment ravel-j4t smoke
+
+Live re-verification of the amended `pilot/e01/` set (new sibling
+[`runtime.md`](runtime.md), `experiments.md` §3/§9, two new `preflight.sh`
+check blocks). Executed 2026-08-09 UTC on Linux 6.12.95-124.187.amzn2023.aarch64,
+rustc/cargo 1.94.1, ripgrep 15.1.0, bubblewrap 0.10.0 (not setuid) and
+`prlimit` from the host distribution.
+
+`bash pilot/e01/preflight.sh` from a fresh clone of the fork — all pre-existing
+checks unchanged; the new blocks appended below the change-viability gate:
+
+```text
+== E01 preflight receipt ==
+date: 2026-08-09T04:47:22Z
+host: Linux 6.12.95-124.187.amzn2023.aarch64
+cloning https://github.com/ahrav/hyperfine.git -> /tmp/e01-preflight.ILl8xr/hyperfine
+PASS  frozen revision — f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7
+…all §2 checks PASS, unchanged…
+PASS  change targets >= 36 — count=40
+unicodedata: 13.0.0 (runtime.md §4 reference: 13.0.0)
+PASS  path collision golden vectors (19 rows, 8 reason categories, 3 collision pairs)
+PASS  containment tool present: bwrap
+PASS  containment tool present: prlimit
+PASS  prlimit frozen limits apply
+PASS  bwrap frozen-shape smoke (runtime.md §3.1)
+PASS  max_user_namespaces > 0 — max_user_namespaces=505718
+PASS  sandbox user namespace differs from host — host=user:[4026531837] sandbox=user:[4026532703]
+PASS  evaluator: cargo build --locked — expected=PASS got=PASS
+PASS  evaluator: cargo test --locked — expected=PASS got=PASS
+PASS  evaluator: cargo fmt --check — expected=PASS got=PASS
+PASS  evaluator: cargo clippy --all-targets --locked — expected=PASS got=PASS
+== result: PREFLIGHT-PASS ==
+```
+
+Inventory, fixtures, and orthogonal audit re-run against a second fresh clone
+at the pinned revision:
+
+```text
+discover.sh records                          -> 41
+rule_digest (all records)                    -> 8bac9074495a8ae283d21811a84db87e28a302f13285779d95a20fd77fdf0261
+vs change/targets.jsonl                      -> field-for-field identical (target_id, path, locator, context_digest)
+git grep -nF '.unwrap()' audit lines         -> 40
+audit occurrences (per-line gsub)            -> 41
+per-file tallies audit vs targets.jsonl      -> identical, zero discrepancies
+comment/string-embedded occurrences          -> 0
+fixtures/run.sh                              -> == result: FIXTURES-PASS ==
+```
+
+The comment/string scan was recomputed per occurrence (a `.unwrap()` is
+embedded only if an unclosed `"` or a preceding `//` covers it), reproducing
+the zero from `change/contract.md` appendix A.5.
+
+### Adversarial checks on the new blocks
+
+Every deliberate violation fails before the trusted evaluators run. The
+tamper set covers each thing the checks now assert — expected key, row count,
+reason-category coverage, both numeric limits, the pair count, and the
+containment tools:
+
+```text
+frozen expected key tampered (row 2 -> "src/Main.rs"):
+  FAIL  path collision golden vectors — vector b'src/Main.rs': want 'src/Main.rs' got 'src/main.rs'
+  == result: PREFLIGHT-FAIL (1) ==
+git-component vector row deleted:
+  FAIL  path collision golden vectors — vector rows: want 18 got 17;
+        reason categories with no vector: git-component;
+  == result: PREFLIGHT-FAIL (1) ==
+MAX_PATH_DEPTH tampered 10 -> 10000:
+  FAIL  path collision golden vectors — vector b'a/b/c/d/e/f/g/h/i/j/k.rs':
+        want 'REJECT:path-too-deep' got 'a/b/c/d/e/f/g/h/i/j/k.rs';
+        reason categories with no vector: path-too-deep;
+  == result: PREFLIGHT-FAIL (1) ==
+MAX_PATH_LENGTH tampered 180 -> 400:
+  FAIL  path collision golden vectors — vector b'src/aaa…' (181 B):
+        want 'REJECT:path-too-long' got 'src/aaa…';
+        reason categories with no vector: path-too-long;
+  == result: PREFLIGHT-FAIL (1) ==
+third ASCII-case variant added (src/MAIN.rs), making one 3-way collision:
+  FAIL  path collision golden vectors — vector rows: want 18 got 19;
+        collision key pairs: want 3 got 5;
+  == result: PREFLIGHT-FAIL (1) ==
+bwrap shadowed by a stub exiting 1:
+  PASS  containment tool present: bwrap
+  FAIL  bwrap frozen-shape smoke (runtime.md §3.1) — rc=1:
+  FAIL  sandbox user namespace differs from host — frozen-shape smoke did not run
+  == result: PREFLIGHT-FAIL (2) ==
+```
+
+The 3-way-collision row is the case that distinguishes counting pairs from
+counting colliding groups: as three groups it would still report 3 and pass,
+so the block counts pairs (`n·(n−1)/2` per group).
+
+The containment quiescence claim in `runtime.md` §3.3 was verified directly on
+this host class: inside `bwrap --unshare-all`, `/proc/1/comm` is `bwrap` and
+the wrapped command runs as PID 2, so reaping the `bwrap` child is sufficient proof
+that the PID namespace — and therefore every descendant — is gone.
+
+`--unshare-all` alone was **not** sufficient for the §3.2 user-namespace
+guarantee: `man bwrap` on this host (bubblewrap 0.10.0) defines it as
+`--unshare-user-try … --unshare-cgroup-try`, and the `-try` variants skip the
+namespace instead of failing. The frozen shape now passes explicit
+`--unshare-user --unshare-cgroup` (verified accepted, rc=0), and the smoke's
+payload reads `/proc/self/ns/user` so preflight asserts a distinct user
+namespace was actually created rather than inferring it from
+`max_user_namespaces`.
+
+### Amended identity
+
+The amended `pilot/e01/` Git revision and content digest
+(`git ls-files -z pilot/e01 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum`)
+are recorded in the **ravel-j4t** bd comment, outside the hashed directory —
+same convention as ravel-q3w.4. Results measured under the earlier digest and
+under this one are never pooled (`budgets.yaml` `amendment_rule`).

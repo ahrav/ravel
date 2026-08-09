@@ -23,9 +23,16 @@ statistics framework, or workflow machinery is defined here (E01 AC8).
   grading (§6), outcome classes (§7), recording rules (§8).
 - **Change contract (Task 3):** `change/contract.md`, trusted
   `change/discover.sh`, frozen inventory `change/targets.jsonl`,
-  `change/fixtures/`. Referenced by these precommitted paths; their exact
-  content identity is fixed by the final `pilot/e01/` content digest
-  recorded in task ravel-q3w.4 completion evidence.
+  `change/fixtures/`.
+- **Downstream runtime contracts (amendment ravel-j4t):**
+  [`runtime.md`](runtime.md) — controller lease (§2), containment mechanism,
+  limits, and descendant quiescence (§3), path grammar/collision key and
+  golden vectors (§4), grouping rule, cap, and the fixed 16-group result
+  (§5).
+- **Content identity:** every file above is referenced by its precommitted
+  path; their exact content identity is fixed by the `pilot/e01/` Git
+  revision and content digest recorded in **ravel-j4t** completion evidence
+  (which supersedes the ravel-q3w.4 pointer for this amended set).
 - **Budgets:** [`budgets.yaml`](budgets.yaml) — one shared flat budget
   file. Per-run deadline: `deadline_run_ab_hours` for A/B cells,
   `deadline_run_c_hours` for C cells. All other caps apply identically to
@@ -80,6 +87,29 @@ runs within a block execute in the listed order.
   interleave. All five Research blocks execute first (runs 1–15), then
   all five Change blocks (runs 16–30), each block in the table order
   above. This single 30-run sequence is the only valid execution order.
+
+- **Reserved treatment-C run IDs (amendment ravel-j4t):** two C slots are
+  reserved for already-planned proof runs, so a qualifying proof run *is* the
+  cell's observation instead of a duplicate execution:
+
+  | Run | Slot | Reserved for |
+  | --- | --- | --- |
+  | 1 | Research block 1, slot C | the qualifying ravel-85q.8 three-host Research proof run |
+  | 16 | Change block 1, slot C | the qualifying ravel-e1n.7 multi-host Change proof run |
+
+  **Qualifying** means all of: executed at the amended frozen `pilot/e01/`
+  revision and content digest (ravel-j4t); fully captured under §9; executed
+  under the frozen cell-C definition of its pilot (§6/§7 — agent/host layout,
+  role profiles, controller-mediated communication, and the fixed
+  fault-injection point) with §5 isolation and reset; within `budgets.yaml`
+  caps; **and executed in its slot's position in the serialized order above**
+  — run 1 before any other run of the campaign, run 16 after run 15 and before
+  run 17 — so the §2 interference boundary still holds. A qualifying proof run
+  counts as a treatment-C observation **exactly once**: the slot is then filled
+  and never re-executed, and no proof run may be counted for more than one
+  slot. A proof run that fails any qualifying condition counts for nothing as
+  an observation (it remains engineering evidence), and the reserved slot then
+  executes normally in schedule order.
 
 - **Nuisance blocks named:** machine pool composition, time window,
   provider quota/throttle state, and source reset state. Each block runs
@@ -173,11 +203,19 @@ runs within a block execute in the listed order.
 - **External state:** each run writes only under its own S3 run prefix
   below `e01/` and (Change) its own `campaign/e01/*` branch per
   `environment.yaml` branch policy. Production branches are never touched.
-- **Reset between complete runs:** delete all run workspaces; reset the
+- **Reset between complete runs:** delete all run workspaces; (Change) tag
+  the finished run's campaign-branch tip under an immutable per-run ref and
+  record that OID in the run's `run_terminal` record, **then** reset the
   campaign branch to the pinned revision; delete the finished run's S3 run
-  prefix working area (measurement artifacts are retained outside it);
+  prefix working area (measurement artifacts — including the §9
+  capture-record stream — are retained outside it);
   then (Change) re-run trusted `change/discover.sh` and confirm the target
   count matches `change/targets.jsonl` before the next run starts.
+  The tip tag is a measurement artifact: §4 permits trusted measurement to
+  run after treatment execution ends (bounded separately by
+  `measurement_deadline_days`), and §9.8 `revision_measured` is that tip, so
+  resetting the branch must not be able to destroy an unmeasured run's input.
+  Per-run tip refs are retained until that run is fully measured.
 
 ## 6. Research pilot (docs/mvp-outline.md §32 Experiment A)
 
@@ -309,3 +347,226 @@ Trusted evaluator verdicts, by contrast, do gate candidate integration in
 every Change cell per `change/contract.md` §4: a candidate with any FAIL
 verdict is rejected automatically — a deterministic, non-overridable
 machine check, not a human gate.
+
+## 9. Treatment-neutral measurement capture (amendment ravel-j4t)
+
+Every cell of both pilots emits **the same record shapes**, so no treatment
+gains a measurement advantage. Single-host cells (A, B) emit the identical
+shapes with one host and one agent list; fields that only C can populate are
+**present and null** in A/B rather than omitted. Records are JSONL and are
+**measurement artifacts**: they are written to the run's retained measurement
+location — outside the run-prefix *working area* that the §5 between-runs
+reset deletes — so the capture stream survives the reset and is available to
+campaign analysis. Private and unstable, no schema, no
+loader — field names may change by amendment and nothing may be built against
+them.
+
+Every record carries the same header fields: `record` (kind), `run_seq`
+(1–30, §3), `pilot`, `cell`, `block`, `host_id`, `ts_utc`. Numeric outcomes
+are always the §6/§7 measures of that run's pilot, computed by the §6/§7
+calculation rules — §9 fixes *what is recorded*, never *how a measure is
+defined*.
+
+**Timing boundaries.** Three UTC boundary timestamps are recorded per run:
+`ts_utc_start` (run-start record), `treatment_end_utc` (Research: the single
+synthesized answer is produced; Change: the last integration to the campaign
+branch, or — for a complete run in which no candidate was ever integrated —
+the instant treatment execution stopped: the last `integration_attempt` or
+work-item terminal event, or the cap/stop instant if later; zero-integration
+runs are valid §4/§7 observations and their cap window and
+wall-clock-to-rediscovery measure stay defined), and `measurement_end_utc` (blinded grading complete / final
+rediscovery verdict recorded). Per-run and campaign caps and deadlines bound
+the **treatment-execution window** `ts_utc_start … treatment_end_utc` only;
+trusted measurement is separately timed and separately bounded by
+`measurement_spend_usd` / `measurement_deadline_days` (§4). The §6/§7
+wall-clock measures are computed from these boundaries exactly as §6/§7 word
+them — Research to the final synthesized answer, Change to the final
+rediscovery result. One boundary is *derived*, not `ts_utc_start`: §6 defines
+Research wall-clock as starting at the **first agent action**, so that
+measure starts at the earliest **agent-attributed** record UTC timestamp in
+the run's stream — exactly the records carrying a non-null `agent_id`:
+`work_event` with `event: dispatch`, `attempt`, `model_call`, or
+`busy_interval`. A `work_event` with `event: ready` is excluded: §9.6 gives it
+a null `agent_id`, so it is not an agent action, and in A/B the root `ready`
+fires at run setup while in C the controller dispatches later — counting it
+would re-import exactly the dispatch and setup delay that differs across
+A/B/C and must not enter the comparison. `ts_utc_start` bounds only the cap
+window above. Change
+wall-clock starts at run start (`ts_utc_start`) exactly as §7 words it.
+
+**Fault placement** is not re-specified here: it stays exactly as frozen in
+§6/§7 (kill the active controller immediately after it records the second
+completed work item; controller restarts as one new agent on host 2). §9 only
+requires the one `fault_injection` record below.
+
+### 9.1 Run-start record — `record: "run_start"`
+
+Written **after** the §5 reset completes and **before any treatment action**.
+The run clock starts at its `ts_utc_start`.
+
+| Field | Definition |
+| --- | --- |
+| `run_seq` | 1–30, the §3 combined serialized order |
+| `pilot` / `cell` / `block` | `research`\|`change`, `A`\|`B`\|`C`, 1–5 |
+| `pilot_revision` / `pilot_digest` | Git revision and content digest of `pilot/e01/` for this run |
+| `subject_revision` | `f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7` (§1) |
+| `hosts` | list of host ids: 1 entry for A/B, 3 for C |
+| `agents` | list of `{agent_id, host_id, role_profile}` planned at start (1 / 4 / 7 per §6/§7) |
+| `ts_utc_start` | UTC instant the run clock starts |
+| `reset_confirmed` | `true` only if the full §5 reset (and, for Change, the rediscovery count match) completed |
+
+### 9.2 Run-terminal record — `record: "run_terminal"`
+
+Written once per run, when the run's record stream ends: after trusted
+measurement completes, or immediately at a campaign-limit stop that prevents
+the run from starting or stops its treatment execution (§4) — in that case
+`complete` is `false`, the measurement fields (`measurement_end_utc`,
+`outcomes` numeric values) are explicitly `null`/absent per §4, and
+`fully_measured` is `false`. The measured windows are the timestamps below,
+not this record's write time.
+
+| Field | Definition |
+| --- | --- |
+| `complete` | `true` if the run is a complete observation per §4 (a per-run-cap stop is still `true`); `false` only for a campaign-limit stop during treatment execution or before start |
+| `unresolved` | `true` for any hard-limit stop — the §4 `unresolved` result label; `true` together with `complete: true` for a per-run-cap stop — else `false` |
+| `stop_reason` | `finished` \| `per_run_cap:<cap key>` \| `campaign_limit:<cap key>` \| `error` |
+| `treatment_end_utc` / `measurement_end_utc` / `ts_utc_end` | treatment window end, measurement end, record write time |
+| `campaign_tip_oid` / `campaign_tip_ref` | Change: the run's campaign-branch tip OID and the immutable per-run ref pinning it before the §5 reset; `null` in Research and for a run that never started |
+| `outcomes` | one field per §6 (Research) or §7 (Change) measure — including Change's final rediscovery result — with `undefined` exactly where the §6/§7 zero-denominator rules say so; absent numeric values for a campaign-limit stop during treatment execution **or before start** (§4) |
+| `fully_measured` | `true` only if every §4 trusted-measurement step completed for this run |
+
+### 9.3 Attempt validity and replacement
+
+One record per generation attempt — `record: "attempt"`: `work_item_id`,
+`agent_id`, `host_id`, `role_profile`, `attempt_index`, `outcome`,
+`invalid_reason`, `consumed_attempt_slot`, `model_calls`.
+
+- An **invalid attempt** is exactly: a provider transport failure, throttle,
+  or 5xx response that returned **no completion content**. It is replaced,
+  does **not** consume `attempts_per_work_item`, and is recorded with
+  `consumed_attempt_slot: false` and the reason category.
+- Its model calls still count against `model_calls_per_run`, so replacement
+  stays bounded and cannot become an unbounded retry loop.
+- **Everything else is a valid assigned outcome** — refusal, malformed
+  output, evaluator or judge rejection, timeout, crash, budget exhaustion —
+  and consumes an attempt slot. §4 failure handling is unchanged: the *run*
+  is one observation regardless, never retried as a fresh observation.
+
+### 9.4 Fault-injection record — `record: "fault_injection"`
+
+Exactly one per run, in every cell. A/B emit `fired: false` with null ids, so
+the shape is identical across treatments.
+
+| Field | Definition |
+| --- | --- |
+| `fired` | `true` in C once the §6/§7 injection point is reached; `false` in A/B always, and in C when the run ends (per-run cap, error, or campaign limit) before two work items complete |
+| `work_items_completed_at_fire` | 2 when `fired: true` (the frozen deterministic point); `null` when `fired: false`, including a C run stopped before the injection point |
+| `killed_agent_id` / `killed_host_id` / `takeover_host_id` | C only; `null` in A/B |
+| `ts_utc` / `monotonic_ns` / `host_boot_id` | when the kill was issued, on the issuing host |
+
+### 9.5 Busy intervals — `record: "busy_interval"`
+
+One record per agent per assigned work item: `host_id`, `agent_id`,
+`work_item_id`, `role_profile`, `start_monotonic_ns`, `end_monotonic_ns`,
+`host_boot_id`, `clock: "CLOCK_MONOTONIC"`.
+
+- Monotonic values are **host-local only**. Instants from different hosts (or
+  different `host_boot_id`s) are never compared, ordered, or subtracted.
+- Only **durations** aggregate: per host, `busy_h` = Σ interval durations and
+  `agent_wall_h` = Σ over that host's agents of (agent end − agent start);
+  the run's utilization measure is `Σ_h busy_h ÷ Σ_h agent_wall_h`. Summing
+  durations never compares clocks across hosts, so the measure is valid for
+  1-host and 3-host cells alike.
+- Agent start/end come from one required `record: "agent_lifecycle"` per
+  agent per run (every cell): `host_id`, `agent_id`, `role_profile`,
+  `start_monotonic_ns`, `end_monotonic_ns`, `host_boot_id`,
+  `clock: "CLOCK_MONOTONIC"` — bounding the agent's availability window from
+  spawn to exit. `agent_wall_h` sums lifecycle durations, never busy
+  intervals, so an agent that received no assignment — and idle time before
+  an agent's first or after its last assignment — stays in the utilization
+  denominator.
+
+### 9.6 Work-item events — `record: "work_event"`
+
+One record per transition, three kinds: `ready`, `dispatch`, `terminal`.
+
+| Field | Definition |
+| --- | --- |
+| `event` | `ready` \| `dispatch` \| `terminal` |
+| `work_item_id` / `parent_work_item_id` / `depth` | identity, follow-up parent (`null` at root), 1–3 per `workflow_depth_levels` |
+| `agent_id` / `host_id` / `role_profile` | assignee (`null` for `ready`) |
+| `terminal_state` | `resolved` \| `rejected` \| `blocked` \| `unresolved` for `terminal`, else `null` |
+| `ts_utc` + `monotonic_ns` + `host_boot_id` | UTC for cross-host ordering; monotonic for host-local durations only (§9.5) |
+
+**Integration attempts (Change pilot only, every cell)** —
+`record: "integration_attempt"`: `work_item_id`, `agent_id`, `host_id`,
+`attempt_index`, `outcome` (`integrated` \| `conflict`), `ts_utc`. One record
+per attempt to integrate a candidate into the campaign branch. §7's
+integration-conflict rate is `conflict` records ÷ all `integration_attempt`
+records, and §7's wasted work counts `attempt` records with no corresponding
+`integrated` outcome — evaluator/judge rejection is already captured on the
+`attempt`/`work_event` records and is not an integration attempt.
+
+### 9.7 Provider usage and cost — `record: "model_call"`
+
+One record per model call: `phase` (`treatment` \| `measurement`),
+`call_seq` (1…`model_calls_per_run`),
+`work_item_id`, `agent_id`, `host_id`, `role_profile`, `provider`,
+`model_id`, `input_tokens`, `output_tokens`, `cached_input_tokens`,
+`long_context`, `usd`. `call_seq` numbering and the `model_calls_per_run`
+cap apply to `phase: treatment` calls only. Trusted blinded-grading judge
+calls are provider calls too: they are recorded with `phase: measurement`,
+`call_seq: null`, null `work_item_id`/`agent_id`, and count against
+`measurement_spend_usd` (§4) — never against per-run treatment caps, so a
+fully measured run cannot look over cap and measurement spend survives for
+budget-stopped analysis.
+
+Token counts are **provider-reported**, never estimated. `input_tokens`
+counts **only uncached** input, so `cached_input_tokens` is disjoint from it
+and both terms appear below; a provider that reports a cache-inclusive input
+count is normalized to that split at record time. Cost is computed, never
+self-reported, and this is the whole function — no rule below it adjusts
+`usd` outside these terms:
+
+```text
+m_in  = 2.0 if long_context else 1.0
+m_out = 1.5 if long_context else 1.0
+usd = (input_tokens + cached_input_tokens)/1e6 * price_in * m_in
+    + output_tokens/1e6 * price_out * m_out
+```
+
+Frozen unit prices (looked up once at authoring time, 2026-08-09 UTC, and
+fixed for all 30 runs):
+
+| `model_id` | USD / 1M input | USD / 1M output |
+| --- | --- | --- |
+| `global.anthropic.claude-opus-5` | 5.00 | 25.00 |
+| `openai.gpt-5.6-sol` | 5.00 | 30.00 |
+
+Provenance: the AWS Pricing API (`aws pricing get-products --service-code
+AmazonBedrock`) had **no entry** for either pinned model id at authoring time
+(Anthropic entries stop at Claude 3; `openai.gpt-5.6-sol` is absent), so the
+scalars are the vendors' published standard per-million-token list prices for
+the two pinned models — Claude Opus 5 base input / output, and gpt-5.6-sol
+short-context input / output. Cached and cache-write tokens, when reported,
+are priced at the input scalar (a deliberate over-estimate; no separate cache
+scalar is frozen) — the `cached_input_tokens` term above. A call reporting
+more than 272,000 total input tokens is recorded
+`long_context: true` and priced at 2× input and 1.5× output per the published
+long-context multiplier; at the pinned subject size (474,732 B total) this is
+not expected to occur. The prices are identical for every cell, so cost stays
+treatment-neutral; a later vendor price change does not retro-amend recorded
+spend.
+
+### 9.8 Final measurement completion — `record: "final_measurement"`
+
+One record per complete run, same shape in both pilots.
+
+| Field | Definition |
+| --- | --- |
+| `revision_measured` | Change: the campaign-branch tip measured by trusted final rediscovery (§4) — the `campaign_tip_oid` pinned by the §5 reset, so it is measurable after that reset; Research: the frozen subject revision |
+| `rule_digest` | Change: the `change/contract.md` §2 digest reported by the rediscovery run (a mismatch is recorded and the verdict is `fail`); Research: `null` |
+| `verdict` | `pass` \| `fail` \| `unresolved` — Change: zero non-exempt records; Research: grading completed under `research.md` §6; `unresolved` only when the §4 measurement caps were exhausted before this run's grading/rediscovery executed (the run's terminal record then carries `fully_measured: false`); a rediscovery invocation that runs but produces no valid verdict is still `fail` (§4) |
+| `per_class` | per-outcome-class counts: Change `resolved`/`rejected`/`blocked`/`unresolved`; Research `research.md` §7 classes |
+| `records_emitted` | Change: rediscovery record count (non-exempt); Research: graded conclusion count |
+| `measurement_start_utc` / `measurement_end_utc` | separately timed measurement window (§4) |

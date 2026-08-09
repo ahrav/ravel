@@ -47,6 +47,19 @@ echo "rustc: $(rustc --version 2>/dev/null || echo MISSING)"
 echo "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 
 # --- checkout ---------------------------------------------------------------
+TEMP_ROOT=""
+cleanup() {
+	[ -n "$TEMP_ROOT" ] && rm -rf -- "$TEMP_ROOT"
+	rm -rf -- "$EVAL_TARGET_DIR"
+}
+# Evaluators always build into a fresh target dir: a caller-supplied checkout
+# may carry stale artifacts in an ignored target/ that `git status` cannot see.
+EVAL_TARGET_DIR="$(mktemp -d /tmp/e01-target.XXXXXX)" || {
+	echo "FAIL mktemp"
+	exit 1
+}
+export CARGO_TARGET_DIR="$EVAL_TARGET_DIR"
+trap cleanup EXIT
 if [ $# -ge 1 ]; then
 	DIR="$1"
 else
@@ -54,7 +67,6 @@ else
 		echo "FAIL mktemp"
 		exit 1
 	}
-	trap 'rm -rf -- "$TEMP_ROOT"' EXIT
 	DIR="$TEMP_ROOT/hyperfine"
 	echo "cloning $REPO_URL -> $DIR"
 	git clone --quiet "$REPO_URL" "$DIR" || {
@@ -93,7 +105,6 @@ n=$(find . -path ./.git -prune -o -path ./target -prune -o \( -perm -4000 -o -pe
 check "no setuid/setgid/world-writable on disk" "$((n != 0))" "count=$n"
 n=$(git grep -l 'version https://git-lfs' -- . 2>/dev/null | wc -l)
 check "no LFS pointers" "$((n != 0))" "count=$n"
-# target/ pruned: the evaluators below create hardlinked artifacts there.
 n=$(find . -path ./.git -prune -o -path ./target -prune -o \( -type p -o -type s -o -type b -o -type c \) -print | wc -l)
 check "no special files on disk" "$((n != 0))" "count=$n"
 n=$(git ls-files -z | xargs -0 stat -c '%h %F' 2>/dev/null | awk '$2=="regular" && $1>1' | wc -l)
@@ -141,6 +152,14 @@ check "trust roots disjoint from change targets" "$((overlap != 0))" "overlaps=$
 tc=$(rg -n '\.unwrap\(\)' --type rust --hidden -g '!.git/**' -g '!tests/**' -g '!benches/**' | wc -l)
 check "change targets >= 36" "$((tc < 36))" "count=$tc"
 
+# Evaluators execute code from the tree; do not run them after any preflight
+# check fails.
+if [ "$FAILURES" -ne 0 ]; then
+	echo "refusing to evaluate a tree that failed preflight checks"
+	echo "== result: PREFLIGHT-FAIL ($FAILURES) =="
+	exit 1
+fi
+
 # --- trusted evaluators (predeclared verdicts; all PASS) -----------------------
 EVAL_TIMEOUT=1800 # seconds per evaluator; a hang must become a verdict, not a stall
 run_eval() {      # run_eval <command...> — expected PASS
@@ -150,7 +169,7 @@ run_eval() {      # run_eval <command...> — expected PASS
 		check "evaluator: $name" 1 "mktemp failed"
 		return
 	}
-	timeout "$EVAL_TIMEOUT" "$@" >"$log" 2>&1 || rc=$?
+	timeout --kill-after=60 "$EVAL_TIMEOUT" "$@" >"$log" 2>&1 || rc=$?
 	if [ "$rc" -eq 0 ]; then
 		check "evaluator: $name" 0 "expected=PASS got=PASS"
 	elif [ "$rc" -eq 124 ]; then

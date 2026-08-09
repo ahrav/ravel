@@ -52,11 +52,11 @@ Winner forked to `ahrav/hyperfine`; pinned revision
 
 ```text
 == E01 preflight receipt ==
-date: 2026-08-08T23:47:19Z
+date: 2026-08-09T00:04:17Z
 host: Linux 6.12.95-124.187.amzn2023.aarch64
 rustc: rustc 1.94.1 (e408947bf 2026-03-25)
 cargo: cargo 1.94.1 (29ea6fb6a 2026-03-24)
-cloning https://github.com/ahrav/hyperfine.git -> /tmp/e01-preflight.V6dURV/hyperfine
+cloning https://github.com/ahrav/hyperfine.git -> /tmp/e01-preflight.0aeMS7/hyperfine
 PASS  frozen revision — f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7
 PASS  clean worktree
 PASS  no submodules — count=0

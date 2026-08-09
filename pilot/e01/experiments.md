@@ -126,7 +126,12 @@ runs within a block execute in the listed order.
   hard limit (`deadline_campaign_days`, `campaign_spend_usd`) stopping
   a run mid-flight or preventing it from starting leaves that run with
   no numeric outcome values, and such runs are never imputed, zeroed,
-  worst-cased, or excluded-by-choice. The §6/§7 decision-rule medians
+  worst-cased, or excluded-by-choice. **Precedence when both limit
+  families fire during one run (fixed):** the campaign limit wins — the
+  run is `unresolved` with no numeric values whenever a campaign hard
+  limit is reached before the run's outcomes (including final
+  rediscovery) are fully measured, regardless of any per-run cap that
+  also fired. The §6/§7 decision-rule medians
   are defined only over exactly 5 complete runs per cell; if any cell of
   a pilot has fewer than 5 complete runs when the campaign stops, that
   pilot's precommitted outcome is **Inconclusive (budget-stopped)**,

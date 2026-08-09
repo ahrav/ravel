@@ -78,6 +78,39 @@ fn literal_event_chain_decodes_and_reencodes_exactly() {
 }
 
 #[test]
+fn literal_event_chain_converts_to_owned_scheduling_mutations() {
+    let decoded_genesis = event::decode(GENESIS_BYTES, GENESIS_KEY).unwrap();
+    let decoded_child = event::decode(CHILD_BYTES, CHILD_KEY).unwrap();
+    let genesis_reference = event_ref(1, GENESIS_DIGEST, GENESIS_KEY);
+    let child_reference = event_ref(2, CHILD_DIGEST, CHILD_KEY);
+
+    let genesis_mutation =
+        event::scheduling_mutation(genesis_reference.clone(), &decoded_genesis).unwrap();
+    assert_eq!(genesis_mutation.reference(), &genesis_reference);
+    assert_eq!(genesis_mutation.parent(), None);
+    assert_eq!(
+        genesis_mutation.effect(),
+        &event::SchedulingEffect::CampaignCreated {
+            campaign_id: "0000000000000001".into(),
+        }
+    );
+
+    let child_mutation =
+        event::scheduling_mutation(child_reference.clone(), &decoded_child).unwrap();
+    assert_eq!(child_mutation.reference(), &child_reference);
+    assert_eq!(
+        child_mutation.parent(),
+        Some(&event_ref(1, GENESIS_DIGEST, GENESIS_KEY))
+    );
+    assert_eq!(
+        child_mutation.effect(),
+        &event::SchedulingEffect::WorkflowStarted {
+            workflow_id: "0000000000000002".into(),
+        }
+    );
+}
+
+#[test]
 fn event_encoding_is_deterministic() {
     let first = event::encode(&genesis()).unwrap();
     let second = event::encode(&genesis()).unwrap();

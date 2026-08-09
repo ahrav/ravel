@@ -1658,6 +1658,7 @@ dependencies = [
  "aws-smithy-runtime",
  "bytes",
  "ciborium",
+ "getrandom 0.4.3",
  "http 1.4.2",
  "http-body 1.1.0",
  "rusqlite",

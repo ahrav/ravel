@@ -18,6 +18,8 @@ aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
 ] }
 # The event format uses deterministic v1 CBOR encoding.
 ciborium = "=0.2.2"
+# Instance identity generation reads operating-system randomness.
+getrandom = "=0.4.3"
 # Disposable projections use bundled SQLite on both CI targets.
 rusqlite = { version = "=0.40.2", default-features = false, features = [
   "bundled",

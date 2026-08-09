@@ -1,4 +1,8 @@
 use ravel::{
+    distributed::{
+        claims::{self, ClaimState},
+        presence,
+    },
     domain::campaign::{Authority, Event, EventContent, EventRef, Head},
     sync::{WireError, event, head},
 };
@@ -18,6 +22,9 @@ const CHILD_BYTES: &[u8] = include_bytes!(
 );
 const HEAD_UNOWNED_BYTES: &[u8] = include_bytes!("fixtures/v1/head-unowned.json");
 const HEAD_OWNED_BYTES: &[u8] = include_bytes!("fixtures/v1/head-owned.json");
+const CLAIM_ACTIVE_BYTES: &[u8] = include_bytes!("fixtures/v1/claim-active.json");
+const CLAIM_SEALED_BYTES: &[u8] = include_bytes!("fixtures/v1/claim-sealed.json");
+const PRESENCE_BYTES: &[u8] = include_bytes!("fixtures/v1/presence.json");
 
 fn event_ref(sequence: u64, digest: &str, key: &str) -> EventRef {
     EventRef::new(sequence, digest.into(), key.into()).unwrap()
@@ -144,4 +151,81 @@ fn literal_heads_decode_and_reencode_exactly() {
     assert_eq!(owned, expected_owned);
     assert_eq!(head::encode(&unowned).unwrap(), HEAD_UNOWNED_BYTES);
     assert_eq!(head::encode(&owned).unwrap(), HEAD_OWNED_BYTES);
+}
+
+#[test]
+fn literal_claims_decode_and_reencode_exactly() {
+    let active = claims::decode(CLAIM_ACTIVE_BYTES).unwrap();
+    assert_eq!(active.work_id().as_str(), "work-17");
+    assert_eq!(active.work_revision(), 4);
+    assert_eq!(active.owner_actor().as_str(), "rust-worker");
+    assert_eq!(active.owner_instance().as_str(), "instance-a");
+    assert_eq!(active.fence(), 9);
+    assert_eq!(active.operation_id(), "op-claim-001");
+    assert_eq!(
+        active.state(),
+        &ClaimState::Active {
+            lease_until: 1_750_000_000_000
+        }
+    );
+    assert_eq!(claims::encode(&active).unwrap(), CLAIM_ACTIVE_BYTES);
+
+    let sealed = claims::decode(CLAIM_SEALED_BYTES).unwrap();
+    assert_eq!(sealed.work_id().as_str(), "work-17");
+    assert_eq!(sealed.work_revision(), 4);
+    assert_eq!(sealed.owner_actor().as_str(), "rust-worker");
+    assert_eq!(sealed.owner_instance().as_str(), "instance-a");
+    assert_eq!(sealed.fence(), 9);
+    assert_eq!(sealed.operation_id(), "op-claim-001");
+    let ClaimState::Sealed { result_ref } = sealed.state() else {
+        panic!("sealed fixture decoded as active")
+    };
+    assert_eq!(result_ref.digest(), "0".repeat(64));
+    assert_eq!(result_ref.size(), 42);
+    assert_eq!(result_ref.media_type(), "application/json");
+    assert_eq!(result_ref.producer_attempt(), "attempt-17");
+    assert_eq!(result_ref.creation_time_unix_ms(), 1_749_999_999_000);
+    assert_eq!(result_ref.retention_class(), None);
+    assert_eq!(claims::encode(&sealed).unwrap(), CLAIM_SEALED_BYTES);
+}
+
+#[test]
+fn literal_presence_decodes_and_reencodes_exactly() {
+    let decoded = presence::decode(PRESENCE_BYTES).unwrap();
+    assert_eq!(decoded.actor().as_str(), "rust-worker");
+    assert_eq!(decoded.instance().as_str(), "instance-a");
+    assert_eq!(decoded.capabilities(), ["rust", "linux-x86_64"]);
+    assert_eq!(decoded.expires_at_unix_ms(), 1_750_000_000_000);
+    assert_eq!(presence::encode(&decoded).unwrap(), PRESENCE_BYTES);
+}
+
+#[test]
+fn claim_and_presence_fixtures_fail_closed_when_mutated() {
+    let active = String::from_utf8(CLAIM_ACTIVE_BYTES.to_vec()).unwrap();
+    let unknown_claim_version = active.replacen("\"version\":1", "\"version\":2", 1);
+    assert_eq!(
+        claims::decode(unknown_claim_version.as_bytes()),
+        Err(WireError::InvalidValue)
+    );
+    let malformed_claim = active.replacen("{", "{\"unexpected\":true,", 1);
+    assert_eq!(
+        claims::decode(malformed_claim.as_bytes()),
+        Err(WireError::InvalidEncoding)
+    );
+
+    let record = String::from_utf8(PRESENCE_BYTES.to_vec()).unwrap();
+    let unknown_presence_version = record.replacen("\"version\":1", "\"version\":2", 1);
+    assert_eq!(
+        presence::decode(unknown_presence_version.as_bytes()),
+        Err(WireError::InvalidValue)
+    );
+    let invalid_expiry = record.replacen(
+        "\"expires_at_unix_ms\":1750000000000",
+        "\"expires_at_unix_ms\":0",
+        1,
+    );
+    assert_eq!(
+        presence::decode(invalid_expiry.as_bytes()),
+        Err(WireError::InvalidValue)
+    );
 }

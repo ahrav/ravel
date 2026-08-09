@@ -248,7 +248,7 @@ enum WireContent {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WireArtifactRef {
+pub(crate) struct WireArtifactRef {
     digest: String,
     size: u64,
     media_type: String,
@@ -440,6 +440,22 @@ impl TryFrom<WireEventRef> for EventRef {
     }
 }
 
+impl TryFrom<WireArtifactRef> for ArtifactRef {
+    type Error = WireError;
+
+    fn try_from(reference: WireArtifactRef) -> Result<Self, Self::Error> {
+        Self::new(
+            reference.digest,
+            reference.size,
+            reference.media_type,
+            reference.producer_attempt,
+            reference.creation_time_unix_ms,
+            reference.retention_class,
+        )
+        .map_err(|_| WireError::InvalidValue)
+    }
+}
+
 impl TryFrom<WireContent> for EventContent {
     type Error = WireError;
 
@@ -447,17 +463,9 @@ impl TryFrom<WireContent> for EventContent {
         match content {
             WireContent::CampaignCreated => Ok(Self::CampaignCreated),
             WireContent::WorkflowStarted => Ok(Self::WorkflowStarted),
-            WireContent::ArtifactPublished(reference) => Ok(Self::ArtifactPublished(
-                ArtifactRef::new(
-                    reference.digest,
-                    reference.size,
-                    reference.media_type,
-                    reference.producer_attempt,
-                    reference.creation_time_unix_ms,
-                    reference.retention_class,
-                )
-                .map_err(|_| WireError::InvalidValue)?,
-            )),
+            WireContent::ArtifactPublished(reference) => {
+                Ok(Self::ArtifactPublished(reference.try_into()?))
+            }
         }
     }
 }

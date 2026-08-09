@@ -304,6 +304,8 @@ pub enum ValidationError {
     InvalidKey,
     InvalidIdentity,
     InvalidParent,
+    InvalidFence,
+    InvalidExpiry,
 }
 
 impl fmt::Display for ValidationError {
@@ -314,6 +316,8 @@ impl fmt::Display for ValidationError {
             Self::InvalidKey => "invalid event key",
             Self::InvalidIdentity => "invalid durable identity",
             Self::InvalidParent => "invalid event parent",
+            Self::InvalidFence => "invalid fence",
+            Self::InvalidExpiry => "invalid expiry",
         })
     }
 }
@@ -328,7 +332,7 @@ fn validate_sequence(sequence: u64) -> Result<(), ValidationError> {
     }
 }
 
-fn validate_identity(value: &str) -> Result<(), ValidationError> {
+pub(crate) fn validate_identity(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() || value.len() > MAX_IDENTITY_BYTES {
         Err(ValidationError::InvalidIdentity)
     } else {

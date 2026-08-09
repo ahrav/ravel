@@ -1,0 +1,102 @@
+{
+  "run_id": "1786283956580303129-3317072",
+  "prefix": "e02-ambiguity/1786283956580303129-3317072",
+  "bucket": "ravel-e02-4c038b2f",
+  "region": "us-east-1",
+  "injected_responses": [
+    {
+      "step": "scenario-a-head-put",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": "If-Match",
+      "supplied_etag": null,
+      "classification": "dropped-response",
+      "status": 200,
+      "error_code": null,
+      "request_id": "YX8PNAAX6K3SHV83",
+      "extended_request_id": "lPxx4VY/jYLsrBVWbwigaa+/y40ruMpSqjaYO4H163VXGUqV34HRZATf3vZCjEZuwwyIZB1S0Iv+3NKZswDwCK2QQUP6CXsc",
+      "response_etag": "\"8e6f3cc4c5eb490f6519c09950e96970\""
+    },
+    {
+      "step": "scenario-b-head-put",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": "If-Match",
+      "supplied_etag": null,
+      "classification": "dropped-response",
+      "status": 200,
+      "error_code": null,
+      "request_id": "CJKTA3K02E25JXBR",
+      "extended_request_id": "FdMuupKUlEdBzky9JSOeyS36W0qTQgMCCOixj07LtXU5AQFsrscD56cTSxEpYT3Cl3PQcGtsjka35KEM/cv4IP9rPoqmgpHE",
+      "response_etag": "\"23f40839c0aa757a4ff75a19b3b0602c\""
+    },
+    {
+      "step": "scenario-b-head-read",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": null,
+      "supplied_etag": null,
+      "classification": "dropped-response",
+      "status": 200,
+      "error_code": null,
+      "request_id": "CJKTYZM8D7GDBAMZ",
+      "extended_request_id": "TCjrD1bBWe4wqeFpza7hnL6lL6CF/+nPfvcDEnlqbpvX3WbB/zKp0jBdt7C/9YtgApL3x1rI8VwREmK0FkRCqDvJ5SiotAOe",
+      "response_etag": "\"23f40839c0aa757a4ff75a19b3b0602c\""
+    },
+    {
+      "step": "scenario-b-identical-resend",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": "If-Match",
+      "supplied_etag": null,
+      "classification": "observed-response",
+      "status": 412,
+      "error_code": null,
+      "request_id": "CJKQHNH7G8MDV1PV",
+      "extended_request_id": "VsBWmf7WrrdhM3Voh953PpKvx+Qq8jgsyAwHbk5jNOJ6osYxzDoh+zWQqPp/jF0+/suCTgI1omSLAr+fzsL93taNAL2PG1gb",
+      "response_etag": null
+    }
+  ],
+  "scenario_a": {
+    "initial_outcome": "committed",
+    "resend_outcome": null,
+    "head_operation_id": "1786283956580303129-3317072-dropped-success-head",
+    "event_operation_id": "1786283956580303129-3317072-dropped-success-event",
+    "event_key": "0000000000000010-dc61dc4c5f3789acfdfc8c34de9ac2697c04c51cf3f27e9717c6b575488e7c69.cbor.zst"
+  },
+  "scenario_b": {
+    "initial_outcome": "unresolved",
+    "resend_outcome": "committed-after-412",
+    "head_operation_id": "1786283956580303129-3317072-missing-evidence-head",
+    "event_operation_id": "1786283956580303129-3317072-missing-evidence-event",
+    "event_key": "0000000000000011-e216270d4ec521e1782605ee40c1e75ce302f4207d6a24ef52d65d42c9db0892.cbor.zst"
+  },
+  "workers": [
+    {
+      "classification": "committed",
+      "worker_id": 0,
+      "event_operation_id": "1786283956580303129-3317072-event-0",
+      "event_key": "0000000000000012-0b813163aad5f44059cf78c92622401656307bdae4fa619269c7acd2976ead0d.cbor.zst",
+      "head_operation_id": "1786283956580303129-3317072-head-0",
+      "artifact_digest": "0b851379570cc097e56209166b8d886bd7ac0f59c3f68fbdb8c5f256811c720a",
+      "artifact_key": "artifacts/sha256/0b851379570cc097e56209166b8d886bd7ac0f59c3f68fbdb8c5f256811c720a",
+      "artifact_size": 38
+    },
+    {
+      "classification": "proven-not-committed",
+      "worker_id": 1,
+      "event_operation_id": "1786283956580303129-3317072-event-1",
+      "event_key": "0000000000000012-a0c730ec918b67ed8be89cc62e534d3d338e8351e8b86d15c95ed075793651e3.cbor.zst",
+      "head_operation_id": "1786283956580303129-3317072-head-1",
+      "artifact_digest": "82985aff23185b7911d9ca7b8c2172aacbb241b5f70b131dd6c307f5e0337a46",
+      "artifact_key": "artifacts/sha256/82985aff23185b7911d9ca7b8c2172aacbb241b5f70b131dd6c307f5e0337a46",
+      "artifact_size": 38
+    }
+  ],
+  "winner_event_key": "0000000000000012-0b813163aad5f44059cf78c92622401656307bdae4fa619269c7acd2976ead0d.cbor.zst",
+  "loser_event_key": "0000000000000012-a0c730ec918b67ed8be89cc62e534d3d338e8351e8b86d15c95ed075793651e3.cbor.zst",
+  "winner_artifact_key": "artifacts/sha256/0b851379570cc097e56209166b8d886bd7ac0f59c3f68fbdb8c5f256811c720a",
+  "loser_artifact_key": "artifacts/sha256/82985aff23185b7911d9ca7b8c2172aacbb241b5f70b131dd6c307f5e0337a46",
+  "final_validation": "passed",
+  "result": "passed"
+}

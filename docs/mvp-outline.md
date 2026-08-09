@@ -456,7 +456,7 @@ P2P and CRDTs remain possible later, but neither is required for initial correct
 Every node runs the same Rust binary.
 
 ```text
-pi-campaign-node
+ravel node
   |
   +-- sync engine
   +-- SQLite projector
@@ -2560,7 +2560,7 @@ Model calls, compilation, testing, benchmarking, and artifact movement are far m
 # 42. Suggested implementation tree
 
 ```text
-pi-campaign/
+ravel/
   src/
     domain/
       campaign.rs

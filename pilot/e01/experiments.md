@@ -119,7 +119,10 @@ runs within a block execute in the listed order.
   including per-run-cap-stopped runs (this is the `budgets.yaml`
   hard-limit "required cleanup/reconciliation"), so every complete run
   carries a pass/fail rediscovery result; a run stopped with non-exempt
-  unresolved targets simply fails it. A *campaign*
+  unresolved targets simply fails it, and a rediscovery invocation that
+  produces no valid verdict (nonzero exit, rule-digest mismatch against
+  `change/targets.jsonl`, or any other error) is recorded **fail** for
+  that run — never blank, never re-judged. A *campaign*
   hard limit (`deadline_campaign_days`, `campaign_spend_usd`) stopping
   a run mid-flight or preventing it from starting leaves that run with
   no numeric outcome values, and such runs are never imputed, zeroed,

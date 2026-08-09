@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     domain::campaign::{Authority, AuthorityState, Event, EventRef, Head},
-    storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+    storage::{
+        artifacts::PublishedArtifact,
+        s3::{
+            AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, PublicationError, S3Store,
+        },
+    },
 };
 
 use super::{
@@ -164,12 +169,50 @@ impl HeadTransition {
 #[must_use]
 pub enum HeadCommitOutcome {
     Committed,
+    CommittedSuperseded,
+    ProvenNotCommitted,
     RetryIdentically(HeadTransition),
-    Advanced {
-        transition: HeadTransition,
-        current: ObservedHead,
-    },
     Unresolved(HeadTransition),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppendError {
+    Publication(PublicationError),
+    InvalidInput,
+}
+
+impl fmt::Display for AppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Publication(_) => "event publication failed",
+            Self::InvalidInput => "invalid append input",
+        })
+    }
+}
+
+impl Error for AppendError {}
+
+pub async fn append(
+    store: &S3Store,
+    parent: HeadParent,
+    authority: Authority,
+    head_operation_id: String,
+    tail: &Event,
+    artifact: Option<&PublishedArtifact>,
+    history: &mut AttemptHistory,
+) -> Result<HeadCommitOutcome, AppendError> {
+    let publication = event::publish(store, tail, artifact)
+        .await
+        .map_err(AppendError::Publication)?;
+    let candidate = Head::new(
+        authority,
+        publication.event_ref().clone(),
+        head_operation_id,
+    )
+    .map_err(|_| AppendError::InvalidInput)?;
+    let transition = HeadTransition::new(parent, candidate, tail, &publication)
+        .map_err(|_| AppendError::InvalidInput)?;
+    Ok(commit(store, transition, history).await)
 }
 
 pub async fn read(store: &S3Store) -> Result<Option<ObservedHead>, HeadReadError> {
@@ -275,17 +318,14 @@ async fn resolve(store: &S3Store, mut transition: HeadTransition) -> HeadCommitO
 
     // A current head that reuses the observed parent's operation identity while
     // carrying different bytes means one operation id names two distinct heads.
-    // Chain reconciliation has no way to pick between them.
+    // Reconciliation has no way to pick between them, so it is not consulted.
     if let HeadParent::Existing(parent) = &transition.parent
         && current.head.operation_id() == parent.head.operation_id()
     {
         return HeadCommitOutcome::Unresolved(transition);
     }
 
-    HeadCommitOutcome::Advanced {
-        transition,
-        current,
-    }
+    crate::recovery::reconcile::reconcile(store, transition, current).await
 }
 
 /// An owned head claims that its controller published the tail, so the tail's
@@ -443,7 +483,7 @@ mod tests {
     use aws_smithy_runtime::client::http::test_util::NeverClient;
 
     use crate::{
-        domain::campaign::EventContent,
+        domain::campaign::{ArtifactRef, EventContent},
         storage::s3::test_support::{replay_store, response, test_builder},
     };
 
@@ -1207,7 +1247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn different_current_head_is_advanced_without_chain_walk() {
+    async fn different_current_head_without_complete_chain_is_unresolved() {
         let parent = parent_head(Authority::unowned(), "parent-op");
         let original = read_observed(&parent, OLD_ETAG).await;
         let transition = successor_transition(original, Authority::unowned(), "head-op-2").await;
@@ -1225,21 +1265,15 @@ mod tests {
         let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
-        match commit(&store, transition, &mut history).await {
-            HeadCommitOutcome::Advanced {
-                transition,
-                current: observed,
-            } => {
-                assert_eq!(transition.candidate().operation_id(), "head-op-2");
-                assert_eq!(observed.head(), &current);
-            }
-            _ => panic!("different current head requires chain reconciliation"),
-        }
+        assert!(matches!(
+            commit(&store, transition, &mut history).await,
+            HeadCommitOutcome::Unresolved(_)
+        ));
         assert_eq!(client.actual_requests().count(), 2);
     }
 
     #[tokio::test]
-    async fn current_head_reusing_parent_operation_but_changing_bytes_is_unresolved() {
+    async fn reused_parent_operation_is_unresolved_without_reconciliation() {
         let parent = parent_head(Authority::unowned(), "parent-op");
         let original = read_observed(&parent, OLD_ETAG).await;
         let transition = successor_transition(original, Authority::unowned(), "head-op-2").await;
@@ -1307,7 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn genesis_with_another_current_head_is_advanced() {
+    async fn genesis_with_another_head_and_missing_chain_is_unresolved() {
         let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
         let current = Head::new(
             Authority::unowned(),
@@ -1328,7 +1362,7 @@ mod tests {
 
         assert!(matches!(
             commit(&store, transition, &mut history).await,
-            HeadCommitOutcome::Advanced { .. }
+            HeadCommitOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 2);
     }
@@ -1348,5 +1382,170 @@ mod tests {
             HeadCommitOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn advanced_head_resolves_through_the_complete_retained_chain() {
+        let parent = parent_head(Authority::unowned(), "parent-head-operation");
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let transition =
+            successor_transition(observed, Authority::unowned(), "candidate-head-operation").await;
+        let candidate_key = transition.candidate().tail().key().to_owned();
+        let candidate_event = event::decode(
+            transition.canonical_event_bytes(),
+            transition.candidate().tail().key(),
+        )
+        .expect("candidate event decodes");
+        let later_event = Event::new(
+            "later-event-operation".into(),
+            candidate_event.sequence() + 1,
+            Some(transition.candidate().tail().clone()),
+            candidate_event.writer_fence() + 1,
+            EventContent::WorkflowStarted,
+        )
+        .expect("later event is valid");
+        let later_bytes = event::encode(&later_event).expect("later event encodes");
+        let current_head = Head::new(
+            Authority::unowned(),
+            EventRef::from_digest(later_event.sequence(), later_bytes.digest().to_owned())
+                .expect("later reference is valid"),
+            "current-head-operation".into(),
+        )
+        .expect("current head is valid");
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", FRESH_ETAG)],
+                encode(&current_head).expect("current head encodes"),
+            ),
+            response(
+                200,
+                &[("etag", "\"later-event\"")],
+                later_bytes.stored_bytes(),
+            ),
+            response(
+                200,
+                &[("etag", "\"candidate-event\"")],
+                transition.canonical_event_bytes(),
+            ),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            commit(&store, transition, &mut history).await,
+            HeadCommitOutcome::CommittedSuperseded
+        ));
+        assert_eq!(client.actual_requests().count(), 4);
+        assert_eq!(request_path(&client, 0), "/head.json");
+        assert_eq!(request_path(&client, 1), "/head.json");
+        assert_eq!(request_path(&client, 2), format!("/{}", later_bytes.key()));
+        assert_eq!(request_path(&client, 3), format!("/{candidate_key}"));
+    }
+
+    #[tokio::test]
+    async fn append_publishes_event_before_head_and_blocks_failed_publication() {
+        let event = genesis_event();
+        let event_key = event::encode(&event)
+            .expect("event encodes")
+            .key()
+            .to_owned();
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            append(
+                &store,
+                HeadParent::Genesis,
+                Authority::unowned(),
+                "head-operation".into(),
+                &event,
+                None,
+                &mut history,
+            )
+            .await,
+            Ok(HeadCommitOutcome::Committed)
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(request_path(&client, 0), format!("/{event_key}"));
+        assert_eq!(request_path(&client, 1), "/head.json");
+        assert_eq!(
+            client.actual_requests().next().expect("event PUT").method(),
+            http::Method::PUT
+        );
+        assert_eq!(
+            client.actual_requests().nth(1).expect("head PUT").method(),
+            http::Method::PUT
+        );
+
+        let artifact = ArtifactRef::new(
+            "0".repeat(64),
+            1,
+            "application/octet-stream".into(),
+            "producer-attempt".into(),
+            1,
+            None,
+        )
+        .expect("artifact reference is valid");
+        let event = Event::new(
+            "artifact-event-operation".into(),
+            1,
+            None,
+            1,
+            EventContent::ArtifactPublished(artifact),
+        )
+        .expect("artifact event is valid");
+        let (store, client) = replay_store(Vec::new());
+        let mut history = AttemptHistory::default();
+        let error = match append(
+            &store,
+            HeadParent::Genesis,
+            Authority::unowned(),
+            "head-operation".into(),
+            &event,
+            None,
+            &mut history,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing artifact witness must fail publication"),
+        };
+        assert_eq!(
+            error,
+            AppendError::Publication(PublicationError::InvalidInput)
+        );
+        assert_eq!(error.to_string(), "event publication failed");
+        assert_eq!(client.actual_requests().count(), 0);
+
+        let event = genesis_event();
+        let event_key = event::encode(&event)
+            .expect("event encodes")
+            .key()
+            .to_owned();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            append(
+                &store,
+                HeadParent::Genesis,
+                Authority::unowned(),
+                "head-operation".into(),
+                &event,
+                None,
+                &mut history,
+            )
+            .await,
+            Err(AppendError::Publication(PublicationError::Unresolved))
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(request_path(&client, 0), format!("/{event_key}"));
+        assert_eq!(request_path(&client, 1), format!("/{event_key}"));
     }
 }

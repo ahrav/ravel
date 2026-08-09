@@ -35,7 +35,7 @@ use crate::{
 
 use super::{WIRE_VERSION, WireError};
 
-const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
 const CBOR_RECURSION_LIMIT: usize = 16;
 const ZSTD_LEVEL: i32 = 3;

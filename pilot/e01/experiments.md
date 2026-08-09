@@ -401,9 +401,13 @@ The run clock starts at its `ts_utc_start`.
 
 ### 9.2 Run-terminal record — `record: "run_terminal"`
 
-Written once per run, after trusted measurement completes. The run's record
-stream ends here; the measured windows are the timestamps below, not this
-record's write time.
+Written once per run, when the run's record stream ends: after trusted
+measurement completes, or immediately at a campaign-limit stop that prevents
+the run from starting or stops its treatment execution (§4) — in that case
+`complete` is `false`, the measurement fields (`measurement_end_utc`,
+`outcomes` numeric values) are explicitly `null`/absent per §4, and
+`fully_measured` is `false`. The measured windows are the timestamps below,
+not this record's write time.
 
 | Field | Definition |
 | --- | --- |
@@ -438,8 +442,8 @@ the shape is identical across treatments.
 
 | Field | Definition |
 | --- | --- |
-| `fired` | `true` only in C, at the §6/§7 injection point |
-| `work_items_completed_at_fire` | 2 in C (the frozen deterministic point); `null` in A/B |
+| `fired` | `true` in C once the §6/§7 injection point is reached; `false` in A/B always, and in C when the run ends (per-run cap, error, or campaign limit) before two work items complete |
+| `work_items_completed_at_fire` | 2 when `fired: true` (the frozen deterministic point); `null` when `fired: false`, including a C run stopped before the injection point |
 | `killed_agent_id` / `killed_host_id` / `takeover_host_id` | C only; `null` in A/B |
 | `ts_utc` / `monotonic_ns` / `host_boot_id` | when the kill was issued, on the issuing host |
 
@@ -456,6 +460,14 @@ One record per agent per assigned work item: `host_id`, `agent_id`,
   the run's utilization measure is `Σ_h busy_h ÷ Σ_h agent_wall_h`. Summing
   durations never compares clocks across hosts, so the measure is valid for
   1-host and 3-host cells alike.
+- Agent start/end come from one required `record: "agent_lifecycle"` per
+  agent per run (every cell): `host_id`, `agent_id`, `role_profile`,
+  `start_monotonic_ns`, `end_monotonic_ns`, `host_boot_id`,
+  `clock: "CLOCK_MONOTONIC"` — bounding the agent's availability window from
+  spawn to exit. `agent_wall_h` sums lifecycle durations, never busy
+  intervals, so an agent that received no assignment — and idle time before
+  an agent's first or after its last assignment — stays in the utilization
+  denominator.
 
 ### 9.6 Work-item events — `record: "work_event"`
 
@@ -468,6 +480,15 @@ One record per transition, three kinds: `ready`, `dispatch`, `terminal`.
 | `agent_id` / `host_id` / `role_profile` | assignee (`null` for `ready`) |
 | `terminal_state` | `resolved` \| `rejected` \| `blocked` \| `unresolved` for `terminal`, else `null` |
 | `ts_utc` + `monotonic_ns` + `host_boot_id` | UTC for cross-host ordering; monotonic for host-local durations only (§9.5) |
+
+**Integration attempts (Change pilot only, every cell)** —
+`record: "integration_attempt"`: `work_item_id`, `agent_id`, `host_id`,
+`attempt_index`, `outcome` (`integrated` \| `conflict`), `ts_utc`. One record
+per attempt to integrate a candidate into the campaign branch. §7's
+integration-conflict rate is `conflict` records ÷ all `integration_attempt`
+records, and §7's wasted work counts `attempt` records with no corresponding
+`integrated` outcome — evaluator/judge rejection is already captured on the
+`attempt`/`work_event` records and is not an integration attempt.
 
 ### 9.7 Provider usage and cost — `record: "model_call"`
 
@@ -513,7 +534,7 @@ One record per complete run, same shape in both pilots.
 | --- | --- |
 | `revision_measured` | Change: the campaign-branch tip measured by trusted final rediscovery (§4); Research: the frozen subject revision |
 | `rule_digest` | Change: the `change/contract.md` §2 digest reported by the rediscovery run (a mismatch is recorded and the verdict is `fail`); Research: `null` |
-| `verdict` | `pass` \| `fail` — Change: zero non-exempt records; Research: grading completed under `research.md` §6 |
+| `verdict` | `pass` \| `fail` \| `unresolved` — Change: zero non-exempt records; Research: grading completed under `research.md` §6; `unresolved` only when the §4 measurement caps were exhausted before this run's grading/rediscovery executed (the run's terminal record then carries `fully_measured: false`); a rediscovery invocation that runs but produces no valid verdict is still `fail` (§4) |
 | `per_class` | per-outcome-class counts: Change `resolved`/`rejected`/`blocked`/`unresolved`; Research `research.md` §7 classes |
 | `records_emitted` | Change: rediscovery record count (non-exempt); Research: graded conclusion count |
 | `measurement_start_utc` / `measurement_end_utc` | separately timed measurement window (§4) |

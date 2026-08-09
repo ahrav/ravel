@@ -118,6 +118,13 @@ it) and the PID namespace — so candidate execution has no network. No
 credentials, no AWS/code-host configuration, no daemon Git metadata, no shared
 writable cache, and no host socket appear in the mount table.
 
+**Candidate output travels through the overlay.** `/work/src` is never
+writable: an attempt that changes files writes them — and any build output —
+under `/work/out`, and validation consumes that overlay content as the
+attempt's delta. In-place edits to the mounted source tree are not part of
+any flow; a payload attempting one fails on the read-only bind, which is the
+intended fail-closed behavior.
+
 **Environment:** `--clearenv` plus exactly `PATH`, `HOME`, `TMPDIR`. The
 ambient process environment is never forwarded and then redacted. Adding a
 variable requires an amendment.
@@ -202,7 +209,12 @@ reason category:
 6. Two distinct accepted raw paths in one validation pass with an equal
    collision key → **the whole pass fails closed** (E07 AC6:
    normalization/case ambiguity is rejected, never silently merged or
-   picked between).
+   picked between). The collision set is the validated delta's accepted
+   paths **plus every tracked path of the base tree the delta applies to**:
+   a delta-only check would accept a lone `src/Main.rs` against an unchanged
+   tracked `src/main.rs`. Preflight separately proves the frozen base tree
+   itself is collision-free, so only delta-vs-delta and delta-vs-base pairs
+   can fire.
 
 No separate component-length rule exists: the 180-byte whole-path limit is
 stricter than any single-component concern, so a component cap would be

@@ -947,6 +947,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_maps_not_sent_and_too_large_to_their_errors() {
+        assert_eq!(
+            terminal(&MutationOutcome::ProvenNotSent),
+            Some(Err(PublicationError::NotSent))
+        );
+        assert_eq!(
+            terminal(&MutationOutcome::TooLarge),
+            Some(Err(PublicationError::TooLarge))
+        );
+    }
+
+    #[test]
     fn public_error_text_is_generic() {
         assert_eq!(
             GetError::TooLarge.to_string(),

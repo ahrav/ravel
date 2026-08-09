@@ -272,14 +272,14 @@ checks unchanged; the new blocks appended below the change-viability gate:
 
 ```text
 == E01 preflight receipt ==
-date: 2026-08-09T04:03:47Z
+date: 2026-08-09T04:26:25Z
 host: Linux 6.12.95-124.187.amzn2023.aarch64
 cloning https://github.com/ahrav/hyperfine.git -> /tmp/e01-preflight.uTwuWm/hyperfine
 PASS  frozen revision — f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7
 …all §2 checks PASS, unchanged…
 PASS  change targets >= 36 — count=40
 unicodedata: 13.0.0 (runtime.md §4 reference: 13.0.0)
-PASS  path collision golden vectors (15 rows, 3 collision pairs)
+PASS  path collision golden vectors (16 rows, 3 collision pairs)
 PASS  containment tool present: bwrap
 PASS  containment tool present: prlimit
 PASS  prlimit frozen limits apply

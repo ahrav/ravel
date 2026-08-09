@@ -205,7 +205,8 @@ runs within a block execute in the listed order.
   `environment.yaml` branch policy. Production branches are never touched.
 - **Reset between complete runs:** delete all run workspaces; reset the
   campaign branch to the pinned revision; delete the finished run's S3 run
-  prefix working area (measurement artifacts are retained outside it);
+  prefix working area (measurement artifacts — including the §9
+  capture-record stream — are retained outside it);
   then (Change) re-run trusted `change/discover.sh` and confirm the target
   count matches `change/targets.jsonl` before the next run starts.
 
@@ -345,8 +346,11 @@ machine check, not a human gate.
 Every cell of both pilots emits **the same record shapes**, so no treatment
 gains a measurement advantage. Single-host cells (A, B) emit the identical
 shapes with one host and one agent list; fields that only C can populate are
-**present and null** in A/B rather than omitted. Records are JSONL written
-under the run's own S3 run prefix (§5), private and unstable, no schema, no
+**present and null** in A/B rather than omitted. Records are JSONL and are
+**measurement artifacts**: they are written to the run's retained measurement
+location — outside the run-prefix *working area* that the §5 between-runs
+reset deletes — so the capture stream survives the reset and is available to
+campaign analysis. Private and unstable, no schema, no
 loader — field names may change by amendment and nothing may be built against
 them.
 
@@ -366,7 +370,13 @@ trusted measurement is separately timed and separately bounded by
 `measurement_spend_usd` / `measurement_deadline_days` (§4). The §6/§7
 wall-clock measures are computed from these boundaries exactly as §6/§7 word
 them — Research to the final synthesized answer, Change to the final
-rediscovery result.
+rediscovery result. One boundary is *derived*, not `ts_utc_start`: §6 defines
+Research wall-clock as starting at the **first agent action**, so that
+measure starts at the earliest treatment-initiated record (`work_event`,
+`attempt`, or `model_call`) UTC timestamp in the run's stream — dispatch or
+setup delay between reset and first action differs across A/B/C and must not
+enter the comparison. `ts_utc_start` bounds only the cap window above. Change
+wall-clock starts at run start (`ts_utc_start`) exactly as §7 words it.
 
 **Fault placement** is not re-specified here: it stays exactly as frozen in
 §6/§7 (kill the active controller immediately after it records the second
@@ -397,7 +407,8 @@ record's write time.
 
 | Field | Definition |
 | --- | --- |
-| `result` | `complete` \| `unresolved` (§4 labels; a per-run-cap stop is `complete` *and* labeled `unresolved`) |
+| `complete` | `true` if the run is a complete observation per §4 (a per-run-cap stop is still `true`); `false` only for a campaign-limit stop during treatment execution or before start |
+| `unresolved` | `true` for any hard-limit stop — the §4 `unresolved` result label; `true` together with `complete: true` for a per-run-cap stop — else `false` |
 | `stop_reason` | `finished` \| `per_run_cap:<cap key>` \| `campaign_limit:<cap key>` \| `error` |
 | `treatment_end_utc` / `measurement_end_utc` / `ts_utc_end` | treatment window end, measurement end, record write time |
 | `outcomes` | one field per §6 (Research) or §7 (Change) measure — including Change's final rediscovery result — with `undefined` exactly where the §6/§7 zero-denominator rules say so; absent numeric values only for a campaign-limit stop during treatment execution (§4) |

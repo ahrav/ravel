@@ -187,7 +187,11 @@ reason category:
 3. Component count (split on `/`) ≤ **10** (`environment.yaml`
    `max_path_depth`) → else `path-too-deep`.
 4. Every component: non-empty (`empty-component`); not `.` or `..`
-   (`dot-component`); no U+0000–U+001F and no U+007F (`control-char`); no
+   (`dot-component`); not `.git` after `casefold` (`git-component` — a
+   nested-repository marker; accepting it would let a validated delta write
+   `src/.git/**` and change repository behavior, so it fails closed here to
+   give E07 a frozen basis for rejecting nested repos); no U+0000–U+001F and
+   no U+007F (`control-char`); no
    `"` and no `\` (`forbidden-char` — the same characters trusted
    `discover.sh` refuses, `change/contract.md` §2).
 5. **Collision key** = `NFC(casefold(NFC(path)))`. Normalization form is
@@ -230,6 +234,7 @@ collision key, or `REJECT:<reason>`.
 | 13 | `src/a\\b.rs` | `REJECT:forbidden-char` |
 | 14 | `src//main.rs` | `REJECT:empty-component` |
 | 15 | `src/` + `a`×177 (181 bytes) | `REJECT:path-too-long` |
+| 16 | `src/.git/config` | `REJECT:git-component` |
 
 Accepted rows form exactly **three** colliding key pairs — (1, 2) ASCII case,
 (3, 4) NFC/NFD, (5, 6) `ß`/`ss` casefold — and each pair is a step-6 pass

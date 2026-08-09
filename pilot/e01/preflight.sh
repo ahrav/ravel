@@ -176,6 +176,8 @@ def collision_key(raw):
             return None, "empty-component"
         if c in (".", ".."):
             return None, "dot-component"
+        if c.casefold() == ".git":
+            return None, "git-component"
         for ch in c:
             if ord(ch) <= 0x1F or ord(ch) == 0x7F:
                 return None, "control-char"
@@ -201,6 +203,7 @@ VECTORS = [  # frozen: runtime.md §4.1, row order
     (b"src/a\\b.rs", "REJECT:forbidden-char"),
     (b"src//main.rs", "REJECT:empty-component"),
     (b"src/" + b"a" * 177, "REJECT:path-too-long"),
+    (b"src/.git/config", "REJECT:git-component"),
 ]
 
 fails = 0
@@ -223,7 +226,7 @@ PY
 )
 vec_rc=$?
 echo "unicodedata: $(printf '%s\n' "$vec_out" | sed -n 's/^unidata_version=//p') (runtime.md §4 reference: 13.0.0)"
-check "path collision golden vectors (15 rows, 3 collision pairs)" "$vec_rc" \
+check "path collision golden vectors (16 rows, 3 collision pairs)" "$vec_rc" \
 	"$(printf '%s\n' "$vec_out" | grep -v '^unidata_version=' | tr '\n' ';')"
 
 for tool in bwrap prlimit; do

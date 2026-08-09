@@ -156,8 +156,21 @@ check_segment() {
     if [ "$(current_branch "$cdir")" = "main" ]; then
       reason="'$seg' is a bare push while on main"; return 0
     fi
-    # ponytail: resolves only mappings visible via @{push}; a bare push to an
-    # explicit remote arg with a remote.<name>.push mapping is not resolved.
+    if [ -n "$remote" ]; then
+      # A repository-only push honors remote.<name>.push mappings, which can
+      # target main from any branch.
+      local m dest2
+      while IFS= read -r m; do
+        dest2="${m#+}"
+        case "$dest2" in *:*) dest2="${dest2##*:}" ;; esac
+        case "$dest2" in
+          main | refs/heads/main)
+            reason="'$seg' pushes via remote.$remote.push mapping to main"; return 0 ;;
+        esac
+      done < <(git -C "${cdir:-${cwd:-.}}" config --get-all "remote.$remote.push" 2>/dev/null)
+    fi
+    # Resolves default-remote mappings via @{push} and named remote.<name>.push
+    # entries; push.default=matching is not modeled.
     case "$(push_dest "$cdir")" in
       */main) reason="'$seg' is a bare push whose configured destination is main"; return 0 ;;
     esac

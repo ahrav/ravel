@@ -28,21 +28,30 @@ message argument do not satisfy the treatment. No alternate treatments exist.
 Inline `#[test]`/`#[cfg(test)]` sites inside matched files receive the same
 treatment (the scope is path-based; see §2).
 
-**Objective resolved condition (per target):** all three, checked by the
+**Objective resolved condition (per target):** all four, checked by the
 trusted side:
 
 1. the target's `.unwrap()` token no longer exists at its site;
 2. rediscovery (§2) at the candidate revision emits no record for it;
-3. **rewrite reconciliation (per file):** the count of `.expect(` calls
+3. **site rewrite verification (per target):** in
+   `git diff -U0 <frozen>..<candidate> -- <file>`, the hunk covering the
+   target's frozen line is exactly a replacement whose removed line
+   contains the target's `.unwrap()` call and whose added line(s),
+   compared after `tr -d '[:space:]'` normalization, are identical to the
+   removed line except that call reads `.expect("<non-empty string
+   literal>")`. Any other change shape at the site (`?`,
+   `unwrap_or_default()`, deletion, receiver changes, extra edits) leaves
+   the target **unresolved** — the precommitted treatment is the
+   `.expect` rewrite, not mere `.unwrap()` removal;
+4. **rewrite reconciliation (per file):** the count of `.expect(` calls
    with a non-empty string-literal argument in the target's file, measured
    by the fixed command
    `tr -d '[:space:]' < <file> | grep -o '\.expect("[^"]' | wc -l`,
    exceeds the frozen-revision count for that file by exactly the number
-   of the file's resolved inventory targets. A target whose site was
-   changed any other way (`?`, `unwrap_or_default()`, deletion, …) breaks
-   this reconciliation, and every target in a file that fails it counts as
-   **unresolved** regardless of rediscovery — the precommitted treatment
-   is the `.expect` rewrite, not mere `.unwrap()` removal.
+   of the file's resolved inventory targets — so an unrelated `.expect`
+   added elsewhere in the file cannot compensate for an untreated site,
+   and every target in a file that fails reconciliation counts as
+   **unresolved** regardless of rediscovery.
 
 **Objective resolved condition (campaign):** rediscovery at the candidate
 revision, under the rule digest in §2, emits zero records that are not

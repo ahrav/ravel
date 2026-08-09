@@ -103,13 +103,17 @@ runs within a block execute in the listed order.
   recorded `unresolved` per `budgets.yaml` hard-limit behavior. No
   adaptive stopping, no run-count changes, no extension after peeking at
   results.
-- **`unresolved` aggregation (fixed):** a run is `unresolved` only when
-  a *campaign* hard limit (`deadline_campaign_days`,
-  `campaign_spend_usd`) stops it mid-run or prevents it from starting.
-  A *per-run* cap exhausting mid-run ends the run as a **complete**
-  observation with numeric outcomes — unfinished work counts against it
-  (omissions, zero resolutions, `unresolved` work items). `unresolved`
-  runs carry no numeric outcome values and are never imputed, zeroed,
+- **`unresolved` aggregation (fixed):** every hard-limit stop emits the
+  explicit `unresolved` run result required by `budgets.yaml`
+  hard-limit behavior; the two limit families differ only in whether the
+  observation still has numeric values. A *per-run* cap exhausting
+  mid-run ends the run as a **complete** observation: it carries the
+  `unresolved` result label *and* numeric outcomes computed from work
+  integrated/graded up to the stop — unfinished work counts against it
+  (omissions, zero resolutions, `unresolved` work items). A *campaign*
+  hard limit (`deadline_campaign_days`, `campaign_spend_usd`) stopping
+  a run mid-flight or preventing it from starting leaves that run with
+  no numeric outcome values, and such runs are never imputed, zeroed,
   worst-cased, or excluded-by-choice. The §6/§7 decision-rule medians
   are defined only over exactly 5 complete runs per cell; if any cell of
   a pilot has fewer than 5 complete runs when the campaign stops, that
@@ -149,7 +153,7 @@ cells):** one single synthesized answer per run, recorded with provenance.
 
 | Attribute | A | B | C |
 | --- | --- | --- | --- |
-| Agents / machines | 1 agent, 1 machine | 4 agents, 1 machine | Exactly 3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify) and exactly 7 agents: 1 active controller + 2 judge agents on host 1; 2 researcher agents on each of hosts 2–3 (4 researchers total). On controller failover the takeover host inherits this layout |
+| Agents / machines | 1 agent, 1 machine | 4 agents, 1 machine | Exactly 3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify) and exactly 7 agents: 1 active controller + 2 judge agents on host 1; 2 researcher agents on each of hosts 2–3 (4 researchers total). On controller failover the takeover host inherits this layout: the controller role restarts as exactly one new agent instance on host 2 (fixed), every other agent continues unchanged in role and placement, and the 7-agent role composition is otherwise identical before and after failover |
 | Role profiles used (environment.yaml) | `generator:research` (×1); exactly one final `synthesizer` call renders the answer | `generator:research` (×4); exactly one final `synthesizer` call merges the thread reports | `generator:research` (×4 researcher agents); `judge:semantic` (×1) and `judge:critic` (×1) judge agents; `judge:adjudicator` calls only to resolve a semantic/critic disagreement; exactly one final `synthesizer` call. `generator:code` unused; the controller makes model calls only through the calls listed here |
 | Assignment & visibility | Sees everything: whole question, whole frozen tree | Disjoint static partitions = the four separable threads of `research.md` §1 (calibration, subtraction, clamping, warning surfaces), one per agent; each agent may read the whole frozen tree but sees only its own thread and workspace, never other agents' outputs | Controller-directed: agents see only their assigned work item plus controller-provided context |
 | Communication | None (single agent) | None — independent agents, no coordination, no shared workspace view (§32 Experiment A treatment B) | Only controller-mediated messages/artifacts; no direct agent-to-agent channels |
@@ -179,7 +183,10 @@ treatment self-report anywhere (§43 invariant 3):
 | Controller idle/bottleneck time | hours/run | C only: wall-clock with zero in-flight agent work while un-dispatched work exists; 0 by definition for A/B |
 
 **Zero denominators (fixed):** a complete run with zero graded
-conclusions records incorrect conclusion rate = 1 (worst case). Any
+conclusions records incorrect conclusion rate = 1 (worst case). If the
+non-struck reference set is empty (all items struck under `research.md`
+§8), material omission rate = 0 for every run of every cell — nothing
+can be omitted — so the decision rule stays total. Any
 other ratio above whose denominator is 0 (including a zero A-cell
 median in scaling efficiency) is recorded `undefined`; `undefined`
 values are descriptive only, never imputed, and never enter the
@@ -210,7 +217,7 @@ from treatment self-report (§43 invariant 3).
 
 | Attribute | A | B | C |
 | --- | --- | --- | --- |
-| Agents / machines | 1 coding agent, 1 machine | 4 independent coding agents, 1 machine | Exactly 3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify) and exactly 7 agents: 1 active controller + 2 judge agents on host 1; 2 worker agents on each of hosts 2–3 (4 workers total). On controller failover the takeover host inherits this layout |
+| Agents / machines | 1 coding agent, 1 machine | 4 independent coding agents, 1 machine | Exactly 3 independent machines/VM hosts (distinct hosts; subprocesses on one host do not qualify) and exactly 7 agents: 1 active controller + 2 judge agents on host 1; 2 worker agents on each of hosts 2–3 (4 workers total). On controller failover the takeover host inherits this layout: the controller role restarts as exactly one new agent instance on host 2 (fixed), every other agent continues unchanged in role and placement, and the 7-agent role composition is otherwise identical before and after failover |
 | Role profiles used (environment.yaml) | `generator:code` (×1) | `generator:code` (×4) | `generator:code` (×4 worker agents); `judge:semantic` (×1) and `judge:critic` (×1) judge agents; `judge:adjudicator` calls only to resolve a semantic/critic disagreement. `generator:research` and `synthesizer` unused; the controller makes model calls only through the calls listed here |
 | Assignment & visibility | Sees everything: full inventory, whole workspace | Disjoint static partitions: `targets.jsonl` sorted by target ID, split into 4 contiguous quarters (remainder to the last quarter), one per agent; each agent sees only its own partition and workspace | Controller-directed claiming: workers see only their assigned targets plus controller-provided context |
 | Communication | None (single agent) | None — no coordination, no shared workspace view | Only controller-mediated messages/artifacts; no direct agent-to-agent channels |

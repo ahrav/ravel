@@ -128,10 +128,14 @@ runs within a block execute in the listed order.
   no numeric outcome values, and such runs are never imputed, zeroed,
   worst-cased, or excluded-by-choice. **Precedence when both limit
   families fire during one run (fixed):** the campaign limit wins — the
-  run is `unresolved` with no numeric values whenever a campaign hard
-  limit is reached before the run's outcomes (including final
-  rediscovery) are fully measured, regardless of any per-run cap that
-  also fired. The §6/§7 decision-rule medians
+  run is `unresolved` with no numeric values — only when it stops the
+  run's *treatment execution* (Research: production of the synthesized
+  answer; Change: work on the campaign branch) or prevents it from
+  starting. A run whose treatment execution finished under the campaign
+  limit is complete, full stop: trusted measurement (blinded grading,
+  final rediscovery) executes for every complete run and is never
+  skipped, cut short, or reclassified by a campaign limit reached after
+  treatment execution ended. The §6/§7 decision-rule medians
   are defined only over exactly 5 complete runs per cell; if any cell of
   a pilot has fewer than 5 complete runs when the campaign stops, that
   pilot's precommitted outcome is **Inconclusive (budget-stopped)**,

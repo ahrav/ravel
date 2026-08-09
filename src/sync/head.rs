@@ -460,7 +460,7 @@ mod tests {
             .expect("head exists")
     }
 
-    async fn rejects_transition(
+    fn rejects_transition(
         parent: HeadParent,
         candidate: Head,
         tail: &Event,
@@ -775,7 +775,7 @@ mod tests {
             "head-op-2".into(),
         )
         .expect("valid head");
-        rejects_transition(HeadParent::Genesis, candidate, &sequence_two, &publication).await;
+        rejects_transition(HeadParent::Genesis, candidate, &sequence_two, &publication);
 
         let genesis = genesis_event();
         let publication = publish_event(&genesis).await;
@@ -783,7 +783,7 @@ mod tests {
             EventRef::from_digest(1, "f".repeat(64)).expect("valid alternate reference");
         let candidate =
             Head::new(Authority::unowned(), different, "head-op-1".into()).expect("valid head");
-        rejects_transition(HeadParent::Genesis, candidate, &genesis, &publication).await;
+        rejects_transition(HeadParent::Genesis, candidate, &genesis, &publication);
 
         let different_tail = Event::new(
             "different-event-operation".into(),
@@ -804,8 +804,7 @@ mod tests {
             candidate,
             &different_tail,
             &publication,
-        )
-        .await;
+        );
 
         let parent = parent_head(Authority::unowned(), "parent-op");
         let observed = read_observed(&parent, OLD_ETAG).await;
@@ -830,8 +829,7 @@ mod tests {
             candidate,
             &sequence_three,
             &publication,
-        )
-        .await;
+        );
 
         let parent = parent_head(Authority::unowned(), "parent-op");
         let observed = read_observed(&parent, OLD_ETAG).await;
@@ -857,8 +855,7 @@ mod tests {
             candidate,
             &tail,
             &publication,
-        )
-        .await;
+        );
 
         let parent = parent_head(
             Authority::owned("owner".into(), "instance".into(), 1, 2).expect("valid authority"),
@@ -881,7 +878,7 @@ mod tests {
             "head-op-2".into(),
         )
         .expect("valid head");
-        rejects_transition(HeadParent::Existing(observed), lower, &tail, &publication).await;
+        rejects_transition(HeadParent::Existing(observed), lower, &tail, &publication);
 
         let observed = read_observed(&parent, OLD_ETAG).await;
         let reused_operation = Head::new(
@@ -895,8 +892,7 @@ mod tests {
             reused_operation,
             &tail,
             &publication,
-        )
-        .await;
+        );
 
         let observed = read_observed(&parent, OLD_ETAG).await;
         let equal = Head::new(

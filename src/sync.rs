@@ -8,6 +8,7 @@ use std::{error::Error, fmt};
 
 pub mod event;
 pub mod head;
+pub mod replay;
 
 pub(crate) const WIRE_VERSION: u64 = 1;
 

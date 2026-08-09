@@ -7,6 +7,8 @@
 
 use std::{error::Error, fmt, path::Path};
 
+use rusqlite::OpenFlags;
+
 const APPLICATION_ID: i32 = 0x5256_4c31; // "RVL1"
 const SCHEMA_VERSION: i32 = 1;
 
@@ -74,6 +76,30 @@ impl fmt::Display for SchemaError {
 
 impl Error for SchemaError {}
 
+/// `ValidateError` reports failures while validating an existing disposable projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ValidateError {
+    DatabaseOperationFailed,
+    WrongApplicationId,
+    WrongSchemaVersion,
+    IntegrityCheckFailed,
+    InvalidHistory,
+}
+
+impl fmt::Display for ValidateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DatabaseOperationFailed => "database operation failed",
+            Self::WrongApplicationId => "database application id does not match",
+            Self::WrongSchemaVersion => "database schema version does not match",
+            Self::IntegrityCheckFailed => "database integrity check failed",
+            Self::InvalidHistory => "database history is invalid",
+        })
+    }
+}
+
+impl Error for ValidateError {}
+
 /// Creates the fixed projection schema at `path` and verifies its integrity.
 ///
 /// Creation requires a path that does not already hold this schema; this function neither
@@ -97,6 +123,112 @@ pub fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, SchemaErro
     }
 
     Ok(connection)
+}
+
+/// Opens an existing projection only when its format, integrity, and event history agree.
+///
+/// The schema has no foreign keys, so validation has no foreign-key check.
+///
+/// # Errors
+///
+/// Returns [`ValidateError`] for an unreadable database, a format mismatch, a failed
+/// `quick_check`, or cursor and applied-event history that do not form one contiguous prefix.
+pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connection, ValidateError> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+
+    let application_id: i32 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if application_id != APPLICATION_ID {
+        return Err(ValidateError::WrongApplicationId);
+    }
+    let schema_version: i32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if schema_version != SCHEMA_VERSION {
+        return Err(ValidateError::WrongSchemaVersion);
+    }
+    let integrity: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if integrity != "ok" {
+        return Err(ValidateError::IntegrityCheckFailed);
+    }
+
+    let cursor = {
+        let mut statement = connection
+            .prepare("SELECT id, sequence, tail_digest FROM sync_cursor")
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        match rows.as_slice() {
+            [cursor] => cursor.clone(),
+            _ => return Err(ValidateError::InvalidHistory),
+        }
+    };
+    let (id, stored_sequence, tail_digest) = cursor;
+    let sequence = u64::try_from(stored_sequence).map_err(|_| ValidateError::InvalidHistory)?;
+    if id != 1 || !valid_cursor(sequence, tail_digest.as_deref()) {
+        return Err(ValidateError::InvalidHistory);
+    }
+
+    let (count, minimum, maximum): (i64, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM applied_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if sequence == 0 {
+        if count != 0 || minimum.is_some() || maximum.is_some() {
+            return Err(ValidateError::InvalidHistory);
+        }
+    } else {
+        let expected = i64::try_from(sequence).map_err(|_| ValidateError::InvalidHistory)?;
+        if count != expected || minimum != Some(1) || maximum != Some(expected) {
+            return Err(ValidateError::InvalidHistory);
+        }
+        let applied_tail: String = connection
+            .query_row(
+                "SELECT digest FROM applied_events WHERE sequence = ?1",
+                [expected],
+                |row| row.get(0),
+            )
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        if tail_digest.as_deref() != Some(applied_tail.as_str()) {
+            return Err(ValidateError::InvalidHistory);
+        }
+    }
+
+    Ok(connection)
+}
+
+fn valid_cursor(sequence: u64, digest: Option<&str>) -> bool {
+    match (sequence, digest) {
+        (0, None) => true,
+        (1..=9_999_999_999_999_999, Some(digest)) => {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        _ => false,
+    }
 }
 
 /// Creates the schema, versions, and genesis cursor as one committed transaction.
@@ -427,6 +559,135 @@ mod tests {
         );
 
         drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opens_fresh_existing_projection() {
+        let path = test_path("open-existing");
+        drop(create(&path).unwrap());
+        let connection = open_existing(&path).unwrap();
+        assert_eq!(cursor_rows(&connection), [(1, 0, None)]);
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_existing_format_and_integrity_mismatches() {
+        for (label, pragma, value, expected) in [
+            (
+                "wrong-application",
+                "application_id",
+                0,
+                ValidateError::WrongApplicationId,
+            ),
+            (
+                "wrong-version",
+                "user_version",
+                2,
+                ValidateError::WrongSchemaVersion,
+            ),
+        ] {
+            let path = test_path(label);
+            let connection = create(&path).unwrap();
+            connection.pragma_update(None, pragma, value).unwrap();
+            drop(connection);
+            assert_eq!(open_existing(&path).unwrap_err(), expected);
+            fs::remove_file(path).unwrap();
+        }
+
+        let path = test_path("quick-check");
+        let connection = create(&path).unwrap();
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        connection
+            .execute("UPDATE sync_cursor SET id = 2 WHERE id = 1", [])
+            .unwrap();
+        connection
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::IntegrityCheckFailed
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_gapped_and_mismatched_history() {
+        let path = test_path("missing-cursor");
+        let connection = create(&path).unwrap();
+        connection.execute("DELETE FROM sync_cursor", []).unwrap();
+        drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+
+        let path = test_path("gapped-history");
+        let connection = create(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO applied_events (sequence, digest) VALUES (2, ?1)",
+                [DIGEST],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_cursor SET sequence = 2, tail_digest = ?1 WHERE id = 1",
+                [DIGEST],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+
+        let path = test_path("tail-mismatch");
+        let connection = create(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1)",
+                [DIGEST],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_cursor SET sequence = 1, tail_digest = ?1 WHERE id = 1",
+                [OTHER_DIGEST],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+
+        let path = test_path("zero-sequence-history");
+        let connection = create(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO applied_events (sequence, digest) VALUES (0, ?1), (2, ?2)",
+                params![OTHER_DIGEST, DIGEST],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_cursor SET sequence = 2, tail_digest = ?1 WHERE id = 1",
+                [DIGEST],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
         fs::remove_file(path).unwrap();
     }
 }

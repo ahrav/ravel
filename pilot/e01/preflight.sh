@@ -210,12 +210,13 @@ VECTORS = [  # frozen: runtime.md §4.1, row order
     (b"src/" + b"a" * 176, "src/" + "a" * 176),
     (b"a/b/c/d/e/f/g/h/i/j/k.rs", "REJECT:path-too-deep"),
     (b"src/.git/config", "REJECT:git-component"),
+    (b"a/b/c/d/e/f/g/h/i/j.rs", "a/b/c/d/e/f/g/h/i/j.rs"),
 ]
 
 # Every reason category in runtime.md §4 steps 1-4 must have a vector, and the
 # row count is asserted, so silently dropping a row cannot leave this block
 # reporting the coverage its check label claims.
-WANT_ROWS = 18
+WANT_ROWS = 19
 WANT_REASONS = {
     "invalid-utf8", "path-too-long", "path-too-deep", "empty-component",
     "dot-component", "git-component", "control-char", "forbidden-char",
@@ -254,7 +255,7 @@ PY
 )
 vec_rc=$?
 echo "unicodedata: $(printf '%s\n' "$vec_out" | sed -n 's/^unidata_version=//p') (runtime.md §4 reference: 13.0.0)"
-check "path collision golden vectors (18 rows, 8 reason categories, 3 collision pairs)" "$vec_rc" \
+check "path collision golden vectors (19 rows, 8 reason categories, 3 collision pairs)" "$vec_rc" \
 	"$(printf '%s\n' "$vec_out" | grep -v '^unidata_version=' | tr '\n' ';')"
 
 for tool in bwrap prlimit; do

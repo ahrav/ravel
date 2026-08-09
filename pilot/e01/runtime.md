@@ -272,17 +272,20 @@ collision key, or `REJECT:<reason>`.
 | 16 | `src/` + `a`×176 (180 bytes, the limit) | `src/` + `a`×176 |
 | 17 | `a/b/c/d/e/f/g/h/i/j/k.rs` (11 components) | `REJECT:path-too-deep` |
 | 18 | `src/.git/config` | `REJECT:git-component` |
+| 19 | `a/b/c/d/e/f/g/h/i/j.rs` (10 components, the limit) | `a/b/c/d/e/f/g/h/i/j.rs` |
 
-Rows 15 and 16 straddle the byte limit in both directions, and row 17 is the
-only row that reaches step 3, so neither numeric limit can be changed without
-a vector failing. Every reason category in steps 1–4 has at least one row.
+Rows 15 and 16 straddle the byte limit in both directions, and rows 17 and
+19 straddle the depth limit the same way, so neither numeric limit can be
+changed — raised or lowered — without a vector failing. Every reason
+category in steps 1–4 has at least one row.
 
 Accepted rows form exactly **three** colliding key pairs — (1, 2) ASCII case,
 (3, 4) NFC/NFD, (5, 6) `ß`/`ss` casefold — and each pair is a step-6 pass
-failure. Row 16's key is unique, so it adds no pair. Executable check: the
+failure. Rows 16 and 19 have unique keys, so they add no pair. Executable
+check: the
 "path collision golden vectors" block in
 [`preflight.sh`](preflight.sh), which recomputes every row, compares it to
-the frozen expected value, and asserts the row count (18), the reason-category
+the frozen expected value, and asserts the row count (19), the reason-category
 set (8), and the collision-pair count (3) — counting pairs, not colliding
 groups — while reading both numeric limits from the script's single copy of
 the `environment.yaml` values. It also records

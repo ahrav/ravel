@@ -279,7 +279,7 @@ PASS  frozen revision — f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7
 …all §2 checks PASS, unchanged…
 PASS  change targets >= 36 — count=40
 unicodedata: 13.0.0 (runtime.md §4 reference: 13.0.0)
-PASS  path collision golden vectors (18 rows, 8 reason categories, 3 collision pairs)
+PASS  path collision golden vectors (19 rows, 8 reason categories, 3 collision pairs)
 PASS  containment tool present: bwrap
 PASS  containment tool present: prlimit
 PASS  prlimit frozen limits apply

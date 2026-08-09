@@ -3,19 +3,22 @@
 Provisioned: 2026-08-09T07:16:17Z
 
 ## Identity
+
 {
-    "UserId": "AROA5GQJJ54Z3UPCXJHTX:ahrav@MIDWAY.AMAZON.COM",
+    "UserId": "AROA5GQJJ54Z3UPCXJHTX:<ahrav@MIDWAY.AMAZON.COM>",
     "Account": "907331366707",
     "Arn": "arn:aws:sts::907331366707:assumed-role/IibsAdminAccess-DO-NOT-DELETE/ahrav@MIDWAY.AMAZON.COM"
 }
 
 ## Create result
+
 {
     "Location": "/ravel-e02-4c038b2f",
     "BucketArn": "arn:aws:s3:::ravel-e02-4c038b2f"
 }
 
 ## Location
+
 {
     "LocationConstraint": null
 }
@@ -27,6 +30,7 @@ An error occurred (NoSuchLifecycleConfiguration) when calling the GetBucketLifec
 ## Versioning (expect unset/disabled)
 
 ## Public access block
+
 {
     "PublicAccessBlockConfiguration": {
         "BlockPublicAcls": true,
@@ -37,6 +41,7 @@ An error occurred (NoSuchLifecycleConfiguration) when calling the GetBucketLifec
 }
 
 ## Encryption
+
 {
     "ServerSideEncryptionConfiguration": {
         "Rules": [

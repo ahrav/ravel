@@ -4,6 +4,8 @@
 
 use std::{error::Error, fmt, time::Duration};
 
+use sha2::{Digest, Sha256};
+
 use aws_sdk_s3::{
     config::{
         Builder, Region, StalledStreamProtectionConfig, retry::RetryConfig, timeout::TimeoutConfig,
@@ -15,6 +17,7 @@ use aws_sdk_s3::{
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 #[derive(PartialEq)]
 pub struct ETag(String);
@@ -52,6 +55,40 @@ pub enum MutationOutcome {
     AmbiguousConflict,
     Unknown,
     ProvenNotSent,
+    TooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationError {
+    InvalidInput,
+    IntegrityMismatch,
+    NotSent,
+    StorageNotFound,
+    TooLarge,
+    Unresolved,
+}
+
+impl fmt::Display for PublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "invalid publication input",
+            Self::IntegrityMismatch => "immutable object does not match",
+            Self::NotSent => "immutable object was not sent",
+            Self::StorageNotFound => "object storage is unavailable",
+            Self::TooLarge => "immutable object exceeds the write limit",
+            Self::Unresolved => "immutable publication is unresolved",
+        })
+    }
+}
+
+impl Error for PublicationError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerificationOutcome {
+    Matched,
+    NotFound,
+    Mismatch,
+    Transport,
 }
 
 /// Dispatch history for one logical publication across all resubmissions.
@@ -143,6 +180,9 @@ impl S3Store {
         bytes: Vec<u8>,
         history: &mut AttemptHistory,
     ) -> MutationOutcome {
+        if validate_single_put_length(bytes.len() as u64).is_err() {
+            return MutationOutcome::TooLarge;
+        }
         history.bind(key);
         self.send_mutation(
             self.client
@@ -163,6 +203,9 @@ impl S3Store {
         etag: &ETag,
         history: &mut AttemptHistory,
     ) -> MutationOutcome {
+        if validate_single_put_length(bytes.len() as u64).is_err() {
+            return MutationOutcome::TooLarge;
+        }
         history.bind(key);
         self.send_mutation(
             self.client
@@ -174,6 +217,100 @@ impl S3Store {
             history,
         )
         .await
+    }
+
+    pub(crate) async fn publish_immutable(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        expected_digest: &str,
+    ) -> Result<(), PublicationError> {
+        let expected_size = bytes.len() as u64;
+        let mut history = AttemptHistory::default();
+        let initial = self.put_if_absent(key, bytes.clone(), &mut history).await;
+        match initial {
+            MutationOutcome::Committed { .. } => return Ok(()),
+            MutationOutcome::ProvenNotSent => return Err(PublicationError::NotSent),
+            MutationOutcome::NotFound => return Err(PublicationError::StorageNotFound),
+            MutationOutcome::TooLarge => return Err(PublicationError::TooLarge),
+            MutationOutcome::Conflict
+            | MutationOutcome::PreconditionFailed
+            | MutationOutcome::AmbiguousConflict
+            | MutationOutcome::Unknown => {}
+        }
+
+        match self
+            .verify_object(key, expected_digest, expected_size)
+            .await
+        {
+            VerificationOutcome::Matched => Ok(()),
+            VerificationOutcome::Mismatch => Err(PublicationError::IntegrityMismatch),
+            VerificationOutcome::Transport => Err(PublicationError::Unresolved),
+            VerificationOutcome::NotFound => {
+                match self.put_if_absent(key, bytes, &mut history).await {
+                    MutationOutcome::Committed { .. } => Ok(()),
+                    MutationOutcome::ProvenNotSent => Err(PublicationError::NotSent),
+                    MutationOutcome::NotFound => Err(PublicationError::StorageNotFound),
+                    MutationOutcome::TooLarge => Err(PublicationError::TooLarge),
+                    MutationOutcome::Conflict
+                    | MutationOutcome::PreconditionFailed
+                    | MutationOutcome::AmbiguousConflict
+                    | MutationOutcome::Unknown => Err(PublicationError::Unresolved),
+                }
+            }
+        }
+    }
+
+    async fn verify_object(
+        &self,
+        key: &str,
+        expected_digest: &str,
+        expected_size: u64,
+    ) -> VerificationOutcome {
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(SdkError::ServiceError(error)) if error.raw().status().as_u16() == 404 => {
+                return VerificationOutcome::NotFound;
+            }
+            Err(_) => return VerificationOutcome::Transport,
+        };
+        if output
+            .content_length()
+            .is_some_and(|length| length < 0 || length as u64 > expected_size)
+        {
+            return VerificationOutcome::Mismatch;
+        }
+
+        let mut body = output.body;
+        let mut measured = 0_u64;
+        let mut hasher = Sha256::new();
+        loop {
+            let chunk = match body.try_next().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => return VerificationOutcome::Transport,
+            };
+            let Ok(chunk_len) = u64::try_from(chunk.len()) else {
+                return VerificationOutcome::Mismatch;
+            };
+            if chunk_len > expected_size - measured {
+                return VerificationOutcome::Mismatch;
+            }
+            measured += chunk_len;
+            hasher.update(&chunk);
+        }
+        if measured == expected_size && format!("{:x}", hasher.finalize()) == expected_digest {
+            VerificationOutcome::Matched
+        } else {
+            VerificationOutcome::Mismatch
+        }
     }
 
     async fn send_mutation(
@@ -195,6 +332,14 @@ impl S3Store {
             | MutationOutcome::NotFound => prior_unknown,
         };
         outcome
+    }
+}
+
+fn validate_single_put_length(length: u64) -> Result<(), PublicationError> {
+    if length <= MAX_SINGLE_PUT_BYTES {
+        Ok(())
+    } else {
+        Err(PublicationError::TooLarge)
     }
 }
 
@@ -600,6 +745,137 @@ mod tests {
         assert_eq!(timeouts.operation_attempt_timeout(), Some(ATTEMPT_TIMEOUT));
     }
 
+    #[tokio::test]
+    async fn streamed_verification_requires_exact_digest_and_size_without_an_etag() {
+        let expected_digest = format!("{:x}", Sha256::digest(b"abcdef"));
+        let (store, _) = replay_store(vec![response(200, &[], chunked_body())]);
+        assert_eq!(
+            store.verify_object("object", &expected_digest, 6).await,
+            VerificationOutcome::Matched
+        );
+
+        for body in [b"abcdeg".as_slice(), b"abc", b"abcdefg"] {
+            let (store, _) =
+                replay_store(vec![response(200, &[("etag", TEST_ETAG)], body.to_vec())]);
+            assert_eq!(
+                store.verify_object("object", &expected_digest, 6).await,
+                VerificationOutcome::Mismatch
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_verification_preserves_not_found_and_transport() {
+        let digest = format!("{:x}", Sha256::digest(b"body"));
+        let (store, _) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        assert_eq!(
+            store.verify_object("missing", &digest, 4).await,
+            VerificationOutcome::NotFound
+        );
+
+        let (store, _) = replay_store(vec![response(500, &[], SdkBody::empty())]);
+        assert_eq!(
+            store.verify_object("failed", &digest, 4).await,
+            VerificationOutcome::Transport
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_publication_reconciles_once_and_resends_identical_bytes() {
+        let bytes = b"immutable".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        assert_eq!(
+            store
+                .publish_immutable("artifact-key", bytes.clone(), &digest)
+                .await,
+            Ok(())
+        );
+        assert_eq!(client.actual_requests().count(), 3);
+        for index in [0, 2] {
+            let request = client.actual_requests().nth(index).expect("PUT request");
+            assert_eq!(
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .expect("valid request URI")
+                    .path(),
+                "/artifact-key"
+            );
+            assert_eq!(request.headers().get("if-none-match"), Some("*"));
+            assert_eq!(request.body().bytes(), Some(bytes.as_slice()));
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_publication_verifies_conflict_and_unknown_results() {
+        let bytes = b"immutable".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        for initial_status in [409, 412, 500] {
+            let (store, _) = replay_store(vec![
+                response(initial_status, &[], SdkBody::empty()),
+                response(200, &[], bytes.clone()),
+            ]);
+            assert_eq!(
+                store
+                    .publish_immutable("object", bytes.clone(), &digest)
+                    .await,
+                Ok(())
+            );
+        }
+
+        let (store, _) = replay_store(vec![
+            response(409, &[], SdkBody::empty()),
+            response(200, &[], b"different".to_vec()),
+        ]);
+        assert_eq!(
+            store.publish_immutable("object", bytes, &digest).await,
+            Err(PublicationError::IntegrityMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_publication_stops_after_the_single_resend() {
+        let bytes = b"immutable".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        for second_status in [409, 412, 500] {
+            let (store, client) = replay_store(vec![
+                response(500, &[], SdkBody::empty()),
+                response(404, &[], SdkBody::empty()),
+                response(second_status, &[], SdkBody::empty()),
+            ]);
+            assert_eq!(
+                store
+                    .publish_immutable("object", bytes.clone(), &digest)
+                    .await,
+                Err(PublicationError::Unresolved)
+            );
+            assert_eq!(client.actual_requests().count(), 3);
+        }
+
+        let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        assert_eq!(
+            store
+                .publish_immutable("object", bytes.clone(), &digest)
+                .await,
+            Err(PublicationError::StorageNotFound)
+        );
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[test]
+    fn single_put_limit_is_inclusive() {
+        assert_eq!(validate_single_put_length(MAX_SINGLE_PUT_BYTES), Ok(()));
+        assert_eq!(
+            validate_single_put_length(MAX_SINGLE_PUT_BYTES + 1),
+            Err(PublicationError::TooLarge)
+        );
+    }
+
     #[test]
     fn public_error_text_is_generic() {
         assert_eq!(
@@ -611,6 +887,10 @@ mod tests {
             "object response is missing a version token"
         );
         assert_eq!(GetError::Transport.to_string(), "object read failed");
+        assert_eq!(
+            PublicationError::Unresolved.to_string(),
+            "immutable publication is unresolved"
+        );
     }
 
     #[test]

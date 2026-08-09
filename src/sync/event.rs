@@ -4,7 +4,8 @@
 //! `version`, `operation_id`, `sequence`, `parent`, `writer_fence`, and
 //! `content`. Integers use ciborium's shortest representation. `parent` is
 //! either null or a declaration-order map of `sequence`, `digest`, and `key`.
-//! Content is one of the text values `campaign_created` or `workflow_started`.
+//! Content is a text value for `campaign_created` and `workflow_started`, or an
+//! externally tagged `artifact_published` reference map.
 //!
 //! The CBOR is compressed by zstd's bulk encoder at level 3: one standard
 //! frame with content size, no checksum, and no dictionary. SHA-256 covers
@@ -22,7 +23,13 @@ use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domain::campaign::{Event, EventContent, EventRef};
+use crate::{
+    domain::campaign::{ArtifactRef, Event, EventContent, EventRef},
+    storage::{
+        artifacts::PublishedArtifact,
+        s3::{PublicationError, S3Store},
+    },
+};
 
 use super::{WIRE_VERSION, WireError};
 
@@ -49,6 +56,19 @@ impl EncodedEvent {
     pub fn key(&self) -> &str {
         self.reference.key()
     }
+
+    fn event_ref(&self) -> &EventRef {
+        &self.reference
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedEventPublication(EventRef);
+
+impl ResolvedEventPublication {
+    pub fn event_ref(&self) -> &EventRef {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -70,11 +90,24 @@ struct WireEventRef {
     key: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireContent {
     CampaignCreated,
     WorkflowStarted,
+    ArtifactPublished(WireArtifactRef),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireArtifactRef {
+    digest: String,
+    size: u64,
+    media_type: String,
+    producer_attempt: String,
+    creation_time_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_class: Option<String>,
 }
 
 pub fn encode(event: &Event) -> Result<EncodedEvent, WireError> {
@@ -87,6 +120,29 @@ pub fn encode(event: &Event) -> Result<EncodedEvent, WireError> {
         stored_bytes,
         reference,
     })
+}
+
+pub async fn publish(
+    store: &S3Store,
+    event: &Event,
+    artifact: Option<&PublishedArtifact>,
+) -> Result<ResolvedEventPublication, PublicationError> {
+    match (event.content(), artifact) {
+        (EventContent::ArtifactPublished(reference), Some(published))
+            if reference == published.artifact_ref() => {}
+        (EventContent::CampaignCreated | EventContent::WorkflowStarted, None) => {}
+        _ => return Err(PublicationError::InvalidInput),
+    }
+
+    let encoded = encode(event).map_err(|_| PublicationError::InvalidInput)?;
+    store
+        .publish_immutable(
+            encoded.key(),
+            encoded.stored_bytes().to_vec(),
+            encoded.digest(),
+        )
+        .await?;
+    Ok(ResolvedEventPublication(encoded.event_ref().clone()))
 }
 
 pub fn decode(stored_bytes: &[u8], expected_key: &str) -> Result<Event, WireError> {
@@ -154,11 +210,27 @@ impl From<&EventRef> for WireEventRef {
     }
 }
 
-impl From<EventContent> for WireContent {
-    fn from(content: EventContent) -> Self {
+impl From<&EventContent> for WireContent {
+    fn from(content: &EventContent) -> Self {
         match content {
             EventContent::CampaignCreated => Self::CampaignCreated,
             EventContent::WorkflowStarted => Self::WorkflowStarted,
+            EventContent::ArtifactPublished(reference) => {
+                Self::ArtifactPublished(WireArtifactRef::from(reference))
+            }
+        }
+    }
+}
+
+impl From<&ArtifactRef> for WireArtifactRef {
+    fn from(reference: &ArtifactRef) -> Self {
+        Self {
+            digest: reference.digest().to_owned(),
+            size: reference.size(),
+            media_type: reference.media_type().to_owned(),
+            producer_attempt: reference.producer_attempt().to_owned(),
+            creation_time_unix_ms: reference.creation_time_unix_ms(),
+            retention_class: reference.retention_class().map(str::to_owned),
         }
     }
 }
@@ -173,7 +245,7 @@ impl TryFrom<WireEvent> for Event {
             wire.sequence,
             parent,
             wire.writer_fence,
-            wire.content.into(),
+            wire.content.try_into()?,
         )
         .map_err(|_| WireError::InvalidValue)
     }
@@ -187,11 +259,24 @@ impl TryFrom<WireEventRef> for EventRef {
     }
 }
 
-impl From<WireContent> for EventContent {
-    fn from(content: WireContent) -> Self {
+impl TryFrom<WireContent> for EventContent {
+    type Error = WireError;
+
+    fn try_from(content: WireContent) -> Result<Self, Self::Error> {
         match content {
-            WireContent::CampaignCreated => Self::CampaignCreated,
-            WireContent::WorkflowStarted => Self::WorkflowStarted,
+            WireContent::CampaignCreated => Ok(Self::CampaignCreated),
+            WireContent::WorkflowStarted => Ok(Self::WorkflowStarted),
+            WireContent::ArtifactPublished(reference) => Ok(Self::ArtifactPublished(
+                ArtifactRef::new(
+                    reference.digest,
+                    reference.size,
+                    reference.media_type,
+                    reference.producer_attempt,
+                    reference.creation_time_unix_ms,
+                    reference.retention_class,
+                )
+                .map_err(|_| WireError::InvalidValue)?,
+            )),
         }
     }
 }
@@ -212,7 +297,16 @@ fn digest(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::{
+        config::{Builder, Credentials, HttpClient, Region},
+        primitives::SdkBody,
+    };
+    use aws_smithy_runtime::client::http::test_util::{
+        NeverClient, ReplayEvent, StaticReplayClient,
+    };
     use ciborium::Value;
+
+    use crate::storage::artifacts;
 
     use super::*;
 
@@ -250,6 +344,34 @@ mod tests {
         let mut output = Vec::new();
         into_writer(&value, &mut output).unwrap();
         output
+    }
+
+    fn test_builder(http_client: impl HttpClient + 'static) -> Builder {
+        aws_sdk_s3::Config::builder()
+            .credentials_provider(Credentials::for_tests())
+            .endpoint_url("https://s3.test.invalid")
+            .http_client(http_client)
+    }
+
+    fn store(responses: Vec<http::Response<SdkBody>>) -> (S3Store, StaticReplayClient) {
+        let events = responses
+            .into_iter()
+            .map(|response| ReplayEvent::new(http::Request::new(SdkBody::empty()), response))
+            .collect();
+        let client = StaticReplayClient::new(events);
+        let store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(client.clone()),
+        );
+        (store, client)
+    }
+
+    fn response(status: u16, body: impl Into<SdkBody>) -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(status)
+            .body(body.into())
+            .expect("valid test response")
     }
 
     fn incompressible_bytes(len: usize) -> Vec<u8> {
@@ -457,6 +579,137 @@ mod tests {
             decode(&bytes, &key(&bytes, 1)),
             Err(WireError::InvalidValue)
         );
+    }
+
+    #[test]
+    fn artifact_content_round_trips_canonically() {
+        let artifact = ArtifactRef::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            4,
+            "application/octet-stream".into(),
+            "attempt".into(),
+            123,
+            None,
+        )
+        .unwrap();
+        let event = Event::new(
+            "artifact-op".into(),
+            1,
+            None,
+            7,
+            EventContent::ArtifactPublished(artifact),
+        )
+        .unwrap();
+        let encoded = encode(&event).unwrap();
+        let decoded = decode(encoded.stored_bytes(), encoded.key()).unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(encode(&decoded).unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    async fn artifact_event_requires_a_matching_publication() {
+        let store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        let reference = ArtifactRef::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            4,
+            "application/octet-stream".into(),
+            "attempt".into(),
+            1,
+            None,
+        )
+        .unwrap();
+        let event = Event::new(
+            "event-op".into(),
+            1,
+            None,
+            1,
+            EventContent::ArtifactPublished(reference),
+        )
+        .unwrap();
+        assert!(matches!(
+            publish(&store, &event, None).await,
+            Err(PublicationError::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_artifact_allows_event_publication_at_the_encoded_key() {
+        let artifact_bytes = b"artifact".to_vec();
+        let (store, client) = store(vec![
+            response(200, SdkBody::empty()),
+            response(200, SdkBody::empty()),
+        ]);
+        let artifact = artifacts::publish(
+            &store,
+            artifact_bytes,
+            "application/octet-stream".into(),
+            "attempt".into(),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let mismatched = Event::new(
+            "event-op".into(),
+            1,
+            None,
+            1,
+            EventContent::ArtifactPublished(
+                ArtifactRef::new(
+                    artifact.artifact_ref().digest().to_owned(),
+                    artifact.artifact_ref().size(),
+                    artifact.artifact_ref().media_type().to_owned(),
+                    "another-attempt".into(),
+                    1,
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            publish(&store, &mismatched, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+
+        let event = Event::new(
+            "event-op".into(),
+            1,
+            None,
+            1,
+            EventContent::ArtifactPublished(artifact.artifact_ref().clone()),
+        )
+        .unwrap();
+        let encoded = encode(&event).unwrap();
+        let resolved = publish(&store, &event, Some(&artifact)).await.unwrap();
+        assert_eq!(resolved.event_ref(), encoded.event_ref());
+        let uri = client
+            .actual_requests()
+            .nth(1)
+            .expect("event PUT")
+            .uri()
+            .parse::<http::Uri>()
+            .expect("valid request URI");
+        assert_eq!(uri.path(), format!("/{}", encoded.key()));
+    }
+
+    #[tokio::test]
+    async fn unresolved_storage_does_not_create_an_event_publication() {
+        let (store, _) = store(vec![
+            response(500, SdkBody::empty()),
+            response(500, SdkBody::empty()),
+        ]);
+        let event =
+            Event::new("event-op".into(), 1, None, 1, EventContent::CampaignCreated).unwrap();
+        assert!(matches!(
+            publish(&store, &event, None).await,
+            Err(PublicationError::Unresolved)
+        ));
     }
 
     #[test]

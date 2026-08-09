@@ -10,8 +10,8 @@
 #   --cmd "<command>" [--cwd <dir>]: plain-text mode for the opencode plugin
 #            and pi extension shims; deny via reason on stdout + exit 2.
 #
-# Override: a command containing ALLOW_MAIN=1 passes (use only when the user
-# explicitly approved touching main).
+# Override: a segment whose git invocation is prefixed with ALLOW_MAIN=1
+# passes (use only when the user explicitly approved touching main).
 set -u
 
 mode=json
@@ -29,7 +29,6 @@ fi
 
 [ -n "$cmd" ] || exit 0
 case "$cmd" in *commit* | *push*) ;; *) exit 0 ;; esac
-case "$cmd" in *ALLOW_MAIN=1*) exit 0 ;; esac
 
 deny() {
   local r="Blocked: $1. Work on a feature branch and open a PR; direct commits/pushes to main require explicit user approval (prefix with ALLOW_MAIN=1 once granted)."
@@ -42,13 +41,19 @@ deny() {
 }
 
 current_branch() {
-  git -C "${cwd:-.}" symbolic-ref --quiet --short HEAD 2>/dev/null
+  # $1: directory from a `git -C <dir>` in the checked command, if any
+  git -C "${1:-${cwd:-.}}" symbolic-ref --quiet --short HEAD 2>/dev/null
 }
 
 reason=""
 
 check_segment() {
   local seg="$1"
+  # Normalize away quote/paren characters so `git push origin "main"`,
+  # `'git' push`, and `(git push ...)` tokenize the same as the bare form.
+  # ponytail: over-approximates (quoted prose mentioning git may match); this
+  # is a guardrail, not a security boundary — real parsing needs a shell parser.
+  seg=${seg//[\"\'()]/}
   local -a toks
   read -ra toks <<<"$seg" || return 0
   local n=${#toks[@]} i gi=-1
@@ -59,11 +64,21 @@ check_segment() {
   done
   ((gi >= 0)) || return 0
 
-  # Find the git subcommand, skipping global options (so `git stash push` etc. don't match)
-  local j=$((gi + 1)) sub=""
+  # Override: ALLOW_MAIN=1 must appear as a token before this segment's git
+  # invocation (env-assignment position). Scoped per segment so it cannot
+  # whitelist an unrelated command riding along in a compound line.
+  for ((i = 0; i < gi; i++)); do
+    [ "${toks[$i]}" = "ALLOW_MAIN=1" ] && return 0
+  done
+
+  # Find the git subcommand, skipping global options (so `git stash push` etc.
+  # don't match). Capture `-C <dir>` so branch checks run against the repo the
+  # command actually targets.
+  local j=$((gi + 1)) sub="" cdir=""
   while ((j < n)); do
     case "${toks[$j]}" in
-      -C | -c | --git-dir | --work-tree | --namespace) ((j += 2)); continue ;;
+      -C) cdir="${toks[$((j + 1))]:-}"; ((j += 2)); continue ;;
+      -c | --git-dir | --work-tree | --namespace) ((j += 2)); continue ;;
       -*) ((j += 1)); continue ;;
       *) sub="${toks[$j]}"; break ;;
     esac
@@ -71,7 +86,7 @@ check_segment() {
 
   case "$sub" in
     commit)
-      if [ "$(current_branch)" = "main" ]; then
+      if [ "$(current_branch "$cdir")" = "main" ]; then
         reason="'$seg' commits while on main"
       fi
       return 0
@@ -98,7 +113,7 @@ check_segment() {
     case "$dest" in
       main | refs/heads/main) reason="'$seg' targets main on ${remote:-the default remote}"; return 0 ;;
       HEAD)
-        if [ "$(current_branch)" = "main" ]; then
+        if [ "$(current_branch "$cdir")" = "main" ]; then
           reason="'$seg' pushes HEAD while on main"; return 0
         fi ;;
     esac
@@ -108,7 +123,7 @@ check_segment() {
     reason="'$seg' uses --all/--mirror, which would update main"; return 0
   fi
 
-  if ((${#refspecs[@]} == 0)) && [ "$(current_branch)" = "main" ]; then
+  if ((${#refspecs[@]} == 0)) && [ "$(current_branch "$cdir")" = "main" ]; then
     reason="'$seg' is a bare push while on main"; return 0
   fi
 }

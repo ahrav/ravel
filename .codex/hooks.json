@@ -28,7 +28,7 @@
       {
         "hooks": [
           {
-            "command": "/local/home/ahrav/scratch/ravel/.agents/hooks/block-main.sh",
+            "command": "bash .agents/hooks/block-main.sh",
             "statusMessage": "Checking main-branch policy",
             "timeout": 15,
             "type": "command"

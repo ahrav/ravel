@@ -1345,46 +1345,27 @@ Call site using generic Error type at module X/function Y.
 
 ---
 
-## 18.2 Autonomous classification
+## 18.2 Fixed treatment assignment
 
-The treatment taxonomy is defined by campaign configuration.
+For the MVP pilot, classification is not model-driven: trusted discovery assigns the single fixed treatment defined by the frozen E01 pilot configuration (see E01/E09 tasks). There is no judge classification, no adjudication of classification, and no per-target taxonomy.
 
-Judges classify each target.
-
-Example:
-
-```text
-retryable
-permanent
-public/client-visible
-internal
-redacted
-context-preserving
-```
-
-Material disagreement triggers adjudication or focused investigation.
-
-The system does not need a human to classify every target.
-
-For the MVP pilot, choose a migration with few or no subjective exemptions.
+Choose a migration with few or no subjective exemptions so the fixed rule is sufficient.
 
 ---
 
-## 18.3 Autonomous grouping
+## 18.3 Deterministic grouping
 
-The controller groups compatible targets into bounded work items using:
+The controller groups compatible targets into bounded work items deterministically:
 
 ```text
-file/path overlap
-treatment class
-dependency relationship
-write-scope collision
-expected context size
+stable target identity and total order
+deterministic tie-breaking
+non-overlapping declared write scopes
+deterministic packing rule
+positive target-count cap
 ```
 
-The grouping itself can be reviewed by judges.
-
-Hard caps prevent giant tasks.
+Grouping is a pure function of the frozen inputs; it is not reviewed by judges and involves no dependency planning. Hard caps prevent giant tasks.
 
 ---
 
@@ -1479,8 +1460,10 @@ A trusted daemon component:
 
    * base OID
    * result tree OID
-   * delta digest
+   * candidate commit OID
 6. Creates a Git bundle/patch artifact for transfer.
+
+Candidate identity binds to those Git identities plus the bundle artifact digest; there is no separate serialized delta stream or delta digest. Verification re-derives the raw base/result-tree diff (paths, modes, blob identities) and checks it against declared write scopes.
 
 Candidate records are immutable.
 
@@ -1558,7 +1541,7 @@ Does this migration preserve the requested error semantics?
 
 Does the change introduce an unsupported externally visible behavior?
 
-Has the agent actually applied the intended treatment class?
+Has the agent actually applied the fixed treatment?
 ```
 
 Mechanical failure overrides semantic approval.
@@ -2608,14 +2591,11 @@ pi-campaign/
 
     db/
       schema.rs
-      migrations.rs
       projections.rs
 
     controller/
       scheduler.rs
       policy.rs
-      budgets.rs
-      adjudication.rs
 
     models/
       provider.rs
@@ -2647,7 +2627,6 @@ pi-campaign/
       state.rs
 
     recovery/
-      outbox.rs
       reconcile.rs
 
     pi/

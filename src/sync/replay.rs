@@ -17,7 +17,7 @@ use crate::{
         projections::{ApplyError, ApplyOutcome},
         worker::{DbHandle, OpenExistingError},
     },
-    domain::campaign::EventRef,
+    domain::campaign::{EventRef, Head},
     storage::s3::{GetError, GetOutcome, S3Store},
     sync::{
         WireError,
@@ -57,8 +57,11 @@ pub enum ReplayError {
     EventInvalid(WireError),
     /// A verified event has no legal scheduling projection.
     Conversion(ConversionError),
-    /// The remote history disagrees with the local cursor or applied events.
     HistoryConflict,
+    /// The local cursor is ahead of the observed head.
+    CursorAhead,
+    /// The local cursor and observed head have the same sequence but different digests.
+    TailMismatch,
     /// The unseen chain exceeds the preparation count or byte cap.
     Overflow,
     /// The SQLite apply transaction rejected a prepared mutation.
@@ -78,6 +81,8 @@ impl fmt::Display for ReplayError {
             Self::EventInvalid(_) => "event object is invalid",
             Self::Conversion(_) => "event has no valid scheduling projection",
             Self::HistoryConflict => "remote history conflicts with the local projection",
+            Self::CursorAhead => "local cursor is ahead of the campaign head",
+            Self::TailMismatch => "local cursor digest differs from the campaign head",
             Self::Overflow => "unseen event preparation exceeds its bound",
             Self::Apply(_) => "event application failed",
             Self::DatabaseUnavailable => "local database is unavailable",
@@ -117,6 +122,59 @@ impl ReplayedProjection {
     }
 }
 
+/// Ephemeral outcome of one refresh attempt.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Readiness {
+    /// Replay succeeded and the local cursor equals the observed head tail.
+    Ready {
+        local_cursor: (u64, String),
+        observed_head: Head,
+    },
+    /// Replay or the final cursor comparison failed.
+    NotReady(NotReadyReason),
+}
+
+/// Data-free reason one refresh attempt did not establish readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotReadyReason {
+    /// Replay failed before its final cursor comparison.
+    Replay(ReplayError),
+    /// The post-replay cursor remains behind the observed head.
+    Behind,
+    /// The post-replay cursor is ahead of the observed head.
+    Ahead,
+    /// The post-replay cursor digest differs from the observed head tail.
+    TailMismatch,
+}
+
+struct ReplaySuccess {
+    observed_head: ObservedHead,
+    local_cursor: (u64, Option<String>),
+}
+
+/// Replays one fresh head observation and reports ephemeral readiness.
+pub async fn refresh(store: &S3Store, handle: &DbHandle) -> Readiness {
+    match replay_with_limits(store, handle, LIMITS).await {
+        Ok(success) => compare_cursor(success.observed_head.head(), success.local_cursor),
+        Err(error) => Readiness::NotReady(NotReadyReason::Replay(error)),
+    }
+}
+
+fn compare_cursor(observed_head: &Head, local_cursor: (u64, Option<String>)) -> Readiness {
+    let tail = observed_head.tail().clone();
+    match local_cursor.0.cmp(&tail.sequence()) {
+        std::cmp::Ordering::Less => Readiness::NotReady(NotReadyReason::Behind),
+        std::cmp::Ordering::Greater => Readiness::NotReady(NotReadyReason::Ahead),
+        std::cmp::Ordering::Equal => match local_cursor.1 {
+            Some(digest) if digest == tail.digest() => Readiness::Ready {
+                local_cursor: (tail.sequence(), digest),
+                observed_head: observed_head.clone(),
+            },
+            _ => Readiness::NotReady(NotReadyReason::TailMismatch),
+        },
+    }
+}
+
 /// Opens or creates the disposable projection and replays the fresh observed ancestry.
 ///
 /// Local validation failure removes the rollback journal, then the database, before creating a
@@ -143,21 +201,21 @@ pub async fn startup(store: &S3Store, db_path: &Path) -> Result<ReplayedProjecti
         let handle = DbHandle::spawn(db_path.to_path_buf())
             .await
             .map_err(|_| ReplayError::DatabaseUnavailable)?;
-        let (head, cursor) = replay_with_limits(store, &handle, LIMITS).await?;
+        let success = replay_with_limits(store, &handle, LIMITS).await?;
         return Ok(ReplayedProjection {
             handle,
-            head,
-            cursor,
+            head: success.observed_head,
+            cursor: success.local_cursor,
         });
     }
 
     match DbHandle::open_existing(db_path.to_path_buf()).await {
         Ok(handle) => {
-            let (head, cursor) = replay_with_limits(store, &handle, LIMITS).await?;
+            let success = replay_with_limits(store, &handle, LIMITS).await?;
             Ok(ReplayedProjection {
                 handle,
-                head,
-                cursor,
+                head: success.observed_head,
+                cursor: success.local_cursor,
             })
         }
         Err(OpenExistingError::DatabaseOperationFailed) => Err(ReplayError::DatabaseUnavailable),
@@ -174,11 +232,11 @@ async fn replace_and_replay(
     let handle = DbHandle::spawn(db_path.to_path_buf())
         .await
         .map_err(|_| ReplayError::DatabaseUnavailable)?;
-    let (head, cursor) = replay_with_limits(store, &handle, LIMITS).await?;
+    let success = replay_with_limits(store, &handle, LIMITS).await?;
     Ok(ReplayedProjection {
         handle,
-        head,
-        cursor,
+        head: success.observed_head,
+        cursor: success.local_cursor,
     })
 }
 
@@ -207,7 +265,7 @@ async fn replay_with_limits(
     store: &S3Store,
     handle: &DbHandle,
     limits: Limits,
-) -> Result<(ObservedHead, (u64, Option<String>)), ReplayError> {
+) -> Result<ReplaySuccess, ReplayError> {
     let observed = match head::read(store).await {
         Ok(Some(observed)) => observed,
         Ok(None) => return Err(ReplayError::CampaignMissing),
@@ -226,11 +284,14 @@ async fn replay_with_limits(
             Err(error) => return Err(ReplayError::Apply(error)),
         }
     }
-    let cursor = handle
+    let local_cursor = handle
         .cursor()
         .await
         .map_err(|_| ReplayError::DatabaseUnavailable)?;
-    Ok((observed, cursor))
+    Ok(ReplaySuccess {
+        observed_head: observed,
+        local_cursor,
+    })
 }
 
 async fn prepare(
@@ -241,13 +302,13 @@ async fn prepare(
 ) -> Result<Vec<SchedulingMutation>, ReplayError> {
     let (cursor_sequence, cursor_digest) = cursor;
     if tail.sequence() < cursor_sequence {
-        return Err(ReplayError::HistoryConflict);
+        return Err(ReplayError::CursorAhead);
     }
     if tail.sequence() == cursor_sequence {
         return if cursor_digest.as_deref() == Some(tail.digest()) {
             Ok(Vec::new())
         } else {
-            Err(ReplayError::HistoryConflict)
+            Err(ReplayError::TailMismatch)
         };
     }
 
@@ -314,7 +375,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use crate::{
-        db::{schema, worker::DbHandle},
+        db::{projections::tests::snapshot, schema, worker::DbHandle},
         domain::campaign::{ArtifactRef, Authority, Event, EventContent, Head},
         storage::s3::test_support::{replay_store, response},
         sync::{event, head},
@@ -352,12 +413,15 @@ mod tests {
         reference(2, CHILD_DIGEST)
     }
 
+    fn head_value(tail: EventRef) -> Head {
+        Head::new(Authority::unowned(), tail, "head-operation".into()).unwrap()
+    }
+
     fn head_response(tail: EventRef) -> http::Response<SdkBody> {
-        let value = Head::new(Authority::unowned(), tail, "head-operation".into()).unwrap();
         response(
             200,
             &[("etag", "\"head-etag\"")],
-            head::encode(&value).unwrap(),
+            head::encode(&head_value(tail)).unwrap(),
         )
     }
 
@@ -446,16 +510,16 @@ mod tests {
         let (store, client) = replay_store(vec![head_response(genesis_ref())]);
         assert_eq!(
             replay_with_limits(&store, &handle, LIMITS).await.err(),
-            Some(ReplayError::HistoryConflict)
+            Some(ReplayError::CursorAhead)
         );
         assert_eq!(apply_count(&handle).await, 2);
         assert_gets(&client, &["head.json"]);
 
-        // A head at the cursor sequence with a different digest is a history conflict.
+        // A head at the cursor sequence with a different digest is a tail mismatch.
         let (store, client) = replay_store(vec![head_response(reference(2, GENESIS_DIGEST))]);
         assert_eq!(
             replay_with_limits(&store, &handle, LIMITS).await.err(),
-            Some(ReplayError::HistoryConflict)
+            Some(ReplayError::TailMismatch)
         );
         assert_eq!(apply_count(&handle).await, 2);
         assert_gets(&client, &["head.json"]);
@@ -695,6 +759,190 @@ mod tests {
         clean(&path);
     }
 
+    #[test]
+    fn cursor_comparison_outcomes_are_typed() {
+        let observed_head = head_value(child_ref());
+        for (local_cursor, expected) in [
+            (
+                (1, Some(GENESIS_DIGEST.to_owned())),
+                Readiness::NotReady(NotReadyReason::Behind),
+            ),
+            (
+                (3, Some("3".repeat(64))),
+                Readiness::NotReady(NotReadyReason::Ahead),
+            ),
+            (
+                (2, Some(GENESIS_DIGEST.to_owned())),
+                Readiness::NotReady(NotReadyReason::TailMismatch),
+            ),
+        ] {
+            assert_eq!(compare_cursor(&observed_head, local_cursor), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_is_ready_only_for_its_successful_head_observation() {
+        let path = path("refresh");
+        clean(&path);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let expected_head = head_value(child_ref());
+        let (store, _) = replay_store(vec![
+            head_response(child_ref()),
+            event_response(CHILD_BYTES),
+            event_response(GENESIS_BYTES),
+        ]);
+        assert_eq!(
+            refresh(&store, &handle).await,
+            Readiness::Ready {
+                local_cursor: (2, CHILD_DIGEST.into()),
+                observed_head: expected_head,
+            }
+        );
+
+        let (store, _) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        assert_eq!(
+            refresh(&store, &handle).await,
+            Readiness::NotReady(NotReadyReason::Replay(ReplayError::CampaignMissing))
+        );
+
+        drop(handle);
+        clean(&path);
+    }
+
+    #[tokio::test]
+    async fn advanced_head_is_not_ready_until_ancestry_is_available() {
+        let path = path("advanced-head");
+        clean(&path);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        handle
+            .apply(fixture_mutation(GENESIS_BYTES, genesis_ref()))
+            .await
+            .unwrap();
+
+        let (store, _) = replay_store(vec![
+            head_response(child_ref()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        assert_eq!(
+            refresh(&store, &handle).await,
+            Readiness::NotReady(NotReadyReason::Replay(ReplayError::EventMissing))
+        );
+
+        let expected_head = head_value(child_ref());
+        let (store, _) = replay_store(vec![
+            head_response(child_ref()),
+            event_response(CHILD_BYTES),
+        ]);
+        assert_eq!(
+            refresh(&store, &handle).await,
+            Readiness::Ready {
+                local_cursor: (2, CHILD_DIGEST.into()),
+                observed_head: expected_head,
+            }
+        );
+
+        drop(handle);
+        clean(&path);
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_wire_version_and_digest_failures_distinct() {
+        let mut cbor = zstd::bulk::decompress(GENESIS_BYTES, 1024 * 1024).unwrap();
+        let version = cbor
+            .windows(7)
+            .position(|window| window == b"version")
+            .unwrap()
+            + 7;
+        assert_eq!(cbor[version], 1);
+        cbor[version] = 2;
+        let unknown_version = zstd::bulk::compress(&cbor, 3).unwrap();
+        let unknown_digest = format!("{:x}", Sha256::digest(&unknown_version));
+        let cases = [
+            (
+                "refresh-version",
+                head_response(reference(1, &unknown_digest)),
+                event_response(unknown_version),
+                WireError::InvalidValue,
+            ),
+            (
+                "refresh-digest",
+                head_response(genesis_ref()),
+                event_response(CHILD_BYTES),
+                WireError::ReferenceMismatch,
+            ),
+        ];
+
+        for (label, head, event, expected) in cases {
+            let path = path(label);
+            clean(&path);
+            let handle = DbHandle::spawn(path.clone()).await.unwrap();
+            let (store, _) = replay_store(vec![head, event]);
+            assert_eq!(
+                refresh(&store, &handle).await,
+                Readiness::NotReady(NotReadyReason::Replay(ReplayError::EventInvalid(expected)))
+            );
+            drop(handle);
+            clean(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_and_incremental_replay_have_equivalent_query_state() {
+        let fresh_path = path("equivalence-fresh");
+        let incremental_path = path("equivalence-incremental");
+        clean(&fresh_path);
+        clean(&incremental_path);
+
+        let (fresh_store, _) = replay_store(vec![
+            head_response(child_ref()),
+            event_response(CHILD_BYTES),
+            event_response(GENESIS_BYTES),
+        ]);
+        let fresh = startup(&fresh_store, &fresh_path)
+            .await
+            .unwrap()
+            .into_handle();
+
+        let incremental = DbHandle::spawn(incremental_path.clone()).await.unwrap();
+        incremental
+            .apply(fixture_mutation(GENESIS_BYTES, genesis_ref()))
+            .await
+            .unwrap();
+        let (incremental_store, _) = replay_store(vec![
+            head_response(child_ref()),
+            event_response(CHILD_BYTES),
+        ]);
+        assert!(matches!(
+            refresh(&incremental_store, &incremental).await,
+            Readiness::Ready { .. }
+        ));
+
+        let capabilities = vec!["rust".to_owned()];
+        let fresh_ready = fresh
+            .list_ready_work("0000000000000001".into(), capabilities.clone(), 10, None)
+            .await
+            .unwrap();
+        let incremental_ready = incremental
+            .list_ready_work("0000000000000001".into(), capabilities, 10, None)
+            .await
+            .unwrap();
+        assert!(fresh_ready.is_empty());
+        assert_eq!(fresh_ready, incremental_ready);
+        let fresh_connection = schema::open_existing(&fresh_path).unwrap();
+        let incremental_connection = schema::open_existing(&incremental_path).unwrap();
+        assert_eq!(
+            snapshot(&fresh_connection),
+            snapshot(&incremental_connection)
+        );
+
+        drop(fresh_connection);
+        drop(incremental_connection);
+        drop(fresh);
+        drop(incremental);
+        clean(&fresh_path);
+        clean(&incremental_path);
+    }
+
     #[tokio::test]
     async fn missing_head_leaves_a_valid_genesis_projection() {
         let path = path("missing-head");
@@ -723,9 +971,12 @@ mod tests {
         clean(&path);
         let connection = schema::create(&path).unwrap();
         connection
-            .execute("INSERT INTO campaigns (campaign_id) VALUES ('old')", [])
+            .execute(
+                "INSERT INTO campaigns (campaign_id, state) VALUES ('old', 'active')",
+                [],
+            )
             .unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
         drop(connection);
         fs::write(journal_path(&path), b"stale").unwrap();
         let (store, _) = replay_store(vec![
@@ -762,9 +1013,12 @@ mod tests {
         clean(&path);
         let connection = schema::create(&path).unwrap();
         connection
-            .execute("INSERT INTO campaigns (campaign_id) VALUES ('old')", [])
+            .execute(
+                "INSERT INTO campaigns (campaign_id, state) VALUES ('old', 'active')",
+                [],
+            )
             .unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
         drop(connection);
         let (store, _) = replay_store(vec![
             head_response(child_ref()),

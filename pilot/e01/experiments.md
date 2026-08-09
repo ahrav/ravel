@@ -112,7 +112,10 @@ runs within a block execute in the listed order.
   integrated/graded up to the stop — unfinished work counts against it
   (omissions, zero resolutions, `unresolved` work items). For Change
   runs, trusted final rediscovery is a measurement step executed by the
-  trusted side against the run's end state for **every** complete run,
+  trusted side against a **fresh clean checkout of the run's
+  campaign-branch tip** (the integrated end state; `discover.sh`
+  refuses dirty worktrees, and un-integrated candidate work is never
+  measured) for **every** complete run,
   including per-run-cap-stopped runs (this is the `budgets.yaml`
   hard-limit "required cleanup/reconciliation"), so every complete run
   carries a pass/fail rediscovery result; a run stopped with non-exempt

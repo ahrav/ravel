@@ -180,7 +180,7 @@ impl S3Store {
         bytes: Vec<u8>,
         history: &mut AttemptHistory,
     ) -> MutationOutcome {
-        if validate_single_put_length(bytes.len() as u64).is_err() {
+        if !fits_single_put(bytes.len() as u64) {
             return MutationOutcome::TooLarge;
         }
         history.bind(key);
@@ -203,7 +203,7 @@ impl S3Store {
         etag: &ETag,
         history: &mut AttemptHistory,
     ) -> MutationOutcome {
-        if validate_single_put_length(bytes.len() as u64).is_err() {
+        if !fits_single_put(bytes.len() as u64) {
             return MutationOutcome::TooLarge;
         }
         history.bind(key);
@@ -219,24 +219,29 @@ impl S3Store {
         .await
     }
 
+    /// Resolves immutable publication with at most two PUTs and one verification GET.
     pub(crate) async fn publish_immutable(
         &self,
         key: &str,
         bytes: Vec<u8>,
         expected_digest: &str,
     ) -> Result<(), PublicationError> {
-        let expected_size = bytes.len() as u64;
         let mut history = AttemptHistory::default();
-        let initial = self.put_if_absent(key, bytes.clone(), &mut history).await;
-        match initial {
-            MutationOutcome::Committed { .. } => return Ok(()),
-            MutationOutcome::ProvenNotSent => return Err(PublicationError::NotSent),
-            MutationOutcome::NotFound => return Err(PublicationError::StorageNotFound),
-            MutationOutcome::TooLarge => return Err(PublicationError::TooLarge),
-            MutationOutcome::Conflict
-            | MutationOutcome::PreconditionFailed
-            | MutationOutcome::AmbiguousConflict
-            | MutationOutcome::Unknown => {}
+        self.publish_with_history(key, bytes, expected_digest, &mut history)
+            .await
+    }
+
+    pub(crate) async fn publish_with_history(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        expected_digest: &str,
+        history: &mut AttemptHistory,
+    ) -> Result<(), PublicationError> {
+        let expected_size = bytes.len() as u64;
+        let initial = self.put_if_absent(key, bytes.clone(), history).await;
+        if let Some(result) = terminal(&initial) {
+            return result;
         }
 
         match self
@@ -247,16 +252,8 @@ impl S3Store {
             VerificationOutcome::Mismatch => Err(PublicationError::IntegrityMismatch),
             VerificationOutcome::Transport => Err(PublicationError::Unresolved),
             VerificationOutcome::NotFound => {
-                match self.put_if_absent(key, bytes, &mut history).await {
-                    MutationOutcome::Committed { .. } => Ok(()),
-                    MutationOutcome::ProvenNotSent => Err(PublicationError::NotSent),
-                    MutationOutcome::NotFound => Err(PublicationError::StorageNotFound),
-                    MutationOutcome::TooLarge => Err(PublicationError::TooLarge),
-                    MutationOutcome::Conflict
-                    | MutationOutcome::PreconditionFailed
-                    | MutationOutcome::AmbiguousConflict
-                    | MutationOutcome::Unknown => Err(PublicationError::Unresolved),
-                }
+                let resent = self.put_if_absent(key, bytes, history).await;
+                terminal(&resent).unwrap_or(Err(PublicationError::Unresolved))
             }
         }
     }
@@ -281,11 +278,12 @@ impl S3Store {
             }
             Err(_) => return VerificationOutcome::Transport,
         };
-        if output
-            .content_length()
-            .is_some_and(|length| length < 0 || length as u64 > expected_size)
-        {
-            return VerificationOutcome::Mismatch;
+        match output.content_length() {
+            Some(length) if length < 0 => return VerificationOutcome::Transport,
+            Some(length) if length as u64 > expected_size => {
+                return VerificationOutcome::Mismatch;
+            }
+            _ => {}
         }
 
         let mut body = output.body;
@@ -335,11 +333,20 @@ impl S3Store {
     }
 }
 
-fn validate_single_put_length(length: u64) -> Result<(), PublicationError> {
-    if length <= MAX_SINGLE_PUT_BYTES {
-        Ok(())
-    } else {
-        Err(PublicationError::TooLarge)
+fn fits_single_put(length: u64) -> bool {
+    length <= MAX_SINGLE_PUT_BYTES
+}
+
+fn terminal(outcome: &MutationOutcome) -> Option<Result<(), PublicationError>> {
+    match outcome {
+        MutationOutcome::Committed { .. } => Some(Ok(())),
+        MutationOutcome::ProvenNotSent => Some(Err(PublicationError::NotSent)),
+        MutationOutcome::NotFound => Some(Err(PublicationError::StorageNotFound)),
+        MutationOutcome::TooLarge => Some(Err(PublicationError::TooLarge)),
+        MutationOutcome::Conflict
+        | MutationOutcome::PreconditionFailed
+        | MutationOutcome::AmbiguousConflict
+        | MutationOutcome::Unknown => None,
     }
 }
 
@@ -382,35 +389,23 @@ fn classify_mutation_result(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{
-        io,
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    use aws_sdk_s3::primitives::SdkBody;
+pub(crate) mod test_support {
     use aws_sdk_s3::{
-        config::{Credentials, HttpClient},
-        error::ConnectorError,
+        config::{Builder, Credentials, HttpClient, Region},
+        primitives::SdkBody,
     };
-    use aws_smithy_runtime::client::http::test_util::{
-        NeverClient, ReplayEvent, StaticReplayClient,
-    };
-    use bytes::Bytes;
-    use http_body::{Body, Frame};
+    use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 
-    const TEST_ETAG: &str = "\"opaque-token:part-7\"";
+    use super::S3Store;
 
-    fn test_builder(http_client: impl HttpClient + 'static) -> Builder {
+    pub(crate) fn test_builder(http_client: impl HttpClient + 'static) -> Builder {
         aws_sdk_s3::Config::builder()
             .credentials_provider(Credentials::for_tests())
             .endpoint_url("https://s3.test.invalid")
             .http_client(http_client)
     }
 
-    fn response(
+    pub(crate) fn response(
         status: u16,
         headers: &[(&str, &str)],
         body: impl Into<SdkBody>,
@@ -422,7 +417,9 @@ mod tests {
         builder.body(body.into()).expect("valid test response")
     }
 
-    fn replay_store(responses: Vec<http::Response<SdkBody>>) -> (S3Store, StaticReplayClient) {
+    pub(crate) fn replay_store(
+        responses: Vec<http::Response<SdkBody>>,
+    ) -> (S3Store, StaticReplayClient) {
         let events = responses
             .into_iter()
             .map(|response| ReplayEvent::new(http::Request::new(SdkBody::empty()), response))
@@ -435,6 +432,25 @@ mod tests {
         );
         (store, client)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use aws_sdk_s3::{config::Region, error::ConnectorError, primitives::SdkBody};
+    use aws_smithy_runtime::client::http::test_util::NeverClient;
+    use bytes::Bytes;
+    use http_body::{Body, Frame};
+
+    use super::test_support::{replay_store, response, test_builder};
+
+    const TEST_ETAG: &str = "\"opaque-token:part-7\"";
 
     fn classify(error: SdkError<PutObjectError>, prior_unknown: bool) -> MutationOutcome {
         classify_mutation_result(Err(error), prior_unknown)
@@ -460,6 +476,26 @@ mod tests {
 
     fn chunked_body() -> SdkBody {
         SdkBody::from_body_1_x(ChunkedBody(vec![b"def", b"abc"]))
+    }
+
+    struct OverrunThenError(u8);
+
+    impl Body for OverrunThenError {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let frame = match self.0 {
+                0 => Some(Ok(Frame::data(Bytes::from_static(b"abcdefg")))),
+                1 => Some(Err(io::Error::other("body stream failed"))),
+                _ => None,
+            };
+            self.0 += 1;
+            Poll::Ready(frame)
+        }
     }
 
     #[tokio::test]
@@ -762,6 +798,40 @@ mod tests {
                 VerificationOutcome::Mismatch
             );
         }
+
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[],
+            SdkBody::from_body_1_x(OverrunThenError(0)),
+        )]);
+        assert_eq!(
+            store.verify_object("object", &expected_digest, 6).await,
+            VerificationOutcome::Mismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_verification_classifies_declared_lengths() {
+        let expected_digest = format!("{:x}", Sha256::digest(b"abcdef"));
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("content-length", "7")],
+            b"abcdef".to_vec(),
+        )]);
+        assert_eq!(
+            store.verify_object("object", &expected_digest, 6).await,
+            VerificationOutcome::Mismatch
+        );
+
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("content-length", "-1")],
+            b"abcdef".to_vec(),
+        )]);
+        assert_eq!(
+            store.verify_object("object", &expected_digest, 6).await,
+            VerificationOutcome::Transport
+        );
     }
 
     #[tokio::test]
@@ -789,12 +859,14 @@ mod tests {
             response(404, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
         ]);
+        let mut history = AttemptHistory::default();
         assert_eq!(
             store
-                .publish_immutable("artifact-key", bytes.clone(), &digest)
+                .publish_with_history("artifact-key", bytes.clone(), &digest, &mut history,)
                 .await,
             Ok(())
         );
+        assert!(!history.may_have_been_sent);
         assert_eq!(client.actual_requests().count(), 3);
         for index in [0, 2] {
             let request = client.actual_requests().nth(index).expect("PUT request");
@@ -816,7 +888,7 @@ mod tests {
         let bytes = b"immutable".to_vec();
         let digest = format!("{:x}", Sha256::digest(&bytes));
         for initial_status in [409, 412, 500] {
-            let (store, _) = replay_store(vec![
+            let (store, client) = replay_store(vec![
                 response(initial_status, &[], SdkBody::empty()),
                 response(200, &[], bytes.clone()),
             ]);
@@ -826,6 +898,7 @@ mod tests {
                     .await,
                 Ok(())
             );
+            assert_eq!(client.actual_requests().count(), 2);
         }
 
         let (store, _) = replay_store(vec![
@@ -869,11 +942,8 @@ mod tests {
 
     #[test]
     fn single_put_limit_is_inclusive() {
-        assert_eq!(validate_single_put_length(MAX_SINGLE_PUT_BYTES), Ok(()));
-        assert_eq!(
-            validate_single_put_length(MAX_SINGLE_PUT_BYTES + 1),
-            Err(PublicationError::TooLarge)
-        );
+        assert!(fits_single_put(MAX_SINGLE_PUT_BYTES));
+        assert!(!fits_single_put(MAX_SINGLE_PUT_BYTES + 1));
     }
 
     #[test]

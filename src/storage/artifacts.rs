@@ -1,3 +1,7 @@
+//! Raw artifact blobs use `artifacts/sha256/{digest}` keys and contain no metadata.
+//!
+//! Publication rejects payloads above 10 MiB before object-store I/O.
+
 use sha2::{Digest, Sha256};
 
 use crate::domain::campaign::ArtifactRef;
@@ -6,7 +10,8 @@ use super::s3::{PublicationError, S3Store};
 
 pub const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Proof that immutable artifact bytes are present at their digest key.
+#[derive(Debug)]
 pub struct PublishedArtifact(ArtifactRef);
 
 impl PublishedArtifact {
@@ -26,7 +31,7 @@ pub async fn publish(
     validate_artifact_length(bytes.len())?;
     let digest = format!("{:x}", Sha256::digest(&bytes));
     let reference = ArtifactRef::new(
-        digest.clone(),
+        digest,
         bytes.len() as u64,
         media_type,
         producer_attempt,
@@ -35,7 +40,7 @@ pub async fn publish(
     )
     .map_err(|_| PublicationError::InvalidInput)?;
     store
-        .publish_immutable(&artifact_key(&digest), bytes, &digest)
+        .publish_immutable(&artifact_key(reference.digest()), bytes, reference.digest())
         .await?;
     Ok(PublishedArtifact(reference))
 }
@@ -54,47 +59,22 @@ fn artifact_key(digest: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::{
-        config::{Builder, Credentials, HttpClient, Region},
-        primitives::SdkBody,
-    };
-    use aws_smithy_runtime::client::http::test_util::{
-        NeverClient, ReplayEvent, StaticReplayClient,
-    };
+    use std::time::Duration;
+
+    use aws_sdk_s3::{config::Region, primitives::SdkBody};
+    use aws_smithy_runtime::client::http::test_util::NeverClient;
 
     use super::*;
-
-    fn test_builder(http_client: impl HttpClient + 'static) -> Builder {
-        aws_sdk_s3::Config::builder()
-            .credentials_provider(Credentials::for_tests())
-            .endpoint_url("https://s3.test.invalid")
-            .http_client(http_client)
-    }
-
-    fn store(responses: Vec<http::Response<SdkBody>>) -> (S3Store, StaticReplayClient) {
-        let events = responses
-            .into_iter()
-            .map(|response| ReplayEvent::new(http::Request::new(SdkBody::empty()), response))
-            .collect();
-        let client = StaticReplayClient::new(events);
-        let store = S3Store::new(
-            "test-bucket",
-            Region::new("us-east-1"),
-            test_builder(client.clone()),
-        );
-        (store, client)
-    }
-
-    fn response(status: u16, body: impl Into<SdkBody>) -> http::Response<SdkBody> {
-        http::Response::builder()
-            .status(status)
-            .body(body.into())
-            .expect("valid test response")
-    }
+    use crate::storage::s3::test_support::{replay_store, response, test_builder};
 
     #[tokio::test]
     async fn zero_byte_artifact_uses_the_deterministic_digest_key() {
-        let (store, client) = store(vec![response(200, SdkBody::empty())]);
+        const EMPTY_SHA256: &str =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const EMPTY_KEY: &str =
+            "/artifacts/sha256/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
         let published = publish(
             &store,
             Vec::new(),
@@ -105,9 +85,13 @@ mod tests {
         )
         .await
         .expect("artifact publishes");
-        let expected = format!("{:x}", Sha256::digest([]));
-        assert_eq!(published.artifact_ref().digest(), expected);
+        assert_eq!(published.artifact_ref().digest(), EMPTY_SHA256);
         assert_eq!(published.artifact_ref().size(), 0);
+        assert_eq!(
+            published.artifact_ref().media_type(),
+            "application/octet-stream"
+        );
+        assert_eq!(published.artifact_ref().producer_attempt(), "attempt-1");
         let uri = client
             .actual_requests()
             .next()
@@ -115,7 +99,7 @@ mod tests {
             .uri()
             .parse::<http::Uri>()
             .expect("valid request URI");
-        assert_eq!(uri.path(), format!("/{}", artifact_key(&expected)));
+        assert_eq!(uri.path(), EMPTY_KEY);
     }
 
     #[tokio::test]
@@ -126,7 +110,8 @@ mod tests {
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         );
-        assert!(matches!(
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
             publish(
                 &store,
                 vec![0; MAX_ARTIFACT_BYTES + 1],
@@ -134,19 +119,58 @@ mod tests {
                 "attempt".into(),
                 1,
                 None,
+            ),
+        )
+        .await
+        .expect("oversize input returns before dispatch");
+        assert!(matches!(result, Err(PublicationError::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn publication_failures_do_not_mint_artifact_witnesses() {
+        let bytes = b"artifact".to_vec();
+        let (store, _) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            publish(
+                &store,
+                bytes.clone(),
+                "application/octet-stream".into(),
+                "attempt".into(),
+                1,
+                None,
             )
             .await,
-            Err(PublicationError::TooLarge)
+            Err(PublicationError::Unresolved)
+        ));
+
+        let (store, _) = replay_store(vec![
+            response(409, &[], SdkBody::empty()),
+            response(200, &[], b"wrong".to_vec()),
+        ]);
+        assert!(matches!(
+            publish(
+                &store,
+                bytes,
+                "application/octet-stream".into(),
+                "attempt".into(),
+                1,
+                None,
+            )
+            .await,
+            Err(PublicationError::IntegrityMismatch)
         ));
     }
 
     #[tokio::test]
     async fn one_blob_supports_distinct_published_metadata() {
         let bytes = b"same artifact".to_vec();
-        let (store, client) = store(vec![
-            response(200, SdkBody::empty()),
-            response(409, SdkBody::empty()),
-            response(200, bytes.clone()),
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(409, &[], SdkBody::empty()),
+            response(200, &[], bytes.clone()),
         ]);
         let first = publish(
             &store,

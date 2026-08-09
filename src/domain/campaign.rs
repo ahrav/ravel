@@ -393,6 +393,10 @@ mod tests {
             Err(ValidationError::InvalidIdentity)
         );
         assert_eq!(
+            ArtifactRef::new(digest(), 0, "type".into(), String::new(), 1, None),
+            Err(ValidationError::InvalidIdentity)
+        );
+        assert_eq!(
             ArtifactRef::new(
                 digest(),
                 0,
@@ -403,5 +407,22 @@ mod tests {
             ),
             Err(ValidationError::InvalidIdentity)
         );
+        for (media_type, producer_attempt, retention_class) in [
+            ("x".repeat(129), "attempt".into(), None),
+            ("type".into(), "x".repeat(129), None),
+            ("type".into(), "attempt".into(), Some("x".repeat(129))),
+        ] {
+            assert_eq!(
+                ArtifactRef::new(
+                    digest(),
+                    0,
+                    media_type,
+                    producer_attempt,
+                    1,
+                    retention_class,
+                ),
+                Err(ValidationError::InvalidIdentity)
+            );
+        }
     }
 }

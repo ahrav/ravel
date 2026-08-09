@@ -34,7 +34,9 @@ caps:
   artifact_size_each_mib: 10
   artifact_size_run_total_mib: 200
   # 8. Total campaign spend, USD across all 30 runs, both pilots, both
-  #    providers (hard, §43 invariant 16).
+  #    providers (hard, §43 invariant 16). The cap bounds treatment execution
+  #    only; trusted measurement (blinded grading, final rediscovery) is
+  #    bounded by its own fixed contracts, not this cap (experiments.md §4).
   campaign_spend_usd: 500
 
 # Applies identically to every cap above.

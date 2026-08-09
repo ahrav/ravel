@@ -135,7 +135,13 @@ runs within a block execute in the listed order.
   limit is complete, full stop: trusted measurement (blinded grading,
   final rediscovery) executes for every complete run and is never
   skipped, cut short, or reclassified by a campaign limit reached after
-  treatment execution ended. The §6/§7 decision-rule medians
+  treatment execution ended. Campaign caps bound **treatment execution
+  only**: trusted measurement is not campaign-budgeted work — blinded
+  grading is bounded by the fixed `research.md` grading protocol (one
+  pass, fixed judge calls per conclusion, never re-prompted) and final
+  rediscovery is one trusted script run — so executing measurement after
+  a campaign cap neither exceeds the precommitted limits nor leaves a
+  complete run ungraded. The §6/§7 decision-rule medians
   are defined only over exactly 5 complete runs per cell; if any cell of
   a pilot has fewer than 5 complete runs when the campaign stops, that
   pilot's precommitted outcome is **Inconclusive (budget-stopped)**,

@@ -152,6 +152,92 @@ check "trust roots disjoint from change targets" "$((overlap != 0))" "overlaps=$
 tc=$(rg -n '\.unwrap\(\)' --type rust --hidden -g '!.git/**' -g '!tests/**' -g '!benches/**' | wc -l)
 check "change targets >= 36" "$((tc < 36))" "count=$tc"
 
+vec_out=$(python3 - <<'PY' 2>&1
+import sys, unicodedata
+
+MAX_PATH_BYTES, MAX_DEPTH = 180, 10  # environment.yaml repository_limits
+FORBIDDEN = {'"', '\\'}              # same characters discover.sh refuses
+
+
+def collision_key(raw):
+    """(key, None) for an accepted path, (None, reason) for a rejection."""
+    try:
+        p = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "invalid-utf8"
+    if len(raw) > MAX_PATH_BYTES:
+        return None, "path-too-long"
+    comps = p.split("/")
+    if len(comps) > MAX_DEPTH:
+        return None, "path-too-deep"
+    for c in comps:
+        if c == "":
+            return None, "empty-component"
+        if c in (".", ".."):
+            return None, "dot-component"
+        for ch in c:
+            if ord(ch) <= 0x1F or ord(ch) == 0x7F:
+                return None, "control-char"
+            if ch in FORBIDDEN:
+                return None, "forbidden-char"
+    # casefold output is not guaranteed NFC, hence the outer normalize.
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", p).casefold()), None
+
+
+VECTORS = [  # frozen: runtime.md §4.1, row order
+    (b"src/main.rs", "src/main.rs"),
+    (b"src/Main.rs", "src/main.rs"),
+    (b"src/caf\xc3\xa9.rs", "src/caf\u00e9.rs"),
+    (b"src/cafe\xcc\x81.rs", "src/caf\u00e9.rs"),
+    (b"src/stra\xc3\x9fe.rs", "src/strasse.rs"),
+    (b"src/strasse.rs", "src/strasse.rs"),
+    (b"src/\xffbad.rs", "REJECT:invalid-utf8"),
+    (b"src/../etc/passwd", "REJECT:dot-component"),
+    (b"src/.", "REJECT:dot-component"),
+    (b"src/a\x01b.rs", "REJECT:control-char"),
+    (b"src/a\x7fb.rs", "REJECT:control-char"),
+    (b'src/a"b.rs', "REJECT:forbidden-char"),
+    (b"src/a\\b.rs", "REJECT:forbidden-char"),
+    (b"src//main.rs", "REJECT:empty-component"),
+    (b"src/" + b"a" * 177, "REJECT:path-too-long"),
+]
+
+fails = 0
+keys = {}
+for raw, want in VECTORS:
+    k, reason = collision_key(raw)
+    got = "REJECT:" + reason if reason else k
+    if got != want:
+        print("vector %r: want %r got %r" % (raw, want, got))
+        fails += 1
+    if reason is None:
+        keys.setdefault(k, []).append(raw)
+pairs = sum(1 for v in keys.values() if len(v) > 1)
+if pairs != 3:  # (1,2) ASCII case, (3,4) NFC/NFD, (5,6) casefold
+    print("collision key pairs: want 3 got %d" % pairs)
+    fails += 1
+print("unidata_version=%s" % unicodedata.unidata_version)
+sys.exit(1 if fails else 0)
+PY
+)
+vec_rc=$?
+echo "unicodedata: $(printf '%s\n' "$vec_out" | sed -n 's/^unidata_version=//p') (runtime.md §4 reference: 13.0.0)"
+check "path collision golden vectors (15 rows, 3 collision pairs)" "$vec_rc" \
+	"$(printf '%s\n' "$vec_out" | grep -v '^unidata_version=' | tr '\n' ';')"
+
+for tool in bwrap prlimit; do
+	check "containment tool present: $tool" "$(command -v "$tool" >/dev/null && echo 0 || echo 1)"
+done
+if ! command -v bwrap >/dev/null; then
+	check "bwrap unprivileged --unshare-all smoke" 1 "bwrap missing"
+elif bwrap --unshare-all --die-with-parent --ro-bind / / --tmpfs /tmp true >/dev/null 2>&1; then
+	check "bwrap unprivileged --unshare-all smoke" 0
+else
+	check "bwrap unprivileged --unshare-all smoke" 1 "nonzero exit"
+fi
+mun=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)
+check "user namespaces enabled" "$([ "${mun:-0}" -gt 0 ] && echo 0 || echo 1)" "max_user_namespaces=$mun"
+
 # Evaluators execute code from the tree; do not run them after any preflight
 # check fails.
 if [ "$FAILURES" -ne 0 ]; then

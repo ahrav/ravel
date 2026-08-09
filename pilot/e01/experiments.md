@@ -136,14 +136,20 @@ runs within a block execute in the listed order.
   final rediscovery) executes for every complete run and is never
   skipped, cut short, or reclassified by a campaign limit reached after
   treatment execution ended. Campaign caps bound **treatment execution
-  only**: trusted measurement is not campaign-budgeted work — blinded
-  grading is bounded by the fixed `research.md` grading protocol (one
-  pass, fixed judge calls per conclusion, never re-prompted) and final
-  rediscovery is one trusted script run — so executing measurement after
-  a campaign cap neither exceeds the precommitted limits nor leaves a
-  complete run ungraded. The §6/§7 decision-rule medians
-  are defined only over exactly 5 complete runs per cell; if any cell of
-  a pilot has fewer than 5 complete runs when the campaign stops, that
+  only**; trusted measurement is separately and hard-bounded by
+  `budgets.yaml` `measurement_spend_usd` (blinded grading judge calls;
+  final rediscovery is one trusted script run with no provider calls)
+  under the fixed `research.md` protocol (one pass, fixed judge calls
+  per conclusion, never re-prompted). Post-cap measurement of a
+  complete run therefore neither exceeds a precommitted limit nor goes
+  unbounded. If `measurement_spend_usd` is exhausted before every
+  complete run is fully measured, already-graded verdicts stand,
+  everything ungraded is `unresolved`, and the affected pilot's outcome
+  is **Inconclusive (budget-stopped)** under the rule below. The §6/§7
+  decision-rule medians are defined only over exactly 5 complete **and
+  fully measured** runs per cell; if any cell of
+  a pilot has fewer than 5 complete and fully measured runs when the
+  campaign stops, that
   pilot's precommitted outcome is **Inconclusive (budget-stopped)**,
   recorded with per-cell complete-run counts.
 - **Failure handling:** crashes, errors, timeouts, and budget exhaustion

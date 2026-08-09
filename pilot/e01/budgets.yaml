@@ -36,8 +36,14 @@ caps:
   # 8. Total campaign spend, USD across all 30 runs, both pilots, both
   #    providers (hard, §43 invariant 16). The cap bounds treatment execution
   #    only; trusted measurement (blinded grading, final rediscovery) is
-  #    bounded by its own fixed contracts, not this cap (experiments.md §4).
+  #    bounded by measurement_spend_usd below (experiments.md §4).
   campaign_spend_usd: 500
+  # Subordinate scalar (permitted: makes cap 8 enforceable without leaving
+  # measurement unbounded). Hard cap on trusted-measurement provider spend —
+  # blinded grading judge calls across all 30 runs; rediscovery uses no
+  # provider calls. Hard-limit behavior below applies: work already graded
+  # stands, everything ungraded is emitted unresolved.
+  measurement_spend_usd: 50
 
 # Applies identically to every cap above.
 hard_limit_behavior:

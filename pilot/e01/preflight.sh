@@ -48,8 +48,10 @@ echo "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 
 # --- checkout ---------------------------------------------------------------
 TEMP_ROOT=""
+SMOKE_DIR=""
 cleanup() {
 	[ -n "$TEMP_ROOT" ] && rm -rf -- "$TEMP_ROOT"
+	[ -n "$SMOKE_DIR" ] && rm -rf -- "$SMOKE_DIR"
 	rm -rf -- "$EVAL_TARGET_DIR"
 }
 # Evaluators always build into a fresh target dir: a caller-supplied checkout
@@ -153,10 +155,12 @@ tc=$(rg -n '\.unwrap\(\)' --type rust --hidden -g '!.git/**' -g '!tests/**' -g '
 check "change targets >= 36" "$((tc < 36))" "count=$tc"
 
 vec_out=$(
-	python3 - <<'PY' 2>&1
+	python3 - "$MAX_PATH_LENGTH" "$MAX_PATH_DEPTH" <<'PY' 2>&1
 import sys, unicodedata
 
-MAX_PATH_BYTES, MAX_DEPTH = 180, 10  # environment.yaml repository_limits
+# Passed in from the shell constants above so exactly one copy of each
+# environment.yaml repository_limits value exists in this script.
+MAX_PATH_BYTES, MAX_DEPTH = int(sys.argv[1]), int(sys.argv[2])
 FORBIDDEN = {'"', '\\'}              # same characters discover.sh refuses
 
 
@@ -203,11 +207,27 @@ VECTORS = [  # frozen: runtime.md §4.1, row order
     (b"src/a\\b.rs", "REJECT:forbidden-char"),
     (b"src//main.rs", "REJECT:empty-component"),
     (b"src/" + b"a" * 177, "REJECT:path-too-long"),
+    (b"src/" + b"a" * 176, "src/" + "a" * 176),
+    (b"a/b/c/d/e/f/g/h/i/j/k.rs", "REJECT:path-too-deep"),
     (b"src/.git/config", "REJECT:git-component"),
 ]
 
+# Every reason category in runtime.md §4 steps 1-4 must have a vector, and the
+# row count is asserted, so silently dropping a row cannot leave this block
+# reporting the coverage its check label claims.
+WANT_ROWS = 18
+WANT_REASONS = {
+    "invalid-utf8", "path-too-long", "path-too-deep", "empty-component",
+    "dot-component", "git-component", "control-char", "forbidden-char",
+}
+WANT_PAIRS = 3  # (1,2) ASCII case, (3,4) NFC/NFD, (5,6) casefold
+
 fails = 0
 keys = {}
+seen_reasons = set()
+if len(VECTORS) != WANT_ROWS:
+    print("vector rows: want %d got %d" % (WANT_ROWS, len(VECTORS)))
+    fails += 1
 for raw, want in VECTORS:
     k, reason = collision_key(raw)
     got = "REJECT:" + reason if reason else k
@@ -216,9 +236,17 @@ for raw, want in VECTORS:
         fails += 1
     if reason is None:
         keys.setdefault(k, []).append(raw)
-pairs = sum(1 for v in keys.values() if len(v) > 1)
-if pairs != 3:  # (1,2) ASCII case, (3,4) NFC/NFD, (5,6) casefold
-    print("collision key pairs: want 3 got %d" % pairs)
+    else:
+        seen_reasons.add(reason)
+missing = WANT_REASONS - seen_reasons
+if missing:
+    print("reason categories with no vector: %s" % ",".join(sorted(missing)))
+    fails += 1
+# Count colliding *pairs*, not colliding groups: a single 3-way collision is
+# 3 pairs, and counting groups would report it as 1.
+pairs = sum(len(v) * (len(v) - 1) // 2 for v in keys.values())
+if pairs != WANT_PAIRS:
+    print("collision key pairs: want %d got %d" % (WANT_PAIRS, pairs))
     fails += 1
 print("unidata_version=%s" % unicodedata.unidata_version)
 sys.exit(1 if fails else 0)
@@ -226,7 +254,7 @@ PY
 )
 vec_rc=$?
 echo "unicodedata: $(printf '%s\n' "$vec_out" | sed -n 's/^unidata_version=//p') (runtime.md §4 reference: 13.0.0)"
-check "path collision golden vectors (16 rows, 3 collision pairs)" "$vec_rc" \
+check "path collision golden vectors (18 rows, 8 reason categories, 3 collision pairs)" "$vec_rc" \
 	"$(printf '%s\n' "$vec_out" | grep -v '^unidata_version=' | tr '\n' ';')"
 
 for tool in bwrap prlimit; do
@@ -234,24 +262,32 @@ for tool in bwrap prlimit; do
 done
 # Presence is not enough: runtime.md §3.2 fails the launch when "any limit
 # cannot be applied", so preflight must apply the frozen limits, not just
-# find prlimit on PATH.
+# find prlimit on PATH. Keep the tool's own stderr: these gates block the
+# campaign and fail for environmental reasons (hard limit below the frozen
+# value, EPERM on raise), which "nonzero exit" alone cannot distinguish.
 if ! command -v prlimit >/dev/null; then
 	check "prlimit frozen limits apply" 1 "prlimit missing"
-elif prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- true >/dev/null 2>&1; then
-	check "prlimit frozen limits apply" 0
 else
-	check "prlimit frozen limits apply" 1 "nonzero exit"
+	pl_out=$(prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- true 2>&1)
+	pl_rc=$?
+	check "prlimit frozen limits apply" "$((pl_rc != 0))" \
+		"$([ "$pl_rc" -ne 0 ] && printf 'rc=%s: %s' "$pl_rc" "$(printf '%s' "$pl_out" | tr '\n' ';')")"
 fi
 # Smoke the frozen invocation shape (runtime.md §3.1) end to end — production
 # mounts, env, and the in-sandbox timeout+prlimit chain — not a permissive
-# bind that can pass while the real shape fails.
+# bind that can pass while the real shape fails. The payload is the §3.1
+# <payload argv> placeholder: it prints the sandbox user namespace so the
+# next check can prove one was actually created.
+HOST_USERNS="$(readlink /proc/self/ns/user 2>/dev/null || echo unknown)"
+smoke_rc=1
+smoke_out=""
 if ! command -v bwrap >/dev/null; then
 	check "bwrap frozen-shape smoke (runtime.md §3.1)" 1 "bwrap missing"
 elif ! SMOKE_DIR="$(mktemp -d /tmp/e01-bwrap.XXXXXX)"; then
 	check "bwrap frozen-shape smoke (runtime.md §3.1)" 1 "mktemp failed"
 else
 	mkdir -p "$SMOKE_DIR/src" "$SMOKE_DIR/toolchain" "$SMOKE_DIR/out"
-	if bwrap --unshare-all --die-with-parent \
+	smoke_out=$(bwrap --unshare-all --unshare-user --unshare-cgroup --die-with-parent \
 		--ro-bind /usr /usr \
 		--symlink usr/bin /bin --symlink usr/lib /lib \
 		--symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
@@ -263,16 +299,27 @@ else
 		--setenv PATH /opt/toolchain/bin:/usr/bin \
 		--setenv HOME /work/out --setenv TMPDIR /tmp \
 		-- timeout --kill-after=60 30 \
-		prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- true \
-		>/dev/null 2>&1; then
-		check "bwrap frozen-shape smoke (runtime.md §3.1)" 0
-	else
-		check "bwrap frozen-shape smoke (runtime.md §3.1)" 1 "nonzero exit"
-	fi
+		prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- \
+		readlink /proc/self/ns/user 2>&1)
+	smoke_rc=$?
+	check "bwrap frozen-shape smoke (runtime.md §3.1)" "$((smoke_rc != 0))" \
+		"$([ "$smoke_rc" -ne 0 ] && printf 'rc=%s: %s' "$smoke_rc" "$(printf '%s' "$smoke_out" | tr '\n' ';')")"
 	rm -rf -- "$SMOKE_DIR"
+	SMOKE_DIR=""
 fi
+# runtime.md §3.2 requires the launch to fail when user namespaces are
+# unavailable. max_user_namespaces is only a necessary condition — it stays
+# nonzero while unprivileged creation is denied — so the authoritative check is
+# that the sandbox actually ran in a different user namespace than the host.
 mun=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)
-check "user namespaces enabled" "$([ "${mun:-0}" -gt 0 ] && echo 0 || echo 1)" "max_user_namespaces=$mun"
+check "max_user_namespaces > 0" "$([ "${mun:-0}" -gt 0 ] && echo 0 || echo 1)" "max_user_namespaces=$mun"
+if [ "$smoke_rc" -ne 0 ]; then
+	check "sandbox user namespace differs from host" 1 "frozen-shape smoke did not run"
+elif [ -n "$smoke_out" ] && [ "$smoke_out" != "$HOST_USERNS" ]; then
+	check "sandbox user namespace differs from host" 0 "host=$HOST_USERNS sandbox=$smoke_out"
+else
+	check "sandbox user namespace differs from host" 1 "host=$HOST_USERNS sandbox=${smoke_out:-<empty>}"
+fi
 
 # Evaluators execute code from the tree; do not run them after any preflight
 # check fails.

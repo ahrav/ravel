@@ -74,7 +74,7 @@ Placeholders (`<…>`) are resolved per attempt by the launcher; everything
 else is fixed:
 
 ```text
-bwrap --unshare-all --die-with-parent \
+bwrap --unshare-all --unshare-user --unshare-cgroup --die-with-parent \
   --ro-bind /usr /usr \
   --symlink usr/bin /bin --symlink usr/lib /lib \
   --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
@@ -112,9 +112,16 @@ Mounts, exactly:
 | `/tmp` | fresh `tmpfs` | read-write, discarded at exit |
 | `/proc`, `/dev` | `bwrap`-managed private `/proc` and minimal `/dev` | as `bwrap` provides |
 
-Nothing else is bound. `--unshare-all` unshares every namespace `bwrap`
-supports — including the **network** namespace (only `--share-net` would keep
-it) and the PID namespace — so candidate execution has no network. No
+Nothing else is bound. `--unshare-all` covers the **network** namespace (only
+`--share-net` would keep it) and the PID namespace, so candidate execution has
+no network. It is **not** sufficient on its own: bubblewrap 0.10.0 defines
+`--unshare-all` as `--unshare-user-try … --unshare-cgroup-try`, and the `-try`
+variants *skip* the namespace when it cannot be created rather than failing.
+A setuid-root `bwrap` install would therefore run the payload with no user
+namespace and still exit 0 — silently violating §3.2's fail-closed rule. The
+frozen shape adds explicit `--unshare-user --unshare-cgroup` so both are
+mandatory and an unavailable user namespace aborts the launch by construction,
+not by accident of how `bwrap` happens to be installed. No
 credentials, no AWS/code-host configuration, no daemon Git metadata, no shared
 writable cache, and no host socket appear in the mount table.
 
@@ -152,7 +159,10 @@ The 10 MiB stream caps align with `budgets.yaml` `artifact_size_each_mib: 10`.
 **Fail closed:** if `bwrap`, `prlimit`, or `timeout` is missing, user
 namespaces are unavailable, or any limit cannot be applied, the launch fails.
 There is no permissive fallback and no partially-limited execution (E07 AC2).
-Availability is checked by `preflight.sh` ("containment" block).
+Availability is checked by `preflight.sh` ("containment" block), which applies
+the frozen `prlimit` values and runs the §3.1 shape end to end — and, inside
+that sandbox, asserts the user namespace differs from the host's, so a skipped
+namespace cannot pass as containment.
 
 Known ceiling: `RLIMIT_AS` is per-process and `RLIMIT_NPROC` is per-UID, so
 neither is an aggregate budget across a fan-out of payload processes. If the
@@ -246,13 +256,23 @@ collision key, or `REJECT:<reason>`.
 | 13 | `src/a\\b.rs` | `REJECT:forbidden-char` |
 | 14 | `src//main.rs` | `REJECT:empty-component` |
 | 15 | `src/` + `a`×177 (181 bytes) | `REJECT:path-too-long` |
-| 16 | `src/.git/config` | `REJECT:git-component` |
+| 16 | `src/` + `a`×176 (180 bytes, the limit) | `src/` + `a`×176 |
+| 17 | `a/b/c/d/e/f/g/h/i/j/k.rs` (11 components) | `REJECT:path-too-deep` |
+| 18 | `src/.git/config` | `REJECT:git-component` |
+
+Rows 15 and 16 straddle the byte limit in both directions, and row 17 is the
+only row that reaches step 3, so neither numeric limit can be changed without
+a vector failing. Every reason category in steps 1–4 has at least one row.
 
 Accepted rows form exactly **three** colliding key pairs — (1, 2) ASCII case,
 (3, 4) NFC/NFD, (5, 6) `ß`/`ss` casefold — and each pair is a step-6 pass
-failure. Executable check: the "path collision golden vectors" block in
+failure. Row 16's key is unique, so it adds no pair. Executable check: the
+"path collision golden vectors" block in
 [`preflight.sh`](preflight.sh), which recomputes every row, compares it to
-the frozen expected value, asserts the three collision pairs, and records
+the frozen expected value, and asserts the row count (18), the reason-category
+set (8), and the collision-pair count (3) — counting pairs, not colliding
+groups — while reading both numeric limits from the script's single copy of
+the `environment.yaml` values. It also records
 `unicodedata.unidata_version`.
 
 ## 5. Grouping (E09)

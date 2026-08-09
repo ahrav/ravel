@@ -203,12 +203,19 @@ runs within a block execute in the listed order.
 - **External state:** each run writes only under its own S3 run prefix
   below `e01/` and (Change) its own `campaign/e01/*` branch per
   `environment.yaml` branch policy. Production branches are never touched.
-- **Reset between complete runs:** delete all run workspaces; reset the
+- **Reset between complete runs:** delete all run workspaces; (Change) tag
+  the finished run's campaign-branch tip under an immutable per-run ref and
+  record that OID in the run's `run_terminal` record, **then** reset the
   campaign branch to the pinned revision; delete the finished run's S3 run
   prefix working area (measurement artifacts — including the §9
   capture-record stream — are retained outside it);
   then (Change) re-run trusted `change/discover.sh` and confirm the target
   count matches `change/targets.jsonl` before the next run starts.
+  The tip tag is a measurement artifact: §4 permits trusted measurement to
+  run after treatment execution ends (bounded separately by
+  `measurement_deadline_days`), and §9.8 `revision_measured` is that tip, so
+  resetting the branch must not be able to destroy an unmeasured run's input.
+  Per-run tip refs are retained until that run is fully measured.
 
 ## 6. Research pilot (docs/mvp-outline.md §32 Experiment A)
 
@@ -372,10 +379,15 @@ wall-clock measures are computed from these boundaries exactly as §6/§7 word
 them — Research to the final synthesized answer, Change to the final
 rediscovery result. One boundary is *derived*, not `ts_utc_start`: §6 defines
 Research wall-clock as starting at the **first agent action**, so that
-measure starts at the earliest treatment-initiated record (`work_event`,
-`attempt`, or `model_call`) UTC timestamp in the run's stream — dispatch or
-setup delay between reset and first action differs across A/B/C and must not
-enter the comparison. `ts_utc_start` bounds only the cap window above. Change
+measure starts at the earliest **agent-attributed** record UTC timestamp in
+the run's stream — exactly the records carrying a non-null `agent_id`:
+`work_event` with `event: dispatch`, `attempt`, `model_call`, or
+`busy_interval`. A `work_event` with `event: ready` is excluded: §9.6 gives it
+a null `agent_id`, so it is not an agent action, and in A/B the root `ready`
+fires at run setup while in C the controller dispatches later — counting it
+would re-import exactly the dispatch and setup delay that differs across
+A/B/C and must not enter the comparison. `ts_utc_start` bounds only the cap
+window above. Change
 wall-clock starts at run start (`ts_utc_start`) exactly as §7 words it.
 
 **Fault placement** is not re-specified here: it stays exactly as frozen in
@@ -415,7 +427,8 @@ not this record's write time.
 | `unresolved` | `true` for any hard-limit stop — the §4 `unresolved` result label; `true` together with `complete: true` for a per-run-cap stop — else `false` |
 | `stop_reason` | `finished` \| `per_run_cap:<cap key>` \| `campaign_limit:<cap key>` \| `error` |
 | `treatment_end_utc` / `measurement_end_utc` / `ts_utc_end` | treatment window end, measurement end, record write time |
-| `outcomes` | one field per §6 (Research) or §7 (Change) measure — including Change's final rediscovery result — with `undefined` exactly where the §6/§7 zero-denominator rules say so; absent numeric values only for a campaign-limit stop during treatment execution (§4) |
+| `campaign_tip_oid` / `campaign_tip_ref` | Change: the run's campaign-branch tip OID and the immutable per-run ref pinning it before the §5 reset; `null` in Research and for a run that never started |
+| `outcomes` | one field per §6 (Research) or §7 (Change) measure — including Change's final rediscovery result — with `undefined` exactly where the §6/§7 zero-denominator rules say so; absent numeric values for a campaign-limit stop during treatment execution **or before start** (§4) |
 | `fully_measured` | `true` only if every §4 trusted-measurement step completed for this run |
 
 ### 9.3 Attempt validity and replacement
@@ -497,11 +510,18 @@ One record per model call: `call_seq` (1…`model_calls_per_run`),
 `model_id`, `input_tokens`, `output_tokens`, `cached_input_tokens`,
 `long_context`, `usd`.
 
-Token counts are **provider-reported**, never estimated. Cost is computed,
-never self-reported:
+Token counts are **provider-reported**, never estimated. `input_tokens`
+counts **only uncached** input, so `cached_input_tokens` is disjoint from it
+and both terms appear below; a provider that reports a cache-inclusive input
+count is normalized to that split at record time. Cost is computed, never
+self-reported, and this is the whole function — no rule below it adjusts
+`usd` outside these terms:
 
 ```text
-usd = input_tokens/1e6 * price_in + output_tokens/1e6 * price_out
+m_in  = 2.0 if long_context else 1.0
+m_out = 1.5 if long_context else 1.0
+usd = (input_tokens + cached_input_tokens)/1e6 * price_in * m_in
+    + output_tokens/1e6 * price_out * m_out
 ```
 
 Frozen unit prices (looked up once at authoring time, 2026-08-09 UTC, and
@@ -519,7 +539,8 @@ scalars are the vendors' published standard per-million-token list prices for
 the two pinned models — Claude Opus 5 base input / output, and gpt-5.6-sol
 short-context input / output. Cached and cache-write tokens, when reported,
 are priced at the input scalar (a deliberate over-estimate; no separate cache
-scalar is frozen). A call reporting more than 272,000 input tokens is recorded
+scalar is frozen) — the `cached_input_tokens` term above. A call reporting
+more than 272,000 total input tokens is recorded
 `long_context: true` and priced at 2× input and 1.5× output per the published
 long-context multiplier; at the pinned subject size (474,732 B total) this is
 not expected to occur. The prices are identical for every cell, so cost stays
@@ -532,7 +553,7 @@ One record per complete run, same shape in both pilots.
 
 | Field | Definition |
 | --- | --- |
-| `revision_measured` | Change: the campaign-branch tip measured by trusted final rediscovery (§4); Research: the frozen subject revision |
+| `revision_measured` | Change: the campaign-branch tip measured by trusted final rediscovery (§4) — the `campaign_tip_oid` pinned by the §5 reset, so it is measurable after that reset; Research: the frozen subject revision |
 | `rule_digest` | Change: the `change/contract.md` §2 digest reported by the rediscovery run (a mismatch is recorded and the verdict is `fail`); Research: `null` |
 | `verdict` | `pass` \| `fail` \| `unresolved` — Change: zero non-exempt records; Research: grading completed under `research.md` §6; `unresolved` only when the §4 measurement caps were exhausted before this run's grading/rediscovery executed (the run's terminal record then carries `fully_measured: false`); a rediscovery invocation that runs but produces no valid verdict is still `fail` (§4) |
 | `per_class` | per-outcome-class counts: Change `resolved`/`rejected`/`blocked`/`unresolved`; Research `research.md` §7 classes |

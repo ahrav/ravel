@@ -1,0 +1,52 @@
+format: e01-budgets/private-unstable
+
+notice: >-
+  E01 pilot budgets — PRIVATE, UNSTABLE FORMAT. Hand-maintained for the E01
+  pilot only. No schema, no loader, no tooling; do not build tooling against
+  this file. Flat scalars only; no budget hierarchies.
+
+amendment_rule: >-
+  Amendments require a new Git revision and a new pilot/e01/ content digest
+  recorded before any affected run. Results from before and after an
+  amendment are never pooled.
+
+# The eight mandatory cap dimensions, per complete assigned run unless the
+# key says campaign. Units are in the key names.
+caps:
+  # 1. Calls per run, both providers combined. Token spend is bounded by this
+  #    cap x the 8192 max_tokens fixed in environment.yaml role_profiles.
+  model_calls_per_run: 400
+  # 2. Generation retries per work item. A failed RUN is never re-run; see
+  #    experiments.md failure handling.
+  attempts_per_work_item: 3
+  # 3. Concurrent agents per run. A cell may use fewer, never more.
+  parallelism_agents_per_run: 8
+  # 4. Controller/agent-created follow-up work items per run.
+  generated_followups_per_run: 24
+  # 5. Levels: root -> follow-up -> sub-follow-up. No deeper recursion
+  #    (docs/mvp-outline.md §43 invariant 15).
+  workflow_depth_levels: 3
+  # 6. Deadlines: wall-clock per run by cell family, plus campaign total.
+  deadline_run_ab_hours: 2
+  deadline_run_c_hours: 4
+  deadline_campaign_days: 14
+  # 7. Artifact size.
+  artifact_size_each_mib: 10
+  artifact_size_run_total_mib: 200
+  # 8. Total campaign spend, USD across all 30 runs, both pilots, both
+  #    providers (hard, §43 invariant 16).
+  campaign_spend_usd: 500
+
+# Applies identically to every cap above.
+hard_limit_behavior:
+  - stop creating new work immediately
+  - >-
+    perform only required cleanup/reconciliation (release claims, flush
+    already-produced artifacts, reset shared state per experiments.md)
+  - >-
+    emit an explicit `unresolved` result for the run and every incomplete
+    work item
+  - no silent expansion; no human-approved expansion mid-run
+  - >-
+    changing any cap requires a new Git revision + content digest before
+    affected runs

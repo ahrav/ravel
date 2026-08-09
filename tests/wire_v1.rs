@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use ravel::{
     domain::campaign::{Authority, Event, EventContent, EventRef, Head},
     sync::{WireError, event, head},
@@ -48,11 +46,7 @@ fn child() -> Event {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        write!(&mut output, "{byte:02x}").unwrap();
-    }
-    output
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[test]

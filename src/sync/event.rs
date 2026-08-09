@@ -16,7 +16,7 @@
 //! Key values exclude object-store prefixes. The `zstd-sys 2.0.16+zstd.1.5.7`
 //! lockfile pin is byte-affecting.
 
-use std::{fmt::Write as _, io::Cursor};
+use std::io::Cursor;
 
 use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
 use serde::{Deserialize, Serialize};
@@ -207,11 +207,7 @@ fn compress(cbor: &[u8]) -> Result<Vec<u8>, WireError> {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -467,16 +463,17 @@ mod tests {
     fn enforces_cbor_recursion_limit_at_the_codec_boundary() {
         // WireEvent has no recursive field; serde rejects nested values before this
         // codec limit matters. This boundary pair pins the decoder setting itself.
+        assert_eq!(CBOR_RECURSION_LIMIT, 16);
         assert!(
             from_reader_with_recursion_limit::<Value, _>(
-                nested_arrays(CBOR_RECURSION_LIMIT).as_slice(),
+                nested_arrays(16).as_slice(),
                 CBOR_RECURSION_LIMIT
             )
             .is_ok()
         );
         assert!(
             from_reader_with_recursion_limit::<Value, _>(
-                nested_arrays(CBOR_RECURSION_LIMIT + 1).as_slice(),
+                nested_arrays(17).as_slice(),
                 CBOR_RECURSION_LIMIT
             )
             .is_err()

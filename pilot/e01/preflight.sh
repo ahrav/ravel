@@ -85,7 +85,7 @@ cd "$DIR" || {
 # A caller-supplied checkout is verified as-is, never reset to the frozen SHA.
 head_sha=$(git rev-parse HEAD)
 check "frozen revision" "$([ "$head_sha" = "$FROZEN_SHA" ] && echo 0 || echo 1)" "$head_sha"
-check "clean worktree" "$([ -z "$(git status --porcelain)" ] && echo 0 || echo 1)"
+check "clean worktree (incl. ignored files)" "$([ -z "$(git status --porcelain --ignored)" ] && echo 0 || echo 1)"
 # The evaluators below execute code from the tree (build scripts, tests).
 # Never run them against anything but the clean frozen revision.
 if [ "$FAILURES" -ne 0 ]; then
@@ -172,8 +172,8 @@ run_eval() {      # run_eval <command...> — expected PASS
 	timeout --kill-after=60 "$EVAL_TIMEOUT" "$@" >"$log" 2>&1 || rc=$?
 	if [ "$rc" -eq 0 ]; then
 		check "evaluator: $name" 0 "expected=PASS got=PASS"
-	elif [ "$rc" -eq 124 ]; then
-		check "evaluator: $name" 1 "expected=PASS got=TIMEOUT(${EVAL_TIMEOUT}s) (see $log)"
+	elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+		check "evaluator: $name" 1 "expected=PASS got=TIMEOUT rc=$rc (see $log)"
 	else
 		check "evaluator: $name" 1 "expected=PASS got=FAIL (see $log)"
 	fi

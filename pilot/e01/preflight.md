@@ -50,15 +50,23 @@ Winner forked to `ahrav/hyperfine`; pinned revision
 
 `bash pilot/e01/preflight.sh` from a fresh clone of the fork:
 
+Artifact checksum — the frozen subject content, independent of git object
+storage (recompute with `git archive --format=tar <sha> | sha256sum`):
+
+```text
+sha256(git archive f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7) =
+65896a6acb7fdb1fcc2f5d81399bd697364aba346699311c62b9d056974b999b
+```
+
 ```text
 == E01 preflight receipt ==
-date: 2026-08-09T00:04:17Z
+date: 2026-08-09T00:17:01Z
 host: Linux 6.12.95-124.187.amzn2023.aarch64
 rustc: rustc 1.94.1 (e408947bf 2026-03-25)
 cargo: cargo 1.94.1 (29ea6fb6a 2026-03-24)
-cloning https://github.com/ahrav/hyperfine.git -> /tmp/e01-preflight.0aeMS7/hyperfine
+cloning https://github.com/ahrav/hyperfine.git -> /tmp/e01-preflight.PravGw/hyperfine
 PASS  frozen revision — f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7
-PASS  clean worktree
+PASS  clean worktree (incl. ignored files)
 PASS  no submodules — count=0
 PASS  no symlinks — count=0
 PASS  no special modes — count=0
@@ -179,6 +187,16 @@ open-ended browsing required):
 - `src/output/warnings.rs` — user-facing warnings on suspect measurements
 - `src/cli.rs` — `--shell` / shell-selection surface
 - `README.md` — documented shell-overhead behavior
+
+Plausible discriminating follow-up (required by the gate; grounds two
+competing conclusions in specific in-repo evidence):
+
+> When the calibrated shell-spawning time exceeds a measured benchmark time,
+> is the corrected result silently clamped, or does the user see a warning?
+> `src/benchmark/executor.rs:216-218` clamps each corrected component with
+> `.max(0.0)`; whether `Warnings::FastExecutionTime` in
+> `src/output/warnings.rs` fires for exactly this case discriminates
+> “clamped with a user-facing warning” from “silently reports zero”.
 
 ## 6. Change viability gate — PASS
 

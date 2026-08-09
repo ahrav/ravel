@@ -18,6 +18,10 @@ aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
 ] }
 # The event format uses deterministic v1 CBOR encoding.
 ciborium = "=0.2.2"
+# Disposable projections use bundled SQLite on both CI targets.
+rusqlite = { version = "=0.40.2", default-features = false, features = [
+  "bundled",
+] }
 # Wire serialization uses serde derives.
 serde = { version = "=1.0.228", features = ["derive"] }
 # Head records use canonical JSON bytes.

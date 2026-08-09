@@ -152,7 +152,8 @@ check "trust roots disjoint from change targets" "$((overlap != 0))" "overlaps=$
 tc=$(rg -n '\.unwrap\(\)' --type rust --hidden -g '!.git/**' -g '!tests/**' -g '!benches/**' | wc -l)
 check "change targets >= 36" "$((tc < 36))" "count=$tc"
 
-vec_out=$(python3 - <<'PY' 2>&1
+vec_out=$(
+	python3 - <<'PY' 2>&1
 import sys, unicodedata
 
 MAX_PATH_BYTES, MAX_DEPTH = 180, 10  # environment.yaml repository_limits
@@ -228,12 +229,44 @@ check "path collision golden vectors (15 rows, 3 collision pairs)" "$vec_rc" \
 for tool in bwrap prlimit; do
 	check "containment tool present: $tool" "$(command -v "$tool" >/dev/null && echo 0 || echo 1)"
 done
-if ! command -v bwrap >/dev/null; then
-	check "bwrap unprivileged --unshare-all smoke" 1 "bwrap missing"
-elif bwrap --unshare-all --die-with-parent --ro-bind / / --tmpfs /tmp true >/dev/null 2>&1; then
-	check "bwrap unprivileged --unshare-all smoke" 0
+# Presence is not enough: runtime.md §3.2 fails the launch when "any limit
+# cannot be applied", so preflight must apply the frozen limits, not just
+# find prlimit on PATH.
+if ! command -v prlimit >/dev/null; then
+	check "prlimit frozen limits apply" 1 "prlimit missing"
+elif prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- true >/dev/null 2>&1; then
+	check "prlimit frozen limits apply" 0
 else
-	check "bwrap unprivileged --unshare-all smoke" 1 "nonzero exit"
+	check "prlimit frozen limits apply" 1 "nonzero exit"
+fi
+# Smoke the frozen invocation shape (runtime.md §3.1) end to end — production
+# mounts, env, and the in-sandbox timeout+prlimit chain — not a permissive
+# bind that can pass while the real shape fails.
+if ! command -v bwrap >/dev/null; then
+	check "bwrap frozen-shape smoke (runtime.md §3.1)" 1 "bwrap missing"
+elif ! SMOKE_DIR="$(mktemp -d /tmp/e01-bwrap.XXXXXX)"; then
+	check "bwrap frozen-shape smoke (runtime.md §3.1)" 1 "mktemp failed"
+else
+	mkdir -p "$SMOKE_DIR/src" "$SMOKE_DIR/toolchain" "$SMOKE_DIR/out"
+	if bwrap --unshare-all --die-with-parent \
+		--ro-bind /usr /usr \
+		--symlink usr/bin /bin --symlink usr/lib /lib \
+		--symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
+		--ro-bind "$SMOKE_DIR/src" /work/src \
+		--ro-bind "$SMOKE_DIR/toolchain" /opt/toolchain \
+		--bind "$SMOKE_DIR/out" /work/out \
+		--tmpfs /tmp --proc /proc --dev /dev \
+		--chdir /work/src --new-session --clearenv \
+		--setenv PATH /opt/toolchain/bin:/usr/bin \
+		--setenv HOME /work/out --setenv TMPDIR /tmp \
+		-- timeout --kill-after=60 30 \
+		prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- true \
+		>/dev/null 2>&1; then
+		check "bwrap frozen-shape smoke (runtime.md §3.1)" 0
+	else
+		check "bwrap frozen-shape smoke (runtime.md §3.1)" 1 "nonzero exit"
+	fi
+	rm -rf -- "$SMOKE_DIR"
 fi
 mun=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)
 check "user namespaces enabled" "$([ "${mun:-0}" -gt 0 ] && echo 0 || echo 1)" "max_user_namespaces=$mun"

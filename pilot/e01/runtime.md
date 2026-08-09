@@ -74,8 +74,6 @@ Placeholders (`<…>`) are resolved per attempt by the launcher; everything
 else is fixed:
 
 ```text
-timeout --kill-after=60 1800 \
-prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- \
 bwrap --unshare-all --die-with-parent \
   --ro-bind /usr /usr \
   --symlink usr/bin /bin --symlink usr/lib /lib \
@@ -87,8 +85,21 @@ bwrap --unshare-all --die-with-parent \
   --chdir /work/src --new-session --clearenv \
   --setenv PATH /opt/toolchain/bin:/usr/bin \
   --setenv HOME /work/out --setenv TMPDIR /tmp \
-  -- <payload argv>
+  -- timeout --kill-after=60 1800 \
+  prlimit --as=8589934592 --nproc=512 --cpu=900 --nofile=4096 -- \
+  <payload argv>
 ```
+
+**Wrapper order is load-bearing.** `bwrap` is outermost so the runner's
+direct child is the `bwrap` process — that is what makes both the §3.3 reap
+rule and `--die-with-parent` literally true. With `timeout` outermost, runner
+death would leave the orphaned `timeout` as `bwrap`'s surviving parent,
+`--die-with-parent` would never fire, and sandbox descendants could keep
+writing the quarantined overlay until the wall clock expired. `timeout` and
+`prlimit` execute inside the sandbox, resolved from the read-only `/usr`
+bind. Wall-clock enforcement is unchanged: when `timeout` kills the payload
+and exits, the in-namespace init exits with it and the kernel `SIGKILL`s any
+surviving descendants (§3.3).
 
 Mounts, exactly:
 
@@ -144,9 +155,10 @@ scope around the `bwrap` process — not a second limit mechanism inside it.
 ### 3.3 Authoritative descendant-quiescence rule
 
 With `--unshare-all`, `bwrap` installs a reaper process as **PID 1 of the new
-PID namespace** and the payload runs as its child (verified on the pilot host
+PID namespace** and the wrapped command runs as its child (verified on the pilot host
 class with bubblewrap 0.10.0: inside the sandbox `/proc/1/comm` is `bwrap` and
-the payload is PID 2). `--as-pid-1`, which would remove that reaper, is
+the wrapped command is PID 2 — with the §3.1 shape that is `timeout`, which
+forks the `prlimit` → payload chain). `--as-pid-1`, which would remove that reaper, is
 deliberately **not** used — the reaper is what makes the rule below true.
 
 - **Quiescence is exactly one fact: the runner's direct child — the `bwrap`

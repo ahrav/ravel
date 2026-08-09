@@ -282,7 +282,8 @@ unicodedata: 13.0.0 (runtime.md §4 reference: 13.0.0)
 PASS  path collision golden vectors (15 rows, 3 collision pairs)
 PASS  containment tool present: bwrap
 PASS  containment tool present: prlimit
-PASS  bwrap unprivileged --unshare-all smoke
+PASS  prlimit frozen limits apply
+PASS  bwrap frozen-shape smoke (runtime.md §3.1)
 PASS  user namespaces enabled — max_user_namespaces=505718
 PASS  evaluator: cargo build --locked — expected=PASS got=PASS
 PASS  evaluator: cargo test --locked — expected=PASS got=PASS
@@ -320,13 +321,13 @@ frozen expected key tampered (row 2 -> "src/Main.rs"):
   == result: PREFLIGHT-FAIL (1) ==
 bwrap shadowed by a stub exiting 1:
   PASS  containment tool present: bwrap
-  FAIL  bwrap unprivileged --unshare-all smoke — nonzero exit
+  FAIL  bwrap frozen-shape smoke (runtime.md §3.1) — nonzero exit
   == result: PREFLIGHT-FAIL (1) ==
 ```
 
 The containment quiescence claim in `runtime.md` §3.3 was verified directly on
 this host class: inside `bwrap --unshare-all`, `/proc/1/comm` is `bwrap` and
-the payload runs as PID 2, so reaping the `bwrap` child is sufficient proof
+the wrapped command runs as PID 2, so reaping the `bwrap` child is sufficient proof
 that the PID namespace — and therefore every descendant — is gone.
 
 ### Amended identity

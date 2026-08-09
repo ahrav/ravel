@@ -42,7 +42,16 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
-          prompt: "/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment"
+          # An existing Claude comment on the PR causes the command's first
+          # guard to skip the review, so `synchronize` runs carry an explicit
+          # override; otherwise new pushes to a reviewed PR go unreviewed.
+          prompt: >-
+            /code-review:code-review
+            ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+            --comment
+            ${{ github.event.action == 'synchronize'
+              && 'Override the skip conditions: proceed even if Claude already commented on this PR. A new push triggered this run, so review the current diff.'
+              || '' }}
           # The /code-review command declares these in its frontmatter, but
           # frontmatter does not grant permissions in non-interactive mode:
           # without them every `gh` call is denied and no review is posted.

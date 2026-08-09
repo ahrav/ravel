@@ -5,13 +5,16 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
+      # Disable ambient AWS credential providers (IMDS and config files).
       AWS_EC2_METADATA_DISABLED: "true"
-      AWS_ACCESS_KEY_ID: ""
-      AWS_SECRET_ACCESS_KEY: ""
       AWS_CONFIG_FILE: /dev/null
       AWS_SHARED_CREDENTIALS_FILE: /dev/null
     steps:
@@ -29,6 +32,9 @@ jobs:
 
       - name: Check aarch64 target
         run: cargo check --locked --target aarch64-unknown-linux-gnu
+
+      - name: Check x86_64 target
+        run: cargo check --locked --target x86_64-unknown-linux-gnu
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings

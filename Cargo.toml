@@ -2,10 +2,14 @@
 name = "ravel"
 version = "0.1.0"
 edition = "2024"
+publish = false
+# Exactly one binary: with autobins off, src/bin/*.rs cannot silently add more.
+autobins = false
 
 [[bin]]
 name = "ravel"
 path = "src/main.rs"
 
 [dependencies]
+# Intentionally unused: pins the async runtime required by the AWS SDK client.
 tokio = { version = "=1.53.1", default-features = false }

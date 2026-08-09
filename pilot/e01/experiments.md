@@ -110,7 +110,13 @@ runs within a block execute in the listed order.
   mid-run ends the run as a **complete** observation: it carries the
   `unresolved` result label *and* numeric outcomes computed from work
   integrated/graded up to the stop — unfinished work counts against it
-  (omissions, zero resolutions, `unresolved` work items). A *campaign*
+  (omissions, zero resolutions, `unresolved` work items). For Change
+  runs, trusted final rediscovery is a measurement step executed by the
+  trusted side against the run's end state for **every** complete run,
+  including per-run-cap-stopped runs (this is the `budgets.yaml`
+  hard-limit "required cleanup/reconciliation"), so every complete run
+  carries a pass/fail rediscovery result; a run stopped with non-exempt
+  unresolved targets simply fails it. A *campaign*
   hard limit (`deadline_campaign_days`, `campaign_spend_usd`) stopping
   a run mid-flight or preventing it from starting leaves that run with
   no numeric outcome values, and such runs are never imputed, zeroed,

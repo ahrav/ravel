@@ -8,10 +8,19 @@
 //! bytes with the production re-encoding before domain conversion; this rejects
 //! extra fields on internally tagged unowned unit variants.
 //!
-//! Head transitions retain canonical bytes. commentlint: allow(JUDGE)
-//! Conditional mutation and resolution preserve observed ETags. commentlint: allow(JUDGE)
-//! Retained-chain reconciliation handles advanced heads. commentlint: allow(JUDGE)
-//! Authority ordering is enforced in `authority_permits`. commentlint: allow(JUDGE)
+//! A validated read couples decoded state, exact canonical bytes, and the ETag from
+//! one GET. Transitions retain that observation plus the candidate head and event
+//! bytes. Genesis uses create-only PUT; replacement passes the coupled ETag unchanged
+//! to `If-Match`.
+//!
+//! Ambiguous mutation outcomes reread `head.json`. Exact candidate head bytes require
+//! exact tail bytes and a successful event decode before commit recognition. An exact
+//! original parent refreshes the coupled ETag for an identical retry; every other
+//! advanced head enters the read-only retained-chain walk.
+//!
+//! Fence ordering applies when both parent and candidate are owned: the candidate
+//! controller fence must not decrease. An owned parent admits no unowned successor, and
+//! the genesis head is unowned. A transition from `Unowned` imposes no fence ordering.
 
 use std::{error::Error, fmt};
 
@@ -35,6 +44,9 @@ use super::{
 const HEAD_KEY: &str = "head.json";
 const MAX_HEAD_BYTES: usize = 4 * 1024;
 
+/// Validated head bytes coupled to the opaque ETag from the same read.
+///
+/// Keeping the fields private prevents pairing an ETag with a different head value.
 pub struct ObservedHead {
     head: Head,
     bytes: Vec<u8>,
@@ -53,6 +65,7 @@ impl ObservedHead {
     }
 }
 
+/// Data-free read failure that distinguishes storage from invalid head bytes.
 #[derive(Debug)]
 pub enum HeadReadError {
     Storage(GetError),
@@ -70,11 +83,15 @@ impl fmt::Display for HeadReadError {
 
 impl Error for HeadReadError {}
 
+/// Exact authority boundary observed before a head mutation.
 pub enum HeadParent {
+    /// No head existed at the observation boundary.
     Genesis,
+    /// Validated head and ETag observed together.
     Existing(Box<ObservedHead>),
 }
 
+/// Stable candidate bytes, event bytes, and original CAS boundary for one mutation.
 pub struct HeadTransition {
     parent: HeadParent,
     candidate: Head,
@@ -85,6 +102,12 @@ pub struct HeadTransition {
 }
 
 impl HeadTransition {
+    /// Binds a candidate head to an already-published tail and its original boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError`] when the publication witness, sequence, parent tuple,
+    /// operation identity, canonical bytes, or owned controller fence is invalid.
     pub fn new(
         parent: HeadParent,
         candidate: Head,
@@ -184,16 +207,22 @@ impl HeadTransition {
     }
 }
 
+/// Final protocol knowledge after conditional mutation and retained-state resolution.
 #[must_use]
 pub enum HeadCommitOutcome {
+    /// The conditional write succeeded or exact current head and tail bytes prove it.
     Committed,
-    /// Candidate event is authoritative, including under a different current head operation.
+    /// The exact candidate event is authoritative under a different current head operation.
     CommittedSuperseded,
+    /// A complete chain reached the original boundary without the candidate event.
     ProvenNotCommitted,
+    /// The original parent remains current; the retained transition carries its refreshed ETag.
     RetryIdentically(HeadTransition),
+    /// Available storage state cannot prove commit or non-commit.
     Unresolved(HeadTransition),
 }
 
+/// Data-free failure category for append preparation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendError {
     Publication(PublicationError),
@@ -211,6 +240,15 @@ impl fmt::Display for AppendError {
 
 impl Error for AppendError {}
 
+/// Publishes the event, builds its witnessed head transition, and attempts the CAS.
+///
+/// Event publication precedes head-input validation. Invalid head input can therefore
+/// leave a retained immutable event that no authoritative head references.
+///
+/// # Errors
+///
+/// Returns [`AppendError::Publication`] when event publication is not definitive and
+/// [`AppendError::InvalidInput`] when the candidate head or transition is invalid.
 pub async fn append(
     store: &S3Store,
     parent: HeadParent,
@@ -236,6 +274,12 @@ pub async fn append(
     Ok(commit(store, transition, history).await)
 }
 
+/// Reads `head.json` and couples a canonical head to its response ETag.
+///
+/// # Errors
+///
+/// Returns [`HeadReadError::Storage`] for transport or missing-ETag failures and
+/// [`HeadReadError::Invalid`] for oversized, malformed, or noncanonical head bytes.
 pub async fn read(store: &S3Store) -> Result<Option<ObservedHead>, HeadReadError> {
     let outcome =
         store
@@ -259,7 +303,10 @@ pub async fn read(store: &S3Store) -> Result<Option<ObservedHead>, HeadReadError
     }
 }
 
-/// Each retry of a returned transition uses the same [`AttemptHistory`].
+/// Attempts the transition once, then resolves ambiguous state from retained objects.
+///
+/// Each retry of a returned transition uses the same [`AttemptHistory`]; replacing it
+/// discards possible-send evidence. This function performs no internal write retry.
 pub async fn commit(
     store: &S3Store,
     transition: HeadTransition,
@@ -424,10 +471,22 @@ struct WireEventRef {
     key: String,
 }
 
+/// Produces compact canonical JSON in the frozen field order.
+///
+/// # Errors
+///
+/// Returns [`WireError::InvalidEncoding`] when JSON serialization fails.
 pub fn encode(head: &Head) -> Result<Vec<u8>, WireError> {
     serde_json::to_vec(&WireHead::from(head)).map_err(|_| WireError::InvalidEncoding)
 }
 
+/// Decodes a head only when its bytes equal the production canonical encoding.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for empty or oversized input, malformed or alternate JSON,
+/// unknown versions, invalid authority identities, invalid event references, or an
+/// invalid head operation identity.
 pub fn decode(bytes: &[u8]) -> Result<Head, WireError> {
     if bytes.is_empty() || bytes.len() > MAX_HEAD_BYTES {
         return Err(WireError::LimitExceeded);

@@ -9,19 +9,23 @@ response."
 ## Observed behavior (bucket ravel-e02-4c038b2f, us-east-1, aws-sdk-s3 =1.135.0)
 
 Five bounded race campaigns (retry-disabled clients, `If-None-Match: *`,
-fresh key per round, truly concurrent contenders on separate clients):
+fresh key per round, concurrent contenders; campaigns 1-2 shared one
+client/connection pool, campaigns 3-5 used one client per contender on a
+multi-thread runtime):
 
 | campaign | rounds x contenders | body size | winners | losers -> status |
 | --- | --- | --- | --- | --- |
-| live-preflight-1786277980216998317-3017418 | 16 x 4 | ~14 B | 16 | 48 x 412 PreconditionFailed |
+| live-preflight-1786277980216998317-3017418 | 16 x 4 | 11-12 B | 16 | 48 x 412 PreconditionFailed |
 | live-preflight-1786278082998481517-3027912 | 16 x 4 | 4 MiB | 16 | 48 x 412 PreconditionFailed |
 | live-preflight-1786278443918750842-3042168 | 16 x 4 | 4 MiB | 16 | 48 x 412 PreconditionFailed |
 | live-preflight-1786278521681702809-3043213 | 4 x 16 | 16 KiB | 4 | 60 x 412 PreconditionFailed |
 | live-preflight-1786278706003695567-3055753 | 4 x 16 | 16 KiB | 4 | 60 x 412 PreconditionFailed |
 
-Counts and statuses above were recounted from the evidence JSON files. Body
-sizes come from each campaign's `RACE_BODY_BYTES` test configuration because
-the evidence schema does not record request-body size.
+Counts and statuses above were recounted from the evidence JSON files.
+Body sizes are cross-checkable against the evidence: each winner's
+`response_etag` equals the MD5 of the request body
+(`vec![contender; RACE_BODY_BYTES]` + `contender-{i}`), and all 56
+winner ETags match the sizes listed here.
 
 Zero 409 responses in 264 concurrent-loser observations.
 

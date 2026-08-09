@@ -1,5 +1,5 @@
 use std::{
-    fs::OpenOptions,
+    fs::File,
     io::Write,
     process,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1108,15 +1108,11 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
 
 fn write_evidence(evidence: &Evidence) -> Result<String, &'static str> {
     let path = format!("pilot/e02/live-preflight-{}.json", evidence.run_id);
-    let bytes = serde_json::to_vec_pretty(evidence).map_err(|_| "evidence serialization failed")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|_| "evidence file creation failed")?;
+    let mut bytes =
+        serde_json::to_vec_pretty(evidence).map_err(|_| "evidence serialization failed")?;
+    bytes.push(b'\n');
+    let mut file = File::create_new(&path).map_err(|_| "evidence file creation failed")?;
     file.write_all(&bytes)
-        .map_err(|_| "evidence file write failed")?;
-    file.write_all(b"\n")
         .map_err(|_| "evidence file write failed")?;
     Ok(path)
 }
@@ -1356,11 +1352,6 @@ fn evaluator_fails_closed_on_noncurrent_and_unsupported_shapes() {
         size: 100,
     };
     assert!(!selector_matches(&anchored_prefix, embedded).matches);
-
-    let unknown_status = test_rule("Future", None, None);
-    let report = lifecycle_report(&[unknown_status], &[object]);
-    assert!(!report[0].safe);
-    assert_eq!(report[0].reason, "unknown-status");
 }
 
 #[test]

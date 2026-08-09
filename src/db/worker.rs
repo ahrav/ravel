@@ -32,6 +32,13 @@ enum Command {
     Cursor {
         respond: oneshot::Sender<Result<(u64, Option<String>), ApplyError>>,
     },
+    ListReadyWork {
+        campaign_id: String,
+        capabilities: Vec<String>,
+        limit: usize,
+        after: Option<(String, String)>,
+        respond: oneshot::Sender<Result<Vec<(String, String)>, ApplyError>>,
+    },
     #[cfg(test)]
     Diagnostics {
         respond: oneshot::Sender<Result<Diagnostics, ApplyError>>,
@@ -176,6 +183,34 @@ impl DbHandle {
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
+    /// Queries ready work on the SQLite owner thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::DatabaseOperationFailed`] when command delivery, response receipt, or
+    /// the SQLite query fails.
+    pub async fn list_ready_work(
+        &self,
+        campaign_id: String,
+        capabilities: Vec<String>,
+        limit: usize,
+        after: Option<(String, String)>,
+    ) -> Result<Vec<(String, String)>, ApplyError> {
+        let (respond, receive) = oneshot::channel();
+        self.commands
+            .send(Command::ListReadyWork {
+                campaign_id,
+                capabilities,
+                limit,
+                after,
+                respond,
+            })
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?;
+        receive
+            .await
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
     #[cfg(test)]
     pub(crate) async fn diagnostics(&self) -> Result<Diagnostics, ApplyError> {
         let (respond, receive) = oneshot::channel();
@@ -221,6 +256,21 @@ fn run(
             }
             Command::Cursor { respond } => {
                 let _ = respond.send(read_cursor(&connection));
+            }
+            Command::ListReadyWork {
+                campaign_id,
+                capabilities,
+                limit,
+                after,
+                respond,
+            } => {
+                let _ = respond.send(projections::list_ready_work(
+                    &connection,
+                    &campaign_id,
+                    &capabilities,
+                    limit,
+                    after,
+                ));
             }
             #[cfg(test)]
             Command::Diagnostics { respond } => {
@@ -324,6 +374,13 @@ mod tests {
             handle.cursor().await.unwrap(),
             (1, Some(encoded.digest().to_owned()))
         );
+        assert!(
+            handle
+                .list_ready_work("0000000000000001".into(), Vec::new(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let diagnostics_after = handle.diagnostics().await.unwrap();
         assert_eq!(diagnostics_after.worker_thread, diagnostics.worker_thread);
@@ -345,6 +402,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queries_ready_work_through_the_owner() {
+        let path = path("ready-work");
+        let _ = fs::remove_file(&path);
+        let connection = schema::create(&path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
+                 INSERT INTO workflows (workflow_id, state) VALUES ('workflow', 'active');
+                 INSERT INTO work_items
+                     (work_id, workflow_id, state, budget_remaining, required_capabilities)
+                 VALUES ('work', 'workflow', 'ready', 1, 'rust');",
+            )
+            .unwrap();
+        drop(connection);
+        let handle = DbHandle::open_existing(path.clone()).await.unwrap();
+
+        assert_eq!(
+            handle
+                .list_ready_work("campaign".into(), vec!["rust".into()], 10, None)
+                .await
+                .unwrap(),
+            [("workflow".to_owned(), "work".to_owned())]
+        );
+
+        drop(handle);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn opens_valid_existing_projection_and_rejects_invalid_version() {
         let valid_path = path("existing-valid");
         let _ = fs::remove_file(&valid_path);
@@ -358,7 +444,7 @@ mod tests {
         let invalid_path = path("existing-invalid");
         let _ = fs::remove_file(&invalid_path);
         let connection = schema::create(&invalid_path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
         drop(connection);
         assert_eq!(
             DbHandle::open_existing(invalid_path.clone()).await.err(),

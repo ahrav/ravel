@@ -1,16 +1,17 @@
 //! Fixed schema for a disposable local SQLite projection.
 //!
-//! S3 is the durable authority. Schema version 1 comprises seven logical tables without
+//! S3 is the durable authority. Schema version 2 comprises seven logical tables without
 //! migration history, and the `RVL1` application id identifies this database format.
 //! `sync_cursor` holds one row, in one of two shapes: the genesis pairing of sequence 0 with a
 //! null digest, or a durable sequence paired with 64 lowercase hexadecimal digest characters.
+//! One database projects one campaign chain, so workflows need no campaign identity column.
 
 use std::{error::Error, fmt, path::Path};
 
 use rusqlite::OpenFlags;
 
 const APPLICATION_ID: i32 = 0x5256_4c31; // "RVL1"
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 const PROJECTION_TABLES: [&str; 7] = [
     "applied_events",
@@ -51,7 +52,8 @@ BEGIN
 END;
 
 CREATE TABLE campaigns (
-    campaign_id TEXT PRIMARY KEY NOT NULL
+    campaign_id TEXT PRIMARY KEY NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'completed'))
 ) STRICT;
 
 CREATE TABLE objectives (
@@ -59,11 +61,16 @@ CREATE TABLE objectives (
 ) STRICT;
 
 CREATE TABLE workflows (
-    workflow_id TEXT PRIMARY KEY NOT NULL
+    workflow_id TEXT PRIMARY KEY NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('active', 'completed'))
 ) STRICT;
 
 CREATE TABLE work_items (
-    work_id TEXT PRIMARY KEY NOT NULL
+    work_id TEXT PRIMARY KEY NOT NULL,
+    workflow_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('ready', 'done', 'cancelled')),
+    budget_remaining INTEGER NOT NULL CHECK (budget_remaining >= 0),
+    required_capabilities TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE dependencies (
@@ -489,14 +496,28 @@ mod tests {
             ]
         );
 
-        let columns = connection
-            .prepare("PRAGMA table_info(applied_events)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(columns, ["sequence", "digest"]);
+        let columns = |table: &str| {
+            connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(columns("applied_events"), ["sequence", "digest"]);
+        assert_eq!(columns("campaigns"), ["campaign_id", "state"]);
+        assert_eq!(columns("workflows"), ["workflow_id", "state"]);
+        assert_eq!(
+            columns("work_items"),
+            [
+                "work_id",
+                "workflow_id",
+                "state",
+                "budget_remaining",
+                "required_capabilities",
+            ]
+        );
 
         drop(connection);
         fs::remove_file(path).unwrap();
@@ -652,20 +673,24 @@ mod tests {
 
         for (insert, insert_null) in [
             (
-                "INSERT INTO campaigns (campaign_id) VALUES ('id')",
-                "INSERT INTO campaigns (campaign_id) VALUES (NULL)",
+                "INSERT INTO campaigns (campaign_id, state) VALUES ('id', 'active')",
+                "INSERT INTO campaigns (campaign_id, state) VALUES (NULL, 'active')",
             ),
             (
                 "INSERT INTO objectives (objective_id) VALUES ('id')",
                 "INSERT INTO objectives (objective_id) VALUES (NULL)",
             ),
             (
-                "INSERT INTO workflows (workflow_id) VALUES ('id')",
-                "INSERT INTO workflows (workflow_id) VALUES (NULL)",
+                "INSERT INTO workflows (workflow_id, state) VALUES ('id', 'active')",
+                "INSERT INTO workflows (workflow_id, state) VALUES (NULL, 'active')",
             ),
             (
-                "INSERT INTO work_items (work_id) VALUES ('id')",
-                "INSERT INTO work_items (work_id) VALUES (NULL)",
+                "INSERT INTO work_items \
+                 (work_id, workflow_id, state, budget_remaining, required_capabilities) \
+                 VALUES ('id', 'workflow', 'ready', 1, '')",
+                "INSERT INTO work_items \
+                 (work_id, workflow_id, state, budget_remaining, required_capabilities) \
+                 VALUES (NULL, 'workflow', 'ready', 1, '')",
             ),
         ] {
             connection.execute(insert, []).unwrap();
@@ -673,6 +698,18 @@ mod tests {
             // STRICT makes PRIMARY KEY columns implicitly NOT NULL, so the explicit clause
             // is belt-and-braces should STRICT ever be dropped.
             assert_constraint(connection.execute(insert_null, []));
+        }
+        for invalid in [
+            "INSERT INTO campaigns (campaign_id, state) VALUES ('bad-campaign', 'paused')",
+            "INSERT INTO workflows (workflow_id, state) VALUES ('bad-workflow', 'paused')",
+            "INSERT INTO work_items \
+             (work_id, workflow_id, state, budget_remaining, required_capabilities) \
+             VALUES ('bad-state', 'workflow', 'blocked', 1, '')",
+            "INSERT INTO work_items \
+             (work_id, workflow_id, state, budget_remaining, required_capabilities) \
+             VALUES ('bad-budget', 'workflow', 'ready', -1, '')",
+        ] {
+            assert_constraint(connection.execute(invalid, []));
         }
 
         connection
@@ -772,7 +809,7 @@ mod tests {
             (
                 "wrong-version",
                 "user_version",
-                2,
+                99,
                 ValidateError::WrongSchemaVersion,
             ),
         ] {

@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use ravel::{
     domain::campaign::{Authority, Event, EventContent, EventRef, Head},
-    sync::{event, head},
+    sync::{WireError, event, head},
 };
 use sha2::{Digest, Sha256};
 
@@ -77,6 +77,10 @@ fn literal_event_chain_decodes_and_reencodes_exactly() {
     assert_eq!(encoded_child.stored_bytes(), CHILD_BYTES);
     assert_eq!(encoded_child.digest(), CHILD_DIGEST);
     assert_eq!(encoded_child.key(), CHILD_KEY);
+    assert_eq!(
+        event::decode(GENESIS_BYTES, CHILD_KEY),
+        Err(WireError::ReferenceMismatch)
+    );
 }
 
 #[test]

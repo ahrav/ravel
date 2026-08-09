@@ -4,16 +4,17 @@
 //! Field order is part of v1's canonical encoding: `version`, `authority`,
 //! `tail`, then `operation_id`. Authority is `{"state":"unowned"}` or an
 //! owned map with `owner`, `instance`, `lease_until`, and `controller_fence`.
-//! Tail contains `sequence`, `digest`, then `key`. Decoding requires exact
-//! production re-encoding before domain conversion.
+//! Tail contains `sequence`, `digest`, then `key`. The decoder compares input
+//! bytes with the production re-encoding before domain conversion; this rejects
+//! extra fields on internally tagged unowned unit variants.
 
 use serde::{Deserialize, Serialize};
 
 use crate::domain::campaign::{Authority, AuthorityState, EventRef, Head};
 
-use super::WireError;
+use super::{WIRE_VERSION, WireError};
 
-const VERSION: u64 = 1;
+const MAX_HEAD_BYTES: usize = 4 * 1024;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +50,9 @@ pub fn encode(head: &Head) -> Result<Vec<u8>, WireError> {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Head, WireError> {
+    if bytes.is_empty() || bytes.len() > MAX_HEAD_BYTES {
+        return Err(WireError::LimitExceeded);
+    }
     let wire: WireHead = serde_json::from_slice(bytes).map_err(|_| WireError::InvalidEncoding)?;
     let canonical = serde_json::to_vec(&wire).map_err(|_| WireError::InvalidEncoding)?;
     if canonical != bytes {
@@ -60,7 +64,7 @@ pub fn decode(bytes: &[u8]) -> Result<Head, WireError> {
 impl From<&Head> for WireHead {
     fn from(head: &Head) -> Self {
         Self {
-            version: VERSION,
+            version: WIRE_VERSION,
             authority: WireAuthority::from(head.authority()),
             tail: WireEventRef::from(head.tail()),
             operation_id: head.operation_id().to_owned(),
@@ -101,7 +105,7 @@ impl TryFrom<WireHead> for Head {
     type Error = WireError;
 
     fn try_from(wire: WireHead) -> Result<Self, Self::Error> {
-        if wire.version != VERSION {
+        if wire.version != WIRE_VERSION {
             return Err(WireError::InvalidValue);
         }
         let authority = Authority::try_from(wire.authority)?;
@@ -132,6 +136,8 @@ impl TryFrom<WireAuthority> for Authority {
 mod tests {
     use super::*;
 
+    const OWNED_HEAD: &[u8] = include_bytes!("../../tests/fixtures/v1/head-owned.json");
+
     fn digest() -> String {
         "0".repeat(64)
     }
@@ -142,7 +148,7 @@ mod tests {
 
     fn valid_wire() -> WireHead {
         WireHead {
-            version: VERSION,
+            version: WIRE_VERSION,
             authority: WireAuthority::Unowned,
             tail: WireEventRef {
                 sequence: 1,
@@ -173,15 +179,15 @@ mod tests {
     fn rejects_unknown_version_and_invalid_values() {
         let mut wire = valid_wire();
         wire.version = 2;
-        assert!(decode(&bytes(&wire)).is_err());
+        assert_eq!(decode(&bytes(&wire)), Err(WireError::InvalidValue));
 
-        wire.version = VERSION;
+        wire.version = WIRE_VERSION;
         wire.tail.key = "bad".into();
-        assert!(decode(&bytes(&wire)).is_err());
+        assert_eq!(decode(&bytes(&wire)), Err(WireError::InvalidValue));
 
         wire.tail.key = key();
         wire.operation_id = "x".repeat(129);
-        assert!(decode(&bytes(&wire)).is_err());
+        assert_eq!(decode(&bytes(&wire)), Err(WireError::InvalidValue));
 
         wire.operation_id = "op".into();
         wire.authority = WireAuthority::Owned {
@@ -190,27 +196,108 @@ mod tests {
             lease_until: 1,
             controller_fence: 1,
         };
-        assert!(decode(&bytes(&wire)).is_err());
+        assert_eq!(decode(&bytes(&wire)), Err(WireError::InvalidValue));
     }
 
     #[test]
     fn rejects_noncanonical_and_unrecognized_json() {
         let canonical = String::from_utf8(bytes(&valid_wire())).unwrap();
-        assert!(decode(format!("{canonical}\n").as_bytes()).is_err());
-        assert!(decode(canonical.replace("\"version\":1,", "").as_bytes()).is_err());
-        assert!(
+        assert_eq!(
+            decode(format!("{canonical}\n").as_bytes()),
+            Err(WireError::NonCanonical)
+        );
+        assert_eq!(
+            decode(canonical.replace("\"version\":1,", "").as_bytes()),
+            Err(WireError::InvalidEncoding)
+        );
+        assert_eq!(
             decode(
                 canonical
                     .replace("{\"version\":1", "{\"version\":1,\"version\":1")
                     .as_bytes()
-            )
-            .is_err()
+            ),
+            Err(WireError::InvalidEncoding)
         );
-        assert!(decode(canonical.replace("\"unowned\"", "\"future\"").as_bytes()).is_err());
-        assert!(decode(canonical.replace("}", ",\"extra\":null}").as_bytes()).is_err());
+        assert_eq!(
+            decode(canonical.replace("\"unowned\"", "\"future\"").as_bytes()),
+            Err(WireError::InvalidEncoding)
+        );
+
+        let root_extra = canonical.strip_suffix('}').unwrap().to_owned() + ",\"extra\":null}";
+        assert_eq!(
+            decode(root_extra.as_bytes()),
+            Err(WireError::InvalidEncoding)
+        );
+        let authority_extra = canonical.replace(
+            "{\"state\":\"unowned\"}",
+            "{\"state\":\"unowned\",\"owner\":\"x\"}",
+        );
+        assert_eq!(
+            decode(authority_extra.as_bytes()),
+            Err(WireError::NonCanonical)
+        );
+        let tail_extra = canonical.replace("\"tail\":{", "\"tail\":{\"extra\":null,");
+        assert_eq!(
+            decode(tail_extra.as_bytes()),
+            Err(WireError::InvalidEncoding)
+        );
 
         let reordered = canonical.replacen("{\"version\":1,\"authority\":", "{\"authority\":", 1);
         let reordered = reordered.replacen("},\"tail\":", "},\"version\":1,\"tail\":", 1);
-        assert!(decode(reordered.as_bytes()).is_err());
+        assert_eq!(decode(reordered.as_bytes()), Err(WireError::NonCanonical));
+    }
+
+    #[test]
+    fn rejects_alternate_scalar_representations() {
+        let canonical = String::from_utf8(bytes(&valid_wire())).unwrap();
+        assert_eq!(
+            decode(
+                canonical
+                    .replace("\"version\":1", "\"version\":1.0")
+                    .as_bytes()
+            ),
+            Err(WireError::InvalidEncoding)
+        );
+        assert_eq!(
+            decode(
+                canonical
+                    .replace("\"version\":1", "\"version\":1e0")
+                    .as_bytes()
+            ),
+            Err(WireError::InvalidEncoding)
+        );
+        assert_eq!(
+            decode(
+                canonical
+                    .replace("\"operation_id\":\"op\"", "\"operation_id\":\"\\u006fp\"")
+                    .as_bytes()
+            ),
+            Err(WireError::NonCanonical)
+        );
+        assert_eq!(
+            decode(canonical.replace(&digest(), &"A".repeat(64)).as_bytes()),
+            Err(WireError::InvalidValue)
+        );
+
+        let owned = String::from_utf8(OWNED_HEAD.to_vec()).unwrap();
+        assert_eq!(
+            decode(
+                owned
+                    .replace("\"lease_until\":1750000000000", "\"lease_until\":-1")
+                    .as_bytes()
+            ),
+            Err(WireError::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn bounds_head_input_before_parsing() {
+        assert!(OWNED_HEAD.len() < MAX_HEAD_BYTES);
+        assert!(decode(OWNED_HEAD).is_ok());
+        assert_eq!(decode(&[]), Err(WireError::LimitExceeded));
+        assert_eq!(
+            decode(&vec![b' '; MAX_HEAD_BYTES + 1]),
+            Err(WireError::LimitExceeded)
+        );
     }
 }

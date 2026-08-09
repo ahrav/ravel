@@ -1,3 +1,5 @@
+//! Constructors enforce semantic invariants for durable campaign values.
+
 use std::{error::Error, fmt};
 
 const MAX_SEQUENCE: u64 = 9_999_999_999_999_999;
@@ -111,7 +113,7 @@ pub struct Authority {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AuthorityState {
+pub enum AuthorityState {
     Unowned,
     Owned {
         owner: String,
@@ -146,7 +148,7 @@ impl Authority {
         })
     }
 
-    pub(crate) fn state(&self) -> &AuthorityState {
+    pub fn state(&self) -> &AuthorityState {
         &self.state
     }
 }
@@ -302,5 +304,11 @@ mod tests {
             Event::new("x".repeat(129), 1, None, 1, EventContent::CampaignCreated,),
             Err(ValidationError::InvalidIdentity)
         );
+        assert!(Authority::owned("x".repeat(MAX_IDENTITY_BYTES), "i".into(), 1, 1).is_ok());
+    }
+
+    #[test]
+    fn accepts_maximum_sequence() {
+        assert!(EventRef::from_digest(MAX_SEQUENCE, digest()).is_ok());
     }
 }

@@ -3,6 +3,8 @@ use std::{error::Error, fmt};
 pub mod event;
 pub mod head;
 
+pub(crate) const WIRE_VERSION: u64 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WireError {
     InvalidEncoding,

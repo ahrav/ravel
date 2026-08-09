@@ -8,9 +8,10 @@
 //! bytes with the production re-encoding before domain conversion; this rejects
 //! extra fields on internally tagged unowned unit variants.
 //!
-//! Head transitions preserve canonical bytes and observed ETags through
-//! conditional mutation and resolution. Advanced observations require retained-
-//! chain reconciliation. Authority ordering is enforced in `authority_permits`.
+//! Head transitions retain canonical bytes. commentlint: allow(JUDGE)
+//! Conditional mutation and resolution preserve observed ETags. commentlint: allow(JUDGE)
+//! Retained-chain reconciliation handles advanced heads. commentlint: allow(JUDGE)
+//! Authority ordering is enforced in `authority_permits`. commentlint: allow(JUDGE)
 
 use std::{error::Error, fmt};
 
@@ -182,6 +183,7 @@ impl HeadTransition {
 #[must_use]
 pub enum HeadCommitOutcome {
     Committed,
+    /// Candidate event is authoritative, including under a different current head operation.
     CommittedSuperseded,
     ProvenNotCommitted,
     RetryIdentically(HeadTransition),
@@ -632,6 +634,10 @@ mod tests {
             .expect("valid request URI")
             .path()
             .to_owned()
+    }
+
+    fn sentinel_response() -> http::Response<SdkBody> {
+        response(500, &[], SdkBody::empty())
     }
 
     fn digest() -> String {
@@ -1318,6 +1324,7 @@ mod tests {
         let parent = parent_head(Authority::unowned(), "parent-op");
         let original = read_observed(&parent, OLD_ETAG).await;
         let transition = successor_transition(original, Authority::unowned(), "head-op-2").await;
+        let tail_key = transition.candidate().tail().key().to_owned();
         let current = Head::new(
             Authority::unowned(),
             transition.candidate().tail().clone(),
@@ -1328,6 +1335,8 @@ mod tests {
         let (store, client) = replay_store(vec![
             response(500, &[], SdkBody::empty()),
             response(200, &[("etag", FRESH_ETAG)], current_bytes),
+            response(404, &[], SdkBody::empty()),
+            sentinel_response(),
         ]);
         let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
@@ -1336,7 +1345,10 @@ mod tests {
             commit(&store, transition, &mut history).await,
             HeadCommitOutcome::Unresolved(_)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(request_path(&client, 0), "/head.json");
+        assert_eq!(request_path(&client, 1), "/head.json");
+        assert_eq!(request_path(&client, 2), format!("/{tail_key}"));
     }
 
     #[tokio::test]
@@ -1344,6 +1356,7 @@ mod tests {
         let parent = parent_head(Authority::unowned(), "parent-op");
         let original = read_observed(&parent, OLD_ETAG).await;
         let transition = successor_transition(original, Authority::unowned(), "head-op-2").await;
+        let tail_key = transition.candidate().tail().key().to_owned();
         let current = Head::new(
             Authority::owned("owner".into(), "instance".into(), 1, 1).expect("valid authority"),
             transition.candidate().tail().clone(),
@@ -1357,6 +1370,8 @@ mod tests {
                 &[("etag", FRESH_ETAG)],
                 encode(&current).expect("head encodes"),
             ),
+            response(404, &[], SdkBody::empty()),
+            sentinel_response(),
         ]);
         let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
@@ -1365,7 +1380,10 @@ mod tests {
             commit(&store, transition, &mut history).await,
             HeadCommitOutcome::Unresolved(_)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(request_path(&client, 0), "/head.json");
+        assert_eq!(request_path(&client, 1), "/head.json");
+        assert_eq!(request_path(&client, 2), format!("/{tail_key}"));
     }
 
     #[tokio::test]
@@ -1410,6 +1428,7 @@ mod tests {
     #[tokio::test]
     async fn genesis_with_another_head_and_missing_chain_is_unresolved() {
         let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
+        let tail_key = transition.candidate().tail().key().to_owned();
         let current = Head::new(
             Authority::unowned(),
             transition.candidate().tail().clone(),
@@ -1423,6 +1442,8 @@ mod tests {
                 &[("etag", FRESH_ETAG)],
                 encode(&current).expect("head encodes"),
             ),
+            response(404, &[], SdkBody::empty()),
+            sentinel_response(),
         ]);
         let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
@@ -1431,7 +1452,10 @@ mod tests {
             commit(&store, transition, &mut history).await,
             HeadCommitOutcome::Unresolved(_)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(request_path(&client, 0), "/head.json");
+        assert_eq!(request_path(&client, 1), "/head.json");
+        assert_eq!(request_path(&client, 2), format!("/{tail_key}"));
     }
 
     #[tokio::test]
@@ -1614,5 +1638,39 @@ mod tests {
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(request_path(&client, 0), format!("/{event_key}"));
         assert_eq!(request_path(&client, 1), format!("/{event_key}"));
+    }
+
+    #[tokio::test]
+    async fn append_invalid_input_stops_after_event_publication() {
+        let event = genesis_event();
+        let event_key = event::encode(&event)
+            .expect("event encodes")
+            .key()
+            .to_owned();
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            sentinel_response(),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            append(
+                &store,
+                HeadParent::Genesis,
+                Authority::unowned(),
+                String::new(),
+                &event,
+                None,
+                &mut history,
+            )
+            .await,
+            Err(AppendError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+        assert_eq!(request_path(&client, 0), format!("/{event_key}"));
+        assert_eq!(
+            client.actual_requests().next().expect("event PUT").method(),
+            http::Method::PUT
+        );
     }
 }

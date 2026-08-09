@@ -11,6 +11,11 @@ use crate::sync::event::{SchedulingEffect, SchedulingMutation};
 
 const MAX_READY_WORK: usize = 1_024;
 
+#[cfg(test)]
+/// Installs the `fail_cursor_update` trigger; removal drops that exact name.
+pub(crate) const FAIL_CURSOR_TRIGGER: &str = "CREATE TRIGGER fail_cursor_update BEFORE UPDATE ON sync_cursor \
+     BEGIN SELECT RAISE(ABORT, 'injected'); END;";
+
 /// Distinguishes a committed mutation from an exact historical replay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyOutcome {
@@ -146,6 +151,8 @@ pub fn apply(
     if updated != 1 {
         return Err(ApplyError::DatabaseOperationFailed);
     }
+    #[cfg(test)]
+    crate::sync::replay::test_crash::reach("before-commit");
     transaction.commit()?;
     Ok(ApplyOutcome::Applied)
 }
@@ -538,12 +545,7 @@ pub(crate) mod tests {
         let mut connection = schema::create(&path).unwrap();
         let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
         assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        connection
-            .execute_batch(
-                "CREATE TRIGGER fail_cursor_update BEFORE UPDATE ON sync_cursor \
-                     BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-            )
-            .unwrap();
+        connection.execute_batch(FAIL_CURSOR_TRIGGER).unwrap();
         let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
         let before = snapshot(&connection);
 

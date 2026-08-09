@@ -72,6 +72,15 @@ and evidentiary basis: ≥ 1 `file:line` citation into the frozen tree.
 A claim without a citation is not a material conclusion (it grades
 unresolved if submitted; see §7).
 
+**Segmentation (predeclared).** Treatment prompts require conclusions as
+a flat list under a `Conclusions` heading — one conclusion per list item,
+each item carrying its own citation(s). One list item = one candidate
+conclusion, taken verbatim. No post-hoc splitting or merging: an item
+bundling several claims is graded as a single compound claim (SUPPORTED
+only if the whole claim as stated is substantiated), and text outside the
+list is not graded. Segmentation is therefore fixed before any output is
+visible; no splitter can change the counts afterward.
+
 **Equivalence.** Two conclusions are equivalent iff they name the same
 mechanism (same file/function in the tree) AND assert the same behavior
 at the same scope with the same polarity. Paraphrase is irrelevant.
@@ -79,6 +88,17 @@ Stronger, weaker, differently scoped, or opposite-polarity claims about
 the same mechanism are **not** equivalent. If the judges disagree on
 equivalence, the fixed outcome is **not equivalent** (deterministic,
 conservative — never adjudicated upward after outputs are visible).
+
+**Class construction (deterministic).** Pairwise judgments are not
+assumed transitive. Classes are built greedily in emission order: the
+first conclusion opens class 1; each later conclusion is judged against
+the **first-emitted member** of each existing class, in class-creation
+order, and joins the first class judged equivalent (per the pair rule
+above, disagreement → not equivalent); otherwise it opens a new class.
+Only these (conclusion, first-member) pairs are judged, so identical
+recorded judgments always yield identical classes, duplicate counts, and
+omission results — non-transitivity cannot arise because membership is
+never decided by more than one pair.
 
 **Deduplication.** Within one treatment's deduplicated output, an
 equivalence class counts once. The retained member is the most precisely
@@ -176,8 +196,8 @@ settings as-is:
 
 One verdict each per conclusion; one equivalence decision each per
 conclusion pair under test — (candidate, reference) pairs for omission
-matching, and (candidate, candidate) pairs within one treatment's output
-for deduplication (§4). No re-prompting,
+matching, and (conclusion, class-first-member) pairs within one
+treatment's output for deduplication per §4's class construction. No re-prompting,
 no averaging, no third tie-breaker (the disagreement rules in §7/§8 make
 one unnecessary).
 
@@ -198,7 +218,8 @@ Conclusion 1: {reference conclusion, citations included}
 Conclusion 2: {candidate conclusion, citations included}
 
 Answer with exactly one word on the first line: EQUIVALENT or DISTINCT.
-Then one sentence naming the mechanism each conclusion refers to.
+Then one sentence naming the mechanism each conclusion refers to, with a
+file:line citation into the frozen revision locating each mechanism.
 ```
 
 Verdict prompt:
@@ -228,7 +249,12 @@ verdict counts only if it cites `file:line` evidence that checks out at
 the frozen revision (the cited lines exist and contain what the verdict
 says they contain, verifiable with `git show`). A verdict without a
 checkable citation is discarded and the conclusion records as
-**unresolved**.
+**unresolved**. The same guard applies to equivalence: an EQUIVALENT
+decision counts only if its mechanism citations check out at the frozen
+revision and locate the same mechanism for both conclusions; otherwise
+that judge's decision records as DISTINCT (the conservative default —
+EQUIVALENT is the upgrading decision, suppressing duplicates and
+resolving omissions, so it is the one that must be evidence-backed).
 
 ## 7. Outcome classes (objective definitions)
 

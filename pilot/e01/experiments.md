@@ -137,12 +137,13 @@ runs within a block execute in the listed order.
   skipped, cut short, or reclassified by a campaign limit reached after
   treatment execution ended. Campaign caps bound **treatment execution
   only**; trusted measurement is separately and hard-bounded by
-  `budgets.yaml` `measurement_spend_usd` (blinded grading judge calls;
+  `budgets.yaml` `measurement_spend_usd` and `measurement_deadline_days`
+  (blinded grading judge calls;
   final rediscovery is one trusted script run with no provider calls)
   under the fixed `research.md` protocol (one pass, fixed judge calls
   per conclusion, never re-prompted). Post-cap measurement of a
   complete run therefore neither exceeds a precommitted limit nor goes
-  unbounded. If `measurement_spend_usd` is exhausted before every
+  unbounded. If a measurement cap is exhausted before every
   complete run is fully measured, already-graded verdicts stand,
   everything ungraded is `unresolved`, and the affected pilot's outcome
   is **Inconclusive (budget-stopped)** under the rule below. The §6/§7

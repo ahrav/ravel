@@ -44,6 +44,9 @@ caps:
   # provider calls. Hard-limit behavior below applies: work already graded
   # stands, everything ungraded is emitted unresolved.
   measurement_spend_usd: 50
+  # measurement_deadline_days starts when treatment execution ends for the
+  # last complete run. Same hard-limit behavior as measurement_spend_usd.
+  measurement_deadline_days: 2
 
 # Applies identically to every cap above.
 hard_limit_behavior:

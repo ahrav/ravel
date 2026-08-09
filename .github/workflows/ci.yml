@@ -24,6 +24,9 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Install aarch64 cross compiler
+        run: sudo apt-get update && sudo apt-get install --yes gcc-aarch64-linux-gnu
+
       - name: Check formatting
         run: cargo fmt --check
 

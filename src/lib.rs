@@ -7,6 +7,7 @@
 //! tokens.
 
 pub mod db {
+    pub mod projections;
     pub mod schema;
 }
 

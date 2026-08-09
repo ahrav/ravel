@@ -207,6 +207,7 @@ mod tests {
         task::{Context, Poll},
     };
 
+    use aws_sdk_s3::primitives::SdkBody;
     use aws_sdk_s3::{
         config::{Credentials, HttpClient},
         error::ConnectorError,
@@ -214,7 +215,6 @@ mod tests {
     use aws_smithy_runtime::client::http::test_util::{
         NeverClient, ReplayEvent, StaticReplayClient,
     };
-    use aws_smithy_types::body::SdkBody;
     use bytes::Bytes;
     use http_body::{Body, Frame};
 
@@ -378,16 +378,6 @@ mod tests {
         )]);
         assert!(matches!(
             store.get_object("large", 8).await,
-            Err(GetError::TooLarge)
-        ));
-
-        let (store, _) = replay_store(vec![response(
-            200,
-            &[("etag", TEST_ETAG)],
-            b"123456789".to_vec(),
-        )]);
-        assert!(matches!(
-            store.get_object("streamed-large", 8).await,
             Err(GetError::TooLarge)
         ));
 

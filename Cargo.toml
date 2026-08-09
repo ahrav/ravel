@@ -14,7 +14,6 @@ path = "src/main.rs"
 # S3 requests use the official AWS SDK with the Tokio HTTPS client.
 aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
   "default-https-client",
-  "http-1x",
   "rt-tokio",
 ] }
 # The event format uses deterministic v1 CBOR encoding.
@@ -35,7 +34,6 @@ aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
 aws-smithy-runtime = { version = "=1.12.1", default-features = false, features = [
   "test-util",
 ] }
-aws-smithy-types = "=1.6.1"
 bytes = "=1.12.1"
 http = "=1.4.2"
 http-body = "=1.1.0"

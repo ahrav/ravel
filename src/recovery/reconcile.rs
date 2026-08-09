@@ -1,10 +1,5 @@
 //! Reconciles ambiguous head mutations by reading an exact retained-event boundary.
 //!
-//! Head resolution routes every observation here except a recognized candidate head and
-//! a byte-identical original parent. A start sequence at or below the boundary sequence
-//! is unresolved before any read, so a genesis boundary or a head that did not advance
-//! costs no GET.
-//!
 //! The walk follows parent keys from `current.head().tail()` until it reaches the
 //! original parent tuple or an event at sequence 1 with no parent. The sequence
 //! difference determines the hop count; there is no open-ended loop or configurable

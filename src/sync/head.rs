@@ -199,7 +199,9 @@ pub enum HeadCommitOutcome {
     CommittedSuperseded,
     /// A complete chain reached the original boundary without the candidate event.
     ProvenNotCommitted,
-    /// The original parent remains current; the retained transition carries its refreshed ETag.
+    /// Resubmitting the retained transition is safe. Three states produce it: a write
+    /// proven not sent, a genesis boundary whose head is still absent, or byte-identical
+    /// head bytes whose refreshed ETag the transition now carries.
     RetryIdentically(HeadTransition),
     /// Available storage state cannot prove commit or non-commit.
     Unresolved(HeadTransition),

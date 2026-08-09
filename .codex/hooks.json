@@ -24,6 +24,19 @@
         "matcher": "manual|auto"
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "bash .agents/hooks/block-main.sh",
+            "statusMessage": "Checking main-branch policy",
+            "timeout": 15,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|bash|shell"
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [

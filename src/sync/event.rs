@@ -164,6 +164,25 @@ pub fn scheduling_mutation(
     {
         return Err(ConversionError::ReferenceMismatch);
     }
+    projected_mutation(reference, event)
+}
+
+/// Pairs `reference` with `event`'s row effect without re-deriving the reference.
+///
+/// Apply-layer tests need mutations whose digests collide across sequences or
+/// diverge at one sequence, which [`scheduling_mutation`] rejects by design.
+#[cfg(test)]
+pub(crate) fn scheduling_mutation_unchecked(
+    reference: EventRef,
+    event: &Event,
+) -> Result<SchedulingMutation, ConversionError> {
+    projected_mutation(reference, event)
+}
+
+fn projected_mutation(
+    reference: EventRef,
+    event: &Event,
+) -> Result<SchedulingMutation, ConversionError> {
     // No wildcard arm: a new EventContent variant must fail compilation here rather than
     // silently project nothing.
     let effect = match (event.content(), event.sequence()) {

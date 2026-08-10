@@ -1,4 +1,21 @@
-//! Exact-boundary reconciliation for ambiguous append-time head mutations.
+//! Reconciles ambiguous head mutations by reading an exact retained-event boundary.
+//!
+//! The walk follows parent keys from `current.head().tail()` until it reaches the
+//! original parent tuple or an event at sequence 1 with no parent. The sequence
+//! difference determines the hop count; there is no open-ended loop or configurable
+//! depth. A genesis boundary costs one sequential GET per retained event between the
+//! current tail and sequence 1.
+//!
+//! Every hop uses a 256 KiB bounded GET and the event decoder. Decoding binds stored
+//! bytes to the expected key. `Event::new` rejects a parent whose sequence is not one
+//! less than its child, making repeated keys and cycles unreachable after decoding.
+//! The repeated-digest and explicit sequence checks remain corruption backstops.
+//!
+//! A candidate-operation match sets `found`; traversal continues until the boundary.
+//! Commit requires the candidate's exact reference, stored bytes, and decoded value.
+//! Reaching the boundary without the candidate proves non-commit. A gap, ambiguous
+//! read, malformed event, conflicting operation identity, or wrong boundary remains
+//! unresolved.
 
 use std::collections::HashSet;
 
@@ -38,7 +55,7 @@ pub(crate) async fn reconcile(
     let mut found = false;
 
     for _ in 0..hop_count {
-        // `Event::new` makes repeated digests unreachable under sequence descent; this set is a corruption backstop. commentlint: allow(JUDGE)
+        // `Event::new` enforces sequence descent; this set is a corruption backstop.
         if !seen_digests.insert(current_ref.digest().to_owned()) {
             return HeadCommitOutcome::Unresolved(transition);
         }
@@ -65,7 +82,7 @@ pub(crate) async fn reconcile(
             }
             found = true;
         } else if current_ref == *transition.candidate().tail() {
-            // `event::decode` binds bytes to this key; exact comparison is a collision backstop. commentlint: allow(JUDGE)
+            // `event::decode` binds bytes to the key; this is a hash-collision backstop.
             return HeadCommitOutcome::Unresolved(transition);
         }
 

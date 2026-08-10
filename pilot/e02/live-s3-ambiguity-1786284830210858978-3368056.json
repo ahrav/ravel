@@ -1,0 +1,100 @@
+{
+  "run_id": "1786284830210858978-3368056",
+  "prefix": "e02-ambiguity/1786284830210858978-3368056",
+  "bucket": "ravel-e02-4c038b2f",
+  "region": "us-east-1",
+  "injected_responses": [
+    {
+      "step": "scenario-a-head-put",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": "If-Match",
+      "supplied_etag": null,
+      "classification": "dropped-response",
+      "status": 200,
+      "error_code": null,
+      "request_id": "76E6RADAQYNSGM55",
+      "extended_request_id": "60Vven2ueaFIVnynkcSMBN/E5DOruyuYXNozzhVGfWVpFrDozkWpZkBubTryIZkYCkRlNcMOl/o=",
+      "response_etag": "\"0e2dca6cb28be24819022b570a797ed3\""
+    },
+    {
+      "step": "scenario-b-head-put",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": "If-Match",
+      "supplied_etag": null,
+      "classification": "dropped-response",
+      "status": 200,
+      "error_code": null,
+      "request_id": "76EDN6PRJS99K3C5",
+      "extended_request_id": "AlXx+togvFWkjeU/eJpnbf96x+Om3rDluWmR33jPafuSY2+rJ3Uax/KC6tCxk1Yj2iqXnRyWWmP9HqlyVeoGMQsKwU4Gxkc8",
+      "response_etag": "\"c5ddf8c64eaf5b89099ece5efcc2323c\""
+    },
+    {
+      "step": "scenario-b-head-read",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": null,
+      "supplied_etag": null,
+      "classification": "dropped-response",
+      "status": 200,
+      "error_code": null,
+      "request_id": "KAWE7AF9WZE9R1N4",
+      "extended_request_id": "sV21pztAiS/sKrD/bF7ADAsPViN1uXU3scVBXdYzm4HzrhMpHmmeUDszS9PfvyJmQe7wXy4r/7u0j9L2cT5WYdAlfBZm2BkF",
+      "response_etag": "\"c5ddf8c64eaf5b89099ece5efcc2323c\""
+    },
+    {
+      "step": "scenario-b-identical-resend",
+      "client": "production-interceptor",
+      "key": "head.json",
+      "condition": "If-Match",
+      "supplied_etag": null,
+      "classification": "observed-response",
+      "status": 412,
+      "error_code": null,
+      "request_id": "KAW385NFCRPQJTRP",
+      "extended_request_id": "vjz4VYEJis0VodeoYIWgcRDISr9A/Q2lQ/FAKsyTKkJHMTjGrOOVEqK3mdQTGQCNTjIWH9+upQtQ74vo8MjK3z2rwPxwrQxj",
+      "response_etag": null
+    }
+  ],
+  "scenario_a": {
+    "initial_outcome": "committed",
+    "resend_outcome": null,
+    "head_operation_id": "1786284830210858978-3368056-dropped-success-head",
+    "event_operation_id": "1786284830210858978-3368056-dropped-success-event",
+    "event_key": "0000000000000013-3188bca93c8e62a0f65fb3916ed34c80d1e15c21028e499d8a698fdd3f2d549a.cbor.zst"
+  },
+  "scenario_b": {
+    "initial_outcome": "unresolved",
+    "resend_outcome": "committed-after-412",
+    "head_operation_id": "1786284830210858978-3368056-missing-evidence-head",
+    "event_operation_id": "1786284830210858978-3368056-missing-evidence-event",
+    "event_key": "0000000000000014-aa1bcb77f06e40698977d3c02a6e4ca7d7e4388a385a76492fe8b36e6e2bd391.cbor.zst"
+  },
+  "workers": [
+    {
+      "classification": "proven-not-committed",
+      "worker_id": 0,
+      "event_operation_id": "1786284830210858978-3368056-event-0",
+      "event_key": "0000000000000015-21e14f4023e2a896db9b7828574cfa98048d5e27374b050d781c0899ac86b8bc.cbor.zst",
+      "head_operation_id": "1786284830210858978-3368056-head-0",
+      "artifact_digest": "99be0f1120a0a4cc525011f1eceff204e54255b121bc06172a8c53b885cf6f66",
+      "artifact_key": "artifacts/sha256/99be0f1120a0a4cc525011f1eceff204e54255b121bc06172a8c53b885cf6f66"
+    },
+    {
+      "classification": "committed",
+      "worker_id": 1,
+      "event_operation_id": "1786284830210858978-3368056-event-1",
+      "event_key": "0000000000000015-b439879808b8f7b984c7ed2f9cc19cd88f5fc30c04ff5aae67e07b8c52f8f174.cbor.zst",
+      "head_operation_id": "1786284830210858978-3368056-head-1",
+      "artifact_digest": "0ec8da2347d6cb46f76c26ed7b5b7ca82b39d7726131fe626b81eae48ec58fba",
+      "artifact_key": "artifacts/sha256/0ec8da2347d6cb46f76c26ed7b5b7ca82b39d7726131fe626b81eae48ec58fba"
+    }
+  ],
+  "winner_event_key": "0000000000000015-b439879808b8f7b984c7ed2f9cc19cd88f5fc30c04ff5aae67e07b8c52f8f174.cbor.zst",
+  "loser_event_key": "0000000000000015-21e14f4023e2a896db9b7828574cfa98048d5e27374b050d781c0899ac86b8bc.cbor.zst",
+  "winner_artifact_key": "artifacts/sha256/0ec8da2347d6cb46f76c26ed7b5b7ca82b39d7726131fe626b81eae48ec58fba",
+  "loser_artifact_key": "artifacts/sha256/99be0f1120a0a4cc525011f1eceff204e54255b121bc06172a8c53b885cf6f66",
+  "final_validation": "passed",
+  "result": "passed"
+}

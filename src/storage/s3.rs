@@ -1,6 +1,17 @@
 //! Concrete Amazon S3 boundary for bounded reads and conditional writes.
 //!
-//! Mutation outcomes preserve ambiguity when request dispatch cannot be ruled out.
+//! Client construction disables SDK retries and applies a 30-second operation timeout
+//! plus a 10-second attempt timeout after caller configuration. Mutation methods mark
+//! [`AttemptHistory`] before awaiting the SDK, so cancellation retains possible-send
+//! evidence. Only the pre-dispatch size rejection and a construction failure with clean
+//! history prove that no request was sent; transport, timeout, response, and
+//! unclassified service failures remain
+//! [`MutationOutcome::Unknown`]. A `409` or `412` after possible-send evidence becomes
+//! [`MutationOutcome::AmbiguousConflict`].
+//!
+//! Immutable publication performs at most two byte-identical create-only PUTs and one
+//! exact-key verification GET. Verification ignores ETags, hashes the streamed body,
+//! and requires its measured size to match.
 
 use std::{
     error::Error,
@@ -24,14 +35,21 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Opaque S3 version token passed unchanged to `If-Match`.
+///
+/// The type exposes no content-hash, ordering, parsing, or string-access API.
 #[derive(PartialEq)]
 pub struct ETag(String);
 
+/// Result of a bounded full-object read.
 pub enum GetOutcome {
+    /// Complete bytes coupled to the opaque ETag from the same response.
     Found { bytes: Vec<u8>, etag: ETag },
+    /// Service response with HTTP status `404`.
     NotFound,
 }
 
+/// Data-free failure category for a bounded object read.
 #[derive(Debug)]
 pub enum GetError {
     TooLarge,
@@ -51,18 +69,28 @@ impl fmt::Display for GetError {
 
 impl Error for GetError {}
 
+/// Knowledge retained after one physical conditional-write attempt.
 #[derive(PartialEq)]
 pub enum MutationOutcome {
+    /// S3 returned success; the response may omit an ETag.
     Committed { etag: Option<ETag> },
+    /// Service response with HTTP status `404`; send history does not gate this outcome.
     NotFound,
+    /// Service response with HTTP status `409` and no prior possible-send evidence.
     Conflict,
+    /// Service response with HTTP status `412` and no prior possible-send evidence.
     PreconditionFailed,
+    /// `409` or `412` when prior possible-send evidence exists.
     AmbiguousConflict,
+    /// No available evidence proves whether S3 accepted the request.
     Unknown,
+    /// Request construction failed before any dispatch was possible.
     ProvenNotSent,
+    /// Input exceeded the single-PUT limit before request construction.
     TooLarge,
 }
 
+/// Data-free failure category for immutable publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationError {
     InvalidInput,
@@ -128,6 +156,14 @@ impl AttemptHistory {
     }
 }
 
+impl AttemptHistory {
+    /// An earlier attempt in this publication may have reached S3.
+    pub fn may_have_been_sent(&self) -> bool {
+        self.may_have_been_sent
+    }
+}
+
+/// Narrow S3 client with enforced retry and timeout policy.
 pub struct S3Store {
     client: aws_sdk_s3::Client,
     bucket: String,
@@ -135,6 +171,9 @@ pub struct S3Store {
 }
 
 impl S3Store {
+    /// Builds a client after overriding caller retry, timeout, region, and behavior policy.
+    ///
+    /// Caller-provided credentials, HTTP clients, and interceptors remain installed.
     pub fn new(bucket: impl Into<String>, region: Region, builder: Builder) -> Self {
         static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
 
@@ -163,6 +202,16 @@ impl S3Store {
         &self.namespace
     }
 
+    /// Reads a complete object without accumulating beyond `max_bytes`.
+    ///
+    /// A found object must include an ETag, but the ETag does not establish content
+    /// identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GetError::TooLarge`] when either declared or streamed length exceeds
+    /// the bound, [`GetError::MissingETag`] for a successful response without a token,
+    /// and [`GetError::Transport`] for every other SDK or body-stream failure.
     pub async fn get_object(&self, key: &str, max_bytes: usize) -> Result<GetOutcome, GetError> {
         let output = match self
             .client
@@ -201,6 +250,9 @@ impl S3Store {
         Ok(GetOutcome::Found { bytes, etag })
     }
 
+    /// Sends one create-only PUT and records possible dispatch before awaiting it.
+    ///
+    /// The request uses `If-None-Match: *`; SDK retries remain disabled.
     pub async fn put_if_absent(
         &self,
         key: &str,
@@ -223,6 +275,9 @@ impl S3Store {
         .await
     }
 
+    /// Sends one replacement PUT with the exact opaque token from a validated read.
+    ///
+    /// Possible dispatch is recorded before awaiting the retry-disabled SDK call.
     pub async fn put_if_match(
         &self,
         key: &str,
@@ -258,6 +313,10 @@ impl S3Store {
             .await
     }
 
+    /// Runs bounded immutable publication while preserving caller-owned send history.
+    ///
+    /// A typed `404` from verification permits one byte-identical resend. Any second
+    /// conflict or unknown result remains unresolved.
     pub(crate) async fn publish_with_history(
         &self,
         key: &str,

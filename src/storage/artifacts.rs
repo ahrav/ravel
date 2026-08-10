@@ -1,6 +1,9 @@
 //! Raw artifact blobs use `artifacts/sha256/{digest}` keys and contain no metadata.
 //!
-//! Publication rejects payloads above 10 MiB before object-store I/O.
+//! SHA-256 covers the raw bytes. Publication rejects payloads above 10 MiB before
+//! hashing or object-store I/O, and duplicate keys require full-byte verification.
+//! Per-producer metadata remains in [`ArtifactRef`], so multiple attempts can name
+//! the same blob without overwriting metadata.
 
 use sha2::{Digest, Sha256};
 
@@ -8,9 +11,12 @@ use crate::domain::campaign::ArtifactRef;
 
 use super::s3::{PublicationError, S3Store};
 
+/// Artifact publication rejects inputs larger than 10 MiB before hashing or dispatch.
 pub const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Proof that immutable artifact bytes are present at their digest key.
+///
+/// Only [`publish`] constructs this witness; artifact-bearing events require it.
 ///
 /// The witness records the object-store namespace it was minted against: the
 /// digest key alone is identical in every bucket, so a witness from one store
@@ -31,6 +37,12 @@ impl PublishedArtifact {
     }
 }
 
+/// Publishes a bytes-only blob and returns metadata authorized to enter an event.
+///
+/// # Errors
+///
+/// Returns [`PublicationError`] when the payload exceeds 10 MiB, metadata is invalid,
+/// an existing object differs in size or digest, or storage cannot prove publication.
 pub async fn publish(
     store: &S3Store,
     bytes: Vec<u8>,

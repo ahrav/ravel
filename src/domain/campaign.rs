@@ -1,10 +1,20 @@
-//! Constructors enforce semantic invariants for durable campaign values.
+//! Validated domain values for the durable event chain and authority-bearing head.
+//!
+//! Constructors are the semantic boundary between permissive wire decoders and
+//! protocol state. Event sequences occupy `1..=9_999_999_999_999_999`, which keeps
+//! the decimal sequence component of every event key at exactly 16 digits. Sequence
+//! 1 has no parent; every subsequent event names the immediately preceding sequence.
+//! Digests are 64 lowercase hexadecimal bytes, and durable identities are nonempty
+//! UTF-8 strings of at most 128 bytes.
+//!
+//! `ArtifactRef` validates durable metadata but accepts any `u64` size.
 
 use std::{error::Error, fmt};
 
 const MAX_SEQUENCE: u64 = 9_999_999_999_999_999;
 const MAX_IDENTITY_BYTES: usize = 128;
 
+/// Sequence, digest, and derived key for one immutable event object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventRef {
     sequence: u64,
@@ -13,6 +23,13 @@ pub struct EventRef {
 }
 
 impl EventRef {
+    /// Validates the sequence and digest, then requires `key` to equal the derived key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] for a sequence outside the durable range or a digest
+    /// that is not 64-byte lowercase hexadecimal text. A key that does not match the
+    /// sequence and digest also fails validation.
     pub fn new(sequence: u64, digest: String, key: String) -> Result<Self, ValidationError> {
         let event_ref = Self::from_digest(sequence, digest)?;
         if key != event_ref.key {
@@ -46,6 +63,7 @@ impl EventRef {
     }
 }
 
+/// Closed set of payloads encoded by the frozen event format.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventContent {
     CampaignCreated,
@@ -53,6 +71,7 @@ pub enum EventContent {
     ArtifactPublished(ArtifactRef),
 }
 
+/// Durable metadata stored inside an event; the artifact object contains only bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactRef {
     digest: String,
@@ -64,6 +83,12 @@ pub struct ArtifactRef {
 }
 
 impl ArtifactRef {
+    /// Validates the digest and bounded textual metadata without applying a blob-size cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] for a malformed digest, empty identity, or identity
+    /// longer than 128 UTF-8 bytes.
     pub fn new(
         digest: String,
         size: u64,
@@ -115,6 +140,7 @@ impl ArtifactRef {
     }
 }
 
+/// Immutable operation record linked to the immediately preceding event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Event {
     operation_id: String,
@@ -125,6 +151,12 @@ pub struct Event {
 }
 
 impl Event {
+    /// Enforces the genesis-or-immediate-parent sequence relationship.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] for an invalid operation identity, sequence outside
+    /// the durable range, or parent inconsistent with the sequence.
     pub fn new(
         operation_id: String,
         sequence: u64,
@@ -170,11 +202,13 @@ impl Event {
     }
 }
 
+/// Controller authority carried by the canonical head.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Authority {
     state: AuthorityState,
 }
 
+/// Explicit absence or ownership of controller authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthorityState {
     Unowned,
@@ -193,6 +227,11 @@ impl Authority {
         }
     }
 
+    /// Creates owned authority after validating the owner and instance identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when either identity is empty or exceeds 128 bytes.
     pub fn owned(
         owner: String,
         instance: String,
@@ -216,6 +255,7 @@ impl Authority {
     }
 }
 
+/// Canonical publication authority and its authoritative event tail.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Head {
     authority: Authority,
@@ -224,6 +264,12 @@ pub struct Head {
 }
 
 impl Head {
+    /// Associates an authority state and event tail with one head-mutation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when the operation identity is empty or exceeds
+    /// 128 bytes.
     pub fn new(
         authority: Authority,
         tail: EventRef,
@@ -250,6 +296,7 @@ impl Head {
     }
 }
 
+/// Static category for a rejected durable domain value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     InvalidSequence,

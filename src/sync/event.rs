@@ -15,7 +15,8 @@
 //! exact CBOR re-encoding and exact zstd recompression before domain conversion.
 //!
 //! Key values exclude object-store prefixes. The `zstd-sys 2.0.16+zstd.1.5.7`
-//! lockfile pin is byte-affecting.
+//! lockfile pin is byte-affecting. Checked-in event fixtures pin both stored bytes
+//! and their derived keys.
 //!
 //! Event publication requires a matching artifact witness before object-store I/O.
 
@@ -40,6 +41,7 @@ const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
 const CBOR_RECURSION_LIMIT: usize = 16;
 const ZSTD_LEVEL: i32 = 3;
 
+/// Canonical compressed bytes paired with their stored-byte digest reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedEvent {
     stored_bytes: Vec<u8>,
@@ -60,7 +62,10 @@ impl EncodedEvent {
     }
 }
 
-/// Proof that immutable event bytes are present at their canonical key.
+/// Successful creation or full-byte duplicate verification accepts immutable event bytes
+/// at their canonical key.
+///
+/// Only [`publish`] constructs this witness; head transitions require it before CAS.
 #[derive(Debug)]
 pub struct ResolvedEventPublication {
     reference: EventRef,
@@ -117,6 +122,12 @@ struct WireArtifactRef {
     retention_class: Option<String>,
 }
 
+/// Produces frozen zstd-framed bytes and a SHA-256 reference over those bytes.
+///
+/// # Errors
+///
+/// Returns [`WireError`] when CBOR serialization, compression, or derived-reference
+/// validation fails.
 pub fn encode(event: &Event) -> Result<EncodedEvent, WireError> {
     let wire = WireEvent::from(event);
     let cbor = encode_cbor(&wire)?;
@@ -129,6 +140,16 @@ pub fn encode(event: &Event) -> Result<EncodedEvent, WireError> {
     })
 }
 
+/// Publishes canonical event bytes only after any artifact witness matches exactly.
+///
+/// The immutable object is accepted after a successful create or full-byte duplicate
+/// verification. No witness is returned while publication remains ambiguous.
+///
+/// # Errors
+///
+/// Returns [`PublicationError`] for a missing, unexpected, or mismatched artifact
+/// witness; an encoding failure; an object above the 5 GiB single-PUT limit; or
+/// unresolved storage state.
 pub async fn publish(
     store: &S3Store,
     event: &Event,
@@ -162,6 +183,13 @@ pub async fn publish(
     })
 }
 
+/// Decodes stored bytes only when framing, canonical bytes, digest, and key all agree.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for empty or oversized frames, absent or oversized content
+/// size, malformed CBOR, unknown versions, noncanonical encodings or zstd framing,
+/// key mismatch, or an invalid domain value.
 pub fn decode(stored_bytes: &[u8], expected_key: &str) -> Result<Event, WireError> {
     if stored_bytes.is_empty() || stored_bytes.len() > MAX_COMPRESSED_BYTES {
         return Err(WireError::LimitExceeded);

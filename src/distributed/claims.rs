@@ -370,6 +370,17 @@ pub(crate) async fn observe(
     }
 }
 
+/// Rejection of a renewal that attempted no mutation.
+///
+/// `ClaimAuthority` is neither `Clone` nor `Debug`, so a rejection hands the
+/// unspent authority back rather than destroying the only proof the caller holds.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) struct RenewalRejected {
+    pub(crate) authority: ClaimAuthority,
+    pub(crate) error: ClaimPrepareError,
+}
+
 #[allow(dead_code)]
 pub(crate) fn prepare_renewal(
     authority: ClaimAuthority,
@@ -378,55 +389,75 @@ pub(crate) fn prepare_renewal(
     instance: &InstanceId,
     expected_fence: u64,
     now: u64,
-) -> Result<ClaimMutation, ClaimPrepareError> {
-    let ClaimAuthority { claim, key, etag } = authority;
-    let Claim {
-        work_id,
-        work_revision,
-        owner_actor,
-        owner_instance,
-        fence,
-        operation_id,
-        state,
-    } = claim;
-    let lease_until = match state {
-        ClaimState::Active { lease_until } => lease_until,
-        ClaimState::Sealed { .. } => return Err(ClaimPrepareError::InvalidInput),
+) -> Result<ClaimMutation, Box<RenewalRejected>> {
+    let reject = |authority| {
+        Err(Box::new(RenewalRejected {
+            authority,
+            error: ClaimPrepareError::InvalidInput,
+        }))
     };
-    if &work_id != work.id()
-        || work_revision != work.revision()
-        || &owner_actor != actor
-        || &owner_instance != instance
-        || fence != expected_fence
+    // Every eligibility fact is read through references first, so a rejection can
+    // return the authority intact.
+    let lease_until = match authority.claim.state() {
+        ClaimState::Active { lease_until } => *lease_until,
+        ClaimState::Sealed { .. } => return reject(authority),
+    };
+    if authority.claim.work_id() != work.id()
+        || authority.claim.work_revision() != work.revision()
+        || authority.claim.owner_actor() != actor
+        || authority.claim.owner_instance() != instance
+        || authority.claim.fence() != expected_fence
         || now >= lease_until
     {
-        return Err(ClaimPrepareError::InvalidInput);
+        return reject(authority);
     }
-    let renewed_until = now
+    let Some(renewed_until) = now
         .checked_add(CLAIM_LEASE_MS)
         .filter(|candidate| *candidate > lease_until)
-        .ok_or(ClaimPrepareError::InvalidInput)?;
-    let claim = Claim::new(
-        work_id,
-        work_revision,
-        owner_actor,
-        owner_instance,
-        fence,
-        operation_id,
+    else {
+        return reject(authority);
+    };
+
+    // The renewed claim is built from copies so that a failure here can still hand
+    // the authority back. The non-`Clone` ETag moves only once nothing can fail.
+    let renewed = Claim::new(
+        authority.claim.work_id().clone(),
+        authority.claim.work_revision(),
+        authority.claim.owner_actor().clone(),
+        authority.claim.owner_instance().clone(),
+        authority.claim.fence(),
+        authority.claim.operation_id().to_owned(),
         ClaimState::Active {
             lease_until: renewed_until,
         },
-    )
-    .map_err(|_| ClaimPrepareError::InvalidInput)?;
-    let canonical_bytes = encode(&claim).map_err(|_| ClaimPrepareError::Encoding)?;
+    );
+    let Ok(renewed) = renewed else {
+        return reject(authority);
+    };
+    let Ok(canonical_bytes) = encode(&renewed) else {
+        return Err(Box::new(RenewalRejected {
+            authority,
+            error: ClaimPrepareError::Encoding,
+        }));
+    };
+    let ClaimAuthority { key, etag, .. } = authority;
     Ok(ClaimMutation {
-        claim,
+        claim: renewed,
         key,
         canonical_bytes,
         etag,
         observed_expiry: Some(lease_until),
         prepared_revision: work.revision(),
     })
+}
+
+impl fmt::Debug for RenewalRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RenewalRejected")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 #[allow(dead_code)]
@@ -1314,7 +1345,7 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1325,7 +1356,7 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1336,7 +1367,7 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1347,7 +1378,7 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1358,7 +1389,7 @@ mod tests {
                 8,
                 200_000,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1372,7 +1403,7 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
         for now in [1_000_000, 1_000_001] {
             assert!(matches!(
@@ -1384,7 +1415,7 @@ mod tests {
                     9,
                     now,
                 ),
-                Err(ClaimPrepareError::InvalidInput)
+                Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
             ));
         }
         assert!(matches!(
@@ -1399,7 +1430,7 @@ mod tests {
                 9,
                 100,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1413,7 +1444,7 @@ mod tests {
                 9,
                 u64::MAX - 1,
             ),
-            Err(ClaimPrepareError::InvalidInput)
+            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
         ));
     }
 
@@ -1824,6 +1855,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn an_early_renewal_returns_the_unspent_authority() {
+        let outcome = prepare_renewal(
+            authority(claim(ClaimState::Active {
+                lease_until: 10_000_000,
+            }))
+            .await,
+            &work("work-17", 4),
+            &ActorId::new("rust-worker".into()).unwrap(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            9,
+            200_000,
+        );
+        let Err(rejection) = outcome else {
+            panic!("a lease already past the proposed one is not renewable");
+        };
+        assert_eq!(rejection.error, ClaimPrepareError::InvalidInput);
+        // The returned authority is intact and still authorizes the same claim.
+        assert!(rejection.authority.authorizes(&work("work-17", 4)));
     }
 
     #[tokio::test]

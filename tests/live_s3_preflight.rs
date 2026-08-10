@@ -1210,6 +1210,9 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     // match. None of these are created; only the rule predicates read them.
     let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
     let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
+    // A rule scoped to `workspace/` matches the production claim prefix but not a
+    // run-prefixed key, so the unprefixed key is evaluated without being created.
+    let production_claim_key = "workspace/live/campaigns/live/work/live/claim.json";
     // Each key family is described by the full inclusive range of sizes a valid
     // object can take, so a rule whose size window sits strictly between two
     // concrete samples is still detected.
@@ -1222,6 +1225,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         ObjectFacts::family(&keys.event_2, 0, MAX_EVENT_BYTES as u64),
         ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
         ObjectFacts::family(&keys.claim, 0, MAX_CLAIM_BYTES as u64),
+        ObjectFacts::family(production_claim_key, 0, MAX_CLAIM_BYTES as u64),
         // The sizes this run actually retained, so the evidence names them.
         ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
         ObjectFacts::exact(&keys.event_1, stored_event_1.len() as u64),

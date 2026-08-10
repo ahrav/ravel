@@ -11,15 +11,34 @@ name = "ravel"
 path = "src/main.rs"
 
 [dependencies]
+# S3 requests use the official AWS SDK with the Tokio HTTPS client.
+aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
 # The event format uses deterministic v1 CBOR encoding.
 ciborium = "=0.2.2"
 # Wire serialization uses serde derives.
 serde = { version = "=1.0.228", features = ["derive"] }
 # Head records use canonical JSON bytes.
-serde_json = "=1.0.145"
+serde_json = "=1.0.146"
 # Stored event bytes use SHA-256 digests.
 sha2 = "=0.10.9"
-# Intentionally unused: pins the async runtime required by the AWS SDK client.
-tokio = { version = "=1.53.1", default-features = false }
 # Event records use zstd compression.
 zstd = { version = "=0.13.3", default-features = false }
+
+[dev-dependencies]
+aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
+  "test-util",
+] }
+aws-smithy-runtime = { version = "=1.12.1", default-features = false, features = [
+  "test-util",
+] }
+bytes = "=1.12.1"
+http = "=1.4.2"
+http-body = "=1.1.0"
+tokio = { version = "=1.53.1", default-features = false, features = [
+  "macros",
+  "rt",
+  "time",
+] }

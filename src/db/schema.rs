@@ -214,6 +214,7 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
             "SELECT COUNT(*) FROM applied_events \
              WHERE typeof(digest) != 'text' \
                 OR length(digest) != 64 \
+                OR length(CAST(digest AS BLOB)) != 64 \
                 OR digest GLOB '*[^0-9a-f]*'",
             [],
             |row| row.get(0),
@@ -243,22 +244,47 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
         }
     }
 
-    // A valid cursor and history do not imply the rest of the projection survived,
-    // and a dropped table surfaces as a replay failure rather than a rebuild.
-    let present: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_schema \
-             WHERE type = 'table' AND name IN \
-             ('applied_events','campaigns','dependencies','objectives','sync_cursor','work_items','workflows')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(local_format_error)?;
-    if present != PROJECTION_TABLES.len() as i64 {
+    // A valid cursor and history do not imply the rest of the projection survived.
+    // Names alone do not either: a table present with different columns or dropped
+    // constraints would serve reads that cannot come from the event chain.
+    let mut definitions = {
+        let mut stored = connection
+            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")
+            .map_err(local_format_error)?;
+        stored
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(local_format_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(local_format_error)?
+    };
+    definitions.retain(|(name, _)| !name.starts_with("sqlite_"));
+    if definitions.len() != PROJECTION_TABLES.len() {
         return Err(ValidateError::InvalidHistory);
+    }
+    for (name, sql) in &definitions {
+        let expected = expected_definition(name).ok_or(ValidateError::InvalidHistory)?;
+        if normalized(sql) != normalized(expected) {
+            return Err(ValidateError::InvalidHistory);
+        }
     }
 
     Ok(connection)
+}
+
+/// Recovers the `CREATE TABLE` statement this schema declares for `table`.
+fn expected_definition(table: &str) -> Option<&'static str> {
+    SCHEMA.split(';').map(str::trim).find(|statement| {
+        statement
+            .strip_prefix("CREATE TABLE ")
+            .is_some_and(|rest| rest.starts_with(table) && rest[table.len()..].starts_with(" ("))
+    })
+}
+
+/// Collapses the whitespace SQLite preserves verbatim in `sqlite_schema.sql`.
+fn normalized(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn local_format_error(error: rusqlite::Error) -> ValidateError {
@@ -794,6 +820,51 @@ mod tests {
             );
             fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn a_table_with_the_right_name_and_wrong_shape_is_rebuildable() {
+        let path = test_path("reshaped-table");
+        let connection = create(&path).unwrap();
+        connection.execute("DROP TABLE campaigns", []).unwrap();
+        connection
+            .execute("CREATE TABLE campaigns (id TEXT)", [])
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_digest_hiding_bytes_after_a_nul_is_rejected() {
+        let path = test_path("nul-digest");
+        let connection = create(&path).unwrap();
+        // length() and GLOB both stop at the NUL, so only a byte-length check sees
+        // the trailing bytes.
+        let smuggled = format!("{DIGEST}\0trailing");
+        connection
+            .execute(
+                "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1), (2, ?2)",
+                params![smuggled, OTHER_DIGEST],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_cursor SET sequence = 2, tail_digest = ?1 WHERE id = 1",
+                [OTHER_DIGEST],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

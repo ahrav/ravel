@@ -279,8 +279,6 @@ mod tests {
 
     use super::*;
 
-    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
     fn path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ravel-worker-{}-{label}.sqlite3", process::id()))
     }
@@ -321,7 +319,10 @@ mod tests {
             (Ok(ApplyOutcome::Applied), Ok(ApplyOutcome::AlreadyApplied))
                 | (Ok(ApplyOutcome::AlreadyApplied), Ok(ApplyOutcome::Applied))
         ));
-        assert_eq!(handle.cursor().await.unwrap(), (1, Some(DIGEST.into())));
+        assert_eq!(
+            handle.cursor().await.unwrap(),
+            (1, Some(encoded.digest().to_owned()))
+        );
 
         let diagnostics_after = handle.diagnostics().await.unwrap();
         assert_eq!(diagnostics_after.worker_thread, diagnostics.worker_thread);

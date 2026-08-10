@@ -136,6 +136,11 @@ impl S3Store {
         }
     }
 
+    /// Identifies the object-store namespace whose keys this store resolves.
+    pub fn namespace(&self) -> &str {
+        &self.bucket
+    }
+
     pub async fn get_object(&self, key: &str, max_bytes: usize) -> Result<GetOutcome, GetError> {
         let output = match self
             .client
@@ -239,6 +244,12 @@ impl S3Store {
         history: &mut AttemptHistory,
     ) -> Result<(), PublicationError> {
         let expected_size = bytes.len() as u64;
+        // The oversize guard has to precede the clone: a body above the single-PUT
+        // limit would otherwise be duplicated in memory before put_if_absent
+        // reaches its own TooLarge check.
+        if !fits_single_put(expected_size) {
+            return Err(PublicationError::TooLarge);
+        }
         let initial = self.put_if_absent(key, bytes.clone(), history).await;
         if let Some(result) = terminal(&initial) {
             return result;
@@ -280,7 +291,7 @@ impl S3Store {
         };
         match output.content_length() {
             Some(length) if length < 0 => return VerificationOutcome::Transport,
-            Some(length) if length as u64 > expected_size => {
+            Some(length) if length as u64 != expected_size => {
                 return VerificationOutcome::Mismatch;
             }
             _ => {}
@@ -831,6 +842,16 @@ mod tests {
         assert_eq!(
             store.verify_object("object", &expected_digest, 6).await,
             VerificationOutcome::Transport
+        );
+
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("content-length", "5")],
+            b"abcdef".to_vec(),
+        )]);
+        assert_eq!(
+            store.verify_object("object", &expected_digest, 6).await,
+            VerificationOutcome::Mismatch
         );
     }
 

@@ -11,12 +11,23 @@ use super::s3::{PublicationError, S3Store};
 pub const MAX_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Proof that immutable artifact bytes are present at their digest key.
+///
+/// The witness records the object-store namespace it was minted against: the
+/// digest key alone is identical in every bucket, so a witness from one store
+/// says nothing about whether the bytes exist in another.
 #[derive(Debug)]
-pub struct PublishedArtifact(ArtifactRef);
+pub struct PublishedArtifact {
+    reference: ArtifactRef,
+    namespace: String,
+}
 
 impl PublishedArtifact {
     pub fn artifact_ref(&self) -> &ArtifactRef {
-        &self.0
+        &self.reference
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 }
 
@@ -42,7 +53,10 @@ pub async fn publish(
     store
         .publish_immutable(&artifact_key(reference.digest()), bytes, reference.digest())
         .await?;
-    Ok(PublishedArtifact(reference))
+    Ok(PublishedArtifact {
+        reference,
+        namespace: store.namespace().to_owned(),
+    })
 }
 
 fn validate_artifact_length(length: usize) -> Result<(), PublicationError> {

@@ -128,7 +128,8 @@ pub async fn publish(
 ) -> Result<ResolvedEventPublication, PublicationError> {
     match (event.content(), artifact) {
         (EventContent::ArtifactPublished(reference), Some(published))
-            if reference == published.artifact_ref() => {}
+            if reference == published.artifact_ref()
+                && published.namespace() == store.namespace() => {}
         (EventContent::CampaignCreated | EventContent::WorkflowStarted, None) => {}
         _ => return Err(PublicationError::InvalidInput),
     }
@@ -708,6 +709,15 @@ mod tests {
         )
         .unwrap();
         let encoded = encode(&event).unwrap();
+        let foreign_store = S3Store::new(
+            "other-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        assert!(matches!(
+            publish(&foreign_store, &event, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
         let resolved = publish(&store, &event, Some(&artifact)).await.unwrap();
         assert_eq!(resolved.event_ref(), &encoded.reference);
         let uri = client

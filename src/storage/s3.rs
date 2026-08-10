@@ -347,14 +347,15 @@ impl S3Store {
         history.may_have_been_sent = true;
         let outcome = classify_mutation_result(request.send().await, prior_unknown);
         // `Committed` and `ProvenNotSent` clear `may_have_been_sent`. `NotFound`,
-        // `Conflict`, and `PreconditionFailed` do not determine whether a prior
-        // request was sent, so they carry the prior value forward.
+        // `Conflict`, `PreconditionFailed`, and `TooLarge` do not determine whether a
+        // prior request was sent, so they carry the prior value forward.
         history.may_have_been_sent = match outcome {
             MutationOutcome::Committed { .. } | MutationOutcome::ProvenNotSent => false,
             MutationOutcome::Unknown | MutationOutcome::AmbiguousConflict => true,
             MutationOutcome::Conflict
             | MutationOutcome::PreconditionFailed
-            | MutationOutcome::NotFound => prior_unknown,
+            | MutationOutcome::NotFound
+            | MutationOutcome::TooLarge => prior_unknown,
         };
         outcome
     }

@@ -1523,6 +1523,7 @@ mod tests {
                 transition.canonical_event_bytes(),
             ),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(

@@ -169,7 +169,7 @@ mod tests {
         )
         .expect("candidate head is valid");
         HeadTransition::new(
-            HeadParent::Existing(parent),
+            HeadParent::Existing(Box::new(parent)),
             candidate_head,
             candidate,
             &publication,

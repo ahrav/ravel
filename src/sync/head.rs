@@ -1289,7 +1289,6 @@ mod tests {
         let parent = parent_head(Authority::unowned(), "parent-op");
         let original = read_observed(&parent, OLD_ETAG).await;
         let transition = successor_transition(original, Authority::unowned(), "head-op-2").await;
-        let tail_key = transition.candidate().tail().key().to_owned();
         let current = Head::new(
             Authority::owned("owner".into(), "instance".into(), 1, 1).expect("valid authority"),
             transition.candidate().tail().clone(),
@@ -1303,7 +1302,6 @@ mod tests {
                 &[("etag", FRESH_ETAG)],
                 encode(&current).expect("head encodes"),
             ),
-            response(404, &[], SdkBody::empty()),
             sentinel_response(),
         ]);
         let transition = transition.attributed_to(store.namespace());
@@ -1313,10 +1311,11 @@ mod tests {
             commit(&store, transition, &mut history).await,
             HeadCommitOutcome::Unresolved(_)
         ));
-        assert_eq!(client.actual_requests().count(), 3);
+        // One operation id naming two head byte-strings is rejected before any
+        // chain read, so no event object is fetched.
+        assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(request_path(&client, 0), "/head.json");
         assert_eq!(request_path(&client, 1), "/head.json");
-        assert_eq!(request_path(&client, 2), format!("/{tail_key}"));
     }
 
     #[tokio::test]

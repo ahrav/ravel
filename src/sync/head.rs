@@ -72,6 +72,8 @@ pub struct HeadTransition {
     candidate: Head,
     head_bytes: Vec<u8>,
     event_bytes: Vec<u8>,
+    /// Namespace the tail event was published into.
+    event_namespace: String,
 }
 
 impl HeadTransition {
@@ -127,6 +129,7 @@ impl HeadTransition {
             candidate,
             head_bytes,
             event_bytes: encoded.stored_bytes().to_vec(),
+            event_namespace: publication.namespace().to_owned(),
         })
     }
 
@@ -182,6 +185,12 @@ pub async fn commit(
     transition: HeadTransition,
     history: &mut AttemptHistory,
 ) -> HeadCommitOutcome {
+    // A head is authoritative over the tail it references, so that tail has to live
+    // in the store this head is committed through. Committing across namespaces
+    // would publish a head whose event object cannot be read back.
+    if transition.event_namespace != store.namespace() {
+        return HeadCommitOutcome::Unresolved(transition);
+    }
     let outcome = match &transition.parent {
         HeadParent::Genesis => {
             store
@@ -419,11 +428,12 @@ impl TryFrom<WireAuthority> for Authority {
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::primitives::SdkBody;
+    use aws_sdk_s3::{config::Region, primitives::SdkBody};
+    use aws_smithy_runtime::client::http::test_util::NeverClient;
 
     use crate::{
         domain::campaign::EventContent,
-        storage::s3::test_support::{replay_store, response},
+        storage::s3::test_support::{replay_store, response, test_builder},
     };
 
     use super::*;
@@ -737,6 +747,41 @@ mod tests {
             HeadReadError::Storage(GetError::Transport).to_string(),
             "head read failed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tail_published_elsewhere_never_becomes_authoritative() {
+        let tail = genesis_event();
+        // The tail is published into the default test bucket...
+        let (publishing_store, publishing_client) =
+            replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let publication = event::publish(&publishing_store, &tail, None)
+            .await
+            .expect("event publication resolves");
+        let candidate = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "head-op-1".into(),
+        )
+        .expect("valid head");
+        let transition = HeadTransition::new(HeadParent::Genesis, candidate, &tail, &publication)
+            .expect("valid transition");
+        assert_eq!(publishing_client.actual_requests().count(), 1);
+
+        // ...so committing the head through another bucket must not proceed. A
+        // NeverClient would hang if the refusal did not precede dispatch.
+        let foreign_store = S3Store::new(
+            "other-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        assert_ne!(foreign_store.namespace(), publishing_store.namespace());
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            commit(&foreign_store, transition, &mut history).await,
+            HeadCommitOutcome::Unresolved(_)
+        ));
     }
 
     #[tokio::test]

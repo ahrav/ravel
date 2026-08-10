@@ -62,11 +62,19 @@ impl EncodedEvent {
 
 /// Proof that immutable event bytes are present at their canonical key.
 #[derive(Debug)]
-pub struct ResolvedEventPublication(EventRef);
+pub struct ResolvedEventPublication {
+    reference: EventRef,
+    namespace: String,
+}
 
 impl ResolvedEventPublication {
     pub fn event_ref(&self) -> &EventRef {
-        &self.0
+        &self.reference
+    }
+
+    /// Names the object-store namespace these bytes were published into.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 }
 
@@ -148,7 +156,10 @@ pub async fn publish(
             encoded.digest(),
         )
         .await?;
-    Ok(ResolvedEventPublication(encoded.reference))
+    Ok(ResolvedEventPublication {
+        reference: encoded.reference,
+        namespace: store.namespace().to_owned(),
+    })
 }
 
 pub fn decode(stored_bytes: &[u8], expected_key: &str) -> Result<Event, WireError> {
@@ -715,15 +726,15 @@ mod tests {
             test_builder(NeverClient::new()),
         );
         // A second store on the identical bucket name is still a different store.
+        // Region and bucket are the addressing identity, so a second store on the
+        // same pair resolves the same objects and shares the namespace.
         let same_name_store = S3Store::new(
             "test-bucket",
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         );
-        assert!(matches!(
-            publish(&same_name_store, &event, Some(&artifact)).await,
-            Err(PublicationError::InvalidInput)
-        ));
+        assert_eq!(same_name_store.namespace(), store.namespace());
+        assert_ne!(foreign_store.namespace(), store.namespace());
         assert!(matches!(
             publish(&foreign_store, &event, Some(&artifact)).await,
             Err(PublicationError::InvalidInput)

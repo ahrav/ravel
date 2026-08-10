@@ -6,9 +6,9 @@ Provisioned: 2026-08-09T07:16:17Z (re-verified below at re-capture time)
 
 ```json
 {
-    "UserId": "AROA5GQJJ54Z3UPCXJHTX:ahrav@MIDWAY.AMAZON.COM",
+    "UserId": "<redacted>",
     "Account": "907331366707",
-    "Arn": "arn:aws:sts::907331366707:assumed-role/IibsAdminAccess-DO-NOT-DELETE/ahrav@MIDWAY.AMAZON.COM"
+    "Arn": "arn:aws:sts::907331366707:assumed-role/<redacted>"
 }
 ```
 

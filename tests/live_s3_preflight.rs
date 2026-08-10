@@ -163,8 +163,16 @@ fn live_enabled() -> Result<bool, &'static str> {
     let flag = std::env::var(LIVE_FLAG).ok();
     let bucket = std::env::var(BUCKET_ENV).ok();
     let region = std::env::var(REGION_ENV).ok();
-    if flag.as_deref() != Some("1") || bucket.is_none() || region.is_none() {
+    if flag.as_deref() != Some("1") {
         return Ok(false);
+    }
+    // An explicit opt-in with incomplete configuration is a misconfigured job,
+    // not an absent one: skipping would let it report green without probing S3.
+    if bucket.is_none() {
+        return Err("live S3 opt-in is missing the bucket variable");
+    }
+    if region.is_none() {
+        return Err("live S3 opt-in is missing the region variable");
     }
     if bucket.as_deref() != Some(EXPECTED_BUCKET) {
         return Err("unexpected live S3 bucket");
@@ -354,12 +362,13 @@ fn expect_live_412(
     match result {
         Err(error) => {
             let record = service_error_record(step, key, Some(condition), supplied_etag, &error);
-            let valid = record.status == Some(412);
+            let valid = record.status == Some(412)
+                && record.error_code.as_deref() == Some("PreconditionFailed");
             evidence.operations.push(record);
             if valid {
                 Ok(())
             } else {
-                Err("expected live 412")
+                Err("expected live 412 PreconditionFailed")
             }
         }
         Ok(output) => {
@@ -764,17 +773,21 @@ async fn race_for_409(
                 }
             }
         }
-        if found_409 {
-            return Ok(());
-        }
+        // A 409 round only proves the conditional-write race if a contender also
+        // won it: without a successful writer there is no retained object and no
+        // first-writer evidence to point at.
         if !success {
             return Err("race key had no successful writer");
+        }
+        if found_409 {
+            return Ok(());
         }
     }
     Err("bounded race did not observe live 409")
 }
 
 async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'static str> {
+    let run_id = evidence.run_id.clone();
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(EXPECTED_REGION))
         .load()
@@ -828,7 +841,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         _ => return Err("repository missing head was not typed NotFound"),
     }
 
-    let artifact_bytes = b"ravel-e02-live-artifact".to_vec();
+    let artifact_bytes = format!("ravel-e02-live-artifact-{run_id}").into_bytes();
     let artifact_digest = sha256(&artifact_bytes);
     let artifact_ref = ArtifactRef::new(
         artifact_digest.clone(),
@@ -840,7 +853,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     )
     .map_err(|_| "artifact reference construction failed")?;
     let event_1 = Event::new(
-        "live-event-1".into(),
+        format!("live-event-1-{run_id}"),
         1,
         None,
         7,
@@ -851,7 +864,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     let reference_1 = EventRef::new(1, encoded_1.digest().to_owned(), encoded_1.key().to_owned())
         .map_err(|_| "event 1 reference construction failed")?;
     let event_2 = Event::new(
-        "live-event-2".into(),
+        format!("live-event-2-{run_id}"),
         2,
         Some(reference_1.clone()),
         7,
@@ -878,11 +891,15 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     let successor_head_bytes =
         head::encode(&successor_head).map_err(|_| "successor head encoding failed")?;
 
-    // Canonical event references stay unprefixed; only physical S3 keys use the run prefix.
+    // Immutable objects are stored at exactly the keys the retained head
+    // references, so production reconciliation traversing this chain resolves the
+    // same objects the preflight validated. Per-run isolation comes from the run
+    // id inside the canonical bytes, which makes every digest-addressed key
+    // unique; only the mutable head needs the run prefix.
     let keys = ChainKeys {
-        artifact: physical(prefix, &format!("artifacts/sha256/{artifact_digest}")),
-        event_1: physical(prefix, encoded_1.key()),
-        event_2: physical(prefix, encoded_2.key()),
+        artifact: format!("artifacts/sha256/{artifact_digest}"),
+        event_1: encoded_1.key().to_owned(),
+        event_2: encoded_2.key().to_owned(),
         head: head_key.clone(),
     };
     evidence.keys = Some(keys.clone());
@@ -1077,10 +1094,16 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         return Err("artifact validation failed");
     }
 
+    // Maximum-size probes prevent size filters from classifying rules as safe
+    // when they can match larger valid objects in the same key family.
     let objects = [
         ObjectFacts {
             key: &keys.head,
             size: final_head_bytes.len() as u64,
+        },
+        ObjectFacts {
+            key: &keys.head,
+            size: MAX_HEAD_BYTES as u64,
         },
         ObjectFacts {
             key: &keys.event_1,
@@ -1091,8 +1114,20 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
             size: stored_event_2.len() as u64,
         },
         ObjectFacts {
+            key: &keys.event_2,
+            size: MAX_EVENT_BYTES as u64,
+        },
+        ObjectFacts {
             key: &keys.artifact,
             size: stored_artifact.len() as u64,
+        },
+        ObjectFacts {
+            key: &keys.artifact,
+            size: 0,
+        },
+        ObjectFacts {
+            key: &keys.artifact,
+            size: MAX_ARTIFACT_BYTES as u64,
         },
     ];
     let lifecycle = inspect_lifecycle(&direct, EXPECTED_BUCKET, &objects, evidence).await?;

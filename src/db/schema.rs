@@ -164,7 +164,7 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
     let cursor = {
         let mut statement = connection
             .prepare("SELECT id, sequence, tail_digest FROM sync_cursor")
-            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+            .map_err(local_format_error)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -173,9 +173,9 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
                     row.get::<_, Option<String>>(2)?,
                 ))
             })
-            .map_err(|_| ValidateError::DatabaseOperationFailed)?
+            .map_err(local_format_error)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+            .map_err(local_format_error)?;
         match rows.as_slice() {
             [cursor] => cursor.clone(),
             _ => return Err(ValidateError::InvalidHistory),
@@ -193,7 +193,22 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        .map_err(local_format_error)?;
+    // Every retained digest is checked, not only the cursor's tail: a malformed
+    // row below the tail cannot have come from the immutable event chain.
+    let malformed: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM applied_events \
+             WHERE typeof(digest) != 'text' \
+                OR length(digest) != 64 \
+                OR digest GLOB '*[^0-9a-f]*'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(local_format_error)?;
+    if malformed != 0 {
+        return Err(ValidateError::InvalidHistory);
+    }
     if sequence == 0 {
         if count != 0 || minimum.is_some() || maximum.is_some() {
             return Err(ValidateError::InvalidHistory);
@@ -209,13 +224,31 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
                 [expected],
                 |row| row.get(0),
             )
-            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+            .map_err(local_format_error)?;
         if tail_digest.as_deref() != Some(applied_tail.as_str()) {
             return Err(ValidateError::InvalidHistory);
         }
     }
 
     Ok(connection)
+}
+
+fn local_format_error(error: rusqlite::Error) -> ValidateError {
+    match error.sqlite_error_code() {
+        Some(
+            rusqlite::ErrorCode::SystemIoFailure
+            | rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::CannotOpen
+            | rusqlite::ErrorCode::PermissionDenied
+            | rusqlite::ErrorCode::ReadOnly
+            | rusqlite::ErrorCode::DiskFull
+            | rusqlite::ErrorCode::OutOfMemory
+            | rusqlite::ErrorCode::OperationInterrupted
+            | rusqlite::ErrorCode::FileLockingProtocolFailed,
+        ) => ValidateError::DatabaseOperationFailed,
+        _ => ValidateError::InvalidHistory,
+    }
 }
 
 fn valid_cursor(sequence: u64, digest: Option<&str>) -> bool {
@@ -684,6 +717,45 @@ mod tests {
             )
             .unwrap();
         drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_malformed_digest_below_the_cursor_tail() {
+        let path = test_path("malformed-interior-digest");
+        let connection = create(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1), (2, ?2)",
+                params![DIGEST.to_uppercase(), OTHER_DIGEST],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_cursor SET sequence = 2, tail_digest = ?1 WHERE id = 1",
+                [OTHER_DIGEST],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_missing_projection_table_is_rebuildable_rather_than_unavailable() {
+        let path = test_path("dropped-table");
+        let connection = create(&path).unwrap();
+        connection.execute("DROP TABLE applied_events", []).unwrap();
+        drop(connection);
+
         assert_eq!(
             open_existing(&path).unwrap_err(),
             ValidateError::InvalidHistory

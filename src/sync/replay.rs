@@ -22,7 +22,7 @@ use crate::{
     sync::{
         WireError,
         event::{self, ConversionError, SchedulingMutation},
-        head::{self, HeadReadError},
+        head::{self, HeadReadError, ObservedHead},
     },
 };
 
@@ -87,6 +87,36 @@ impl fmt::Display for ReplayError {
 
 impl Error for ReplayError {}
 
+/// A projection synchronized against one specific observed head.
+///
+/// The head and cursor are the ones this replay attempt read and reached, so a
+/// readiness check compares against that attempt's boundary. Rereading head and
+/// cursor after `startup` instead would let a remote head advance in between and
+/// make a synchronized projection look not-ready.
+pub struct ReplayedProjection {
+    handle: DbHandle,
+    head: ObservedHead,
+    cursor: (u64, Option<String>),
+}
+
+impl ReplayedProjection {
+    pub fn handle(&self) -> &DbHandle {
+        &self.handle
+    }
+
+    pub fn into_handle(self) -> DbHandle {
+        self.handle
+    }
+
+    pub fn head(&self) -> &ObservedHead {
+        &self.head
+    }
+
+    pub fn cursor(&self) -> (u64, Option<&str>) {
+        (self.cursor.0, self.cursor.1.as_deref())
+    }
+}
+
 /// Opens or creates the disposable projection and replays the fresh observed ancestry.
 ///
 /// Local validation failure removes the rollback journal, then the database, before creating a
@@ -99,7 +129,7 @@ impl Error for ReplayError {}
 /// Returns [`ReplayError::DatabaseUnavailable`] when the path cannot be inspected, the worker
 /// cannot start, or an existing file fails outside validation. Every other variant reports the
 /// replay stage that failed.
-pub async fn startup(store: &S3Store, db_path: &Path) -> Result<DbHandle, ReplayError> {
+pub async fn startup(store: &S3Store, db_path: &Path) -> Result<ReplayedProjection, ReplayError> {
     if !db_path
         .try_exists()
         .map_err(|_| ReplayError::DatabaseUnavailable)?
@@ -107,28 +137,43 @@ pub async fn startup(store: &S3Store, db_path: &Path) -> Result<DbHandle, Replay
         let handle = DbHandle::spawn(db_path.to_path_buf())
             .await
             .map_err(|_| ReplayError::DatabaseUnavailable)?;
-        replay_with_limits(store, &handle, LIMITS).await?;
-        return Ok(handle);
+        let (head, cursor) = replay_with_limits(store, &handle, LIMITS).await?;
+        return Ok(ReplayedProjection {
+            handle,
+            head,
+            cursor,
+        });
     }
 
     match DbHandle::open_existing(db_path.to_path_buf()).await {
         Ok(handle) => {
-            replay_with_limits(store, &handle, LIMITS).await?;
-            Ok(handle)
+            let (head, cursor) = replay_with_limits(store, &handle, LIMITS).await?;
+            Ok(ReplayedProjection {
+                handle,
+                head,
+                cursor,
+            })
         }
         Err(OpenExistingError::DatabaseOperationFailed) => Err(ReplayError::DatabaseUnavailable),
         Err(OpenExistingError::Validation(_)) => replace_and_replay(store, db_path).await,
     }
 }
 
-async fn replace_and_replay(store: &S3Store, db_path: &Path) -> Result<DbHandle, ReplayError> {
+async fn replace_and_replay(
+    store: &S3Store,
+    db_path: &Path,
+) -> Result<ReplayedProjection, ReplayError> {
     remove_if_present(&journal_path(db_path))?;
     remove_if_present(db_path)?;
     let handle = DbHandle::spawn(db_path.to_path_buf())
         .await
         .map_err(|_| ReplayError::DatabaseUnavailable)?;
-    replay_with_limits(store, &handle, LIMITS).await?;
-    Ok(handle)
+    let (head, cursor) = replay_with_limits(store, &handle, LIMITS).await?;
+    Ok(ReplayedProjection {
+        handle,
+        head,
+        cursor,
+    })
 }
 
 fn remove_if_present(path: &Path) -> Result<(), ReplayError> {
@@ -149,7 +194,7 @@ async fn replay_with_limits(
     store: &S3Store,
     handle: &DbHandle,
     limits: Limits,
-) -> Result<(), ReplayError> {
+) -> Result<(ObservedHead, (u64, Option<String>)), ReplayError> {
     let observed = match head::read(store).await {
         Ok(Some(observed)) => observed,
         Ok(None) => return Err(ReplayError::CampaignMissing),
@@ -168,7 +213,11 @@ async fn replay_with_limits(
             Err(error) => return Err(ReplayError::Apply(error)),
         }
     }
-    Ok(())
+    let cursor = handle
+        .cursor()
+        .await
+        .map_err(|_| ReplayError::DatabaseUnavailable)?;
+    Ok((observed, cursor))
 }
 
 async fn prepare(
@@ -341,7 +390,10 @@ mod tests {
             event_response(GENESIS_BYTES),
         ]);
 
-        let handle = startup(&store, &path).await.unwrap();
+        let replayed = startup(&store, &path).await.unwrap();
+        assert_eq!(replayed.cursor(), (2, Some(CHILD_DIGEST)));
+        assert_eq!(replayed.head().head().tail(), &child_ref());
+        let handle = replayed.into_handle();
         assert_eq!(
             handle.cursor().await.unwrap(),
             (2, Some(CHILD_DIGEST.into()))
@@ -380,8 +432,8 @@ mod tests {
 
         let (store, client) = replay_store(vec![head_response(genesis_ref())]);
         assert_eq!(
-            replay_with_limits(&store, &handle, LIMITS).await,
-            Err(ReplayError::HistoryConflict)
+            replay_with_limits(&store, &handle, LIMITS).await.err(),
+            Some(ReplayError::HistoryConflict)
         );
         assert_eq!(apply_count(&handle).await, 2);
         assert_gets(&client, &["head.json"]);
@@ -389,8 +441,8 @@ mod tests {
         // A head at the cursor sequence with a different digest is a history conflict.
         let (store, client) = replay_store(vec![head_response(reference(2, GENESIS_DIGEST))]);
         assert_eq!(
-            replay_with_limits(&store, &handle, LIMITS).await,
-            Err(ReplayError::HistoryConflict)
+            replay_with_limits(&store, &handle, LIMITS).await.err(),
+            Some(ReplayError::HistoryConflict)
         );
         assert_eq!(apply_count(&handle).await, 2);
         assert_gets(&client, &["head.json"]);
@@ -438,8 +490,8 @@ mod tests {
         ]);
 
         assert_eq!(
-            replay_with_limits(&store, &handle, LIMITS).await,
-            Err(ReplayError::HistoryConflict)
+            replay_with_limits(&store, &handle, LIMITS).await.err(),
+            Some(ReplayError::HistoryConflict)
         );
         assert_eq!(apply_count(&handle).await, 1);
         assert_eq!(
@@ -548,8 +600,8 @@ mod tests {
             let handle = DbHandle::spawn(path.clone()).await.unwrap();
             let (store, _) = replay_store(responses);
             assert_eq!(
-                replay_with_limits(&store, &handle, LIMITS).await,
-                Err(expected)
+                replay_with_limits(&store, &handle, LIMITS).await.err(),
+                Some(expected)
             );
             assert_eq!(apply_count(&handle).await, 0);
             assert_eq!(handle.cursor().await.unwrap(), (0, None));
@@ -573,8 +625,9 @@ mod tests {
                     bytes: usize::MAX,
                 },
             )
-            .await,
-            Err(ReplayError::Overflow)
+            .await
+            .err(),
+            Some(ReplayError::Overflow)
         );
         assert_gets(&client, &["head.json"]);
 
@@ -591,8 +644,9 @@ mod tests {
                     bytes: GENESIS_BYTES.len() - 1,
                 },
             )
-            .await,
-            Err(ReplayError::Overflow)
+            .await
+            .err(),
+            Some(ReplayError::Overflow)
         );
         assert_gets(&client, &["head.json", genesis_ref().key()]);
         assert_eq!(apply_count(&handle).await, 0);
@@ -657,7 +711,7 @@ mod tests {
             event_response(GENESIS_BYTES),
         ]);
 
-        let handle = startup(&store, &path).await.unwrap();
+        let handle = startup(&store, &path).await.unwrap().into_handle();
         assert_eq!(
             handle.cursor().await.unwrap(),
             (2, Some(CHILD_DIGEST.into()))

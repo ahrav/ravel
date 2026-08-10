@@ -16,7 +16,7 @@ use crate::{
     sync::{WIRE_VERSION, WireError, event::WireArtifactRef},
 };
 
-const MAX_SUBMISSION_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_SUBMISSION_BYTES: usize = 4 * 1024;
 
 /// Immutable submission identity for one claimed work generation.
 #[derive(Clone, Debug, Eq, PartialEq)]

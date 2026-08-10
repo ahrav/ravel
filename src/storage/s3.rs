@@ -184,10 +184,16 @@ impl S3Store {
         let prior_unknown = history.may_have_been_sent;
         history.may_have_been_sent = true;
         let outcome = classify_mutation_result(request.send().await, prior_unknown);
-        history.may_have_been_sent = matches!(
-            outcome,
-            MutationOutcome::Unknown | MutationOutcome::AmbiguousConflict
-        );
+        // `Committed` and `ProvenNotSent` clear `may_have_been_sent`. `NotFound`,
+        // `Conflict`, and `PreconditionFailed` do not determine whether a prior
+        // request was sent, so they carry the prior value forward.
+        history.may_have_been_sent = match outcome {
+            MutationOutcome::Committed { .. } | MutationOutcome::ProvenNotSent => false,
+            MutationOutcome::Unknown | MutationOutcome::AmbiguousConflict => true,
+            MutationOutcome::Conflict
+            | MutationOutcome::PreconditionFailed
+            | MutationOutcome::NotFound => prior_unknown,
+        };
         outcome
     }
 }
@@ -532,10 +538,17 @@ mod tests {
         assert!(history.may_have_been_sent);
 
         let (store, _) = replay_store(vec![
+            response(404, &[], SdkBody::empty()),
             response(409, &[], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
         ]);
+        // A 404 answers only this attempt, so it must not clear the taint.
+        let missing = store
+            .put_if_absent("object", Vec::new(), &mut history)
+            .await;
+        assert!(missing == MutationOutcome::NotFound);
+        assert!(history.may_have_been_sent);
         let conflict = store
             .put_if_absent("object", Vec::new(), &mut history)
             .await;

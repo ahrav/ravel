@@ -94,12 +94,13 @@ selected bucket:
 }
 ```
 
-The bucket-wide resource is required because isolated live-test claim keys have
-a run prefix before `workspace/`. A claim-prefix-only resource would not cover
-those objects. Denying `s3:PutBucketLifecycleConfiguration` is also recommended
+The bucket-wide resource is required because the isolated delete-denial claim
+key has a run prefix before `workspace/`. A claim-prefix-only resource would
+not cover that object. Denying `s3:PutBucketLifecycleConfiguration` is also recommended
 because retained claims rely on the absence of matching lifecycle expiration.
-The profile must assume a role (`role_arn` + `source_profile`); the evidence
-check records the assumed-role ARN, so an IAM-user profile fails it.
+The profile must resolve to an assumed role (for example `role_arn` +
+`source_profile`); the evidence check records the assumed-role ARN, so an
+IAM-user profile fails it.
 
 `tests/live_s3_preflight.rs` gates delete-denial evidence on the named runtime
 profile, requires the exact `AccessDenied` error code, and rereads byte-identical

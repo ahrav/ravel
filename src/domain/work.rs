@@ -23,7 +23,7 @@ impl WorkId {
     }
 }
 
-/// Shape-validated work identity paired with its current revision.
+/// Shape-validated work identity paired with a caller-supplied revision.
 ///
 /// `WorkRef::new` accepts any `WorkId` regardless of provenance;
 /// provenance-restricted construction is tracked by `ravel-yno`.

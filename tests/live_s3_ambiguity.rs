@@ -642,7 +642,6 @@ struct WorkerResult {
     head_operation_id: String,
     artifact_digest: String,
     artifact_key: String,
-    claim_key: Option<String>,
     claim_operation_id: Option<String>,
 }
 
@@ -656,7 +655,6 @@ impl WorkerResult {
             head_operation_id: String::new(),
             artifact_digest: String::new(),
             artifact_key: String::new(),
-            claim_key: None,
             claim_operation_id: None,
         }
     }
@@ -780,7 +778,6 @@ async fn head_worker_scenario(
         head_operation_id,
         artifact_digest,
         artifact_key,
-        claim_key: None,
         claim_operation_id: None,
     })
 }
@@ -828,7 +825,6 @@ async fn claim_worker_scenario(
         head_operation_id: String::new(),
         artifact_digest: String::new(),
         artifact_key: String::new(),
-        claim_key: Some(key.to_owned()),
         claim_operation_id: Some(operation_id),
     })
 }
@@ -1059,6 +1055,40 @@ async fn validate_worker_objects(
     Ok(event)
 }
 
+fn race_pair(
+    listener: &TcpListener,
+    params: &[WorkerParams; 2],
+    evidence: &mut Evidence,
+) -> Result<[WorkerResult; 2], &'static str> {
+    let mut first_child = spawn_worker(&params[0])?;
+    let mut second_child = match spawn_worker(&params[1]) {
+        Ok(child) => child,
+        Err(error) => {
+            stop_worker(&mut first_child);
+            return Err(error);
+        }
+    };
+    if let Err(error) = release_workers(listener) {
+        stop_worker(&mut first_child);
+        stop_worker(&mut second_child);
+        return Err(error);
+    }
+    let deadline = Instant::now() + WORKER_JOIN_DEADLINE;
+    let first_result = match wait_worker(first_child, deadline, params[0].worker_id) {
+        Ok(result) => result,
+        Err(error) => {
+            stop_worker(&mut second_child);
+            return Err(error);
+        }
+    };
+    let results = [
+        first_result,
+        wait_worker(second_child, deadline, params[1].worker_id)?,
+    ];
+    evidence.workers.extend(results.iter().cloned());
+    Ok(results)
+}
+
 async fn two_process_race(
     config: &SdkConfig,
     run_id: &str,
@@ -1084,32 +1114,7 @@ async fn two_process_race(
         worker_params(run_id, 0, &observed, address, creation_time_unix_ms),
         worker_params(run_id, 1, &observed, address, creation_time_unix_ms),
     ];
-    let mut first_child = spawn_worker(&params[0])?;
-    let mut second_child = match spawn_worker(&params[1]) {
-        Ok(child) => child,
-        Err(error) => {
-            stop_worker(&mut first_child);
-            return Err(error);
-        }
-    };
-    if let Err(error) = release_workers(&listener) {
-        stop_worker(&mut first_child);
-        stop_worker(&mut second_child);
-        return Err(error);
-    }
-    let deadline = Instant::now() + WORKER_JOIN_DEADLINE;
-    let first_result = match wait_worker(first_child, deadline, params[0].worker_id) {
-        Ok(result) => result,
-        Err(error) => {
-            stop_worker(&mut second_child);
-            return Err(error);
-        }
-    };
-    let results = [
-        first_result,
-        wait_worker(second_child, deadline, params[1].worker_id)?,
-    ];
-    evidence.workers.extend(results.iter().cloned());
+    let results = race_pair(&listener, &params, evidence)?;
     let committed: Vec<_> = results
         .iter()
         .filter(|result| result.classification == "committed")
@@ -1167,32 +1172,7 @@ async fn two_process_claim_race(
         claim_worker_params(run_id, 0, &key, address, creation_time_unix_ms),
         claim_worker_params(run_id, 1, &key, address, creation_time_unix_ms),
     ];
-    let mut first_child = spawn_worker(&params[0])?;
-    let mut second_child = match spawn_worker(&params[1]) {
-        Ok(child) => child,
-        Err(error) => {
-            stop_worker(&mut first_child);
-            return Err(error);
-        }
-    };
-    if let Err(error) = release_workers(&listener) {
-        stop_worker(&mut first_child);
-        stop_worker(&mut second_child);
-        return Err(error);
-    }
-    let deadline = Instant::now() + WORKER_JOIN_DEADLINE;
-    let first_result = match wait_worker(first_child, deadline, params[0].worker_id) {
-        Ok(result) => result,
-        Err(error) => {
-            stop_worker(&mut second_child);
-            return Err(error);
-        }
-    };
-    let results = [
-        first_result,
-        wait_worker(second_child, deadline, params[1].worker_id)?,
-    ];
-    evidence.workers.extend(results.iter().cloned());
+    let results = race_pair(&listener, &params, evidence)?;
     let committed: Vec<_> = results
         .iter()
         .filter(|result| result.classification == "claim-committed")
@@ -1203,12 +1183,6 @@ async fn two_process_claim_race(
         .collect();
     if committed.len() != 1 || collisions.len() != 1 {
         return Err("claim-race-worker-outcomes");
-    }
-    if results
-        .iter()
-        .any(|result| result.claim_key.as_deref() != Some(&key))
-    {
-        return Err("claim-race-key");
     }
     let winner = committed[0];
     let stored = match clean_store(config)

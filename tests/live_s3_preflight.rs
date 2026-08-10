@@ -18,8 +18,16 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{LifecycleRule, LifecycleRuleFilter},
 };
+use aws_sdk_sts::Client as StsClient;
 use ravel::{
-    domain::campaign::{ArtifactRef, Authority, Event, EventContent, EventRef, Head},
+    distributed::{
+        claims::{self, Claim, ClaimState},
+        identity::{ActorId, InstanceId},
+    },
+    domain::{
+        campaign::{ArtifactRef, Authority, Event, EventContent, EventRef, Head},
+        work::WorkId,
+    },
     storage::{
         artifacts::MAX_ARTIFACT_BYTES,
         s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
@@ -33,6 +41,7 @@ use sha2::{Digest, Sha256};
 const LIVE_FLAG: &str = "RAVEL_LIVE_S3";
 const BUCKET_ENV: &str = "RAVEL_LIVE_S3_BUCKET";
 const REGION_ENV: &str = "RAVEL_LIVE_S3_REGION";
+const RUNTIME_PROFILE_ENV: &str = "RAVEL_LIVE_S3_RUNTIME_PROFILE";
 const EXPECTED_BUCKET: &str = "ravel-e02-4c038b2f";
 const EXPECTED_REGION: &str = "us-east-1";
 const HEAD_KEY: &str = "head.json";
@@ -40,6 +49,7 @@ const MAX_PREFIX_BYTES: usize = 64;
 // Mirrors the stored-event and canonical-head decode limits in the library.
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_HEAD_BYTES: usize = 4 * 1024;
+const MAX_CLAIM_BYTES: usize = 4 * 1024;
 const RACE_ROUNDS: usize = 4;
 const RACE_CONTENDERS: usize = 16;
 const RACE_BODY_BYTES: usize = 16 * 1024;
@@ -67,6 +77,7 @@ struct ChainKeys {
     event_1: String,
     event_2: String,
     head: String,
+    claim: String,
 }
 
 #[derive(Serialize)]
@@ -936,6 +947,20 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         head::encode(&genesis_head).map_err(|_| "genesis head encoding failed")?;
     let successor_head_bytes =
         head::encode(&successor_head).map_err(|_| "successor head encoding failed")?;
+    let claim = Claim::new(
+        WorkId::new("live".into()).map_err(|_| "claim work construction failed")?,
+        1,
+        ActorId::new("live-preflight".into()).map_err(|_| "claim actor construction failed")?,
+        InstanceId::new(evidence.run_id.clone())
+            .map_err(|_| "claim instance construction failed")?,
+        1,
+        "live-preflight-claim".into(),
+        ClaimState::Active {
+            lease_until: (evidence.epoch_nanos / 1_000_000) as u64 + 60_000,
+        },
+    )
+    .map_err(|_| "claim construction failed")?;
+    let claim_bytes = claims::encode(&claim).map_err(|_| "claim encoding failed")?;
 
     // Immutable objects are stored at exactly the keys the retained head
     // references, so production reconciliation traversing this chain resolves the
@@ -947,6 +972,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         event_1: encoded_1.key().to_owned(),
         event_2: encoded_2.key().to_owned(),
         head: head_key.clone(),
+        claim: physical(prefix, "workspace/live/campaigns/live/work/live/claim.json"),
     };
     evidence.keys = Some(keys.clone());
 
@@ -983,6 +1009,15 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         &keys.head,
         &genesis_head_bytes,
         "create-genesis-head",
+        evidence,
+    )
+    .await?;
+    create_object(
+        &direct,
+        EXPECTED_BUCKET,
+        &keys.claim,
+        &claim_bytes,
+        "create-claim",
         evidence,
     )
     .await?;
@@ -1139,6 +1174,17 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     {
         return Err("artifact validation failed");
     }
+    let stored_claim = get_found_bytes(
+        &store,
+        &keys.claim,
+        MAX_CLAIM_BYTES,
+        "validate-claim",
+        evidence,
+    )
+    .await?;
+    if claims::decode(&stored_claim).map_err(|_| "claim validation failed")? != claim {
+        return Err("claim mismatch");
+    }
 
     // Rules are evaluated against the whole production key family, not only the
     // keys this run created: `head.json` at the bucket root, a later event
@@ -1157,11 +1203,13 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         ObjectFacts::family(&keys.event_1, 0, MAX_EVENT_BYTES as u64),
         ObjectFacts::family(&keys.event_2, 0, MAX_EVENT_BYTES as u64),
         ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
+        ObjectFacts::family(&keys.claim, 0, MAX_CLAIM_BYTES as u64),
         // The sizes this run actually retained, so the evidence names them.
         ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
         ObjectFacts::exact(&keys.event_1, stored_event_1.len() as u64),
         ObjectFacts::exact(&keys.event_2, stored_event_2.len() as u64),
         ObjectFacts::exact(&keys.artifact, stored_artifact.len() as u64),
+        ObjectFacts::exact(&keys.claim, stored_claim.len() as u64),
     ];
     let lifecycle = inspect_lifecycle(&direct, EXPECTED_BUCKET, &objects, evidence).await?;
     let safe = lifecycle.safe;
@@ -1172,6 +1220,27 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
 
     race_for_409(&sdk_config, EXPECTED_BUCKET, prefix, evidence).await?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct DeleteDenialEvidence {
+    classification: &'static str,
+    error_code: &'static str,
+    runtime_role_arn: String,
+}
+
+fn write_delete_denial_evidence(
+    run_id: &str,
+    evidence: &DeleteDenialEvidence,
+) -> Result<String, &'static str> {
+    let path = format!("pilot/e02/live-delete-denial-{run_id}.json");
+    let mut bytes =
+        serde_json::to_vec_pretty(evidence).map_err(|_| "delete evidence serialization failed")?;
+    bytes.push(b'\n');
+    let mut file = File::create_new(&path).map_err(|_| "delete evidence file creation failed")?;
+    file.write_all(&bytes)
+        .map_err(|_| "delete evidence file write failed")?;
+    Ok(path)
 }
 
 fn write_evidence(evidence: &Evidence) -> Result<String, &'static str> {
@@ -1230,6 +1299,108 @@ async fn live_s3_preflight() {
     if let Err(step) = outcome {
         panic!("live S3 preflight failed at {step}; see {path}");
     }
+}
+
+#[tokio::test]
+async fn live_runtime_principal_cannot_delete_claims() {
+    let profile = match std::env::var(RUNTIME_PROFILE_ENV) {
+        Ok(profile) => profile,
+        Err(_) => {
+            println!(
+                "live S3 delete-denial check skipped: set {RUNTIME_PROFILE_ENV} to a named profile"
+            );
+            return;
+        }
+    };
+    match live_enabled() {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("live S3 delete-denial check skipped: enable live S3 bucket and region");
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch");
+    let run_id = format!("{}-{}", now.as_nanos(), process::id());
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .profile_name(&profile)
+        .region(Region::new(EXPECTED_REGION))
+        .load()
+        .await;
+    let runtime_role_arn = StsClient::new(&config)
+        .get_caller_identity()
+        .send()
+        .await
+        .expect("runtime profile must call GetCallerIdentity")
+        .arn()
+        .expect("runtime identity must include an ARN")
+        .to_owned();
+    assert!(
+        runtime_role_arn.contains(":assumed-role/"),
+        "runtime profile must resolve to an assumed role"
+    );
+
+    let key =
+        format!("e04-delete-denial/{run_id}/workspace/live/campaigns/live/work/live/claim.json");
+    let claim = Claim::new(
+        WorkId::new("live".into()).unwrap(),
+        1,
+        ActorId::new("live-runtime".into()).unwrap(),
+        InstanceId::new(run_id.clone()).unwrap(),
+        1,
+        "live-delete-denial".into(),
+        ClaimState::Active {
+            lease_until: now.as_millis() as u64 + 60_000,
+        },
+    )
+    .unwrap();
+    let bytes = claims::encode(&claim).unwrap();
+    let store = S3Store::new(
+        EXPECTED_BUCKET,
+        Region::new(EXPECTED_REGION),
+        Builder::from(&config),
+    );
+    let mut history = AttemptHistory::default();
+    assert!(matches!(
+        store.put_if_absent(&key, bytes.clone(), &mut history).await,
+        MutationOutcome::Committed { .. }
+    ));
+
+    let error_code = match direct_client(&config)
+        .delete_object()
+        .bucket(EXPECTED_BUCKET)
+        .key(&key)
+        .send()
+        .await
+    {
+        Ok(_) => panic!("runtime principal deleted a retained claim"),
+        Err(SdkError::ServiceError(service)) => {
+            assert_eq!(
+                service.err().code(),
+                Some("AccessDenied"),
+                "delete denial must be explicit"
+            );
+            "AccessDenied"
+        }
+        Err(_) => panic!("delete denial was not an S3 service error"),
+    };
+    match store.get_object(&key, bytes.len()).await {
+        Ok(GetOutcome::Found { bytes: found, .. }) => assert_eq!(found, bytes),
+        Ok(GetOutcome::NotFound) => panic!("denied deletion removed the claim"),
+        Err(_) => panic!("claim reread failed after denied deletion"),
+    }
+
+    let evidence = DeleteDenialEvidence {
+        classification: "access-denied",
+        error_code,
+        runtime_role_arn,
+    };
+    let path = write_delete_denial_evidence(&run_id, &evidence)
+        .expect("delete-denial evidence must be retained");
+    println!("live S3 delete-denial evidence: {path}");
 }
 
 fn test_rule(

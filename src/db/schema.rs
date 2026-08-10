@@ -14,7 +14,7 @@ const SCHEMA: &str = "
 CREATE TABLE applied_events (
     sequence INTEGER PRIMARY KEY,
     digest TEXT NOT NULL UNIQUE
-);
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE sync_cursor (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -29,29 +29,29 @@ CREATE TABLE sync_cursor (
             AND tail_digest NOT GLOB '*[^0-9a-f]*'
         )
     )
-);
+) STRICT;
 
 CREATE TABLE campaigns (
     campaign_id TEXT PRIMARY KEY NOT NULL
-);
+) STRICT;
 
 CREATE TABLE objectives (
     objective_id TEXT PRIMARY KEY NOT NULL
-);
+) STRICT;
 
 CREATE TABLE workflows (
     workflow_id TEXT PRIMARY KEY NOT NULL
-);
+) STRICT;
 
 CREATE TABLE work_items (
     work_id TEXT PRIMARY KEY NOT NULL
-);
+) STRICT;
 
 CREATE TABLE dependencies (
     work_id TEXT NOT NULL,
     depends_on_work_id TEXT NOT NULL,
     PRIMARY KEY (work_id, depends_on_work_id)
-);
+) STRICT;
 ";
 
 /// Failure while creating or checking the projection schema.
@@ -84,7 +84,8 @@ impl Error for SchemaError {}
 /// # Errors
 ///
 /// Returns [`SchemaError::DatabaseOperationFailed`] when SQLite cannot open the database,
-/// initialize it, or run the integrity check, including when the tables already exist.
+/// initialize it, or run the integrity check, including when the file already holds any
+/// objects at all rather than only when these table names collide.
 /// Returns [`SchemaError::IntegrityCheckFailed`] when `PRAGMA quick_check` does not return `ok`.
 pub fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, SchemaError> {
     let connection = initialize(path.as_ref()).map_err(|_| SchemaError::DatabaseOperationFailed)?;
@@ -102,6 +103,16 @@ pub fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, SchemaErro
 fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
     let mut connection = rusqlite::Connection::open(path)?;
     let transaction = connection.transaction()?;
+    // Stamping RVL1 onto a database that already holds unrelated objects would
+    // produce a mixed file that passes quick_check while not being this schema.
+    let existing: i64 =
+        transaction.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
+    if existing != 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is not empty".into()),
+        ));
+    }
     transaction.execute_batch(SCHEMA)?;
     transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -264,7 +275,55 @@ mod tests {
         );
         assert_eq!(cursor_rows(&connection), [(1, 1, Some(DIGEST.to_owned()))]);
 
+        // STRICT rejects a REAL `sequence` and a BLOB `tail_digest` that pass the
+        // CHECK constraints.
+        assert_constraint(connection.execute(
+            "UPDATE sync_cursor SET sequence = 1.5, tail_digest = ?1 WHERE id = 1",
+            [DIGEST],
+        ));
+        assert_constraint(connection.execute(
+            "UPDATE sync_cursor SET sequence = 1, tail_digest = ?1 WHERE id = 1",
+            [DIGEST.as_bytes()],
+        ));
+        assert_eq!(cursor_rows(&connection), [(1, 1, Some(DIGEST.to_owned()))]);
+
         drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_database_that_already_holds_objects() {
+        let path = test_path("non-empty");
+        let foreign = rusqlite::Connection::open(&path).unwrap();
+        foreign
+            .execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        drop(foreign);
+
+        assert_eq!(
+            create(&path).err(),
+            Some(SchemaError::DatabaseOperationFailed)
+        );
+
+        let inspect = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            inspect
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            inspect
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM sqlite_schema WHERE name = 'sync_cursor'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(inspect);
         fs::remove_file(path).unwrap();
     }
 
@@ -314,6 +373,21 @@ mod tests {
         assert_constraint(connection.execute(
             "INSERT INTO applied_events (sequence, digest) VALUES (2, NULL)",
             [],
+        ));
+        // WITHOUT ROWID stops `sequence` from aliasing the rowid, so a missing or
+        // NULL sequence is rejected instead of being auto-generated.
+        assert_constraint(connection.execute(
+            "INSERT INTO applied_events (digest) VALUES (?1)",
+            [OTHER_DIGEST],
+        ));
+        assert_constraint(connection.execute(
+            "INSERT INTO applied_events (sequence, digest) VALUES (NULL, ?1)",
+            [OTHER_DIGEST],
+        ));
+        // STRICT rejects storage classes outside the declared column types.
+        assert_constraint(connection.execute(
+            "INSERT INTO applied_events (sequence, digest) VALUES (2.5, ?1)",
+            [OTHER_DIGEST],
         ));
 
         connection

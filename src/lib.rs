@@ -13,6 +13,7 @@ pub mod db {
 }
 
 pub mod domain {
+    pub mod attempt;
     pub mod campaign;
     pub mod work;
 }

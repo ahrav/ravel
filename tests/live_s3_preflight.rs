@@ -130,7 +130,8 @@ struct RuleProjection {
 struct LifecycleReport {
     rule_id: Option<String>,
     object_key: String,
-    object_size: u64,
+    object_size_low: u64,
+    object_size_high: u64,
     selector_matches: bool,
     supported: bool,
     safe: bool,
@@ -151,7 +152,28 @@ struct LifecycleEvidence {
 #[derive(Clone, Copy)]
 struct ObjectFacts<'a> {
     key: &'a str,
-    size: u64,
+    /// Inclusive range of sizes a valid object under this key family can take.
+    ///
+    /// A rule's size window can sit strictly between two sampled sizes, so a
+    /// predicate is tested for intersection with the whole allowed range rather
+    /// than against individual points.
+    sizes: (u64, u64),
+}
+
+impl<'a> ObjectFacts<'a> {
+    fn exact(key: &'a str, size: u64) -> Self {
+        Self {
+            key,
+            sizes: (size, size),
+        }
+    }
+
+    fn family(key: &'a str, low: u64, high: u64) -> Self {
+        Self {
+            key,
+            sizes: (low, high),
+        }
+    }
 }
 
 struct SelectorDecision {
@@ -483,12 +505,20 @@ fn project_rule(rule: &LifecycleRule) -> RuleProjection {
     }
 }
 
-fn size_matches(size: u64, greater_than: Option<i64>, less_than: Option<i64>) -> Option<bool> {
-    let size = i64::try_from(size).ok()?;
-    Some(
-        greater_than.is_none_or(|minimum| size > minimum)
-            && less_than.is_none_or(|maximum| size < maximum),
-    )
+fn size_matches(
+    sizes: (u64, u64),
+    greater_than: Option<i64>,
+    less_than: Option<i64>,
+) -> Option<bool> {
+    let mut low = i64::try_from(sizes.0).ok()?;
+    let mut high = i64::try_from(sizes.1).ok()?;
+    if let Some(minimum) = greater_than {
+        low = low.max(minimum.checked_add(1)?);
+    }
+    if let Some(maximum) = less_than {
+        high = high.min(maximum.checked_sub(1)?);
+    }
+    Some(low <= high)
 }
 
 fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorDecision {
@@ -556,7 +586,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
             };
         }
         let Some(size_match) = size_matches(
-            object.size,
+            object.sizes,
             and.object_size_greater_than,
             and.object_size_less_than,
         ) else {
@@ -577,7 +607,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
         };
     }
     let Some(matches) = size_matches(
-        object.size,
+        object.sizes,
         filter.object_size_greater_than,
         filter.object_size_less_than,
     ) else {
@@ -594,6 +624,14 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
     }
 }
 
+/// `ExpiredObjectDeleteMarker` removes expired delete markers, never a retained
+/// current object, so a rule carrying only that action cannot expire what this
+/// preflight writes.
+fn expires_current_version(expiration: &Value) -> bool {
+    !expiration.get("days").is_none_or(Value::is_null)
+        || !expiration.get("date").is_none_or(Value::is_null)
+}
+
 fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Vec<LifecycleReport> {
     let mut report = Vec::with_capacity(rules.len() * objects.len());
     for rule in rules {
@@ -604,8 +642,11 @@ fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Ve
                 "Disabled" => Some(false),
                 _ => None,
             };
-            let has_expiration =
-                rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some();
+            let has_expiration = rule
+                .expiration
+                .as_ref()
+                .is_some_and(expires_current_version)
+                || rule.noncurrent_version_expiration.is_some();
             let safe = enabled == Some(false)
                 || (enabled == Some(true)
                     && selector.supported
@@ -624,7 +665,8 @@ fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Ve
             report.push(LifecycleReport {
                 rule_id: rule.id.clone(),
                 object_key: object.key.to_owned(),
-                object_size: object.size,
+                object_size_low: object.sizes.0,
+                object_size_high: object.sizes.1,
                 selector_matches: selector.matches,
                 supported: selector.supported,
                 safe,
@@ -1104,53 +1146,22 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     // match. None of these are created; only the rule predicates read them.
     let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
     let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
-    // Maximum-size probes prevent size filters from classifying rules as safe
-    // when they can match larger valid objects in the same key family.
+    // Each key family is described by the full inclusive range of sizes a valid
+    // object can take, so a rule whose size window sits strictly between two
+    // concrete samples is still detected.
     let objects = [
-        ObjectFacts {
-            key: HEAD_KEY,
-            size: MAX_HEAD_BYTES as u64,
-        },
-        ObjectFacts {
-            key: &future_event_key,
-            size: MAX_EVENT_BYTES as u64,
-        },
-        ObjectFacts {
-            key: &other_artifact_key,
-            size: MAX_ARTIFACT_BYTES as u64,
-        },
-        ObjectFacts {
-            key: &keys.head,
-            size: final_head_bytes.len() as u64,
-        },
-        ObjectFacts {
-            key: &keys.head,
-            size: MAX_HEAD_BYTES as u64,
-        },
-        ObjectFacts {
-            key: &keys.event_1,
-            size: stored_event_1.len() as u64,
-        },
-        ObjectFacts {
-            key: &keys.event_2,
-            size: stored_event_2.len() as u64,
-        },
-        ObjectFacts {
-            key: &keys.event_2,
-            size: MAX_EVENT_BYTES as u64,
-        },
-        ObjectFacts {
-            key: &keys.artifact,
-            size: stored_artifact.len() as u64,
-        },
-        ObjectFacts {
-            key: &keys.artifact,
-            size: 0,
-        },
-        ObjectFacts {
-            key: &keys.artifact,
-            size: MAX_ARTIFACT_BYTES as u64,
-        },
+        ObjectFacts::family(HEAD_KEY, 0, MAX_HEAD_BYTES as u64),
+        ObjectFacts::family(&future_event_key, 0, MAX_EVENT_BYTES as u64),
+        ObjectFacts::family(&other_artifact_key, 0, MAX_ARTIFACT_BYTES as u64),
+        ObjectFacts::family(&keys.head, 0, MAX_HEAD_BYTES as u64),
+        ObjectFacts::family(&keys.event_1, 0, MAX_EVENT_BYTES as u64),
+        ObjectFacts::family(&keys.event_2, 0, MAX_EVENT_BYTES as u64),
+        ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
+        // The sizes this run actually retained, so the evidence names them.
+        ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
+        ObjectFacts::exact(&keys.event_1, stored_event_1.len() as u64),
+        ObjectFacts::exact(&keys.event_2, stored_event_2.len() as u64),
+        ObjectFacts::exact(&keys.artifact, stored_artifact.len() as u64),
     ];
     let lifecycle = inspect_lifecycle(&direct, EXPECTED_BUCKET, &objects, evidence).await?;
     let safe = lifecycle.safe;
@@ -1240,11 +1251,71 @@ fn test_rule(
 }
 
 #[test]
+fn size_windows_are_tested_against_the_whole_allowed_range() {
+    let family = ObjectFacts::family("artifacts/sha256/abc", 0, MAX_ARTIFACT_BYTES as u64);
+    let window = test_rule(
+        "Enabled",
+        Some(FilterProjection {
+            and: Some(AndProjection {
+                prefix: Some("artifacts/sha256/".into()),
+                tags: Vec::new(),
+                object_size_greater_than: Some(1024),
+                object_size_less_than: Some(2048),
+            }),
+            ..Default::default()
+        }),
+        None,
+    );
+
+    // No sampled size lands inside (1024, 2048), but a 1500-byte artifact does.
+    let decision = selector_matches(&window, family);
+    assert!(decision.supported);
+    assert!(decision.matches, "a window inside the range must match");
+
+    for point in [0, MAX_ARTIFACT_BYTES as u64] {
+        let sample = ObjectFacts::exact("artifacts/sha256/abc", point);
+        assert!(
+            !selector_matches(&window, sample).matches,
+            "point sample {point} sits outside the window"
+        );
+    }
+
+    let above = ObjectFacts::family("artifacts/sha256/abc", 4096, MAX_ARTIFACT_BYTES as u64);
+    assert!(!selector_matches(&window, above).matches);
+}
+
+#[test]
+fn delete_marker_cleanup_alone_does_not_expire_retained_objects() {
+    let object = ObjectFacts::family(HEAD_KEY, 0, MAX_HEAD_BYTES as u64);
+    let mut marker_only = test_rule("Enabled", None, None);
+    marker_only.expiration = Some(json!({
+        "date": Value::Null,
+        "days": Value::Null,
+        "expired_object_delete_marker": true,
+    }));
+
+    let report = lifecycle_report(&[marker_only.clone()], &[object]);
+    assert_eq!(report.len(), 1);
+    assert!(
+        report[0].safe,
+        "delete-marker cleanup expires no current object"
+    );
+    assert_eq!(report[0].reason, "no-expiration");
+
+    // A days-based expiration on the same matching rule is still unsafe.
+    marker_only.expiration = Some(json!({
+        "date": Value::Null,
+        "days": 1,
+        "expired_object_delete_marker": true,
+    }));
+    let report = lifecycle_report(&[marker_only], &[object]);
+    assert!(!report[0].safe);
+    assert_eq!(report[0].reason, "matching-expiration");
+}
+
+#[test]
 fn lifecycle_rule_evaluator_covers_all_selector_forms_and_overlaps() {
-    let object = ObjectFacts {
-        key: "e02-preflight/run/head.json",
-        size: 100,
-    };
+    let object = ObjectFacts::exact("e02-preflight/run/head.json", 100);
     let cases = [
         ("global", test_rule("Enabled", None, None), true, true),
         (
@@ -1343,10 +1414,7 @@ fn lifecycle_rule_evaluator_covers_all_selector_forms_and_overlaps() {
 
 #[test]
 fn evaluator_fails_closed_on_noncurrent_and_unsupported_shapes() {
-    let object = ObjectFacts {
-        key: "e02-preflight/run/head.json",
-        size: 100,
-    };
+    let object = ObjectFacts::exact("e02-preflight/run/head.json", 100);
 
     let mut noncurrent = test_rule("Enabled", None, None);
     noncurrent.expiration = None;
@@ -1404,10 +1472,7 @@ fn evaluator_fails_closed_on_noncurrent_and_unsupported_shapes() {
         }),
         None,
     );
-    let embedded = ObjectFacts {
-        key: "x/e02-preflight/run/head.json",
-        size: 100,
-    };
+    let embedded = ObjectFacts::exact("x/e02-preflight/run/head.json", 100);
     assert!(!selector_matches(&anchored_prefix, embedded).matches);
 }
 

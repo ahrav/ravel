@@ -23,7 +23,14 @@ use aws_sdk_s3::{
 };
 use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 use ravel::{
-    domain::campaign::{Authority, Event, EventContent, EventRef},
+    distributed::{
+        claims::{self, Claim, ClaimState},
+        identity::{ActorId, InstanceId},
+    },
+    domain::{
+        campaign::{Authority, Event, EventContent, EventRef},
+        work::WorkId,
+    },
     storage::{
         artifacts,
         s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
@@ -33,6 +40,7 @@ use ravel::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+const MAX_CLAIM_BYTES: usize = 4 * 1024;
 const LIVE_FLAG: &str = "RAVEL_LIVE_S3";
 const BUCKET_ENV: &str = "RAVEL_LIVE_S3_BUCKET";
 const REGION_ENV: &str = "RAVEL_LIVE_S3_REGION";
@@ -400,6 +408,8 @@ struct Evidence {
     inherited_parent_key: Option<String>,
     inherited_chain_length: Option<u64>,
     final_validation: Option<&'static str>,
+    claim_key: Option<String>,
+    claim_winner: Option<u8>,
     result: String,
 }
 
@@ -602,8 +612,16 @@ async fn scenario_b(
     Ok(())
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerMode {
+    Head,
+    Claim,
+}
+
 #[derive(Deserialize, Serialize)]
 struct WorkerParams {
+    mode: WorkerMode,
     run_id: String,
     worker_id: u8,
     parent_head_bytes: Vec<u8>,
@@ -612,6 +630,7 @@ struct WorkerParams {
     parent_tail_key: String,
     barrier_address: String,
     creation_time_unix_ms: u64,
+    claim_key: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -623,6 +642,8 @@ struct WorkerResult {
     head_operation_id: String,
     artifact_digest: String,
     artifact_key: String,
+    claim_key: Option<String>,
+    claim_operation_id: Option<String>,
 }
 
 impl WorkerResult {
@@ -635,6 +656,8 @@ impl WorkerResult {
             head_operation_id: String::new(),
             artifact_digest: String::new(),
             artifact_key: String::new(),
+            claim_key: None,
+            claim_operation_id: None,
         }
     }
 }
@@ -655,7 +678,17 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
         return Err("worker-live-gate");
     }
     let config = load_sdk_config().await?;
-    let store = clean_store(&config);
+    match params.mode {
+        WorkerMode::Head => head_worker_scenario(params, &config).await,
+        WorkerMode::Claim => claim_worker_scenario(params, &config).await,
+    }
+}
+
+async fn head_worker_scenario(
+    params: &WorkerParams,
+    config: &SdkConfig,
+) -> Result<WorkerResult, &'static str> {
+    let store = clean_store(config);
     let observed = head::read(&store)
         .await
         .map_err(|_| "worker-head-read")?
@@ -682,28 +715,7 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
     .await
     .map_err(|_| "worker-artifact-publication")?;
 
-    let address = params
-        .barrier_address
-        .parse::<SocketAddr>()
-        .map_err(|_| "worker-barrier-address")?;
-    let mut barrier = TcpStream::connect_timeout(&address, BARRIER_IO_TIMEOUT)
-        .map_err(|_| "worker-barrier-connect")?;
-    barrier
-        .set_read_timeout(Some(WORKER_READY_DEADLINE))
-        .map_err(|_| "worker-barrier-timeout")?;
-    barrier
-        .set_write_timeout(Some(BARRIER_IO_TIMEOUT))
-        .map_err(|_| "worker-barrier-timeout")?;
-    barrier
-        .write_all(&[params.worker_id])
-        .map_err(|_| "worker-barrier-ready")?;
-    let mut release = [0_u8; 1];
-    barrier
-        .read_exact(&mut release)
-        .map_err(|_| "worker-barrier-release")?;
-    if release[0] != b'G' {
-        return Err("worker-barrier-token");
-    }
+    wait_for_release(params)?;
 
     let event_operation_id = format!("{}-event-{}", params.run_id, params.worker_id);
     // append gives the head the tail's operation identity, so one append is
@@ -768,7 +780,83 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
         head_operation_id,
         artifact_digest,
         artifact_key,
+        claim_key: None,
+        claim_operation_id: None,
     })
+}
+
+async fn claim_worker_scenario(
+    params: &WorkerParams,
+    config: &SdkConfig,
+) -> Result<WorkerResult, &'static str> {
+    let key = params.claim_key.as_deref().ok_or("worker-claim-key")?;
+    let operation_id = format!("{}-claim-{}", params.run_id, params.worker_id);
+    let claim = Claim::new(
+        WorkId::new("live-race-work".into()).map_err(|_| "worker-claim-work")?,
+        4,
+        ActorId::new(format!("claim-actor-{}", params.worker_id))
+            .map_err(|_| "worker-claim-actor")?,
+        InstanceId::new(format!("claim-instance-{}", params.worker_id))
+            .map_err(|_| "worker-claim-instance")?,
+        1,
+        operation_id.clone(),
+        ClaimState::Active {
+            lease_until: params.creation_time_unix_ms + 60_000,
+        },
+    )
+    .map_err(|_| "worker-claim")?;
+    let bytes = claims::encode(&claim).map_err(|_| "worker-claim-encode")?;
+    wait_for_release(params)?;
+    let store = clean_store(config);
+    let mut history = AttemptHistory::default();
+    let outcome = tokio::time::timeout(
+        OPERATION_DEADLINE,
+        store.put_if_absent(key, bytes, &mut history),
+    )
+    .await
+    .map_err(|_| "worker-claim-timeout")?;
+    let classification = match outcome {
+        MutationOutcome::Committed { .. } => "claim-committed",
+        MutationOutcome::Conflict | MutationOutcome::PreconditionFailed => "claim-collision",
+        _ => return Err("worker-claim-outcome"),
+    };
+    Ok(WorkerResult {
+        classification: classification.into(),
+        worker_id: params.worker_id,
+        event_operation_id: String::new(),
+        event_key: String::new(),
+        head_operation_id: String::new(),
+        artifact_digest: String::new(),
+        artifact_key: String::new(),
+        claim_key: Some(key.to_owned()),
+        claim_operation_id: Some(operation_id),
+    })
+}
+
+fn wait_for_release(params: &WorkerParams) -> Result<(), &'static str> {
+    let address = params
+        .barrier_address
+        .parse::<SocketAddr>()
+        .map_err(|_| "worker-barrier-address")?;
+    let mut barrier = TcpStream::connect_timeout(&address, BARRIER_IO_TIMEOUT)
+        .map_err(|_| "worker-barrier-connect")?;
+    barrier
+        .set_read_timeout(Some(WORKER_READY_DEADLINE))
+        .map_err(|_| "worker-barrier-timeout")?;
+    barrier
+        .set_write_timeout(Some(BARRIER_IO_TIMEOUT))
+        .map_err(|_| "worker-barrier-timeout")?;
+    barrier
+        .write_all(&[params.worker_id])
+        .map_err(|_| "worker-barrier-ready")?;
+    let mut release = [0_u8; 1];
+    barrier
+        .read_exact(&mut release)
+        .map_err(|_| "worker-barrier-release")?;
+    if release[0] != b'G' {
+        return Err("worker-barrier-token");
+    }
+    Ok(())
 }
 
 fn worker_params(
@@ -779,6 +867,7 @@ fn worker_params(
     creation_time_unix_ms: u64,
 ) -> WorkerParams {
     WorkerParams {
+        mode: WorkerMode::Head,
         run_id: run_id.to_owned(),
         worker_id,
         parent_head_bytes: observed.canonical_bytes().to_vec(),
@@ -787,6 +876,28 @@ fn worker_params(
         parent_tail_key: observed.head().tail().key().to_owned(),
         barrier_address: barrier_address.to_string(),
         creation_time_unix_ms,
+        claim_key: None,
+    }
+}
+
+fn claim_worker_params(
+    run_id: &str,
+    worker_id: u8,
+    claim_key: &str,
+    barrier_address: SocketAddr,
+    creation_time_unix_ms: u64,
+) -> WorkerParams {
+    WorkerParams {
+        mode: WorkerMode::Claim,
+        run_id: run_id.to_owned(),
+        worker_id,
+        parent_head_bytes: Vec::new(),
+        parent_sequence: 0,
+        parent_tail_digest: String::new(),
+        parent_tail_key: String::new(),
+        barrier_address: barrier_address.to_string(),
+        creation_time_unix_ms,
+        claim_key: Some(claim_key.to_owned()),
     }
 }
 
@@ -1043,6 +1154,89 @@ async fn two_process_race(
     Ok(())
 }
 
+async fn two_process_claim_race(
+    config: &SdkConfig,
+    run_id: &str,
+    creation_time_unix_ms: u64,
+    evidence: &mut Evidence,
+) -> Result<(), &'static str> {
+    let key = format!("workspace/{run_id}/campaigns/live-race/work/live-race-work/claim.json");
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| "claim-barrier-bind")?;
+    let address = listener.local_addr().map_err(|_| "claim-barrier-address")?;
+    let params = [
+        claim_worker_params(run_id, 0, &key, address, creation_time_unix_ms),
+        claim_worker_params(run_id, 1, &key, address, creation_time_unix_ms),
+    ];
+    let mut first_child = spawn_worker(&params[0])?;
+    let mut second_child = match spawn_worker(&params[1]) {
+        Ok(child) => child,
+        Err(error) => {
+            stop_worker(&mut first_child);
+            return Err(error);
+        }
+    };
+    if let Err(error) = release_workers(&listener) {
+        stop_worker(&mut first_child);
+        stop_worker(&mut second_child);
+        return Err(error);
+    }
+    let deadline = Instant::now() + WORKER_JOIN_DEADLINE;
+    let first_result = match wait_worker(first_child, deadline, params[0].worker_id) {
+        Ok(result) => result,
+        Err(error) => {
+            stop_worker(&mut second_child);
+            return Err(error);
+        }
+    };
+    let results = [
+        first_result,
+        wait_worker(second_child, deadline, params[1].worker_id)?,
+    ];
+    evidence.workers.extend(results.iter().cloned());
+    let committed: Vec<_> = results
+        .iter()
+        .filter(|result| result.classification == "claim-committed")
+        .collect();
+    let collisions: Vec<_> = results
+        .iter()
+        .filter(|result| result.classification == "claim-collision")
+        .collect();
+    if committed.len() != 1 || collisions.len() != 1 {
+        return Err("claim-race-worker-outcomes");
+    }
+    if results
+        .iter()
+        .any(|result| result.claim_key.as_deref() != Some(&key))
+    {
+        return Err("claim-race-key");
+    }
+    let winner = committed[0];
+    let stored = match clean_store(config)
+        .get_object(&key, MAX_CLAIM_BYTES)
+        .await
+        .map_err(|_| "claim-race-read")?
+    {
+        GetOutcome::Found { bytes, .. } => bytes,
+        GetOutcome::NotFound => return Err("claim-race-missing"),
+    };
+    let claim = claims::decode(&stored).map_err(|_| "claim-race-decode")?;
+    if claim.operation_id()
+        != winner
+            .claim_operation_id
+            .as_deref()
+            .ok_or("claim-race-operation")?
+        || claim.owner_actor().as_str() != format!("claim-actor-{}", winner.worker_id)
+        || claim.owner_instance().as_str() != format!("claim-instance-{}", winner.worker_id)
+        || claim.fence() != 1
+        || claim.work_revision() != 4
+    {
+        return Err("claim-race-authority");
+    }
+    evidence.claim_key = Some(key);
+    evidence.claim_winner = Some(winner.worker_id);
+    Ok(())
+}
+
 #[tokio::test]
 async fn dropped_response_is_unknown_through_the_production_store() {
     let interceptor = ResponseInterceptor::new([ResponseAction::drop(
@@ -1109,6 +1303,7 @@ async fn run_live(
     .await
     .map_err(|_| "scenario-b-timeout")??;
     two_process_race(&config, run_id, creation_time_unix_ms, evidence).await?;
+    two_process_claim_race(&config, run_id, creation_time_unix_ms, evidence).await?;
     Ok(())
 }
 
@@ -1157,6 +1352,8 @@ async fn live_s3_ambiguity() {
         inherited_parent_key: None,
         inherited_chain_length: None,
         final_validation: None,
+        claim_key: None,
+        claim_winner: None,
         result: "running".into(),
     };
     let result = run_live(&run_id, now.as_millis() as u64, &mut evidence).await;

@@ -323,7 +323,10 @@ mod tests {
             ]);
         }
         let (store, client) = replay_store(responses);
-        let handle = replay::startup(&store, &database).await.unwrap();
+        let handle = replay::startup(&store, &database)
+            .await
+            .unwrap()
+            .into_handle();
         let requested = [work("active-work", 1), work("sealed-work", 4)];
 
         let first = intake(&store, &handle, &workspace(), "campaign-1", &requested)
@@ -659,7 +662,10 @@ mod tests {
             found(CHILD_BYTES),
             found(GENESIS_BYTES),
         ]);
-        let handle = replay::startup(&startup_store, &database).await.unwrap();
+        let handle = replay::startup(&startup_store, &database)
+            .await
+            .unwrap()
+            .into_handle();
 
         let result = result_ref("attempt-17", 6);
         let sealed = sealed_claim("sealed-work", 4, result.clone());

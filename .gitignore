@@ -5,3 +5,6 @@
 .beads/.bv.lock
 .beads/daemon-error
 .pi-subagents/
+
+# Cargo build artifacts
+/target

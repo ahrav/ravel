@@ -1875,7 +1875,11 @@ mod tests {
         };
         assert_eq!(rejection.error, ClaimPrepareError::InvalidInput);
         // The returned authority is intact and still authorizes the same claim.
-        assert!(rejection.authority.authorizes(&work("work-17", 4)));
+        assert!(rejection.authority.authorizes(
+            &work("work-17", 4),
+            &workspace("workspace-1"),
+            "campaign-1"
+        ));
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@
 //!
 //! Head transitions preserve canonical bytes and observed ETags through
 //! conditional mutation and resolution. Advanced observations require retained-
-//! chain reconciliation. Only owned-to-owned controller fences are ordered here.
+//! chain reconciliation. Authority ordering is enforced in `authority_permits`.
 
 use std::{error::Error, fmt};
 
@@ -93,7 +93,10 @@ impl HeadTransition {
 
         match &parent {
             HeadParent::Genesis => {
-                if tail.sequence() != 1 || tail.parent().is_some() {
+                if tail.sequence() != 1
+                    || tail.parent().is_some()
+                    || !matches!(candidate.authority().state(), AuthorityState::Unowned)
+                {
                     return Err(WireError::InvalidValue);
                 }
             }
@@ -107,7 +110,7 @@ impl HeadTransition {
                 if candidate.operation_id() == observed.head.operation_id()
                     || tail.sequence() != expected_sequence
                     || tail.parent() != Some(observed.head.tail())
-                    || !fence_permits(&observed.head, &candidate)
+                    || !authority_permits(&observed.head, &candidate)
                 {
                     return Err(WireError::InvalidValue);
                 }
@@ -246,16 +249,28 @@ async fn resolve(store: &S3Store, mut transition: HeadTransition) -> HeadCommitO
     };
     if parent_is_current {
         transition.parent = HeadParent::Existing(current);
-        HeadCommitOutcome::RetryIdentically(transition)
-    } else {
-        HeadCommitOutcome::Advanced {
-            transition,
-            current,
-        }
+        return HeadCommitOutcome::RetryIdentically(transition);
+    }
+
+    // A current head that reuses the observed parent's operation identity while
+    // carrying different bytes means one operation id names two distinct heads.
+    // Chain reconciliation has no way to pick between them.
+    if let HeadParent::Existing(parent) = &transition.parent
+        && current.head.operation_id() == parent.head.operation_id()
+    {
+        return HeadCommitOutcome::Unresolved(transition);
+    }
+
+    HeadCommitOutcome::Advanced {
+        transition,
+        current,
     }
 }
 
-fn fence_permits(parent: &Head, candidate: &Head) -> bool {
+/// An unowned successor to an owned head would let any holder of the current
+/// ETag strip the controller fence through the ordinary `If-Match` CAS, so the
+/// non-regression check rejects it rather than falling through.
+fn authority_permits(parent: &Head, candidate: &Head) -> bool {
     match (parent.authority().state(), candidate.authority().state()) {
         (
             AuthorityState::Owned {
@@ -267,6 +282,7 @@ fn fence_permits(parent: &Head, candidate: &Head) -> bool {
                 ..
             },
         ) => candidate_fence >= parent_fence,
+        (AuthorityState::Owned { .. }, AuthorityState::Unowned) => false,
         _ => true,
     }
 }
@@ -779,6 +795,16 @@ mod tests {
 
         let genesis = genesis_event();
         let publication = publish_event(&genesis).await;
+        let owned_genesis = Head::new(
+            Authority::owned("owner".into(), "instance".into(), 1, 1).expect("valid authority"),
+            publication.event_ref().clone(),
+            "head-op-1".into(),
+        )
+        .expect("valid head");
+        rejects_transition(HeadParent::Genesis, owned_genesis, &genesis, &publication);
+
+        let genesis = genesis_event();
+        let publication = publish_event(&genesis).await;
         let different =
             EventRef::from_digest(1, "f".repeat(64)).expect("valid alternate reference");
         let candidate =
@@ -879,6 +905,20 @@ mod tests {
         )
         .expect("valid head");
         rejects_transition(HeadParent::Existing(observed), lower, &tail, &publication);
+
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let unfenced = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "head-op-2".into(),
+        )
+        .expect("valid head");
+        rejects_transition(
+            HeadParent::Existing(observed),
+            unfenced,
+            &tail,
+            &publication,
+        );
 
         let observed = read_observed(&parent, OLD_ETAG).await;
         let reused_operation = Head::new(
@@ -1096,7 +1136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_head_reusing_parent_operation_but_changing_bytes_is_advanced() {
+    async fn current_head_reusing_parent_operation_but_changing_bytes_is_unresolved() {
         let parent = parent_head(Authority::unowned(), "parent-op");
         let original = read_observed(&parent, OLD_ETAG).await;
         let transition = successor_transition(original, Authority::unowned(), "head-op-2").await;
@@ -1118,7 +1158,7 @@ mod tests {
 
         assert!(matches!(
             commit(&store, transition, &mut history).await,
-            HeadCommitOutcome::Advanced { .. }
+            HeadCommitOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 2);
     }

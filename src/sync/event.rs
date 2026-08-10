@@ -19,8 +19,10 @@
 //! and their derived keys.
 //!
 //! Event publication requires a matching artifact witness before object-store I/O.
+//! [`scheduling_mutation`] converts one decoded event into durable coordinates and a row effect
+//! for the disposable projection.
 
-use std::io::Cursor;
+use std::{error::Error, fmt, io::Cursor};
 
 use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
 use serde::{Deserialize, Serialize};
@@ -81,6 +83,121 @@ impl ResolvedEventPublication {
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
+}
+
+/// Row effect a frozen-v1 event produces in the disposable projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchedulingEffect {
+    CampaignCreated { campaign_id: String },
+    WorkflowStarted { workflow_id: String },
+}
+
+/// Owned durable coordinates and row effect for one apply transaction.
+///
+/// Each effect's ID is the converted event's sequence as 16-digit zero-padded decimal. The
+/// caller must pass a reference whose sequence equals [`Self::reference`]'s sequence.
+/// Consumers use the carried ID rather than deriving it again. The mutation carries no
+/// operation identity and no writer fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchedulingMutation {
+    reference: EventRef,
+    parent: Option<EventRef>,
+    effect: SchedulingEffect,
+}
+
+impl SchedulingMutation {
+    pub fn reference(&self) -> &EventRef {
+        &self.reference
+    }
+
+    pub fn parent(&self) -> Option<&EventRef> {
+        self.parent.as_ref()
+    }
+
+    pub fn effect(&self) -> &SchedulingEffect {
+        &self.effect
+    }
+}
+
+/// Fail-closed category produced by intrinsic v1 scheduling conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversionError {
+    IllegalPosition,
+    UnsupportedContent,
+    ReferenceMismatch,
+}
+
+impl fmt::Display for ConversionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::IllegalPosition => "event content is illegal at this sequence",
+            Self::UnsupportedContent => "event content has no scheduling projection",
+            Self::ReferenceMismatch => "event reference does not name this event",
+        })
+    }
+}
+
+impl Error for ConversionError {}
+
+/// Converts a verified v1 event into an owned scheduling mutation.
+///
+/// `reference` must name `event` exactly: the sequence, digest, and key are all
+/// re-derived from `event` and compared, so a reference belonging to another event
+/// cannot pair a durable coordinate with this event's row effect.
+///
+/// # Errors
+///
+/// Returns [`ConversionError::ReferenceMismatch`] when `reference` does not name
+/// `event`, or when `event` cannot be re-encoded. Returns
+/// [`ConversionError::IllegalPosition`] for `CampaignCreated` at any sequence other
+/// than 1 and for `WorkflowStarted` at sequence 1. Returns
+/// [`ConversionError::UnsupportedContent`] for `ArtifactPublished`, which has no
+/// scheduling projection.
+pub fn scheduling_mutation(
+    reference: EventRef,
+    event: &Event,
+) -> Result<SchedulingMutation, ConversionError> {
+    let encoded = encode(event).map_err(|_| ConversionError::ReferenceMismatch)?;
+    if reference.sequence() != event.sequence()
+        || reference.digest() != encoded.digest()
+        || reference.key() != encoded.key()
+    {
+        return Err(ConversionError::ReferenceMismatch);
+    }
+    // No wildcard arm: a new EventContent variant must fail compilation here rather than
+    // silently project nothing.
+    let effect = match (event.content(), event.sequence()) {
+        (EventContent::CampaignCreated, 1) => SchedulingEffect::CampaignCreated {
+            campaign_id: projected_id(1),
+        },
+        (EventContent::WorkflowStarted, sequence) if sequence > 1 => {
+            SchedulingEffect::WorkflowStarted {
+                workflow_id: projected_id(sequence),
+            }
+        }
+        (EventContent::CampaignCreated | EventContent::WorkflowStarted, _) => {
+            return Err(ConversionError::IllegalPosition);
+        }
+        (EventContent::ArtifactPublished(_), _) => {
+            return Err(ConversionError::UnsupportedContent);
+        }
+    };
+
+    Ok(SchedulingMutation {
+        reference,
+        parent: event.parent().cloned(),
+        effect,
+    })
+}
+
+/// Derives an identity unique within the single chain tracked by the singleton sync cursor.
+///
+/// Genesis is always sequence 1, so every campaign row carries the constant ID
+/// `0000000000000001`; one database projects one chain, which keeps that constant
+/// collision-free. The identity is the event's own 16-digit sequence, matching the padding
+/// the event key already uses, because v1 event payloads carry no identities of their own.
+fn projected_id(sequence: u64) -> String {
+    format!("{sequence:016}")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -352,6 +469,16 @@ mod tests {
     };
 
     use super::*;
+
+    fn reference_for(event: &Event) -> EventRef {
+        let encoded = encode(event).expect("event encodes");
+        EventRef::new(
+            event.sequence(),
+            encoded.digest().to_owned(),
+            encoded.key().to_owned(),
+        )
+        .expect("canonical reference")
+    }
 
     fn valid_wire() -> WireEvent {
         WireEvent {
@@ -632,6 +759,124 @@ mod tests {
         assert_eq!(
             decode(&bytes, &key(&bytes, 1)),
             Err(WireError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn derives_workflow_identity_from_the_event_sequence() {
+        let workflow = Event::new(
+            "workflow-op".into(),
+            3,
+            Some(EventRef::from_digest(2, "1".repeat(64)).unwrap()),
+            7,
+            EventContent::WorkflowStarted,
+        )
+        .unwrap();
+        let reference = reference_for(&workflow);
+
+        assert_eq!(
+            scheduling_mutation(reference, &workflow).unwrap().effect(),
+            &SchedulingEffect::WorkflowStarted {
+                workflow_id: "0000000000000003".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_scheduling_content_at_illegal_positions() {
+        let workflow = Event::new(
+            "workflow-op".into(),
+            1,
+            None,
+            7,
+            EventContent::WorkflowStarted,
+        )
+        .unwrap();
+        let workflow_reference = reference_for(&workflow);
+        assert_eq!(
+            scheduling_mutation(workflow_reference, &workflow),
+            Err(ConversionError::IllegalPosition)
+        );
+
+        let campaign = Event::new(
+            "campaign-op".into(),
+            2,
+            Some(EventRef::from_digest(1, "0".repeat(64)).unwrap()),
+            7,
+            EventContent::CampaignCreated,
+        )
+        .unwrap();
+        let campaign_reference = reference_for(&campaign);
+        assert_eq!(
+            scheduling_mutation(campaign_reference, &campaign),
+            Err(ConversionError::IllegalPosition)
+        );
+    }
+
+    #[test]
+    fn rejects_a_reference_with_the_right_sequence_and_wrong_digest() {
+        let campaign = Event::new(
+            "campaign-op".into(),
+            1,
+            None,
+            7,
+            EventContent::CampaignCreated,
+        )
+        .unwrap();
+        let canonical = reference_for(&campaign);
+        let wrong_digest =
+            EventRef::from_digest(canonical.sequence(), "c".repeat(64)).expect("valid reference");
+        assert_eq!(wrong_digest.sequence(), canonical.sequence());
+        assert_ne!(wrong_digest.digest(), canonical.digest());
+
+        assert_eq!(
+            scheduling_mutation(wrong_digest, &campaign),
+            Err(ConversionError::ReferenceMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_a_reference_naming_another_sequence() {
+        let campaign = Event::new(
+            "campaign-op".into(),
+            1,
+            None,
+            7,
+            EventContent::CampaignCreated,
+        )
+        .unwrap();
+        let foreign = EventRef::from_digest(2, "0".repeat(64)).unwrap();
+
+        assert_eq!(
+            scheduling_mutation(foreign, &campaign),
+            Err(ConversionError::ReferenceMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_artifact_content_without_a_scheduling_projection() {
+        let artifact = ArtifactRef::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            4,
+            "application/octet-stream".into(),
+            "attempt".into(),
+            123,
+            None,
+        )
+        .unwrap();
+        let event = Event::new(
+            "artifact-op".into(),
+            1,
+            None,
+            7,
+            EventContent::ArtifactPublished(artifact),
+        )
+        .unwrap();
+        let reference = reference_for(&event);
+
+        assert_eq!(
+            scheduling_mutation(reference, &event),
+            Err(ConversionError::UnsupportedContent)
         );
     }
 

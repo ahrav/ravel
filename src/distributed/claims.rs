@@ -416,6 +416,9 @@ pub(crate) fn prepare_reclamation(
     now: u64,
 ) -> Result<ClaimMutation, ClaimPrepareError> {
     if observed.claim.work_id() != work.id()
+        // A claim written for a newer revision must not be rolled back to this
+        // caller's older one.
+        || observed.claim.work_revision() > work.revision()
         || !matches!(
             observed.claim.state(),
             ClaimState::Active { lease_until } if now >= *lease_until
@@ -435,7 +438,10 @@ pub(crate) fn prepare_supersession(
     now: u64,
 ) -> Result<ClaimMutation, ClaimPrepareError> {
     if observed.claim.work_id() != work.id()
-        || observed.claim.work_revision() == work.revision()
+        // Supersession only moves forward: an equal revision has nothing to
+        // supersede, and a greater one would regain authority over a claim already
+        // sealed for a newer generation.
+        || observed.claim.work_revision() >= work.revision()
         || !matches!(observed.claim.state(), ClaimState::Sealed { .. })
     {
         return Err(ClaimPrepareError::InvalidInput);
@@ -542,9 +548,8 @@ pub(crate) async fn apply_mutation(
         MutationOutcome::Committed { etag: None }
         | MutationOutcome::AmbiguousConflict
         | MutationOutcome::Unknown => resolve_mutation(store, mutation).await,
-        MutationOutcome::Conflict | MutationOutcome::PreconditionFailed => {
-            ClaimMutationOutcome::Lost
-        }
+        MutationOutcome::PreconditionFailed => ClaimMutationOutcome::Lost,
+        MutationOutcome::Conflict => ClaimMutationOutcome::RetryIdentically(mutation),
         MutationOutcome::ProvenNotSent => ClaimMutationOutcome::RetryIdentically(mutation),
         MutationOutcome::NotFound | MutationOutcome::TooLarge => {
             ClaimMutationOutcome::Unresolved(mutation)
@@ -559,7 +564,7 @@ pub(crate) async fn apply_mutation(
 /// expected bytes.
 enum CandidateRead {
     Matching(ETag),
-    Different,
+    Different(ETag),
     Missing,
     Failed,
 }
@@ -567,7 +572,7 @@ enum CandidateRead {
 async fn read_candidate(store: &S3Store, key: &str, expected: &[u8]) -> CandidateRead {
     match store.get_object(key, MAX_CLAIM_BYTES).await {
         Ok(GetOutcome::Found { bytes, etag }) if bytes == expected => CandidateRead::Matching(etag),
-        Ok(GetOutcome::Found { .. }) => CandidateRead::Different,
+        Ok(GetOutcome::Found { etag, .. }) => CandidateRead::Different(etag),
         Ok(GetOutcome::NotFound) => CandidateRead::Missing,
         Err(_) => CandidateRead::Failed,
     }
@@ -580,7 +585,7 @@ async fn resolve_acquisition(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcq
             key: attempt.key,
             etag,
         }),
-        CandidateRead::Different => ClaimAcquireOutcome::Collision,
+        CandidateRead::Different(_) => ClaimAcquireOutcome::Collision,
         // Absence proves the PUT had not landed at read time: retained claim
         // keys admit no delete path or lifecycle expiration and S3 reads are
         // strongly consistent after write. A write still in flight is safe to
@@ -599,7 +604,12 @@ async fn resolve_mutation(store: &S3Store, mutation: ClaimMutation) -> ClaimMuta
             key: mutation.key,
             etag,
         }),
-        CandidateRead::Different => ClaimMutationOutcome::Lost,
+        // An unchanged ETag means nothing else has taken the claim, and a possibly
+        // dispatched PUT stays able to land.
+        CandidateRead::Different(etag) if etag == mutation.etag => {
+            ClaimMutationOutcome::Unresolved(mutation)
+        }
+        CandidateRead::Different(_) => ClaimMutationOutcome::Lost,
         CandidateRead::Missing | CandidateRead::Failed => {
             ClaimMutationOutcome::Unresolved(mutation)
         }
@@ -1369,8 +1379,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renewal_precondition_failure_loses_authority() {
-        for status in [409, 412] {
+    async fn renewal_separates_a_stale_precondition_from_a_fresh_conflict() {
+        for (status, expect_lost) in [(412, true), (409, false)] {
             let mutation = prepare_renewal(
                 authority(claim(ClaimState::Active {
                     lease_until: 1_000_000,
@@ -1385,10 +1395,18 @@ mod tests {
             .unwrap();
             let (store, client) = replay_store(vec![response(status, &[], SdkBody::empty())]);
             let mut history = AttemptHistory::default();
-            assert!(matches!(
-                apply_mutation(&store, mutation, &mut history).await,
-                ClaimMutationOutcome::Lost
-            ));
+            let outcome = apply_mutation(&store, mutation, &mut history).await;
+            if expect_lost {
+                assert!(
+                    matches!(outcome, ClaimMutationOutcome::Lost),
+                    "status {status}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, ClaimMutationOutcome::RetryIdentically(_)),
+                    "status {status}"
+                );
+            }
             assert_eq!(client.actual_requests().count(), 1);
         }
     }
@@ -1708,6 +1726,92 @@ mod tests {
             ),
             Err(ClaimPrepareError::InvalidInput)
         ));
+    }
+
+    #[tokio::test]
+    async fn replacements_never_roll_a_claim_revision_backward() {
+        let actor = ActorId::new("replacement".into()).unwrap();
+        let instance = InstanceId::new("replacement-instance".into()).unwrap();
+        let newer = |state: ClaimState| {
+            Claim::new(
+                WorkId::new("work-17".into()).unwrap(),
+                5,
+                ActorId::new("rust-worker".into()).unwrap(),
+                InstanceId::new("instance-a".into()).unwrap(),
+                9,
+                "op-claim-005".into(),
+                state,
+            )
+            .unwrap()
+        };
+
+        assert!(matches!(
+            prepare_reclamation(
+                observed(newer(ClaimState::Active { lease_until: 1 })).await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                2_000_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_supersession(
+                observed(newer(ClaimState::Sealed {
+                    result_ref: artifact(),
+                }))
+                .await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                2_000_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(
+            prepare_supersession(
+                observed(claim(ClaimState::Sealed {
+                    result_ref: artifact(),
+                }))
+                .await,
+                &work("work-17", 5),
+                &actor,
+                &instance,
+                2_000_000,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_object_keeps_an_ambiguous_mutation_unresolved() {
+        let mutation = prepare_renewal(
+            authority(claim(ClaimState::Active {
+                lease_until: 1_000_000,
+            }))
+            .await,
+            &work("work-17", 4),
+            &ActorId::new("rust-worker".into()).unwrap(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            9,
+            200_000,
+        )
+        .unwrap();
+        let pre_mutation = encode(&claim(ClaimState::Active {
+            lease_until: 1_000_000,
+        }))
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(200, &[("etag", TEST_ETAG)], pre_mutation),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            apply_mutation(&store, mutation, &mut history).await,
+            ClaimMutationOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
     }
 
     #[tokio::test]

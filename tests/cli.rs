@@ -4,6 +4,12 @@ fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ravel"))
         .args(args)
         .env_clear()
+        // env_clear() would drop CI's ambient-AWS guards, so the child re-declares
+        // them: a default-startup regression that initializes AWS config must not be
+        // able to reach IMDS or on-disk credentials from inside this smoke test.
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_CONFIG_FILE", "/dev/null")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
         .output()
         .expect("ravel binary should run")
 }

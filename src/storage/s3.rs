@@ -2,7 +2,12 @@
 //!
 //! Mutation outcomes preserve ambiguity when request dispatch cannot be ruled out.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -126,19 +131,30 @@ impl AttemptHistory {
 pub struct S3Store {
     client: aws_sdk_s3::Client,
     bucket: String,
+    namespace: String,
 }
 
 impl S3Store {
     pub fn new(bucket: impl Into<String>, region: Region, builder: Builder) -> Self {
+        static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+        let bucket = bucket.into();
+        let config = configured(region, builder);
+        let namespace = format!(
+            "{}|{bucket}#{}",
+            config.region().map_or("", Region::as_ref),
+            NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        );
         Self {
-            client: aws_sdk_s3::Client::from_conf(configured(region, builder)),
-            bucket: bucket.into(),
+            client: aws_sdk_s3::Client::from_conf(config),
+            bucket,
+            namespace,
         }
     }
 
     /// Identifies the object-store namespace whose keys this store resolves.
     pub fn namespace(&self) -> &str {
-        &self.bucket
+        &self.namespace
     }
 
     pub async fn get_object(&self, key: &str, max_bytes: usize) -> Result<GetOutcome, GetError> {

@@ -714,6 +714,16 @@ mod tests {
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         );
+        // A second store on the identical bucket name is still a different store.
+        let same_name_store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        assert!(matches!(
+            publish(&same_name_store, &event, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
         assert!(matches!(
             publish(&foreign_store, &event, Some(&artifact)).await,
             Err(PublicationError::InvalidInput)

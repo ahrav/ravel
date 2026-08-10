@@ -127,7 +127,7 @@ impl S3Store {
         let mut body = output.body;
         let mut bytes = Vec::with_capacity(declared_length);
         while let Some(chunk) = body.try_next().await.map_err(|_| GetError::Transport)? {
-            if bytes.len() + chunk.len() > max_bytes {
+            if bytes.len().saturating_add(chunk.len()) > max_bytes {
                 return Err(GetError::TooLarge);
             }
             bytes.extend_from_slice(&chunk);

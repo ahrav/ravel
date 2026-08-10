@@ -650,20 +650,20 @@ mod tests {
 
     #[test]
     fn key_segments_cannot_change_the_claim_prefix() {
-        for (workspace_id, campaign_id, work_id) in [
-            ("bad/workspace", "campaign", "work"),
-            ("workspace", "bad/campaign", "work"),
-            ("workspace", "campaign", "bad/work"),
-        ] {
-            assert_eq!(
-                claim_key(
-                    &workspace(workspace_id),
-                    campaign_id,
-                    &WorkId::new(work_id.into()).unwrap()
-                ),
-                Err(ValidationError::InvalidKey)
-            );
-        }
+        // Workspace and work identities reject the delimiter at construction, so an
+        // ambiguous key cannot be built from them in the first place.
+        assert!(WorkspaceId::new("bad/workspace".into()).is_err());
+        assert!(WorkId::new("bad/work".into()).is_err());
+
+        // A campaign id arrives as a plain string, so claim_key validates it.
+        assert_eq!(
+            claim_key(
+                &workspace("workspace"),
+                "bad/campaign",
+                &WorkId::new("work".into()).unwrap()
+            ),
+            Err(ValidationError::InvalidKey)
+        );
         assert_eq!(
             claim_key(
                 &workspace("workspace"),
@@ -772,14 +772,17 @@ mod tests {
     async fn ambiguous_conflict_resolves_from_same_key_bytes() {
         let attempt = attempt();
         let bytes = attempt.canonical_bytes.clone();
+        let key = attempt.key.clone();
         let (store, client) = replay_store(vec![
             response(500, &[], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
             response(200, &[("etag", TEST_ETAG)], bytes),
         ]);
         let mut history = AttemptHistory::default();
+        // The taint has to come from this claim's own key: one history covers one
+        // object, so tainting through another key would be the misuse the store asserts against.
         assert!(matches!(
-            store.put_if_absent("taint", Vec::new(), &mut history).await,
+            store.put_if_absent(&key, Vec::new(), &mut history).await,
             MutationOutcome::Unknown
         ));
         assert!(matches!(

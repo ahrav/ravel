@@ -5,7 +5,9 @@
 use std::{error::Error, fmt, time::Duration};
 
 use aws_sdk_s3::{
-    config::{Builder, Region, retry::RetryConfig, timeout::TimeoutConfig},
+    config::{
+        Builder, Region, StalledStreamProtectionConfig, retry::RetryConfig, timeout::TimeoutConfig,
+    },
     error::SdkError,
     operation::put_object::{PutObjectError, PutObjectOutput, builders::PutObjectFluentBuilder},
     primitives::ByteStream,
@@ -195,10 +197,15 @@ fn configured(region: Region, builder: Builder) -> aws_sdk_s3::Config {
         .operation_timeout(OPERATION_TIMEOUT)
         .operation_attempt_timeout(ATTEMPT_TIMEOUT)
         .build();
+    // Operation and attempt timeouts stop applying once response headers arrive,
+    // so a trickling or stalled body is bounded by stalled-stream protection
+    // instead. Setting it after the caller's builder keeps a supplied
+    // configuration from disabling it.
     builder
         .region(region)
         .retry_config(RetryConfig::disabled())
         .timeout_config(timeouts)
+        .stalled_stream_protection(StalledStreamProtectionConfig::enabled().build())
         .behavior_version_latest()
         .build()
 }
@@ -560,7 +567,8 @@ mod tests {
             Region::new("us-east-1"),
             test_builder(NeverClient::new())
                 .retry_config(RetryConfig::standard())
-                .timeout_config(hostile_timeouts),
+                .timeout_config(hostile_timeouts)
+                .stalled_stream_protection(StalledStreamProtectionConfig::disabled()),
         );
         let config = store.client.config();
         assert_eq!(
@@ -569,6 +577,13 @@ mod tests {
         );
         let timeouts = config.timeout_config().expect("timeout config");
         assert_eq!(timeouts.operation_timeout(), Some(OPERATION_TIMEOUT));
+        assert!(
+            config
+                .stalled_stream_protection()
+                .expect("stalled-stream protection is configured")
+                .is_enabled(),
+            "a caller-supplied builder must not be able to disable it"
+        );
         assert_eq!(timeouts.operation_attempt_timeout(), Some(ATTEMPT_TIMEOUT));
     }
 

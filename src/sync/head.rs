@@ -198,7 +198,6 @@ pub async fn append(
     store: &S3Store,
     parent: HeadParent,
     authority: Authority,
-    head_operation_id: String,
     tail: &Event,
     artifact: Option<&PublishedArtifact>,
     history: &mut AttemptHistory,
@@ -206,10 +205,13 @@ pub async fn append(
     let publication = event::publish(store, tail, artifact)
         .await
         .map_err(AppendError::Publication)?;
+    // One append is one commit identity. Reconciliation walks retained events and
+    // searches the operation id, so a head recording a different id than its tail
+    // would be reconciled under two identities for the same logical append.
     let candidate = Head::new(
         authority,
         publication.event_ref().clone(),
-        head_operation_id,
+        tail.operation_id().to_owned(),
     )
     .map_err(|_| AppendError::InvalidInput)?;
     let transition = HeadTransition::new(parent, candidate, tail, &publication)
@@ -1485,7 +1487,6 @@ mod tests {
                 &store,
                 HeadParent::Genesis,
                 Authority::unowned(),
-                "head-operation".into(),
                 &event,
                 None,
                 &mut history,
@@ -1528,7 +1529,6 @@ mod tests {
             &store,
             HeadParent::Genesis,
             Authority::unowned(),
-            "head-operation".into(),
             &event,
             None,
             &mut history,
@@ -1560,7 +1560,6 @@ mod tests {
                 &store,
                 HeadParent::Genesis,
                 Authority::unowned(),
-                "head-operation".into(),
                 &event,
                 None,
                 &mut history,
@@ -1574,13 +1573,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_invalid_input_stops_after_event_publication() {
+    async fn append_gives_the_head_the_tail_operation_identity() {
         let event = genesis_event();
         let event_key = event::encode(&event)
             .expect("event encodes")
             .key()
             .to_owned();
         let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             sentinel_response(),
         ]);
@@ -1591,19 +1591,29 @@ mod tests {
                 &store,
                 HeadParent::Genesis,
                 Authority::unowned(),
-                String::new(),
                 &event,
                 None,
                 &mut history,
             )
             .await,
-            Err(AppendError::InvalidInput)
+            Ok(HeadCommitOutcome::Committed)
         ));
-        assert_eq!(client.actual_requests().count(), 1);
+        assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(request_path(&client, 0), format!("/{event_key}"));
-        assert_eq!(
-            client.actual_requests().next().expect("event PUT").method(),
-            http::Method::PUT
-        );
+        assert_eq!(request_path(&client, 1), "/head.json");
+
+        // The committed head records the tail's operation id, so retained-chain
+        // reconciliation searching that id finds this append.
+        let committed = decode(
+            client
+                .actual_requests()
+                .nth(1)
+                .expect("head PUT")
+                .body()
+                .bytes()
+                .expect("head bytes"),
+        )
+        .expect("head decodes");
+        assert_eq!(committed.operation_id(), event.operation_id());
     }
 }

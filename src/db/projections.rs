@@ -155,7 +155,7 @@ mod tests {
     use crate::{
         db::schema,
         domain::campaign::{Event, EventContent, EventRef},
-        sync::event::scheduling_mutation,
+        sync::event::scheduling_mutation_unchecked,
     };
 
     use super::*;
@@ -200,7 +200,7 @@ mod tests {
             content,
         )
         .unwrap();
-        scheduling_mutation(
+        scheduling_mutation_unchecked(
             EventRef::from_digest(sequence, digest.to_owned()).unwrap(),
             &event,
         )

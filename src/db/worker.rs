@@ -159,12 +159,10 @@ mod tests {
 
     use crate::{
         domain::campaign::{Event, EventContent, EventRef},
-        sync::event::scheduling_mutation,
+        sync::event::{encode, scheduling_mutation},
     };
 
     use super::*;
-
-    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[tokio::test]
     async fn owns_one_delete_journal_connection_on_a_blocking_thread() {
@@ -178,9 +176,14 @@ mod tests {
             EventContent::CampaignCreated,
         )
         .unwrap();
-        let mutation =
-            scheduling_mutation(EventRef::from_digest(1, DIGEST.to_owned()).unwrap(), &event)
-                .unwrap();
+        let encoded = encode(&event).unwrap();
+        let reference = EventRef::new(
+            event.sequence(),
+            encoded.digest().to_owned(),
+            encoded.key().to_owned(),
+        )
+        .unwrap();
+        let mutation = scheduling_mutation(reference, &event).unwrap();
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let caller_thread = thread::current().id();
         let (worker_thread, applied_on, journal_mode) = handle.diagnostics().await.unwrap();

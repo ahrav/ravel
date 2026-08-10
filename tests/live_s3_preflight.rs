@@ -1348,8 +1348,10 @@ async fn live_runtime_principal_cannot_delete_claims() {
         "runtime profile must resolve to an assumed role"
     );
 
-    let key =
-        format!("e04-delete-denial/{run_id}/workspace/live/campaigns/live/work/live/claim.json");
+    // A runtime policy has to deny the production claim prefix. A key under
+    // `e04-delete-denial/` would pass while real claims stayed deletable, so
+    // isolation comes from a unique workspace segment instead of a test prefix.
+    let key = format!("workspace/{run_id}/campaigns/live/work/live/claim.json");
     let claim = Claim::new(
         WorkId::new("live".into()).unwrap(),
         1,

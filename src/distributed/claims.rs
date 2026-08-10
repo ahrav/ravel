@@ -150,14 +150,28 @@ enum WireClaimState {
 #[allow(dead_code)]
 pub(crate) struct ClaimAuthority {
     claim: Claim,
+    key: String,
     etag: ETag,
 }
 
 #[allow(dead_code)]
 impl ClaimAuthority {
+    /// Claim keys are namespaced by workspace and campaign. A decoded `Claim`
+    /// carries neither namespace, so the caller supplies both and the stored key
+    /// has to match them.
     #[must_use]
-    pub(crate) fn authorizes(&self, work: &WorkRef) -> bool {
-        self.claim.work_id() == work.id() && self.claim.work_revision() == work.revision()
+    pub(crate) fn authorizes(
+        &self,
+        work: &WorkRef,
+        workspace: &WorkspaceId,
+        campaign_id: &str,
+    ) -> bool {
+        let Ok(expected) = claim_key(workspace, campaign_id, work.id()) else {
+            return false;
+        };
+        self.key == expected
+            && self.claim.work_id() == work.id()
+            && self.claim.work_revision() == work.revision()
     }
 }
 
@@ -267,6 +281,7 @@ pub(crate) async fn acquire(
         MutationOutcome::Committed { etag: Some(etag) } => {
             ClaimAcquireOutcome::Acquired(ClaimAuthority {
                 claim: attempt.claim,
+                key: attempt.key,
                 etag,
             })
         }
@@ -291,6 +306,7 @@ async fn resolve(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcquireOutcome 
         Ok(GetOutcome::Found { bytes, etag }) if bytes == attempt.canonical_bytes => {
             ClaimAcquireOutcome::Acquired(ClaimAuthority {
                 claim: attempt.claim,
+                key: attempt.key,
                 etag,
             })
         }
@@ -686,7 +702,7 @@ mod tests {
             _ => panic!("successful create must return authority"),
         };
         assert!(authority.etag == etag(TEST_ETAG).await);
-        assert!(authority.authorizes(&work("work-17", 4)));
+        assert!(authority.authorizes(&work("work-17", 4), &workspace("workspace-1"), "campaign-1"));
         assert_eq!(client.actual_requests().count(), 1);
         let request = client.actual_requests().next().unwrap();
         assert_eq!(request.headers().get("if-none-match"), Some("*"));
@@ -842,13 +858,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authority_matches_both_work_identity_and_revision() {
+    async fn authority_matches_work_identity_revision_and_namespace() {
         let authority = ClaimAuthority {
             claim: claim(ClaimState::Active { lease_until: 1 }),
+            key: claim_key(
+                &workspace("workspace-1"),
+                "campaign-1",
+                work("work-17", 4).id(),
+            )
+            .unwrap(),
             etag: etag(TEST_ETAG).await,
         };
-        assert!(authority.authorizes(&work("work-17", 4)));
-        assert!(!authority.authorizes(&work("other-work", 4)));
-        assert!(!authority.authorizes(&work("work-17", 5)));
+        assert!(authority.authorizes(&work("work-17", 4), &workspace("workspace-1"), "campaign-1"));
+        assert!(!authority.authorizes(
+            &work("other-work", 4),
+            &workspace("workspace-1"),
+            "campaign-1"
+        ));
+        assert!(!authority.authorizes(
+            &work("work-17", 5),
+            &workspace("workspace-1"),
+            "campaign-1"
+        ));
+        assert!(!authority.authorizes(
+            &work("work-17", 4),
+            &workspace("workspace-2"),
+            "campaign-1"
+        ));
+        assert!(!authority.authorizes(
+            &work("work-17", 4),
+            &workspace("workspace-1"),
+            "campaign-2"
+        ));
     }
 }

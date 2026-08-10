@@ -35,6 +35,7 @@ const BUCKET_ENV: &str = "RAVEL_LIVE_S3_BUCKET";
 const REGION_ENV: &str = "RAVEL_LIVE_S3_REGION";
 const EXPECTED_BUCKET: &str = "ravel-e02-4c038b2f";
 const EXPECTED_REGION: &str = "us-east-1";
+const HEAD_KEY: &str = "head.json";
 const MAX_PREFIX_BYTES: usize = 64;
 // Mirrors the stored-event and canonical-head decode limits in the library.
 const MAX_EVENT_BYTES: usize = 256 * 1024;
@@ -749,13 +750,13 @@ async fn race_for_409(
             results.push(task.await.map_err(|_| "race task panicked")?);
         }
         evidence.race_rounds = round + 1;
-        let mut success = false;
+        let mut successes = 0_usize;
         let mut found_409 = false;
         for (contender, result) in results.into_iter().enumerate() {
             let step = format!("race-{round}-{contender}");
             match result {
                 Ok(output) => {
-                    success = true;
+                    successes += 1;
                     evidence.operations.push(success_record(
                         &step,
                         &key,
@@ -773,11 +774,14 @@ async fn race_for_409(
                 }
             }
         }
-        // A 409 round only proves the conditional-write race if a contender also
-        // won it: without a successful writer there is no retained object and no
-        // first-writer evidence to point at.
-        if !success {
+        // Create-if-absent admits exactly one first writer for a fresh key, so a
+        // round with none has no retained object to point at and a round with two
+        // contradicts the semantics the 409 is meant to prove.
+        if successes == 0 {
             return Err("race key had no successful writer");
+        }
+        if successes > 1 {
+            return Err("race key admitted more than one successful writer");
         }
         if found_409 {
             return Ok(());
@@ -799,7 +803,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         Builder::from(&sdk_config),
     );
 
-    let head_key = physical(prefix, "head.json");
+    let head_key = physical(prefix, HEAD_KEY);
     match direct
         .get_object()
         .bucket(EXPECTED_BUCKET)
@@ -1094,9 +1098,27 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         return Err("artifact validation failed");
     }
 
+    // Rules are evaluated against the whole production key family, not only the
+    // keys this run created: `head.json` at the bucket root, a later event
+    // sequence, and another artifact digest are all valid E02 objects a rule can
+    // match. None of these are created; only the rule predicates read them.
+    let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
+    let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
     // Maximum-size probes prevent size filters from classifying rules as safe
     // when they can match larger valid objects in the same key family.
     let objects = [
+        ObjectFacts {
+            key: HEAD_KEY,
+            size: MAX_HEAD_BYTES as u64,
+        },
+        ObjectFacts {
+            key: &future_event_key,
+            size: MAX_EVENT_BYTES as u64,
+        },
+        ObjectFacts {
+            key: &other_artifact_key,
+            size: MAX_ARTIFACT_BYTES as u64,
+        },
         ObjectFacts {
             key: &keys.head,
             size: final_head_bytes.len() as u64,

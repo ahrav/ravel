@@ -165,7 +165,7 @@ mod tests {
         let candidate_head = Head::new(
             Authority::unowned(),
             publication.event_ref().clone(),
-            "candidate-head-operation".into(),
+            candidate.operation_id().to_owned(),
         )
         .expect("candidate head is valid");
         HeadTransition::new(
@@ -182,7 +182,7 @@ mod tests {
         let candidate_head = Head::new(
             Authority::unowned(),
             publication.event_ref().clone(),
-            "candidate-head-operation".into(),
+            candidate.operation_id().to_owned(),
         )
         .expect("candidate head is valid");
         HeadTransition::new(HeadParent::Genesis, candidate_head, candidate, &publication)

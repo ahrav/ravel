@@ -97,6 +97,10 @@ impl HeadTransition {
             || tail.sequence() != candidate.tail().sequence()
             || encoded.key() != published.key()
             || encoded.digest() != published.digest()
+            // Reconciliation walks retained events and searches the operation id, so a
+            // head recording a different id than its tail is the same append tracked
+            // under two identities.
+            || candidate.operation_id() != tail.operation_id()
         {
             return Err(WireError::InvalidValue);
         }
@@ -530,8 +534,12 @@ mod tests {
     }
 
     fn genesis_event() -> Event {
+        genesis_event_named("event-op-1")
+    }
+
+    fn genesis_event_named(operation_id: &str) -> Event {
         Event::new(
-            "event-op-1".into(),
+            operation_id.into(),
             1,
             None,
             7,
@@ -557,7 +565,7 @@ mod tests {
     }
 
     async fn genesis_transition(authority: Authority, operation_id: &str) -> HeadTransition {
-        let tail = genesis_event();
+        let tail = genesis_event_named(operation_id);
         let publication = publish_event(&tail).await;
         let candidate = Head::new(
             authority,
@@ -600,7 +608,7 @@ mod tests {
     ) -> HeadTransition {
         let parent_ref = parent.head().tail().clone();
         let tail = Event::new(
-            "event-op-2".into(),
+            operation_id.into(),
             parent_ref.sequence() + 1,
             Some(parent_ref),
             8,
@@ -840,6 +848,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_head_cannot_record_another_identity_than_its_tail() {
+        let tail = genesis_event();
+        let publication = publish_event(&tail).await;
+        let divergent = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "some-other-operation".into(),
+        )
+        .expect("valid head");
+        assert_ne!(divergent.operation_id(), tail.operation_id());
+
+        // Reconciliation searches retained events by operation id, so the two
+        // identities must not diverge even on the low-level constructor path.
+        rejects_transition(HeadParent::Genesis, divergent, &tail, &publication);
+    }
+
+    #[tokio::test]
     async fn a_tail_published_elsewhere_never_becomes_authoritative() {
         let tail = genesis_event();
         // The tail is published into the default test bucket...
@@ -851,7 +876,7 @@ mod tests {
         let candidate = Head::new(
             Authority::unowned(),
             publication.event_ref().clone(),
-            "head-op-1".into(),
+            tail.operation_id().to_owned(),
         )
         .expect("valid head");
         let transition = HeadTransition::new(HeadParent::Genesis, candidate, &tail, &publication)
@@ -1144,7 +1169,7 @@ mod tests {
         let equal = Head::new(
             Authority::owned("owner".into(), "instance".into(), 2, 2).expect("valid authority"),
             publication.event_ref().clone(),
-            "head-op-2".into(),
+            tail.operation_id().to_owned(),
         )
         .expect("valid head");
         assert!(

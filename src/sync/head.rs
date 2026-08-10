@@ -148,6 +148,17 @@ impl HeadTransition {
     pub fn canonical_event_bytes(&self) -> &[u8] {
         &self.event_bytes
     }
+
+    /// Re-labels the namespace this transition's tail was published into.
+    ///
+    /// Fixtures publish a tail through a throwaway store and then commit through
+    /// the store under test, so they restate which store holds the tail rather
+    /// than owning both response queues.
+    #[cfg(test)]
+    pub(crate) fn attributed_to(mut self, namespace: &str) -> Self {
+        self.event_namespace = namespace.to_owned();
+        self
+    }
 }
 
 #[must_use]
@@ -277,9 +288,6 @@ async fn resolve(store: &S3Store, mut transition: HeadTransition) -> HeadCommitO
     }
 }
 
-/// An unowned successor to an owned head would let any holder of the current
-/// ETag strip the controller fence through the ordinary `If-Match` CAS, so the
-/// non-regression check rejects it rather than falling through.
 /// An owned head claims that its controller published the tail, so the tail's
 /// `writer_fence` has to equal the candidate's `controller_fence`. Without the
 /// equality a stale-fence event can be published first and then presented under a
@@ -293,6 +301,9 @@ fn tail_fence_matches(tail: &Event, candidate: &Head) -> bool {
     }
 }
 
+/// An unowned successor to an owned head would let any holder of the current
+/// ETag strip the controller fence through the ordinary `If-Match` CAS, so the
+/// non-regression check rejects it rather than falling through.
 fn authority_permits(parent: &Head, candidate: &Head) -> bool {
     match (parent.authority().state(), candidate.authority().state()) {
         (
@@ -789,6 +800,7 @@ mod tests {
         let transition = genesis_transition(Authority::unowned(), "head-op-1").await;
         let expected = transition.canonical_head_bytes().to_vec();
         let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -816,6 +828,7 @@ mod tests {
             .expect("read succeeds")
             .expect("parent exists");
         let transition = successor_transition(observed, Authority::unowned(), "head-op-2").await;
+        let transition = transition.attributed_to(store.namespace());
         let expected = transition.canonical_head_bytes().to_vec();
         let mut history = AttemptHistory::default();
 
@@ -1041,6 +1054,7 @@ mod tests {
             response(200, &[("etag", OLD_ETAG)], head_bytes),
             response(200, &[("etag", "\"tail\"")], event_bytes),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -1067,6 +1081,7 @@ mod tests {
                 response(200, &[("etag", OLD_ETAG)], head_bytes.clone()),
                 response(200, &[("etag", "\"tail\"")], event_bytes),
             ]);
+            let transition = transition.attributed_to(store.namespace());
             let mut history = AttemptHistory::default();
 
             let transition = match commit(&store, transition, &mut history).await {
@@ -1110,6 +1125,7 @@ mod tests {
             ),
             response(200, &[("etag", "\"tail\"")], event_bytes),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -1139,6 +1155,7 @@ mod tests {
                 response(200, &[("etag", OLD_ETAG)], head_bytes),
                 tail_response,
             ]);
+            let transition = transition.attributed_to(store.namespace());
             let mut history = AttemptHistory::default();
 
             assert!(matches!(
@@ -1166,6 +1183,7 @@ mod tests {
                 response(200, &[("etag", FRESH_ETAG)], parent_bytes),
                 response(200, &[], SdkBody::empty()),
             ]);
+            let transition = transition.attributed_to(store.namespace());
             let mut history = AttemptHistory::default();
 
             let transition = match commit(&store, transition, &mut history).await {
@@ -1204,6 +1222,7 @@ mod tests {
             response(500, &[], SdkBody::empty()),
             response(200, &[("etag", FRESH_ETAG)], current_bytes),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         match commit(&store, transition, &mut history).await {
@@ -1238,6 +1257,7 @@ mod tests {
                 encode(&current).expect("head encodes"),
             ),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -1256,6 +1276,7 @@ mod tests {
             response(500, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -1274,6 +1295,7 @@ mod tests {
             response(404, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -1301,6 +1323,7 @@ mod tests {
                 encode(&current).expect("head encodes"),
             ),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -1317,6 +1340,7 @@ mod tests {
             response(500, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),
         ]);
+        let transition = transition.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(

@@ -725,16 +725,19 @@ mod tests {
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         );
-        // A second store on the identical bucket name is still a different store.
-        // Region and bucket are the addressing identity, so a second store on the
-        // same pair resolves the same objects and shares the namespace.
+        // A second store sharing the bucket name is still a different store, since
+        // the endpoint and credentials behind that name can differ.
         let same_name_store = S3Store::new(
             "test-bucket",
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         );
-        assert_eq!(same_name_store.namespace(), store.namespace());
+        assert_ne!(same_name_store.namespace(), store.namespace());
         assert_ne!(foreign_store.namespace(), store.namespace());
+        assert!(matches!(
+            publish(&same_name_store, &event, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
         assert!(matches!(
             publish(&foreign_store, &event, Some(&artifact)).await,
             Err(PublicationError::InvalidInput)

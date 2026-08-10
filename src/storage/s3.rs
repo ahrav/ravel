@@ -2,7 +2,12 @@
 //!
 //! Mutation outcomes preserve ambiguity when request dispatch cannot be ruled out.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -131,9 +136,15 @@ pub struct S3Store {
 
 impl S3Store {
     pub fn new(bucket: impl Into<String>, region: Region, builder: Builder) -> Self {
+        static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
+
         let bucket = bucket.into();
         let config = configured(region, builder);
-        let namespace = format!("{}|{bucket}", config.region().map_or("", Region::as_ref));
+        let namespace = format!(
+            "{}|{bucket}#{}",
+            config.region().map_or("", Region::as_ref),
+            NEXT_STORE.fetch_add(1, Ordering::Relaxed)
+        );
         Self {
             client: aws_sdk_s3::Client::from_conf(config),
             bucket,
@@ -143,10 +154,11 @@ impl S3Store {
 
     /// Identifies the object-store namespace whose keys this store resolves.
     ///
-    /// Region and bucket are the addressing identity: two stores sharing both
-    /// resolve the same objects, so a witness minted against one holds for the
-    /// other. A differing endpoint behind the same pair is not distinguished,
-    /// because `aws_sdk_s3::Config` exposes no resolved endpoint.
+    /// Each constructed store gets its own namespace. Region and bucket alone do
+    /// not identify an object store, and `aws_sdk_s3::Config` exposes no resolved
+    /// endpoint to compare, so a witness is honoured only by the store that wrote
+    /// the bytes. That refuses two genuinely equivalent stores, which is the
+    /// conservative direction.
     pub fn namespace(&self) -> &str {
         &self.namespace
     }

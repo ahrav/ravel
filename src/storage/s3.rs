@@ -156,6 +156,13 @@ impl AttemptHistory {
     }
 }
 
+impl AttemptHistory {
+    /// An earlier attempt in this publication may have reached S3.
+    pub fn may_have_been_sent(&self) -> bool {
+        self.may_have_been_sent
+    }
+}
+
 /// Narrow S3 client with enforced retry and timeout policy.
 pub struct S3Store {
     client: aws_sdk_s3::Client,

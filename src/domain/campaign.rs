@@ -46,10 +46,73 @@ impl EventRef {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventContent {
     CampaignCreated,
     WorkflowStarted,
+    ArtifactPublished(ArtifactRef),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactRef {
+    digest: String,
+    size: u64,
+    media_type: String,
+    producer_attempt: String,
+    creation_time_unix_ms: u64,
+    retention_class: Option<String>,
+}
+
+impl ArtifactRef {
+    pub fn new(
+        digest: String,
+        size: u64,
+        media_type: String,
+        producer_attempt: String,
+        creation_time_unix_ms: u64,
+        retention_class: Option<String>,
+    ) -> Result<Self, ValidationError> {
+        if !is_digest(&digest) {
+            return Err(ValidationError::InvalidDigest);
+        }
+        validate_identity(&media_type)?;
+        validate_identity(&producer_attempt)?;
+        if let Some(value) = &retention_class {
+            validate_identity(value)?;
+        }
+        Ok(Self {
+            digest,
+            size,
+            media_type,
+            producer_attempt,
+            creation_time_unix_ms,
+            retention_class,
+        })
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    pub fn producer_attempt(&self) -> &str {
+        &self.producer_attempt
+    }
+
+    pub fn creation_time_unix_ms(&self) -> u64 {
+        self.creation_time_unix_ms
+    }
+
+    pub fn retention_class(&self) -> Option<&str> {
+        self.retention_class.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,8 +165,8 @@ impl Event {
         self.writer_fence
     }
 
-    pub fn content(&self) -> EventContent {
-        self.content
+    pub fn content(&self) -> &EventContent {
+        &self.content
     }
 }
 
@@ -310,5 +373,56 @@ mod tests {
     #[test]
     fn accepts_maximum_sequence() {
         assert!(EventRef::from_digest(MAX_SEQUENCE, digest()).is_ok());
+    }
+
+    #[test]
+    fn validates_artifact_reference_fields_without_a_publication_cap() {
+        assert!(
+            ArtifactRef::new(
+                digest(),
+                u64::MAX,
+                "application/octet-stream".into(),
+                "attempt".into(),
+                1,
+                None
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            ArtifactRef::new(digest(), 0, String::new(), "attempt".into(), 1, None),
+            Err(ValidationError::InvalidIdentity)
+        );
+        assert_eq!(
+            ArtifactRef::new(digest(), 0, "type".into(), String::new(), 1, None),
+            Err(ValidationError::InvalidIdentity)
+        );
+        assert_eq!(
+            ArtifactRef::new(
+                digest(),
+                0,
+                "type".into(),
+                "attempt".into(),
+                1,
+                Some(String::new())
+            ),
+            Err(ValidationError::InvalidIdentity)
+        );
+        for (media_type, producer_attempt, retention_class) in [
+            ("x".repeat(129), "attempt".into(), None),
+            ("type".into(), "x".repeat(129), None),
+            ("type".into(), "attempt".into(), Some("x".repeat(129))),
+        ] {
+            assert_eq!(
+                ArtifactRef::new(
+                    digest(),
+                    0,
+                    media_type,
+                    producer_attempt,
+                    1,
+                    retention_class,
+                ),
+                Err(ValidationError::InvalidIdentity)
+            );
+        }
     }
 }

@@ -4,7 +4,8 @@
 //! `version`, `operation_id`, `sequence`, `parent`, `writer_fence`, and
 //! `content`. Integers use ciborium's shortest representation. `parent` is
 //! either null or a declaration-order map of `sequence`, `digest`, and `key`.
-//! Content is one of the text values `campaign_created` or `workflow_started`.
+//! Content is a text value for `campaign_created` and `workflow_started`, or an
+//! externally tagged `artifact_published` reference map.
 //!
 //! The CBOR is compressed by zstd's bulk encoder at level 3: one standard
 //! frame with content size, no checksum, and no dictionary. SHA-256 covers
@@ -15,6 +16,8 @@
 //!
 //! Key values exclude object-store prefixes. The `zstd-sys 2.0.16+zstd.1.5.7`
 //! lockfile pin is byte-affecting.
+//!
+//! Event publication requires a matching artifact witness before object-store I/O.
 
 use std::io::Cursor;
 
@@ -22,7 +25,13 @@ use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domain::campaign::{Event, EventContent, EventRef};
+use crate::{
+    domain::campaign::{ArtifactRef, Event, EventContent, EventRef},
+    storage::{
+        artifacts::PublishedArtifact,
+        s3::{PublicationError, S3Store},
+    },
+};
 
 use super::{WIRE_VERSION, WireError};
 
@@ -51,6 +60,16 @@ impl EncodedEvent {
     }
 }
 
+/// Proof that immutable event bytes are present at their canonical key.
+#[derive(Debug)]
+pub struct ResolvedEventPublication(EventRef);
+
+impl ResolvedEventPublication {
+    pub fn event_ref(&self) -> &EventRef {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireEvent {
@@ -70,11 +89,24 @@ struct WireEventRef {
     key: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireContent {
     CampaignCreated,
     WorkflowStarted,
+    ArtifactPublished(WireArtifactRef),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireArtifactRef {
+    digest: String,
+    size: u64,
+    media_type: String,
+    producer_attempt: String,
+    creation_time_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_class: Option<String>,
 }
 
 pub fn encode(event: &Event) -> Result<EncodedEvent, WireError> {
@@ -87,6 +119,36 @@ pub fn encode(event: &Event) -> Result<EncodedEvent, WireError> {
         stored_bytes,
         reference,
     })
+}
+
+pub async fn publish(
+    store: &S3Store,
+    event: &Event,
+    artifact: Option<&PublishedArtifact>,
+) -> Result<ResolvedEventPublication, PublicationError> {
+    match (event.content(), artifact) {
+        (EventContent::ArtifactPublished(reference), Some(published))
+            if reference == published.artifact_ref()
+                && published.namespace() == store.namespace() => {}
+        (EventContent::CampaignCreated | EventContent::WorkflowStarted, None) => {}
+        _ => return Err(PublicationError::InvalidInput),
+    }
+
+    let encoded = encode(event).map_err(|error| match error {
+        WireError::LimitExceeded => PublicationError::TooLarge,
+        WireError::InvalidEncoding
+        | WireError::NonCanonical
+        | WireError::InvalidValue
+        | WireError::ReferenceMismatch => PublicationError::InvalidInput,
+    })?;
+    store
+        .publish_immutable(
+            encoded.key(),
+            encoded.stored_bytes().to_vec(),
+            encoded.digest(),
+        )
+        .await?;
+    Ok(ResolvedEventPublication(encoded.reference))
 }
 
 pub fn decode(stored_bytes: &[u8], expected_key: &str) -> Result<Event, WireError> {
@@ -154,11 +216,27 @@ impl From<&EventRef> for WireEventRef {
     }
 }
 
-impl From<EventContent> for WireContent {
-    fn from(content: EventContent) -> Self {
+impl From<&EventContent> for WireContent {
+    fn from(content: &EventContent) -> Self {
         match content {
             EventContent::CampaignCreated => Self::CampaignCreated,
             EventContent::WorkflowStarted => Self::WorkflowStarted,
+            EventContent::ArtifactPublished(reference) => {
+                Self::ArtifactPublished(WireArtifactRef::from(reference))
+            }
+        }
+    }
+}
+
+impl From<&ArtifactRef> for WireArtifactRef {
+    fn from(reference: &ArtifactRef) -> Self {
+        Self {
+            digest: reference.digest().to_owned(),
+            size: reference.size(),
+            media_type: reference.media_type().to_owned(),
+            producer_attempt: reference.producer_attempt().to_owned(),
+            creation_time_unix_ms: reference.creation_time_unix_ms(),
+            retention_class: reference.retention_class().map(str::to_owned),
         }
     }
 }
@@ -173,7 +251,7 @@ impl TryFrom<WireEvent> for Event {
             wire.sequence,
             parent,
             wire.writer_fence,
-            wire.content.into(),
+            wire.content.try_into()?,
         )
         .map_err(|_| WireError::InvalidValue)
     }
@@ -187,11 +265,24 @@ impl TryFrom<WireEventRef> for EventRef {
     }
 }
 
-impl From<WireContent> for EventContent {
-    fn from(content: WireContent) -> Self {
+impl TryFrom<WireContent> for EventContent {
+    type Error = WireError;
+
+    fn try_from(content: WireContent) -> Result<Self, Self::Error> {
         match content {
-            WireContent::CampaignCreated => Self::CampaignCreated,
-            WireContent::WorkflowStarted => Self::WorkflowStarted,
+            WireContent::CampaignCreated => Ok(Self::CampaignCreated),
+            WireContent::WorkflowStarted => Ok(Self::WorkflowStarted),
+            WireContent::ArtifactPublished(reference) => Ok(Self::ArtifactPublished(
+                ArtifactRef::new(
+                    reference.digest,
+                    reference.size,
+                    reference.media_type,
+                    reference.producer_attempt,
+                    reference.creation_time_unix_ms,
+                    reference.retention_class,
+                )
+                .map_err(|_| WireError::InvalidValue)?,
+            )),
         }
     }
 }
@@ -212,7 +303,14 @@ fn digest(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::{config::Region, primitives::SdkBody};
+    use aws_smithy_runtime::client::http::test_util::NeverClient;
     use ciborium::Value;
+
+    use crate::storage::{
+        artifacts,
+        s3::test_support::{replay_store, response, test_builder},
+    };
 
     use super::*;
 
@@ -275,6 +373,45 @@ mod tests {
         let cbor = encode_cbor(&valid_wire()).unwrap();
         assert!(cbor.starts_with(b"\xa6\x67version\x01\x6coperation_id"));
         assert!(cbor.ends_with(b"\x67content\x70campaign_created"));
+
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let prefix = b"\xa6\x67version\x01\x6coperation_id\x62op\x68sequence\x01\x66parent\xf6\x6cwriter_fence\x07\x67content\xa1\x72artifact_published";
+        let fields = b"\x66digest\x78\x40";
+        let suffix = b"\x64size\x04\x6amedia_type\x78\x18application/octet-stream\x70producer_attempt\x67attempt\x75creation_time_unix_ms\x18\x7b";
+
+        let mut wire = valid_wire();
+        wire.content = WireContent::ArtifactPublished(WireArtifactRef {
+            digest: digest.into(),
+            size: 4,
+            media_type: "application/octet-stream".into(),
+            producer_attempt: "attempt".into(),
+            creation_time_unix_ms: 123,
+            retention_class: None,
+        });
+        let expected = [
+            prefix.as_slice(),
+            b"\xa5".as_slice(),
+            fields.as_slice(),
+            digest.as_bytes(),
+            suffix.as_slice(),
+        ]
+        .concat();
+        assert_eq!(encode_cbor(&wire).unwrap(), expected);
+
+        let WireContent::ArtifactPublished(reference) = &mut wire.content else {
+            unreachable!();
+        };
+        reference.retention_class = Some("pilot".into());
+        let expected = [
+            prefix.as_slice(),
+            b"\xa6".as_slice(),
+            fields.as_slice(),
+            digest.as_bytes(),
+            suffix.as_slice(),
+            b"\x6fretention_class\x65pilot".as_slice(),
+        ]
+        .concat();
+        assert_eq!(encode_cbor(&wire).unwrap(), expected);
     }
 
     #[test]
@@ -457,6 +594,164 @@ mod tests {
             decode(&bytes, &key(&bytes, 1)),
             Err(WireError::InvalidValue)
         );
+    }
+
+    #[test]
+    fn artifact_content_round_trips_canonically() {
+        for retention_class in [None, Some("pilot".to_owned())] {
+            let artifact = ArtifactRef::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                4,
+                "application/octet-stream".into(),
+                "attempt".into(),
+                123,
+                retention_class,
+            )
+            .unwrap();
+            let event = Event::new(
+                "artifact-op".into(),
+                1,
+                None,
+                7,
+                EventContent::ArtifactPublished(artifact),
+            )
+            .unwrap();
+            let encoded = encode(&event).unwrap();
+            let decoded = decode(encoded.stored_bytes(), encoded.key()).unwrap();
+            assert_eq!(decoded, event);
+            assert_eq!(encode(&decoded).unwrap(), encoded);
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_event_requires_a_matching_publication() {
+        let store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        let reference = ArtifactRef::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            4,
+            "application/octet-stream".into(),
+            "attempt".into(),
+            1,
+            None,
+        )
+        .unwrap();
+        let event = Event::new(
+            "event-op".into(),
+            1,
+            None,
+            1,
+            EventContent::ArtifactPublished(reference),
+        )
+        .unwrap();
+        assert!(matches!(
+            publish(&store, &event, None).await,
+            Err(PublicationError::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn matching_artifact_allows_event_publication_at_the_encoded_key() {
+        let artifact_bytes = b"artifact".to_vec();
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        let artifact = artifacts::publish(
+            &store,
+            artifact_bytes,
+            "application/octet-stream".into(),
+            "attempt".into(),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let mismatched = Event::new(
+            "event-op".into(),
+            1,
+            None,
+            1,
+            EventContent::ArtifactPublished(
+                ArtifactRef::new(
+                    artifact.artifact_ref().digest().to_owned(),
+                    artifact.artifact_ref().size(),
+                    artifact.artifact_ref().media_type().to_owned(),
+                    "another-attempt".into(),
+                    1,
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            publish(&store, &mismatched, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
+        let unit_event =
+            Event::new("unit-op".into(), 1, None, 1, EventContent::CampaignCreated).unwrap();
+        assert!(matches!(
+            publish(&store, &unit_event, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+
+        let event = Event::new(
+            "event-op".into(),
+            1,
+            None,
+            1,
+            EventContent::ArtifactPublished(artifact.artifact_ref().clone()),
+        )
+        .unwrap();
+        let encoded = encode(&event).unwrap();
+        let foreign_store = S3Store::new(
+            "other-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        // A second store on the identical bucket name is still a different store.
+        let same_name_store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        assert!(matches!(
+            publish(&same_name_store, &event, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
+        assert!(matches!(
+            publish(&foreign_store, &event, Some(&artifact)).await,
+            Err(PublicationError::InvalidInput)
+        ));
+        let resolved = publish(&store, &event, Some(&artifact)).await.unwrap();
+        assert_eq!(resolved.event_ref(), &encoded.reference);
+        let uri = client
+            .actual_requests()
+            .nth(1)
+            .expect("event PUT")
+            .uri()
+            .parse::<http::Uri>()
+            .expect("valid request URI");
+        assert_eq!(uri.path(), format!("/{}", encoded.key()));
+    }
+
+    #[tokio::test]
+    async fn unresolved_storage_does_not_create_an_event_publication() {
+        let (store, _) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        let event =
+            Event::new("event-op".into(), 1, None, 1, EventContent::CampaignCreated).unwrap();
+        assert!(matches!(
+            publish(&store, &event, None).await,
+            Err(PublicationError::Unresolved)
+        ));
     }
 
     #[test]

@@ -47,6 +47,7 @@ const WORKER_READY_DEADLINE: Duration = Duration::from_secs(60);
 const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(120);
 const BARRIER_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_MARKER: &str = "RAVEL_WORKER_RESULT=";
+const WORKER_LAUNCH_ENV: &str = "RAVEL_WORKER_LAUNCH";
 
 type HookError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -137,6 +138,12 @@ struct InterceptorState {
     pending: Option<RequestMeta>,
     records: Vec<ResponseRecord>,
     failure: Option<&'static str>,
+    /// First `If-Match` token this plan observed on the wire.
+    ///
+    /// Each conditional replacement in one plan must present the identical
+    /// token, which is what proves the code under test reuses the ETag it
+    /// originally observed instead of a freshly read one.
+    pinned_etag: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +159,7 @@ impl ResponseInterceptor {
                 pending: None,
                 records: Vec::new(),
                 failure: None,
+                pinned_etag: None,
             })),
         }
     }
@@ -247,14 +255,28 @@ impl Intercept for ResponseInterceptor {
             state.failure = Some("interceptor request did not match the response plan");
             return Err(Box::new(ConnectionReset));
         }
+        if action.condition == Condition::Match {
+            let supplied = request
+                .if_match
+                .clone()
+                .expect("a matched If-Match condition carries a token");
+            match &state.pinned_etag {
+                Some(pinned) if *pinned != supplied => {
+                    state.failure = Some("conditional replacement did not reuse the observed ETag");
+                    return Err(Box::new(ConnectionReset));
+                }
+                Some(_) => {}
+                None => state.pinned_etag = Some(supplied),
+            }
+        }
 
         let response = context.response();
         state.records.push(ResponseRecord {
             step: action.step,
             client: "production-interceptor",
-            key: request.key,
             condition: action.condition.label(),
-            supplied_etag: None,
+            supplied_etag: request.if_match.clone(),
+            key: request.key,
             classification: match action.mode {
                 ResponseMode::Drop => "dropped-response",
                 ResponseMode::Observe => "observed-response",
@@ -279,8 +301,16 @@ fn live_enabled() -> Result<bool, &'static str> {
     let flag = std::env::var(LIVE_FLAG).ok();
     let bucket = std::env::var(BUCKET_ENV).ok();
     let region = std::env::var(REGION_ENV).ok();
-    if flag.as_deref() != Some("1") || bucket.is_none() || region.is_none() {
+    if flag.as_deref() != Some("1") {
         return Ok(false);
+    }
+    // An explicit opt-in with incomplete configuration is a misconfigured job,
+    // not an absent one: skipping would let it report green without probing S3.
+    if bucket.is_none() {
+        return Err("live S3 opt-in is missing the bucket variable");
+    }
+    if region.is_none() {
+        return Err("live S3 opt-in is missing the region variable");
     }
     if bucket.as_deref() != Some(EXPECTED_BUCKET) {
         return Err("unexpected live S3 bucket");
@@ -325,6 +355,34 @@ async fn get_event(store: &S3Store, key: &str) -> Result<(Vec<u8>, Event), &'sta
     }
 }
 
+/// A validator that checks only `tail` cannot detect a missing or malformed
+/// ancestor below it.
+async fn validate_retained_chain(store: &S3Store, tail: &EventRef) -> Result<u64, &'static str> {
+    let mut expected = tail.clone();
+    let mut hops = 0_u64;
+    loop {
+        let (bytes, event) = get_event(store, expected.key()).await?;
+        if sha256(&bytes) != expected.digest() || event.sequence() != expected.sequence() {
+            return Err("chain-hop-identity");
+        }
+        hops += 1;
+        match event.parent() {
+            Some(parent) => {
+                if parent.sequence() + 1 != event.sequence() {
+                    return Err("chain-hop-sequence");
+                }
+                expected = parent.clone();
+            }
+            None => {
+                if event.sequence() != 1 {
+                    return Err("chain-root-sequence");
+                }
+                return Ok(hops);
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Evidence {
     run_id: String,
@@ -339,6 +397,8 @@ struct Evidence {
     loser_event_key: Option<String>,
     winner_artifact_key: Option<String>,
     loser_artifact_key: Option<String>,
+    inherited_parent_key: Option<String>,
+    inherited_chain_length: Option<u64>,
     final_validation: Option<&'static str>,
     result: String,
 }
@@ -347,6 +407,7 @@ struct Evidence {
 struct ScenarioRecord {
     initial_outcome: &'static str,
     resend_outcome: Option<&'static str>,
+    prior_send_evidence: bool,
     head_operation_id: String,
     event_operation_id: String,
     event_key: String,
@@ -470,6 +531,7 @@ async fn scenario_a(
     evidence.scenario_a = Some(ScenarioRecord {
         initial_outcome: "committed",
         resend_outcome: None,
+        prior_send_evidence: history.may_have_been_sent(),
         head_operation_id,
         event_operation_id,
         event_key,
@@ -507,6 +569,13 @@ async fn scenario_b(
     {
         return Err("scenario-b-transition-changed");
     }
+    // The resend must carry the first attempt's possible-send evidence. Without
+    // it the 412 below would be classified as an ordinary stale precondition,
+    // and the same reread branch would still commit — so HTTP status alone
+    // cannot tell the two apart.
+    if !history.may_have_been_sent() {
+        return Err("scenario-b-missing-prior-send-evidence");
+    }
     let second = head::commit(&fault, transition, &mut history).await;
     if !matches!(second, head::HeadCommitOutcome::Committed) {
         return Err("scenario-b-resend-outcome");
@@ -525,6 +594,7 @@ async fn scenario_b(
     evidence.scenario_b = Some(ScenarioRecord {
         initial_outcome: "unresolved",
         resend_outcome: Some("committed-after-412"),
+        prior_send_evidence: true,
         head_operation_id,
         event_operation_id,
         event_key,
@@ -729,6 +799,7 @@ fn spawn_worker(params: &WorkerParams) -> Result<Child, &'static str> {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(WORKER_LAUNCH_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -888,6 +959,13 @@ async fn two_process_race(
         .map_err(|_| "race-parent-read")?
         .ok_or("race-parent-missing")?;
     let common_parent = observed.head().tail().clone();
+    let inherited_bytes = observed.canonical_bytes().to_vec();
+    // The chain below the pre-race parent is inherited from whatever already
+    // existed at head.json, so it is validated before the race rather than
+    // assumed sound.
+    let inherited_hops = validate_retained_chain(&store, &common_parent).await?;
+    evidence.inherited_parent_key = Some(common_parent.key().to_owned());
+    evidence.inherited_chain_length = Some(inherited_hops);
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| "barrier-bind")?;
     let address = listener.local_addr().map_err(|_| "barrier-address")?;
     let params = [
@@ -944,6 +1022,17 @@ async fn two_process_race(
         || winner_event.operation_id() != winner.event_operation_id
     {
         return Err("race-final-authority");
+    }
+    // A third writer replacing `head.json` after the pre-race read would make the
+    // two local workers race against an unobserved head, so
+    // `winner_event.parent()` must equal `common_parent`.
+    let final_parent = winner_event.parent().ok_or("race-final-parent-missing")?;
+    if *final_parent != common_parent {
+        return Err("race-foreign-head-writer");
+    }
+    let final_hops = validate_retained_chain(&store, final_head.head().tail()).await?;
+    if final_hops != inherited_hops + 1 || inherited_bytes == final_head.canonical_bytes() {
+        return Err("race-final-chain");
     }
     evidence.winner_event_key = Some(winner.event_key.clone());
     evidence.loser_event_key = Some(loser.event_key.clone());
@@ -1064,6 +1153,8 @@ async fn live_s3_ambiguity() {
         loser_event_key: None,
         winner_artifact_key: None,
         loser_artifact_key: None,
+        inherited_parent_key: None,
+        inherited_chain_length: None,
         final_validation: None,
         result: "running".into(),
     };
@@ -1085,6 +1176,11 @@ async fn live_s3_ambiguity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn live_s3_race_worker() {
+    // Only the parent process supplies `WorkerParams` on stdin.
+    if std::env::var(WORKER_LAUNCH_ENV).as_deref() != Ok("1") {
+        println!("live S3 race worker skipped: launched outside spawn_worker");
+        return;
+    }
     let mut line = String::new();
     let parsed = BufReader::new(std::io::stdin())
         .read_line(&mut line)

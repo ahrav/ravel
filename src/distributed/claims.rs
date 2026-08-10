@@ -591,15 +591,28 @@ fn prepare_replacement(
 /// Sealing deliberately has no lease-time check: renewal needs a clock to
 /// calculate an extension, while completion versus reclamation is decided by
 /// the authority-bound key and ETag.
+/// The work generation and claim namespace one submission is scoped to.
+#[allow(dead_code)]
+pub(crate) struct ClaimScope<'a> {
+    pub(crate) work: &'a WorkRef,
+    pub(crate) workspace: &'a WorkspaceId,
+    pub(crate) campaign_id: &'a str,
+}
+
 #[allow(dead_code)]
 pub(crate) async fn submit(
     store: &S3Store,
     authority: ClaimAuthority,
-    workspace: &WorkspaceId,
-    campaign_id: &str,
+    scope: ClaimScope<'_>,
     published: &PublishedArtifact,
+    now: u64,
     history: &mut AttemptHistory,
 ) -> Result<ClaimMutationOutcome, SubmitFailure> {
+    let ClaimScope {
+        work,
+        workspace,
+        campaign_id,
+    } = scope;
     if !matches!(authority.claim.state(), ClaimState::Active { .. }) {
         return Err(SubmitFailure {
             authority,
@@ -689,6 +702,7 @@ pub(crate) async fn submit(
             error: SubmitError::Publication,
         });
     }
+    let prepared_revision = authority.claim.work_revision();
     let ClaimAuthority { key, etag, .. } = authority;
     Ok(apply_mutation(
         store,
@@ -697,7 +711,13 @@ pub(crate) async fn submit(
             key,
             canonical_bytes,
             etag,
+            // A seal carries no expiry: the bound ETag CAS already excludes a
+            // reclaimer, so a lapsed lease alone must not discard completed work.
+            observed_expiry: None,
+            prepared_revision,
         },
+        work,
+        now,
         history,
     )
     .await)
@@ -2230,9 +2250,13 @@ mod tests {
             submit(
                 &store,
                 authority,
-                &workspace("workspace-1"),
-                "campaign-1",
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace("workspace-1"),
+                    campaign_id: "campaign-1",
+                },
                 &published,
+                200_000,
                 &mut history,
             )
             .await,
@@ -2307,9 +2331,13 @@ mod tests {
             let failure = match submit(
                 &store,
                 authority,
-                &workspace(workspace_id),
-                campaign_id,
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace(workspace_id),
+                    campaign_id,
+                },
                 &published,
+                200_000,
                 &mut history,
             )
             .await
@@ -2333,9 +2361,13 @@ mod tests {
         let failure = match submit(
             &store,
             authority,
-            &workspace("workspace-1"),
-            "campaign-1",
+            ClaimScope {
+                work: &work("work-17", 4),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
             &published,
+            200_000,
             &mut history,
         )
         .await
@@ -2344,7 +2376,11 @@ mod tests {
             Ok(_) => panic!("failed evidence publication must not seal"),
         };
         assert_eq!(failure.error(), SubmitError::Publication);
-        assert!(failure.into_authority().authorizes(&work("work-17", 4)));
+        assert!(failure.into_authority().authorizes(
+            &work("work-17", 4),
+            &workspace("workspace-1"),
+            "campaign-1"
+        ));
         assert_eq!(client.actual_requests().count(), 1);
     }
 
@@ -2372,14 +2408,25 @@ mod tests {
                 submit(
                     &store,
                     authority(original).await,
-                    &workspace("workspace-1"),
-                    "campaign-1",
+                    ClaimScope {
+                        work: &work("work-17", 4),
+                        workspace: &workspace("workspace-1"),
+                        campaign_id: "campaign-1",
+                    },
                     &published,
+                    200_000,
                     &mut seal_history,
                 )
                 .await,
             ),
-            apply_mutation(&store, reclaim, &mut reclaim_history).await,
+            apply_mutation(
+                &store,
+                reclaim,
+                &work("work-17", 5),
+                200_000,
+                &mut reclaim_history,
+            )
+            .await,
         ];
         assert_eq!(
             outcomes
@@ -2417,7 +2464,14 @@ mod tests {
         ]);
         let mut reclaim_history = AttemptHistory::default();
         assert!(matches!(
-            apply_mutation(&store, reclaim, &mut reclaim_history).await,
+            apply_mutation(
+                &store,
+                reclaim,
+                &work("work-17", 5),
+                200_000,
+                &mut reclaim_history,
+            )
+            .await,
             ClaimMutationOutcome::Applied(_)
         ));
         let mut seal_history = AttemptHistory::default();
@@ -2426,9 +2480,13 @@ mod tests {
                 submit(
                     &store,
                     authority(original).await,
-                    &workspace("workspace-1"),
-                    "campaign-1",
+                    ClaimScope {
+                        work: &work("work-17", 4),
+                        workspace: &workspace("workspace-1"),
+                        campaign_id: "campaign-1",
+                    },
                     &published,
+                    200_000,
                     &mut seal_history,
                 )
                 .await,
@@ -2504,9 +2562,13 @@ mod tests {
             submit(
                 &store,
                 authority(claim(ClaimState::Active { lease_until: 1 })).await,
-                &workspace("workspace-1"),
-                "campaign-1",
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace("workspace-1"),
+                    campaign_id: "campaign-1",
+                },
                 &published,
+                200_000,
                 &mut history,
             )
             .await,
@@ -2526,17 +2588,30 @@ mod tests {
             response(200, &[("etag", NEW_ETAG)], encode(&expected).unwrap()),
         ]);
         let mut history = AttemptHistory::default();
+        // One history covers one object, so the taint comes from the claim's own key.
+        let claim_key = claim_key(
+            &workspace("workspace-1"),
+            "campaign-1",
+            work("work-17", 4).id(),
+        )
+        .expect("valid claim key");
         assert!(matches!(
-            store.put_if_absent("taint", Vec::new(), &mut history).await,
+            store
+                .put_if_absent(&claim_key, Vec::new(), &mut history)
+                .await,
             MutationOutcome::Unknown
         ));
         let outcome = submit_outcome(
             submit(
                 &store,
                 authority(claim(ClaimState::Active { lease_until: 1 })).await,
-                &workspace("workspace-1"),
-                "campaign-1",
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace("workspace-1"),
+                    campaign_id: "campaign-1",
+                },
                 &published,
+                200_000,
                 &mut history,
             )
             .await,
@@ -2571,9 +2646,13 @@ mod tests {
                 submit(
                     &store,
                     authority(claim(ClaimState::Active { lease_until: 1 })).await,
-                    &workspace("workspace-1"),
-                    "campaign-1",
+                    ClaimScope {
+                        work: &work("work-17", 4),
+                        workspace: &workspace("workspace-1"),
+                        campaign_id: "campaign-1",
+                    },
                     &published,
+                    200_000,
                     &mut history,
                 )
                 .await,

@@ -35,7 +35,7 @@ use crate::{
 
 use super::{WIRE_VERSION, WireError};
 
-const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
 const CBOR_RECURSION_LIMIT: usize = 16;
 const ZSTD_LEVEL: i32 = 3;
@@ -62,11 +62,19 @@ impl EncodedEvent {
 
 /// Proof that immutable event bytes are present at their canonical key.
 #[derive(Debug)]
-pub struct ResolvedEventPublication(EventRef);
+pub struct ResolvedEventPublication {
+    reference: EventRef,
+    namespace: String,
+}
 
 impl ResolvedEventPublication {
     pub fn event_ref(&self) -> &EventRef {
-        &self.0
+        &self.reference
+    }
+
+    /// Names the object-store namespace these bytes were published into.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 }
 
@@ -148,7 +156,10 @@ pub async fn publish(
             encoded.digest(),
         )
         .await?;
-    Ok(ResolvedEventPublication(encoded.reference))
+    Ok(ResolvedEventPublication {
+        reference: encoded.reference,
+        namespace: store.namespace().to_owned(),
+    })
 }
 
 pub fn decode(stored_bytes: &[u8], expected_key: &str) -> Result<Event, WireError> {
@@ -714,12 +725,15 @@ mod tests {
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         );
-        // A second store on the identical bucket name is still a different store.
+        // A second store sharing the bucket name is still a different store, since
+        // the endpoint and credentials behind that name can differ.
         let same_name_store = S3Store::new(
             "test-bucket",
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         );
+        assert_ne!(same_name_store.namespace(), store.namespace());
+        assert_ne!(foreign_store.namespace(), store.namespace());
         assert!(matches!(
             publish(&same_name_store, &event, Some(&artifact)).await,
             Err(PublicationError::InvalidInput)

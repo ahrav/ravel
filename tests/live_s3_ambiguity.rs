@@ -706,7 +706,9 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
     }
 
     let event_operation_id = format!("{}-event-{}", params.run_id, params.worker_id);
-    let head_operation_id = format!("{}-head-{}", params.run_id, params.worker_id);
+    // append gives the head the tail's operation identity, so one append is
+    // recorded under one id in both the head and the retained event.
+    let head_operation_id = event_operation_id.clone();
     let event = Event::new(
         event_operation_id.clone(),
         params
@@ -729,7 +731,6 @@ async fn worker_scenario(params: &WorkerParams) -> Result<WorkerResult, &'static
             &store,
             head::HeadParent::Existing(observed),
             authority,
-            head_operation_id.clone(),
             &event,
             Some(&artifact),
             &mut history,

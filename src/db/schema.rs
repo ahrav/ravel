@@ -12,6 +12,16 @@ use rusqlite::OpenFlags;
 const APPLICATION_ID: i32 = 0x5256_4c31; // "RVL1"
 const SCHEMA_VERSION: i32 = 1;
 
+const PROJECTION_TABLES: [&str; 7] = [
+    "applied_events",
+    "campaigns",
+    "dependencies",
+    "objectives",
+    "sync_cursor",
+    "work_items",
+    "workflows",
+];
+
 const SCHEMA: &str = "
 CREATE TABLE applied_events (
     sequence INTEGER PRIMARY KEY,
@@ -142,21 +152,24 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
     )
     .map_err(|_| ValidateError::DatabaseOperationFailed)?;
 
+    // A truncated or non-SQLite file opens successfully and then fails these
+    // pragmas with SQLITE_NOTADB or a corruption code rather than a mismatched id,
+    // which is a local format failure the caller repairs by rebuilding.
     let application_id: i32 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
-        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        .map_err(local_format_error)?;
     if application_id != APPLICATION_ID {
         return Err(ValidateError::WrongApplicationId);
     }
     let schema_version: i32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        .map_err(local_format_error)?;
     if schema_version != SCHEMA_VERSION {
         return Err(ValidateError::WrongSchemaVersion);
     }
     let integrity: String = connection
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        .map_err(local_format_error)?;
     if integrity != "ok" {
         return Err(ValidateError::IntegrityCheckFailed);
     }
@@ -228,6 +241,21 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
         if tail_digest.as_deref() != Some(applied_tail.as_str()) {
             return Err(ValidateError::InvalidHistory);
         }
+    }
+
+    // A valid cursor and history do not imply the rest of the projection survived,
+    // and a dropped table surfaces as a replay failure rather than a rebuild.
+    let present: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name IN \
+             ('applied_events','campaigns','dependencies','objectives','sync_cursor','work_items','workflows')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(local_format_error)?;
+    if present != PROJECTION_TABLES.len() as i64 {
+        return Err(ValidateError::InvalidHistory);
     }
 
     Ok(connection)
@@ -751,10 +779,27 @@ mod tests {
 
     #[test]
     fn a_missing_projection_table_is_rebuildable_rather_than_unavailable() {
-        let path = test_path("dropped-table");
-        let connection = create(&path).unwrap();
-        connection.execute("DROP TABLE applied_events", []).unwrap();
-        drop(connection);
+        for table in ["applied_events", "campaigns", "workflows", "dependencies"] {
+            let path = test_path(&format!("dropped-{table}"));
+            let connection = create(&path).unwrap();
+            connection
+                .execute(&format!("DROP TABLE {table}"), [])
+                .unwrap();
+            drop(connection);
+
+            assert_eq!(
+                open_existing(&path).unwrap_err(),
+                ValidateError::InvalidHistory,
+                "dropped {table}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_corrupt_database_header_is_rebuildable_rather_than_unavailable() {
+        let path = test_path("corrupt-header");
+        fs::write(&path, b"this is not a sqlite database at all, just bytes").unwrap();
 
         assert_eq!(
             open_existing(&path).unwrap_err(),

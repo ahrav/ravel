@@ -127,9 +127,15 @@ impl ReplayedProjection {
 /// # Errors
 ///
 /// Returns [`ReplayError::DatabaseUnavailable`] when the path cannot be inspected, the worker
-/// cannot start, or an existing file fails outside validation. Every other variant reports the
-/// replay stage that failed.
+/// cannot start, an existing file fails outside validation, or `db_path` is a SQLite URI or
+/// reserved filename. Every other variant reports the replay stage that failed.
 pub async fn startup(store: &S3Store, db_path: &Path) -> Result<ReplayedProjection, ReplayError> {
+    // Existence drives the create-or-validate decision, and `try_exists` compares a
+    // literal path. SQLite would resolve `file:` URIs and `:memory:` to something
+    // else, so a URI-backed projection would look absent on every startup.
+    if is_sqlite_uri(db_path) {
+        return Err(ReplayError::DatabaseUnavailable);
+    }
     if !db_path
         .try_exists()
         .map_err(|_| ReplayError::DatabaseUnavailable)?
@@ -182,6 +188,13 @@ fn remove_if_present(path: &Path) -> Result<(), ReplayError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(ReplayError::DatabaseUnavailable),
     }
+}
+
+fn is_sqlite_uri(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    text == ":memory:" || text.starts_with("file:")
 }
 
 fn journal_path(path: &Path) -> PathBuf {
@@ -608,6 +621,16 @@ mod tests {
             drop(handle);
             clean(&path);
         }
+    }
+
+    #[test]
+    fn sqlite_uri_paths_are_rejected_rather_than_treated_as_absent() {
+        for text in [":memory:", "file:/var/lib/ravel/projection.sqlite?mode=rwc"] {
+            assert!(is_sqlite_uri(Path::new(text)), "{text}");
+        }
+        assert!(!is_sqlite_uri(Path::new(
+            "/var/lib/ravel/projection.sqlite"
+        )));
     }
 
     #[tokio::test]

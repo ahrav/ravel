@@ -25,11 +25,14 @@ use crate::{
         campaign::{ArtifactRef, ValidationError, validate_identity},
         work::{WorkId, WorkRef},
     },
-    storage::s3::{AttemptHistory, ETag, GetOutcome, MutationOutcome, S3Store},
+    storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
     sync::{WIRE_VERSION, WireError, event::WireArtifactRef},
 };
 
 const MAX_CLAIM_BYTES: usize = 4 * 1024;
+const CLAIM_LEASE_MS: u64 = 15 * 60 * 1000;
+#[allow(dead_code)]
+const CLAIM_RENEWAL_CADENCE_MS: u64 = 5 * 60 * 1000;
 
 /// Active lease or terminal immutable result reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,7 +69,6 @@ impl Claim {
     ///
     /// Returns [`ValidationError`] for a zero fence, invalid operation identity, or zero
     /// active lease expiry.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         work_id: WorkId,
         work_revision: u64,
@@ -143,10 +145,11 @@ enum WireClaimState {
     Sealed { result_ref: WireArtifactRef },
 }
 
-/// Couples a validated claim to the opaque ETag observed either on the
-/// mutation that wrote it or on an exact same-key reread of the attempted
-/// canonical bytes. Only this module constructs it; it implements neither
-/// `Clone` nor `Debug`, so the proof cannot be copied or logged.
+/// Claim authority binds a validated claim to its exact object key and the
+/// opaque ETag observed either on the mutation that wrote it or on an exact
+/// same-key reread of the attempted canonical bytes. Only this module
+/// constructs it; it implements neither `Clone` nor `Debug`, so the proof
+/// cannot be copied or logged.
 #[allow(dead_code)]
 pub(crate) struct ClaimAuthority {
     claim: Claim,
@@ -191,6 +194,54 @@ pub(crate) enum ClaimAcquireOutcome {
     Unresolved(ClaimAttempt),
 }
 
+/// `ObservedClaim` prevents pairing a decoded claim with an unrelated object
+/// key or ETag.
+#[allow(dead_code)]
+pub(crate) struct ObservedClaim {
+    claim: Claim,
+    key: String,
+    etag: ETag,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum ClaimReadError {
+    InvalidInput,
+    Storage(GetError),
+    Invalid(WireError),
+}
+
+impl fmt::Display for ClaimReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "claim key is invalid",
+            Self::Storage(_) => "claim read failed",
+            Self::Invalid(_) => "claim encoding is invalid",
+        })
+    }
+}
+
+impl Error for ClaimReadError {}
+
+/// `ClaimMutation` binds stable candidate bytes to the exact key and expected
+/// ETag for replacement.
+#[allow(dead_code)]
+pub(crate) struct ClaimMutation {
+    claim: Claim,
+    key: String,
+    canonical_bytes: Vec<u8>,
+    etag: ETag,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) enum ClaimMutationOutcome {
+    Applied(ClaimAuthority),
+    Lost,
+    RetryIdentically(ClaimMutation),
+    Unresolved(ClaimMutation),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimPrepareError {
     InvalidInput,
@@ -217,10 +268,13 @@ pub(crate) fn prepare_acquisition(
     campaign_id: &str,
     owner_actor: &ActorId,
     owner_instance: &InstanceId,
-    lease_until: u64,
+    now: u64,
 ) -> Result<ClaimAttempt, ClaimPrepareError> {
     let key = claim_key(workspace, campaign_id, work.id())
         .map_err(|_| ClaimPrepareError::InvalidInput)?;
+    let lease_until = now
+        .checked_add(CLAIM_LEASE_MS)
+        .ok_or(ClaimPrepareError::InvalidInput)?;
     let operation_id = InstanceId::generate()
         .map_err(|_| ClaimPrepareError::Entropy)?
         .as_str()
@@ -264,6 +318,169 @@ fn claim_key(
     ))
 }
 
+/// Reads a claim and keeps its key and ETag coupled to the decoded record.
+///
+/// # Errors
+///
+/// Returns [`ClaimReadError::InvalidInput`] for an invalid key,
+/// [`ClaimReadError::Storage`] for storage failures, and
+/// [`ClaimReadError::Invalid`] for invalid claim bytes.
+#[allow(dead_code)]
+pub(crate) async fn observe(
+    store: &S3Store,
+    workspace: &WorkspaceId,
+    campaign_id: &str,
+    work_id: &WorkId,
+) -> Result<Option<ObservedClaim>, ClaimReadError> {
+    let key =
+        claim_key(workspace, campaign_id, work_id).map_err(|_| ClaimReadError::InvalidInput)?;
+    let outcome = store
+        .get_object(&key, MAX_CLAIM_BYTES)
+        .await
+        .map_err(|error| match error {
+            GetError::TooLarge => ClaimReadError::Invalid(WireError::LimitExceeded),
+            other => ClaimReadError::Storage(other),
+        })?;
+    match outcome {
+        GetOutcome::NotFound => Ok(None),
+        GetOutcome::Found { bytes, etag } => {
+            let claim = decode(&bytes).map_err(ClaimReadError::Invalid)?;
+            Ok(Some(ObservedClaim { claim, key, etag }))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_renewal(
+    authority: ClaimAuthority,
+    work: &WorkRef,
+    actor: &ActorId,
+    instance: &InstanceId,
+    expected_fence: u64,
+    now: u64,
+) -> Result<ClaimMutation, ClaimPrepareError> {
+    let ClaimAuthority { claim, key, etag } = authority;
+    let Claim {
+        work_id,
+        work_revision,
+        owner_actor,
+        owner_instance,
+        fence,
+        operation_id,
+        state,
+    } = claim;
+    let lease_until = match state {
+        ClaimState::Active { lease_until } => lease_until,
+        ClaimState::Sealed { .. } => return Err(ClaimPrepareError::InvalidInput),
+    };
+    if &work_id != work.id()
+        || work_revision != work.revision()
+        || &owner_actor != actor
+        || &owner_instance != instance
+        || fence != expected_fence
+        || now >= lease_until
+    {
+        return Err(ClaimPrepareError::InvalidInput);
+    }
+    let renewed_until = now
+        .checked_add(CLAIM_LEASE_MS)
+        .filter(|candidate| *candidate > lease_until)
+        .ok_or(ClaimPrepareError::InvalidInput)?;
+    let claim = Claim::new(
+        work_id,
+        work_revision,
+        owner_actor,
+        owner_instance,
+        fence,
+        operation_id,
+        ClaimState::Active {
+            lease_until: renewed_until,
+        },
+    )
+    .map_err(|_| ClaimPrepareError::InvalidInput)?;
+    let canonical_bytes = encode(&claim).map_err(|_| ClaimPrepareError::Encoding)?;
+    Ok(ClaimMutation {
+        claim,
+        key,
+        canonical_bytes,
+        etag,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_reclamation(
+    observed: ObservedClaim,
+    work: &WorkRef,
+    replacement_actor: &ActorId,
+    replacement_instance: &InstanceId,
+    now: u64,
+) -> Result<ClaimMutation, ClaimPrepareError> {
+    if observed.claim.work_id() != work.id()
+        || !matches!(
+            observed.claim.state(),
+            ClaimState::Active { lease_until } if now >= *lease_until
+        )
+    {
+        return Err(ClaimPrepareError::InvalidInput);
+    }
+    prepare_replacement(observed, work, replacement_actor, replacement_instance, now)
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_supersession(
+    observed: ObservedClaim,
+    work: &WorkRef,
+    replacement_actor: &ActorId,
+    replacement_instance: &InstanceId,
+    now: u64,
+) -> Result<ClaimMutation, ClaimPrepareError> {
+    if observed.claim.work_id() != work.id()
+        || observed.claim.work_revision() == work.revision()
+        || !matches!(observed.claim.state(), ClaimState::Sealed { .. })
+    {
+        return Err(ClaimPrepareError::InvalidInput);
+    }
+    prepare_replacement(observed, work, replacement_actor, replacement_instance, now)
+}
+
+fn prepare_replacement(
+    observed: ObservedClaim,
+    work: &WorkRef,
+    replacement_actor: &ActorId,
+    replacement_instance: &InstanceId,
+    now: u64,
+) -> Result<ClaimMutation, ClaimPrepareError> {
+    let fence = observed
+        .claim
+        .fence()
+        .checked_add(1)
+        .ok_or(ClaimPrepareError::InvalidInput)?;
+    let lease_until = now
+        .checked_add(CLAIM_LEASE_MS)
+        .ok_or(ClaimPrepareError::InvalidInput)?;
+    let operation_id = InstanceId::generate()
+        .map_err(|_| ClaimPrepareError::Entropy)?
+        .as_str()
+        .to_owned();
+    let claim = Claim::new(
+        work.id().clone(),
+        work.revision(),
+        replacement_actor.clone(),
+        replacement_instance.clone(),
+        fence,
+        operation_id,
+        ClaimState::Active { lease_until },
+    )
+    .map_err(|_| ClaimPrepareError::InvalidInput)?;
+    let canonical_bytes = encode(&claim).map_err(|_| ClaimPrepareError::Encoding)?;
+    Ok(ClaimMutation {
+        claim,
+        key: observed.key,
+        canonical_bytes,
+        etag: observed.etag,
+    })
+}
+
 /// Safe retries of a returned attempt must reuse the same [`ClaimAttempt`]
 /// and caller-owned [`AttemptHistory`]: identical key, canonical bytes,
 /// operation ID, and `If-None-Match: *` precondition. Acquisition itself
@@ -287,7 +504,7 @@ pub(crate) async fn acquire(
         }
         MutationOutcome::Committed { etag: None }
         | MutationOutcome::AmbiguousConflict
-        | MutationOutcome::Unknown => resolve(store, attempt).await,
+        | MutationOutcome::Unknown => resolve_acquisition(store, attempt).await,
         MutationOutcome::Conflict | MutationOutcome::PreconditionFailed => {
             ClaimAcquireOutcome::Collision
         }
@@ -298,27 +515,94 @@ pub(crate) async fn acquire(
     }
 }
 
-/// Byte equality against the reread proves this attempt committed: the
-/// canonical bytes embed a 128-bit random operation ID, so no other claimant
-/// can produce them.
-async fn resolve(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcquireOutcome {
-    match store.get_object(&attempt.key, MAX_CLAIM_BYTES).await {
-        Ok(GetOutcome::Found { bytes, etag }) if bytes == attempt.canonical_bytes => {
-            ClaimAcquireOutcome::Acquired(ClaimAuthority {
-                claim: attempt.claim,
-                key: attempt.key,
+/// Safe retries of a returned mutation must preserve its key, bytes, ETag, and
+/// caller-owned [`AttemptHistory`]. This function performs no internal retry.
+#[allow(dead_code)]
+pub(crate) async fn apply_mutation(
+    store: &S3Store,
+    mutation: ClaimMutation,
+    history: &mut AttemptHistory,
+) -> ClaimMutationOutcome {
+    let outcome = store
+        .put_if_match(
+            &mutation.key,
+            mutation.canonical_bytes.clone(),
+            &mutation.etag,
+            history,
+        )
+        .await;
+    match outcome {
+        MutationOutcome::Committed { etag: Some(etag) } => {
+            ClaimMutationOutcome::Applied(ClaimAuthority {
+                claim: mutation.claim,
+                key: mutation.key,
                 etag,
             })
         }
-        Ok(GetOutcome::Found { .. }) => ClaimAcquireOutcome::Collision,
+        MutationOutcome::Committed { etag: None }
+        | MutationOutcome::AmbiguousConflict
+        | MutationOutcome::Unknown => resolve_mutation(store, mutation).await,
+        MutationOutcome::Conflict | MutationOutcome::PreconditionFailed => {
+            ClaimMutationOutcome::Lost
+        }
+        MutationOutcome::ProvenNotSent => ClaimMutationOutcome::RetryIdentically(mutation),
+        MutationOutcome::NotFound | MutationOutcome::TooLarge => {
+            ClaimMutationOutcome::Unresolved(mutation)
+        }
+    }
+}
+
+/// Byte equality against the reread proves the attempted operation committed:
+/// creation and replacement candidates embed a fresh 128-bit random operation
+/// ID, and a renewal candidate preserves its owner and operation ID while any
+/// competing reclaimer mints a new one, so no other claimant can produce the
+/// expected bytes.
+enum CandidateRead {
+    Matching(ETag),
+    Different,
+    Missing,
+    Failed,
+}
+
+async fn read_candidate(store: &S3Store, key: &str, expected: &[u8]) -> CandidateRead {
+    match store.get_object(key, MAX_CLAIM_BYTES).await {
+        Ok(GetOutcome::Found { bytes, etag }) if bytes == expected => CandidateRead::Matching(etag),
+        Ok(GetOutcome::Found { .. }) => CandidateRead::Different,
+        Ok(GetOutcome::NotFound) => CandidateRead::Missing,
+        Err(_) => CandidateRead::Failed,
+    }
+}
+
+async fn resolve_acquisition(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcquireOutcome {
+    match read_candidate(store, &attempt.key, &attempt.canonical_bytes).await {
+        CandidateRead::Matching(etag) => ClaimAcquireOutcome::Acquired(ClaimAuthority {
+            claim: attempt.claim,
+            key: attempt.key,
+            etag,
+        }),
+        CandidateRead::Different => ClaimAcquireOutcome::Collision,
         // Absence proves the PUT had not landed at read time: retained claim
         // keys admit no delete path or lifecycle expiration and S3 reads are
         // strongly consistent after write. A write still in flight is safe to
         // resend because the reused AttemptHistory turns its 409/412 into
         // AmbiguousConflict and the same-key byte comparison recovers
         // authority.
-        Ok(GetOutcome::NotFound) => ClaimAcquireOutcome::RetryIdentically(attempt),
-        Err(_) => ClaimAcquireOutcome::Unresolved(attempt),
+        CandidateRead::Missing => ClaimAcquireOutcome::RetryIdentically(attempt),
+        CandidateRead::Failed => ClaimAcquireOutcome::Unresolved(attempt),
+    }
+}
+
+async fn resolve_mutation(store: &S3Store, mutation: ClaimMutation) -> ClaimMutationOutcome {
+    match read_candidate(store, &mutation.key, &mutation.canonical_bytes).await {
+        CandidateRead::Matching(etag) => ClaimMutationOutcome::Applied(ClaimAuthority {
+            claim: mutation.claim,
+            key: mutation.key,
+            etag,
+        }),
+        CandidateRead::Different => ClaimMutationOutcome::Lost,
+        CandidateRead::Missing | CandidateRead::Failed => {
+            ClaimMutationOutcome::Unresolved(mutation)
+        }
     }
 }
 
@@ -418,6 +702,8 @@ mod tests {
     use super::*;
 
     const TEST_ETAG: &str = "\"claim-token\"";
+    const NEW_ETAG: &str = "\"claim-token-2\"";
+    const TEST_KEY: &str = "workspace/workspace-1/campaigns/campaign-1/work/work-17/claim.json";
 
     fn artifact() -> ArtifactRef {
         ArtifactRef::new(
@@ -602,7 +888,7 @@ mod tests {
             "campaign-1",
             &ActorId::new("actor-a".into()).unwrap(),
             &InstanceId::new("instance-a".into()).unwrap(),
-            1_750_000_000_000,
+            1_749_999_100_000,
         )
         .unwrap()
     }
@@ -616,6 +902,22 @@ mod tests {
         match store.get_object("etag", 0).await.unwrap() {
             GetOutcome::Found { etag, .. } => etag,
             GetOutcome::NotFound => panic!("test ETag is missing"),
+        }
+    }
+
+    async fn authority(claim: Claim) -> ClaimAuthority {
+        ClaimAuthority {
+            claim,
+            key: TEST_KEY.into(),
+            etag: etag(TEST_ETAG).await,
+        }
+    }
+
+    async fn observed(claim: Claim) -> ObservedClaim {
+        ObservedClaim {
+            claim,
+            key: TEST_KEY.into(),
+            etag: etag(TEST_ETAG).await,
         }
     }
 
@@ -676,10 +978,10 @@ mod tests {
             prepare_acquisition(
                 &work("work", 0),
                 &workspace("workspace"),
-                "campaign",
+                "bad/campaign",
                 &ActorId::new("actor".into()).unwrap(),
                 &InstanceId::new("instance".into()).unwrap(),
-                0,
+                100,
             ),
             Err(ClaimPrepareError::InvalidInput)
         ));
@@ -858,6 +1160,619 @@ mod tests {
             ClaimAcquireOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[test]
+    fn acquisition_uses_the_fixed_lease_and_rejects_timestamp_overflow() {
+        assert_eq!(CLAIM_LEASE_MS, 900_000);
+        assert_eq!(CLAIM_RENEWAL_CADENCE_MS, 300_000);
+        let attempt = prepare_acquisition(
+            &work("work-17", 4),
+            &workspace("workspace-1"),
+            "campaign-1",
+            &ActorId::new("actor-a".into()).unwrap(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            100,
+        )
+        .unwrap();
+        assert!(matches!(
+            attempt.claim.state(),
+            ClaimState::Active {
+                lease_until: 900_100
+            }
+        ));
+        assert!(matches!(
+            prepare_acquisition(
+                &work("work-17", 4),
+                &workspace("workspace-1"),
+                "campaign-1",
+                &ActorId::new("actor-a".into()).unwrap(),
+                &InstanceId::new("instance-a".into()).unwrap(),
+                u64::MAX,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn renewal_preserves_generation_and_uses_bound_key_and_etag() {
+        let original = claim(ClaimState::Active {
+            lease_until: 1_000_000,
+        });
+        let original_operation = original.operation_id().to_owned();
+        let mutation = prepare_renewal(
+            authority(original).await,
+            &work("work-17", 4),
+            &ActorId::new("rust-worker".into()).unwrap(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            9,
+            200_000,
+        )
+        .unwrap();
+        assert_eq!(mutation.key, TEST_KEY);
+        assert_eq!(mutation.claim.fence(), 9);
+        assert_eq!(mutation.claim.operation_id(), original_operation);
+        assert_eq!(mutation.claim.owner_actor().as_str(), "rust-worker");
+        assert_eq!(mutation.claim.owner_instance().as_str(), "instance-a");
+        assert!(matches!(
+            mutation.claim.state(),
+            ClaimState::Active {
+                lease_until: 1_100_000
+            }
+        ));
+        let expected_bytes = mutation.canonical_bytes.clone();
+        let (store, client) =
+            replay_store(vec![response(200, &[("etag", NEW_ETAG)], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        let refreshed = match apply_mutation(&store, mutation, &mut history).await {
+            ClaimMutationOutcome::Applied(authority) => authority,
+            _ => panic!("committed renewal must return refreshed authority"),
+        };
+        assert_eq!(refreshed.key, TEST_KEY);
+        assert!(refreshed.etag == etag(NEW_ETAG).await);
+        assert!(matches!(
+            refreshed.claim.state(),
+            ClaimState::Active {
+                lease_until: 1_100_000
+            }
+        ));
+        let request = client.actual_requests().next().unwrap();
+        assert_eq!(request.headers().get("if-match"), Some(TEST_ETAG));
+        assert!(request.headers().get("if-none-match").is_none());
+        assert_eq!(request.body().bytes(), Some(expected_bytes.as_slice()));
+        assert_eq!(
+            request.uri().parse::<http::Uri>().unwrap().path(),
+            format!("/{TEST_KEY}")
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_preparation_rejects_every_stale_or_invalid_boundary() {
+        let actor = ActorId::new("rust-worker".into()).unwrap();
+        let instance = InstanceId::new("instance-a".into()).unwrap();
+        let valid = || {
+            claim(ClaimState::Active {
+                lease_until: 1_000_000,
+            })
+        };
+
+        assert!(matches!(
+            prepare_renewal(
+                authority(valid()).await,
+                &work("other-work", 4),
+                &actor,
+                &instance,
+                9,
+                200_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_renewal(
+                authority(valid()).await,
+                &work("work-17", 5),
+                &actor,
+                &instance,
+                9,
+                200_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_renewal(
+                authority(valid()).await,
+                &work("work-17", 4),
+                &ActorId::new("other-actor".into()).unwrap(),
+                &instance,
+                9,
+                200_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_renewal(
+                authority(valid()).await,
+                &work("work-17", 4),
+                &actor,
+                &InstanceId::new("other-instance".into()).unwrap(),
+                9,
+                200_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_renewal(
+                authority(valid()).await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                8,
+                200_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_renewal(
+                authority(claim(ClaimState::Sealed {
+                    result_ref: artifact(),
+                }))
+                .await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                9,
+                200_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        for now in [1_000_000, 1_000_001] {
+            assert!(matches!(
+                prepare_renewal(
+                    authority(valid()).await,
+                    &work("work-17", 4),
+                    &actor,
+                    &instance,
+                    9,
+                    now,
+                ),
+                Err(ClaimPrepareError::InvalidInput)
+            ));
+        }
+        assert!(matches!(
+            prepare_renewal(
+                authority(claim(ClaimState::Active {
+                    lease_until: 900_100,
+                }))
+                .await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                9,
+                100,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_renewal(
+                authority(claim(ClaimState::Active {
+                    lease_until: u64::MAX,
+                }))
+                .await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                9,
+                u64::MAX - 1,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn renewal_precondition_failure_loses_authority() {
+        for status in [409, 412] {
+            let mutation = prepare_renewal(
+                authority(claim(ClaimState::Active {
+                    lease_until: 1_000_000,
+                }))
+                .await,
+                &work("work-17", 4),
+                &ActorId::new("rust-worker".into()).unwrap(),
+                &InstanceId::new("instance-a".into()).unwrap(),
+                9,
+                200_000,
+            )
+            .unwrap();
+            let (store, client) = replay_store(vec![response(status, &[], SdkBody::empty())]);
+            let mut history = AttemptHistory::default();
+            assert!(matches!(
+                apply_mutation(&store, mutation, &mut history).await,
+                ClaimMutationOutcome::Lost
+            ));
+            assert_eq!(client.actual_requests().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn renewal_storage_not_found_remains_unresolved() {
+        let mutation = prepare_renewal(
+            authority(claim(ClaimState::Active {
+                lease_until: 1_000_000,
+            }))
+            .await,
+            &work("work-17", 4),
+            &ActorId::new("rust-worker".into()).unwrap(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            9,
+            200_000,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            apply_mutation(&store, mutation, &mut history).await,
+            ClaimMutationOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn renewal_ambiguity_requires_exact_durable_bytes() {
+        for initial_status in [200, 500] {
+            let mutation = prepare_renewal(
+                authority(claim(ClaimState::Active {
+                    lease_until: 1_000_000,
+                }))
+                .await,
+                &work("work-17", 4),
+                &ActorId::new("rust-worker".into()).unwrap(),
+                &InstanceId::new("instance-a".into()).unwrap(),
+                9,
+                200_000,
+            )
+            .unwrap();
+            let bytes = mutation.canonical_bytes.clone();
+            let (store, _) = replay_store(vec![
+                response(initial_status, &[], SdkBody::empty()),
+                response(200, &[("etag", NEW_ETAG)], bytes),
+            ]);
+            let mut history = AttemptHistory::default();
+            let authority = match apply_mutation(&store, mutation, &mut history).await {
+                ClaimMutationOutcome::Applied(authority) => authority,
+                _ => panic!("exact reread must prove renewal"),
+            };
+            assert!(authority.etag == etag(NEW_ETAG).await);
+            assert!(matches!(
+                authority.claim.state(),
+                ClaimState::Active {
+                    lease_until: 1_100_000
+                }
+            ));
+        }
+
+        let mutation = prepare_renewal(
+            authority(claim(ClaimState::Active {
+                lease_until: 1_000_000,
+            }))
+            .await,
+            &work("work-17", 4),
+            &ActorId::new("rust-worker".into()).unwrap(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            9,
+            200_000,
+        )
+        .unwrap();
+        let mut different = mutation.canonical_bytes.clone();
+        different[0] ^= 1;
+        let (store, _) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(200, &[("etag", NEW_ETAG)], different),
+        ]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            apply_mutation(&store, mutation, &mut history).await,
+            ClaimMutationOutcome::Lost
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_or_failed_renewal_reread_is_unresolved() {
+        for reread in [
+            response(404, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ] {
+            let mutation = prepare_renewal(
+                authority(claim(ClaimState::Active {
+                    lease_until: 1_000_000,
+                }))
+                .await,
+                &work("work-17", 4),
+                &ActorId::new("rust-worker".into()).unwrap(),
+                &InstanceId::new("instance-a".into()).unwrap(),
+                9,
+                200_000,
+            )
+            .unwrap();
+            let (store, _) = replay_store(vec![response(500, &[], SdkBody::empty()), reread]);
+            let mut history = AttemptHistory::default();
+            assert!(matches!(
+                apply_mutation(&store, mutation, &mut history).await,
+                ClaimMutationOutcome::Unresolved(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_claim_reclamation_advances_fence_and_rebinds_owner() {
+        let original = claim(ClaimState::Active {
+            lease_until: 1_000_000,
+        });
+        let original_operation = original.operation_id().to_owned();
+        let mutation = prepare_reclamation(
+            observed(original).await,
+            &work("work-17", 5),
+            &ActorId::new("replacement".into()).unwrap(),
+            &InstanceId::new("replacement-instance".into()).unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(mutation.claim.work_revision(), 5);
+        assert_eq!(mutation.claim.owner_actor().as_str(), "replacement");
+        assert_eq!(
+            mutation.claim.owner_instance().as_str(),
+            "replacement-instance"
+        );
+        assert_eq!(mutation.claim.fence(), 10);
+        assert_ne!(mutation.claim.operation_id(), original_operation);
+        assert_eq!(mutation.key, TEST_KEY);
+        assert!(matches!(
+            mutation.claim.state(),
+            ClaimState::Active {
+                lease_until: 1_900_000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reclamation_rejects_ineligible_and_overflowing_claims() {
+        let actor = ActorId::new("replacement".into()).unwrap();
+        let instance = InstanceId::new("replacement-instance".into()).unwrap();
+        assert!(matches!(
+            prepare_reclamation(
+                observed(claim(ClaimState::Active {
+                    lease_until: 1_000_001,
+                }))
+                .await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                1_000_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_reclamation(
+                observed(claim(ClaimState::Sealed {
+                    result_ref: artifact(),
+                }))
+                .await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                1_000_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        let max_fence = Claim::new(
+            WorkId::new("work-17".into()).unwrap(),
+            4,
+            ActorId::new("rust-worker".into()).unwrap(),
+            InstanceId::new("instance-a".into()).unwrap(),
+            u64::MAX,
+            "op-max".into(),
+            ClaimState::Active { lease_until: 1 },
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_reclamation(
+                observed(max_fence).await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                1,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_reclamation(
+                observed(claim(ClaimState::Active { lease_until: 1 })).await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                u64::MAX,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_of_two_reclaimers_from_one_etag_wins() {
+        let actor = ActorId::new("replacement".into()).unwrap();
+        let first = prepare_reclamation(
+            observed(claim(ClaimState::Active { lease_until: 1 })).await,
+            &work("work-17", 4),
+            &actor,
+            &InstanceId::new("replacement-a".into()).unwrap(),
+            1,
+        )
+        .unwrap();
+        let second = prepare_reclamation(
+            observed(claim(ClaimState::Active { lease_until: 1 })).await,
+            &work("work-17", 4),
+            &actor,
+            &InstanceId::new("replacement-b".into()).unwrap(),
+            1,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+        ]);
+        let mut first_history = AttemptHistory::default();
+        let mut second_history = AttemptHistory::default();
+        let outcomes = [
+            apply_mutation(&store, first, &mut first_history).await,
+            apply_mutation(&store, second, &mut second_history).await,
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ClaimMutationOutcome::Applied(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ClaimMutationOutcome::Lost))
+                .count(),
+            1
+        );
+        for request in client.actual_requests() {
+            assert_eq!(request.headers().get("if-match").unwrap(), TEST_ETAG);
+            assert_eq!(
+                request.uri().parse::<http::Uri>().unwrap().path(),
+                format!("/{TEST_KEY}")
+            );
+        }
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_sealed_claim_can_be_superseded_but_current_terminal_cannot() {
+        let actor = ActorId::new("replacement".into()).unwrap();
+        let instance = InstanceId::new("replacement-instance".into()).unwrap();
+        let mutation = prepare_supersession(
+            observed(claim(ClaimState::Sealed {
+                result_ref: artifact(),
+            }))
+            .await,
+            &work("work-17", 5),
+            &actor,
+            &instance,
+            2_000_000,
+        )
+        .unwrap();
+        assert_eq!(mutation.claim.work_revision(), 5);
+        assert_eq!(mutation.claim.fence(), 10);
+        assert_eq!(mutation.key, TEST_KEY);
+        assert!(matches!(
+            mutation.claim.state(),
+            ClaimState::Active {
+                lease_until: 2_900_000
+            }
+        ));
+        assert!(matches!(
+            prepare_supersession(
+                observed(claim(ClaimState::Sealed {
+                    result_ref: artifact(),
+                }))
+                .await,
+                &work("work-17", 4),
+                &actor,
+                &instance,
+                2_000_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_supersession(
+                observed(claim(ClaimState::Active { lease_until: 1 })).await,
+                &work("work-17", 5),
+                &actor,
+                &instance,
+                2_000_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+        assert!(matches!(
+            prepare_supersession(
+                observed(claim(ClaimState::Sealed {
+                    result_ref: artifact(),
+                }))
+                .await,
+                &work("other-work", 5),
+                &actor,
+                &instance,
+                2_000_000,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observation_couples_claim_key_and_etag_and_fails_closed() {
+        let expected = claim(ClaimState::Active { lease_until: 1 });
+        let bytes = encode(&expected).unwrap();
+        let (store, _) = replay_store(vec![response(200, &[("etag", TEST_ETAG)], bytes)]);
+        let found = observe(
+            &store,
+            &workspace("workspace-1"),
+            "campaign-1",
+            &WorkId::new("work-17".into()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(found.claim, expected);
+        assert_eq!(found.key, TEST_KEY);
+        assert!(found.etag == etag(TEST_ETAG).await);
+
+        let (store, _) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        assert!(
+            observe(
+                &store,
+                &workspace("workspace-1"),
+                "campaign-1",
+                &WorkId::new("work-17".into()).unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("etag", TEST_ETAG)],
+            b"not-json".to_vec(),
+        )]);
+        assert!(matches!(
+            observe(
+                &store,
+                &workspace("workspace-1"),
+                "campaign-1",
+                &WorkId::new("work-17".into()).unwrap(),
+            )
+            .await,
+            Err(ClaimReadError::Invalid(WireError::InvalidEncoding))
+        ));
+
+        let oversized = (MAX_CLAIM_BYTES + 1).to_string();
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("content-length", oversized.as_str()), ("etag", TEST_ETAG)],
+            SdkBody::empty(),
+        )]);
+        assert!(matches!(
+            observe(
+                &store,
+                &workspace("workspace-1"),
+                "campaign-1",
+                &WorkId::new("work-17".into()).unwrap(),
+            )
+            .await,
+            Err(ClaimReadError::Invalid(WireError::LimitExceeded))
+        ));
     }
 
     #[tokio::test]

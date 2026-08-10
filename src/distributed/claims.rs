@@ -231,12 +231,32 @@ pub(crate) struct ClaimMutation {
     key: String,
     canonical_bytes: Vec<u8>,
     etag: ETag,
+    /// Expiry of the claim this mutation renews, when it renews one.
+    observed_expiry: Option<u64>,
+    /// Verified `work.revision()` that made this mutation eligible.
+    prepared_revision: u64,
+}
+
+#[allow(dead_code)]
+impl ClaimMutation {
+    /// A frozen mutation stays safe to resend only while the facts that made it
+    /// eligible still hold: the same work generation, and for a renewal an
+    /// observed lease that has not expired.
+    #[must_use]
+    fn still_eligible(&self, work: &WorkRef, now: u64) -> bool {
+        self.claim.work_id() == work.id()
+            && self.prepared_revision == work.revision()
+            && self.observed_expiry.is_none_or(|expiry| now < expiry)
+    }
 }
 
 #[must_use]
 #[allow(dead_code)]
 pub(crate) enum ClaimMutationOutcome {
     Applied(ClaimAuthority),
+    /// The facts that made the mutation eligible no longer hold, so it must be
+    /// prepared again from a fresh observation rather than resent.
+    Ineligible,
     Lost,
     RetryIdentically(ClaimMutation),
     Unresolved(ClaimMutation),
@@ -404,6 +424,8 @@ pub(crate) fn prepare_renewal(
         key,
         canonical_bytes,
         etag,
+        observed_expiry: Some(lease_until),
+        prepared_revision: work.revision(),
     })
 }
 
@@ -484,6 +506,10 @@ fn prepare_replacement(
         key: observed.key,
         canonical_bytes,
         etag: observed.etag,
+        // Replacement eligibility is an expired lease or an older sealed revision,
+        // neither of which a later clock reading can invalidate.
+        observed_expiry: None,
+        prepared_revision: work.revision(),
     })
 }
 
@@ -527,8 +553,13 @@ pub(crate) async fn acquire(
 pub(crate) async fn apply_mutation(
     store: &S3Store,
     mutation: ClaimMutation,
+    work: &WorkRef,
+    now: u64,
     history: &mut AttemptHistory,
 ) -> ClaimMutationOutcome {
+    if !mutation.still_eligible(work, now) {
+        return ClaimMutationOutcome::Ineligible;
+    }
     let outcome = store
         .put_if_match(
             &mutation.key,
@@ -1234,7 +1265,15 @@ mod tests {
         let (store, client) =
             replay_store(vec![response(200, &[("etag", NEW_ETAG)], SdkBody::empty())]);
         let mut history = AttemptHistory::default();
-        let refreshed = match apply_mutation(&store, mutation, &mut history).await {
+        let refreshed = match apply_mutation(
+            &store,
+            mutation,
+            &work("work-17", 4),
+            200_000,
+            &mut history,
+        )
+        .await
+        {
             ClaimMutationOutcome::Applied(authority) => authority,
             _ => panic!("committed renewal must return refreshed authority"),
         };
@@ -1395,7 +1434,8 @@ mod tests {
             .unwrap();
             let (store, client) = replay_store(vec![response(status, &[], SdkBody::empty())]);
             let mut history = AttemptHistory::default();
-            let outcome = apply_mutation(&store, mutation, &mut history).await;
+            let outcome =
+                apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await;
             if expect_lost {
                 assert!(
                     matches!(outcome, ClaimMutationOutcome::Lost),
@@ -1428,7 +1468,7 @@ mod tests {
         let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            apply_mutation(&store, mutation, &mut history).await,
+            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
             ClaimMutationOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 1);
@@ -1455,10 +1495,13 @@ mod tests {
                 response(200, &[("etag", NEW_ETAG)], bytes),
             ]);
             let mut history = AttemptHistory::default();
-            let authority = match apply_mutation(&store, mutation, &mut history).await {
-                ClaimMutationOutcome::Applied(authority) => authority,
-                _ => panic!("exact reread must prove renewal"),
-            };
+            let authority =
+                match apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history)
+                    .await
+                {
+                    ClaimMutationOutcome::Applied(authority) => authority,
+                    _ => panic!("exact reread must prove renewal"),
+                };
             assert!(authority.etag == etag(NEW_ETAG).await);
             assert!(matches!(
                 authority.claim.state(),
@@ -1488,7 +1531,7 @@ mod tests {
         ]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            apply_mutation(&store, mutation, &mut history).await,
+            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
             ClaimMutationOutcome::Lost
         ));
     }
@@ -1514,7 +1557,7 @@ mod tests {
             let (store, _) = replay_store(vec![response(500, &[], SdkBody::empty()), reread]);
             let mut history = AttemptHistory::default();
             assert!(matches!(
-                apply_mutation(&store, mutation, &mut history).await,
+                apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
                 ClaimMutationOutcome::Unresolved(_)
             ));
         }
@@ -1639,8 +1682,8 @@ mod tests {
         let mut first_history = AttemptHistory::default();
         let mut second_history = AttemptHistory::default();
         let outcomes = [
-            apply_mutation(&store, first, &mut first_history).await,
-            apply_mutation(&store, second, &mut second_history).await,
+            apply_mutation(&store, first, &work("work-17", 4), 1, &mut first_history).await,
+            apply_mutation(&store, second, &work("work-17", 4), 1, &mut second_history).await,
         ];
         assert_eq!(
             outcomes
@@ -1784,6 +1827,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_frozen_mutation_is_ineligible_once_its_preconditions_lapse() {
+        async fn renewal() -> ClaimMutation {
+            prepare_renewal(
+                authority(claim(ClaimState::Active {
+                    lease_until: 1_000_000,
+                }))
+                .await,
+                &work("work-17", 4),
+                &ActorId::new("rust-worker".into()).unwrap(),
+                &InstanceId::new("instance-a".into()).unwrap(),
+                9,
+                200_000,
+            )
+            .expect("renewal prepares")
+        }
+
+        // The observed lease has expired by the time the retry is attempted.
+        let (store, client) =
+            replay_store(vec![response(200, &[("etag", NEW_ETAG)], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            apply_mutation(
+                &store,
+                renewal().await,
+                &work("work-17", 4),
+                1_000_000,
+                &mut history
+            )
+            .await,
+            ClaimMutationOutcome::Ineligible
+        ));
+
+        // The work generation advanced past the revision the mutation froze.
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            apply_mutation(
+                &store,
+                renewal().await,
+                &work("work-17", 5),
+                200_000,
+                &mut history
+            )
+            .await,
+            ClaimMutationOutcome::Ineligible
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
     async fn an_unchanged_object_keeps_an_ambiguous_mutation_unresolved() {
         let mutation = prepare_renewal(
             authority(claim(ClaimState::Active {
@@ -1808,7 +1900,7 @@ mod tests {
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
-            apply_mutation(&store, mutation, &mut history).await,
+            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
             ClaimMutationOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 2);

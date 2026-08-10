@@ -56,9 +56,32 @@ pub enum MutationOutcome {
 ///
 /// Replacing this value between attempts discards evidence that an earlier
 /// request may have been sent.
+///
+/// One history belongs to exactly one object key. Carrying a history across two
+/// logical publications leaks the first one's dispatch uncertainty into the
+/// second, which can only over-report ambiguity (`AmbiguousConflict` where a
+/// definitive `Conflict`/`PreconditionFailed` held) and never under-report it.
+/// Debug builds assert the single-key binding.
 #[derive(Default)]
 pub struct AttemptHistory {
     may_have_been_sent: bool,
+    #[cfg(debug_assertions)]
+    key: Option<String>,
+}
+
+impl AttemptHistory {
+    fn bind(&mut self, key: &str) {
+        #[cfg(debug_assertions)]
+        match &self.key {
+            Some(bound) => debug_assert_eq!(
+                bound, key,
+                "an AttemptHistory covers one object key; reusing it across \
+                 publications leaks dispatch uncertainty"
+            ),
+            None => self.key = Some(key.to_owned()),
+        }
+        let _ = key;
+    }
 }
 
 pub struct S3Store {
@@ -118,6 +141,7 @@ impl S3Store {
         bytes: Vec<u8>,
         history: &mut AttemptHistory,
     ) -> MutationOutcome {
+        history.bind(key);
         self.send_mutation(
             self.client
                 .put_object()
@@ -137,6 +161,7 @@ impl S3Store {
         etag: &ETag,
         history: &mut AttemptHistory,
     ) -> MutationOutcome {
+        history.bind(key);
         self.send_mutation(
             self.client
                 .put_object()
@@ -558,5 +583,14 @@ mod tests {
             "object response is missing a version token"
         );
         assert_eq!(GetError::Transport.to_string(), "object read failed");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "one object key")]
+    fn one_history_cannot_span_two_keys() {
+        let mut history = AttemptHistory::default();
+        history.bind("campaigns/c/head.json");
+        history.bind("campaigns/other/head.json");
     }
 }

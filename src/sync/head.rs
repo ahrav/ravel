@@ -111,6 +111,7 @@ impl HeadTransition {
                     || tail.sequence() != expected_sequence
                     || tail.parent() != Some(observed.head.tail())
                     || !authority_permits(&observed.head, &candidate)
+                    || !tail_fence_matches(tail, &candidate)
                 {
                     return Err(WireError::InvalidValue);
                 }
@@ -270,6 +271,19 @@ async fn resolve(store: &S3Store, mut transition: HeadTransition) -> HeadCommitO
 /// An unowned successor to an owned head would let any holder of the current
 /// ETag strip the controller fence through the ordinary `If-Match` CAS, so the
 /// non-regression check rejects it rather than falling through.
+/// An owned head claims that its controller published the tail, so the tail's
+/// `writer_fence` has to equal the candidate's `controller_fence`. Without the
+/// equality a stale-fence event can be published first and then presented under a
+/// higher-fence head, leaving authoritative history attributed to an old fence.
+fn tail_fence_matches(tail: &Event, candidate: &Head) -> bool {
+    match candidate.authority().state() {
+        AuthorityState::Owned {
+            controller_fence, ..
+        } => tail.writer_fence() == *controller_fence,
+        AuthorityState::Unowned => true,
+    }
+}
+
 fn authority_permits(parent: &Head, candidate: &Head) -> bool {
     match (parent.authority().state(), candidate.authority().state()) {
         (
@@ -892,8 +906,8 @@ mod tests {
         let tail = Event::new(
             "event-op-2".into(),
             2,
-            Some(parent_ref),
-            8,
+            Some(parent_ref.clone()),
+            2,
             EventContent::WorkflowStarted,
         )
         .expect("valid event");
@@ -905,6 +919,31 @@ mod tests {
         )
         .expect("valid head");
         rejects_transition(HeadParent::Existing(observed), lower, &tail, &publication);
+
+        // A tail published at an older writer fence cannot be adopted by a
+        // higher-fence owned head.
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let stale_tail = Event::new(
+            "event-op-stale".into(),
+            2,
+            Some(parent_ref.clone()),
+            1,
+            EventContent::WorkflowStarted,
+        )
+        .expect("valid event");
+        let stale_publication = publish_event(&stale_tail).await;
+        let higher = Head::new(
+            Authority::owned("owner".into(), "instance".into(), 2, 2).expect("valid authority"),
+            stale_publication.event_ref().clone(),
+            "head-op-stale".into(),
+        )
+        .expect("valid head");
+        rejects_transition(
+            HeadParent::Existing(observed),
+            higher,
+            &stale_tail,
+            &stale_publication,
+        );
 
         let observed = read_observed(&parent, OLD_ETAG).await;
         let unfenced = Head::new(

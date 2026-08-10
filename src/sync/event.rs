@@ -141,23 +141,27 @@ impl Error for ConversionError {}
 
 /// Converts a verified v1 event into an owned scheduling mutation.
 ///
-/// `reference` must be the verified reference whose key was supplied to [`decode`] for `event`.
-/// The sequences are checked here; the digest/key binding is what [`decode`] already proved
-/// against `expected_key`, so re-deriving it would only re-verify the caller's own input.
+/// `reference` must name `event` exactly: the sequence, digest, and key are all
+/// re-derived from `event` and compared, so a reference belonging to another event
+/// cannot pair a durable coordinate with this event's row effect.
 ///
 /// # Errors
 ///
-/// Returns [`ConversionError::ReferenceMismatch`] when `reference` names a different sequence
-/// than `event`, which would give the mutation a durable coordinate and a row effect drawn from
-/// two different positions in the chain. Returns [`ConversionError::IllegalPosition`] for
-/// `CampaignCreated` at any sequence other than 1 and for `WorkflowStarted` at sequence 1.
-/// Returns [`ConversionError::UnsupportedContent`] for `ArtifactPublished`, which has no
+/// Returns [`ConversionError::ReferenceMismatch`] when `reference` does not name
+/// `event`, or when `event` cannot be re-encoded. Returns
+/// [`ConversionError::IllegalPosition`] for `CampaignCreated` at any sequence other
+/// than 1 and for `WorkflowStarted` at sequence 1. Returns
+/// [`ConversionError::UnsupportedContent`] for `ArtifactPublished`, which has no
 /// scheduling projection.
 pub fn scheduling_mutation(
     reference: EventRef,
     event: &Event,
 ) -> Result<SchedulingMutation, ConversionError> {
-    if reference.sequence() != event.sequence() {
+    let encoded = encode(event).map_err(|_| ConversionError::ReferenceMismatch)?;
+    if reference.sequence() != event.sequence()
+        || reference.digest() != encoded.digest()
+        || reference.key() != encoded.key()
+    {
         return Err(ConversionError::ReferenceMismatch);
     }
     // No wildcard arm: a new EventContent variant must fail compilation here rather than
@@ -466,6 +470,16 @@ mod tests {
 
     use super::*;
 
+    fn reference_for(event: &Event) -> EventRef {
+        let encoded = encode(event).expect("event encodes");
+        EventRef::new(
+            event.sequence(),
+            encoded.digest().to_owned(),
+            encoded.key().to_owned(),
+        )
+        .expect("canonical reference")
+    }
+
     fn valid_wire() -> WireEvent {
         WireEvent {
             version: WIRE_VERSION,
@@ -758,7 +772,7 @@ mod tests {
             EventContent::WorkflowStarted,
         )
         .unwrap();
-        let reference = EventRef::from_digest(3, "2".repeat(64)).unwrap();
+        let reference = reference_for(&workflow);
 
         assert_eq!(
             scheduling_mutation(reference, &workflow).unwrap().effect(),
@@ -778,7 +792,7 @@ mod tests {
             EventContent::WorkflowStarted,
         )
         .unwrap();
-        let workflow_reference = EventRef::from_digest(1, "0".repeat(64)).unwrap();
+        let workflow_reference = reference_for(&workflow);
         assert_eq!(
             scheduling_mutation(workflow_reference, &workflow),
             Err(ConversionError::IllegalPosition)
@@ -792,10 +806,32 @@ mod tests {
             EventContent::CampaignCreated,
         )
         .unwrap();
-        let campaign_reference = EventRef::from_digest(2, "1".repeat(64)).unwrap();
+        let campaign_reference = reference_for(&campaign);
         assert_eq!(
             scheduling_mutation(campaign_reference, &campaign),
             Err(ConversionError::IllegalPosition)
+        );
+    }
+
+    #[test]
+    fn rejects_a_reference_with_the_right_sequence_and_wrong_digest() {
+        let campaign = Event::new(
+            "campaign-op".into(),
+            1,
+            None,
+            7,
+            EventContent::CampaignCreated,
+        )
+        .unwrap();
+        let canonical = reference_for(&campaign);
+        let wrong_digest =
+            EventRef::from_digest(canonical.sequence(), "c".repeat(64)).expect("valid reference");
+        assert_eq!(wrong_digest.sequence(), canonical.sequence());
+        assert_ne!(wrong_digest.digest(), canonical.digest());
+
+        assert_eq!(
+            scheduling_mutation(wrong_digest, &campaign),
+            Err(ConversionError::ReferenceMismatch)
         );
     }
 
@@ -836,7 +872,7 @@ mod tests {
             EventContent::ArtifactPublished(artifact),
         )
         .unwrap();
-        let reference = EventRef::from_digest(1, "0".repeat(64)).unwrap();
+        let reference = reference_for(&event);
 
         assert_eq!(
             scheduling_mutation(reference, &event),

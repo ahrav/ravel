@@ -935,16 +935,19 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     let encoded_2 = event::encode(&event_2).map_err(|_| "event 2 encoding failed")?;
     let reference_2 = EventRef::new(2, encoded_2.digest().to_owned(), encoded_2.key().to_owned())
         .map_err(|_| "event 2 reference construction failed")?;
+    // Production builds heads with the tail's operation id, and
+    // HeadTransition::new rejects a divergence, so the retained chain has to carry
+    // the same identities a real commit would.
     let genesis_head = Head::new(
         Authority::unowned(),
         reference_1.clone(),
-        "live-head-genesis".into(),
+        event_1.operation_id().to_owned(),
     )
     .map_err(|_| "genesis head construction failed")?;
     let successor_head = Head::new(
         Authority::unowned(),
         reference_2.clone(),
-        "live-head-successor".into(),
+        event_2.operation_id().to_owned(),
     )
     .map_err(|_| "successor head construction failed")?;
     let genesis_head_bytes =

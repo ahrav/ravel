@@ -94,8 +94,8 @@ pub enum SchedulingEffect {
 
 /// Owned durable coordinates and row effect for one apply transaction.
 ///
-/// Each effect's ID is the converted event's sequence as 16-digit zero-padded decimal, which
-/// [`scheduling_mutation`]'s caller contract makes equal to [`Self::reference`]'s sequence.
+/// Each effect's ID is the converted event's sequence as 16-digit zero-padded decimal. The
+/// caller must pass a reference whose sequence equals [`Self::reference`]'s sequence.
 /// Consumers use the carried ID rather than deriving it again. The mutation carries no
 /// operation identity and no writer fence.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,6 +124,7 @@ impl SchedulingMutation {
 pub enum ConversionError {
     IllegalPosition,
     UnsupportedContent,
+    ReferenceMismatch,
 }
 
 impl fmt::Display for ConversionError {
@@ -131,6 +132,7 @@ impl fmt::Display for ConversionError {
         formatter.write_str(match self {
             Self::IllegalPosition => "event content is illegal at this sequence",
             Self::UnsupportedContent => "event content has no scheduling projection",
+            Self::ReferenceMismatch => "event reference does not name this event",
         })
     }
 }
@@ -140,18 +142,24 @@ impl Error for ConversionError {}
 /// Converts a verified v1 event into an owned scheduling mutation.
 ///
 /// `reference` must be the verified reference whose key was supplied to [`decode`] for `event`.
-/// This is a caller contract rather than a construction guarantee because [`Event::new`] is public.
+/// The sequences are checked here; the digest/key binding is what [`decode`] already proved
+/// against `expected_key`, so re-deriving it would only re-verify the caller's own input.
 ///
 /// # Errors
 ///
-/// Returns [`ConversionError::IllegalPosition`] for `CampaignCreated` at any sequence other
-/// than 1 and for `WorkflowStarted` at sequence 1. Returns
-/// [`ConversionError::UnsupportedContent`] for `ArtifactPublished`, which has no scheduling
-/// projection.
+/// Returns [`ConversionError::ReferenceMismatch`] when `reference` names a different sequence
+/// than `event`, which would give the mutation a durable coordinate and a row effect drawn from
+/// two different positions in the chain. Returns [`ConversionError::IllegalPosition`] for
+/// `CampaignCreated` at any sequence other than 1 and for `WorkflowStarted` at sequence 1.
+/// Returns [`ConversionError::UnsupportedContent`] for `ArtifactPublished`, which has no
+/// scheduling projection.
 pub fn scheduling_mutation(
     reference: EventRef,
     event: &Event,
 ) -> Result<SchedulingMutation, ConversionError> {
+    if reference.sequence() != event.sequence() {
+        return Err(ConversionError::ReferenceMismatch);
+    }
     // No wildcard arm: a new EventContent variant must fail compilation here rather than
     // silently project nothing.
     let effect = match (event.content(), event.sequence()) {
@@ -182,10 +190,8 @@ pub fn scheduling_mutation(
 ///
 /// Genesis is always sequence 1, so every campaign row carries the constant ID
 /// `0000000000000001`; one database projects one chain, which keeps that constant
-/// collision-free.
-// ponytail: pilot identity is the event's own 16-digit sequence, the padding the
-// event key already uses. Replace with event-carried ids when E06's work-creation
-// events (ravel-85q.3) put real identities in the payload.
+/// collision-free. The identity is the event's own 16-digit sequence, matching the padding
+/// the event key already uses, because v1 event payloads carry no identities of their own.
 fn projected_id(sequence: u64) -> String {
     format!("{sequence:016}")
 }
@@ -790,6 +796,24 @@ mod tests {
         assert_eq!(
             scheduling_mutation(campaign_reference, &campaign),
             Err(ConversionError::IllegalPosition)
+        );
+    }
+
+    #[test]
+    fn rejects_a_reference_naming_another_sequence() {
+        let campaign = Event::new(
+            "campaign-op".into(),
+            1,
+            None,
+            7,
+            EventContent::CampaignCreated,
+        )
+        .unwrap();
+        let foreign = EventRef::from_digest(2, "0".repeat(64)).unwrap();
+
+        assert_eq!(
+            scheduling_mutation(foreign, &campaign),
+            Err(ConversionError::ReferenceMismatch)
         );
     }
 

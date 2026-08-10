@@ -23,13 +23,11 @@ use crate::{
     },
     domain::{
         campaign::{ArtifactRef, ValidationError, validate_identity},
-        work::WorkRef,
+        work::{WorkId, WorkRef},
     },
     storage::s3::{AttemptHistory, ETag, GetOutcome, MutationOutcome, S3Store},
     sync::{WIRE_VERSION, WireError, event::WireArtifactRef},
 };
-
-use crate::domain::work::WorkId;
 
 const MAX_CLAIM_BYTES: usize = 4 * 1024;
 
@@ -145,10 +143,10 @@ enum WireClaimState {
     Sealed { result_ref: WireArtifactRef },
 }
 
-/// Couples a validated claim to the opaque ETag observed on the mutation that
-/// wrote it. Only successful claim mutations inside this module construct it;
-/// it implements neither `Clone` nor `Debug`, so the proof cannot be copied or
-/// logged.
+/// Couples a validated claim to the opaque ETag observed either on the
+/// mutation that wrote it or on an exact same-key reread of the attempted
+/// canonical bytes. Only this module constructs it; it implements neither
+/// `Clone` nor `Debug`, so the proof cannot be copied or logged.
 #[allow(dead_code)]
 pub(crate) struct ClaimAuthority {
     claim: Claim,
@@ -232,7 +230,7 @@ pub(crate) fn prepare_acquisition(
 }
 
 // Key layout is duplicated in tests/live_s3_ambiguity.rs and
-// tests/live_s3_preflight.rs; keep the three literals in sync.
+// tests/live_s3_preflight.rs; keep those literals in sync.
 fn claim_key(
     workspace: &WorkspaceId,
     campaign_id: &str,
@@ -297,9 +295,12 @@ async fn resolve(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcquireOutcome 
             })
         }
         Ok(GetOutcome::Found { .. }) => ClaimAcquireOutcome::Collision,
-        // An absent key proves the PUT never landed only because retained claim
+        // Absence proves the PUT had not landed at read time: retained claim
         // keys admit no delete path or lifecycle expiration and S3 reads are
-        // strongly consistent after write.
+        // strongly consistent after write. A write still in flight is safe to
+        // resend because the reused AttemptHistory turns its 409/412 into
+        // AmbiguousConflict and the same-key byte comparison recovers
+        // authority.
         Ok(GetOutcome::NotFound) => ClaimAcquireOutcome::RetryIdentically(attempt),
         Err(_) => ClaimAcquireOutcome::Unresolved(attempt),
     }
@@ -394,12 +395,9 @@ impl TryFrom<WireClaim> for Claim {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use aws_sdk_s3::primitives::SdkBody;
 
-    use aws_sdk_s3::{config::Region, primitives::SdkBody};
-    use aws_smithy_runtime::client::http::test_util::NeverClient;
-
-    use crate::storage::s3::test_support::{replay_store, response, test_builder};
+    use crate::storage::s3::test_support::{replay_store, response};
 
     use super::*;
 
@@ -745,8 +743,9 @@ mod tests {
             ]);
             let mut history = AttemptHistory::default();
             let outcome = acquire(&store, attempt, &mut history).await;
-            assert_eq!(matches!(&outcome, ClaimAcquireOutcome::Acquired(_)), exact);
-            if !exact {
+            if exact {
+                assert!(matches!(outcome, ClaimAcquireOutcome::Acquired(_)));
+            } else {
                 assert!(matches!(outcome, ClaimAcquireOutcome::Collision));
             }
             assert_eq!(client.actual_requests().count(), 2);
@@ -755,32 +754,23 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_conflict_resolves_from_same_key_bytes() {
-        let never = S3Store::new(
-            "test-bucket",
-            Region::new("us-east-1"),
-            test_builder(NeverClient::new()),
-        );
-        let mut history = AttemptHistory::default();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                never.put_if_absent("taint", Vec::new(), &mut history),
-            )
-            .await
-            .is_err()
-        );
-
         let attempt = attempt();
         let bytes = attempt.canonical_bytes.clone();
         let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
             response(200, &[("etag", TEST_ETAG)], bytes),
         ]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            store.put_if_absent("taint", Vec::new(), &mut history).await,
+            MutationOutcome::Unknown
+        ));
         assert!(matches!(
             acquire(&store, attempt, &mut history).await,
             ClaimAcquireOutcome::Acquired(_)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 3);
     }
 
     #[tokio::test]

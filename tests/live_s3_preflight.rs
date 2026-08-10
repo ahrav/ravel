@@ -1247,29 +1247,34 @@ struct DeleteDenialEvidence {
     runtime_role_arn: String,
 }
 
-fn write_delete_denial_evidence(
-    run_id: &str,
-    evidence: &DeleteDenialEvidence,
+fn write_json_evidence<T: serde::Serialize>(
+    path: String,
+    value: &T,
 ) -> Result<String, &'static str> {
-    let path = format!("pilot/e02/live-delete-denial-{run_id}.json");
     let mut bytes =
-        serde_json::to_vec_pretty(evidence).map_err(|_| "delete evidence serialization failed")?;
-    bytes.push(b'\n');
-    let mut file = File::create_new(&path).map_err(|_| "delete evidence file creation failed")?;
-    file.write_all(&bytes)
-        .map_err(|_| "delete evidence file write failed")?;
-    Ok(path)
-}
-
-fn write_evidence(evidence: &Evidence) -> Result<String, &'static str> {
-    let path = format!("pilot/e02/live-preflight-{}.json", evidence.run_id);
-    let mut bytes =
-        serde_json::to_vec_pretty(evidence).map_err(|_| "evidence serialization failed")?;
+        serde_json::to_vec_pretty(value).map_err(|_| "evidence serialization failed")?;
     bytes.push(b'\n');
     let mut file = File::create_new(&path).map_err(|_| "evidence file creation failed")?;
     file.write_all(&bytes)
         .map_err(|_| "evidence file write failed")?;
     Ok(path)
+}
+
+fn write_delete_denial_evidence(
+    run_id: &str,
+    evidence: &DeleteDenialEvidence,
+) -> Result<String, &'static str> {
+    write_json_evidence(
+        format!("pilot/e02/live-delete-denial-{run_id}.json"),
+        evidence,
+    )
+}
+
+fn write_evidence(evidence: &Evidence) -> Result<String, &'static str> {
+    write_json_evidence(
+        format!("pilot/e02/live-preflight-{}.json", evidence.run_id),
+        evidence,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

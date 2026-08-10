@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     distributed::identity::{ActorId, InstanceId},
-    domain::campaign::{ValidationError, validate_identity},
+    domain::campaign::{ValidationError, validate_identity, validate_key_segment},
     sync::{WIRE_VERSION, WireError},
 };
 
@@ -19,9 +19,10 @@ impl WorkspaceId {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError`] when `value` is empty or exceeds 128 UTF-8 bytes.
+    /// Returns [`ValidationError`] when `value` is empty, exceeds 128 UTF-8 bytes,
+    /// or contains `/`.
     pub fn new(value: String) -> Result<Self, ValidationError> {
-        validate_identity(&value)?;
+        validate_key_segment(&value)?;
         Ok(Self(value))
     }
 
@@ -99,8 +100,8 @@ struct WirePresence {
 
 /// Builds the object key `workspace/{workspace}/presence/{actor}/{instance}.json`.
 ///
-/// Identities are validated for length only, not path-sanitized; any writer must
-/// constrain them before the key reaches object storage.
+/// `WorkspaceId`, `ActorId`, and `InstanceId` reject `/`. The identity-to-key
+/// mapping is therefore injective.
 pub fn presence_key(workspace: &WorkspaceId, actor: &ActorId, instance: &InstanceId) -> String {
     format!(
         "workspace/{}/presence/{}/{}.json",
@@ -242,6 +243,16 @@ mod tests {
             ),
             "workspace/workspace-a/presence/rust-worker/instance-a.json"
         );
+    }
+
+    #[test]
+    fn ambiguous_identity_triples_cannot_be_constructed() {
+        // `(w, a/b, c)` and `(w, a, b/c)` would both derive
+        // `workspace/w/presence/a/b/c.json`.
+        assert!(ActorId::new("a/b".into()).is_err());
+        assert!(InstanceId::new("b/c".into()).is_err());
+        // `w/presence/a` would add path segments to the workspace component.
+        assert!(WorkspaceId::new("w/presence/a".into()).is_err());
     }
 
     #[test]

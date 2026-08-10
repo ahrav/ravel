@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     distributed::identity::{ActorId, InstanceId},
-    domain::campaign::{ArtifactRef, ValidationError, validate_identity},
+    domain::campaign::{ArtifactRef, ValidationError, validate_identity, validate_key_segment},
     storage::s3::ETag,
     sync::{WIRE_VERSION, WireError, event::WireArtifactRef},
 };
@@ -32,9 +32,10 @@ impl WorkId {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError`] when `value` is empty or exceeds 128 UTF-8 bytes.
+    /// Returns [`ValidationError`] when `value` is empty, exceeds 128 UTF-8 bytes,
+    /// or contains `/`.
     pub fn new(value: String) -> Result<Self, ValidationError> {
-        validate_identity(&value)?;
+        validate_key_segment(&value)?;
         Ok(Self(value))
     }
 

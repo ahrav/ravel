@@ -1,6 +1,6 @@
 //! Validated actor and process-incarnation identities.
 
-use crate::domain::campaign::{ValidationError, validate_identity};
+use crate::domain::campaign::{ValidationError, validate_key_segment};
 
 /// Identity of a logical claimant, stable across process restarts.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11,9 +11,10 @@ impl ActorId {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError`] when `value` is empty or exceeds 128 UTF-8 bytes.
+    /// Returns [`ValidationError`] when `value` is empty, exceeds 128 UTF-8 bytes,
+    /// or contains `/`.
     pub fn new(value: String) -> Result<Self, ValidationError> {
-        validate_identity(&value)?;
+        validate_key_segment(&value)?;
         Ok(Self(value))
     }
 
@@ -34,9 +35,10 @@ impl InstanceId {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError`] when `value` is empty or exceeds 128 UTF-8 bytes.
+    /// Returns [`ValidationError`] when `value` is empty, exceeds 128 UTF-8 bytes,
+    /// or contains `/`.
     pub fn new(value: String) -> Result<Self, ValidationError> {
-        validate_identity(&value)?;
+        validate_key_segment(&value)?;
         Ok(Self(value))
     }
 
@@ -69,6 +71,17 @@ mod tests {
         }
         assert!(ActorId::new("x".repeat(128)).is_ok());
         assert!(InstanceId::new("x".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn identities_reject_the_key_delimiter() {
+        for value in ["a/b", "/leading", "trailing/", "/"] {
+            assert!(ActorId::new(value.to_owned()).is_err(), "actor {value:?}");
+            assert!(
+                InstanceId::new(value.to_owned()).is_err(),
+                "instance {value:?}"
+            );
+        }
     }
 
     #[test]

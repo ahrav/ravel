@@ -340,6 +340,22 @@ pub(crate) fn validate_identity(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// A `/` inside a key segment makes distinct identity tuples derive one key: an
+/// actor `a/b` with instance `c` and an actor `a` with instance `b/c` both land on
+/// `.../a/b/c.json`.
+///
+/// # Errors
+///
+/// Returns [`ValidationError::InvalidIdentity`] when `value` is empty, exceeds
+/// 128 UTF-8 bytes, or contains `/`.
+pub(crate) fn validate_key_segment(value: &str) -> Result<(), ValidationError> {
+    validate_identity(value)?;
+    if value.contains('/') {
+        return Err(ValidationError::InvalidIdentity);
+    }
+    Ok(())
+}
+
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value

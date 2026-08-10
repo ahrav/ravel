@@ -79,7 +79,7 @@ fn validate_artifact_length(length: usize) -> Result<(), PublicationError> {
     }
 }
 
-fn artifact_key(digest: &str) -> String {
+pub(crate) fn artifact_key(digest: &str) -> String {
     format!("artifacts/sha256/{digest}")
 }
 

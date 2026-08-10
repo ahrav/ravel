@@ -117,7 +117,7 @@ impl fmt::Display for PublicationError {
 impl Error for PublicationError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VerificationOutcome {
+pub(crate) enum VerificationOutcome {
     Matched,
     NotFound,
     Mismatch,
@@ -350,7 +350,7 @@ impl S3Store {
         }
     }
 
-    async fn verify_object(
+    pub(crate) async fn verify_object(
         &self,
         key: &str,
         expected_digest: &str,

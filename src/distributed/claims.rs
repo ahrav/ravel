@@ -201,15 +201,19 @@ pub(crate) enum ClaimAcquireOutcome {
 
 /// `ObservedClaim` prevents pairing a decoded claim with an unrelated object
 /// key or ETag.
-#[allow(dead_code)]
 pub(crate) struct ObservedClaim {
     claim: Claim,
     key: String,
     etag: ETag,
 }
 
+impl ObservedClaim {
+    pub(crate) fn claim(&self) -> &Claim {
+        &self.claim
+    }
+}
+
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum ClaimReadError {
     InvalidInput,
     Storage(GetError),
@@ -387,7 +391,6 @@ fn claim_key(
 /// Returns [`ClaimReadError::InvalidInput`] for an invalid key,
 /// [`ClaimReadError::Storage`] for storage failures, and
 /// [`ClaimReadError::Invalid`] for invalid claim bytes.
-#[allow(dead_code)]
 pub(crate) async fn observe(
     store: &S3Store,
     workspace: &WorkspaceId,

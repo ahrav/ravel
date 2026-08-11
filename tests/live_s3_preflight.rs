@@ -18,8 +18,16 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{LifecycleRule, LifecycleRuleFilter},
 };
+use aws_sdk_sts::Client as StsClient;
 use ravel::{
-    domain::campaign::{ArtifactRef, Authority, Event, EventContent, EventRef, Head},
+    distributed::{
+        claims::{self, Claim, ClaimState},
+        identity::{ActorId, InstanceId},
+    },
+    domain::{
+        campaign::{ArtifactRef, Authority, Event, EventContent, EventRef, Head},
+        work::WorkId,
+    },
     storage::{
         artifacts::MAX_ARTIFACT_BYTES,
         s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
@@ -33,6 +41,7 @@ use sha2::{Digest, Sha256};
 const LIVE_FLAG: &str = "RAVEL_LIVE_S3";
 const BUCKET_ENV: &str = "RAVEL_LIVE_S3_BUCKET";
 const REGION_ENV: &str = "RAVEL_LIVE_S3_REGION";
+const RUNTIME_PROFILE_ENV: &str = "RAVEL_LIVE_S3_RUNTIME_PROFILE";
 const EXPECTED_BUCKET: &str = "ravel-e02-4c038b2f";
 const EXPECTED_REGION: &str = "us-east-1";
 const HEAD_KEY: &str = "head.json";
@@ -40,6 +49,7 @@ const MAX_PREFIX_BYTES: usize = 64;
 // Mirrors the stored-event and canonical-head decode limits in the library.
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_HEAD_BYTES: usize = 4 * 1024;
+const MAX_CLAIM_BYTES: usize = 4 * 1024;
 const RACE_ROUNDS: usize = 4;
 const RACE_CONTENDERS: usize = 16;
 const RACE_BODY_BYTES: usize = 16 * 1024;
@@ -67,6 +77,7 @@ struct ChainKeys {
     event_1: String,
     event_2: String,
     head: String,
+    claim: String,
 }
 
 #[derive(Serialize)]
@@ -158,6 +169,12 @@ struct ObjectFacts<'a> {
     /// predicate is tested for intersection with the whole allowed range rather
     /// than against individual points.
     sizes: (u64, u64),
+    /// When set, `key` is a `/`-separated key-shape pattern (`*` = one whole
+    /// segment) naming every key of that shape: a rule prefix matches when some
+    /// key of the shape starts with it, so a rule scoped inside the namespace
+    /// (for example `workspace/prod/`) is caught while a sibling subtree that
+    /// can never hold the shape (for example `workspace/prod/presence/`) is not.
+    namespace: bool,
 }
 
 impl<'a> ObjectFacts<'a> {
@@ -165,6 +182,7 @@ impl<'a> ObjectFacts<'a> {
         Self {
             key,
             sizes: (size, size),
+            namespace: false,
         }
     }
 
@@ -172,8 +190,94 @@ impl<'a> ObjectFacts<'a> {
         Self {
             key,
             sizes: (low, high),
+            namespace: false,
         }
     }
+
+    fn namespace(pattern: &'a str, low: u64, high: u64) -> Self {
+        Self {
+            key: pattern,
+            sizes: (low, high),
+            namespace: true,
+        }
+    }
+
+    /// A rule prefix constrains this object when some key it describes starts
+    /// with the rule prefix: shape admission for a namespace pattern, plain
+    /// `starts_with` for a single key.
+    fn prefix_matches(&self, prefix: &str) -> bool {
+        if self.namespace {
+            pattern_admits_prefix(self.key, prefix)
+        } else {
+            self.key.starts_with(prefix)
+        }
+    }
+}
+
+#[test]
+fn pattern_prefix_admission_respects_the_claim_key_shape() {
+    let pattern = "workspace/*/campaigns/*/work/*/claim.json";
+    for admitted in [
+        "",
+        "work",
+        "workspace/",
+        "workspace/prod",
+        "workspace/prod/",
+        "workspace/prod/campaigns/c1/work/w1/claim.json",
+        "workspace/prod/campaigns/c1/work/w1/claim",
+    ] {
+        assert!(pattern_admits_prefix(pattern, admitted), "{admitted}");
+    }
+    for rejected in [
+        "workspaces/",
+        "workspace//",
+        "workspace/prod/presence/",
+        "workspace/prod/campaigns/c1/submissions/",
+        "workspace/prod/campaigns/c1/work/w1/claim.json/extra",
+        "workspace/prod/campaigns/c1/work/w1/other.json",
+    ] {
+        assert!(!pattern_admits_prefix(pattern, rejected), "{rejected}");
+    }
+}
+
+/// Reports whether some key matching `pattern` starts with `prefix`.
+///
+/// `pattern` is `/`-separated with `*` standing for exactly one non-empty
+/// segment without `/`. The final pattern segment is terminal: a prefix that
+/// descends past it names keys outside the shape.
+fn pattern_admits_prefix(pattern: &str, prefix: &str) -> bool {
+    let pattern: Vec<&str> = pattern.split('/').collect();
+    let mut parts: Vec<&str> = prefix.split('/').collect();
+    // A trailing '/' leaves an empty final part: every named part is complete.
+    let partial_last = match parts.last() {
+        Some(&"") => {
+            parts.pop();
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if parts.len() > pattern.len() {
+        return false;
+    }
+    for (index, part) in parts.iter().enumerate() {
+        let last = index + 1 == parts.len();
+        let segment = pattern[index];
+        let complete = !last || !partial_last;
+        let admits = if segment == "*" {
+            // A complete wildcard segment must be non-empty like every real key
+            // segment; a partial one can extend to any segment value.
+            !complete || !part.is_empty()
+        } else if complete {
+            *part == segment
+        } else {
+            segment.starts_with(part)
+        };
+        if !admits {
+            return false;
+        }
+    }
+    true
 }
 
 struct SelectorDecision {
@@ -534,7 +638,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
             matches: rule
                 .legacy_prefix
                 .as_deref()
-                .is_none_or(|prefix| object.key.starts_with(prefix)),
+                .is_none_or(|prefix| object.prefix_matches(prefix)),
             supported: true,
             reason: if rule.legacy_prefix.is_some() {
                 "legacy-prefix"
@@ -565,7 +669,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
     }
     if let Some(prefix) = &filter.prefix {
         return SelectorDecision {
-            matches: object.key.starts_with(prefix),
+            matches: object.prefix_matches(prefix),
             supported: true,
             reason: "prefix",
         };
@@ -600,7 +704,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
             matches: and
                 .prefix
                 .as_deref()
-                .is_none_or(|prefix| object.key.starts_with(prefix))
+                .is_none_or(|prefix| object.prefix_matches(prefix))
                 && size_match,
             supported: true,
             reason: "and",
@@ -954,6 +1058,20 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         head::encode(&genesis_head).map_err(|_| "genesis head encoding failed")?;
     let successor_head_bytes =
         head::encode(&successor_head).map_err(|_| "successor head encoding failed")?;
+    let claim = Claim::new(
+        WorkId::new("live".into()).map_err(|_| "claim work construction failed")?,
+        1,
+        ActorId::new("live-preflight".into()).map_err(|_| "claim actor construction failed")?,
+        InstanceId::new(evidence.run_id.clone())
+            .map_err(|_| "claim instance construction failed")?,
+        1,
+        "live-preflight-claim".into(),
+        ClaimState::Active {
+            lease_until: (evidence.epoch_nanos / 1_000_000) as u64 + 60_000,
+        },
+    )
+    .map_err(|_| "claim construction failed")?;
+    let claim_bytes = claims::encode(&claim).map_err(|_| "claim encoding failed")?;
 
     // Immutable objects are stored at exactly the keys the retained head
     // references, so production reconciliation traversing this chain resolves the
@@ -965,6 +1083,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         event_1: encoded_1.key().to_owned(),
         event_2: encoded_2.key().to_owned(),
         head: head_key.clone(),
+        claim: physical(prefix, "workspace/live/campaigns/live/work/live/claim.json"),
     };
     evidence.keys = Some(keys.clone());
 
@@ -1001,6 +1120,15 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         &keys.head,
         &genesis_head_bytes,
         "create-genesis-head",
+        evidence,
+    )
+    .await?;
+    create_object(
+        &direct,
+        EXPECTED_BUCKET,
+        &keys.claim,
+        &claim_bytes,
+        "create-claim",
         evidence,
     )
     .await?;
@@ -1157,6 +1285,17 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     {
         return Err("artifact validation failed");
     }
+    let stored_claim = get_found_bytes(
+        &store,
+        &keys.claim,
+        MAX_CLAIM_BYTES,
+        "validate-claim",
+        evidence,
+    )
+    .await?;
+    if claims::decode(&stored_claim).map_err(|_| "claim validation failed")? != claim {
+        return Err("claim mismatch");
+    }
 
     // Rules are evaluated against the whole production key family, not only the
     // keys this run created: `head.json` at the bucket root, a later event
@@ -1164,6 +1303,12 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     // match. None of these are created; only the rule predicates read them.
     let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
     let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
+    // Claims can be retained under any workspace/campaign/work identity, so
+    // the claim key shape is evaluated as a namespace family: a rule scoped
+    // anywhere a claim can live (for example `workspace/prod/`) matches, while
+    // a subtree no claim key can start with (for example a presence prefix)
+    // does not.
+    let claim_namespace = "workspace/*/campaigns/*/work/*/claim.json";
     // Each key family is described by the full inclusive range of sizes a valid
     // object can take, so a rule whose size window sits strictly between two
     // concrete samples is still detected.
@@ -1175,11 +1320,14 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         ObjectFacts::family(&keys.event_1, 0, MAX_EVENT_BYTES as u64),
         ObjectFacts::family(&keys.event_2, 0, MAX_EVENT_BYTES as u64),
         ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
+        ObjectFacts::family(&keys.claim, 0, MAX_CLAIM_BYTES as u64),
+        ObjectFacts::namespace(claim_namespace, 0, MAX_CLAIM_BYTES as u64),
         // The sizes this run actually retained, so the evidence names them.
         ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
         ObjectFacts::exact(&keys.event_1, stored_event_1.len() as u64),
         ObjectFacts::exact(&keys.event_2, stored_event_2.len() as u64),
         ObjectFacts::exact(&keys.artifact, stored_artifact.len() as u64),
+        ObjectFacts::exact(&keys.claim, stored_claim.len() as u64),
     ];
     let lifecycle = inspect_lifecycle(&direct, EXPECTED_BUCKET, &objects, evidence).await?;
     let safe = lifecycle.safe;
@@ -1192,15 +1340,43 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     Ok(())
 }
 
-fn write_evidence(evidence: &Evidence) -> Result<String, &'static str> {
-    let path = format!("pilot/e02/live-preflight-{}.json", evidence.run_id);
+#[derive(Serialize)]
+struct DeleteDenialEvidence {
+    classification: &'static str,
+    error_code: &'static str,
+    /// `None` when the bucket returned no version id (unversioned bucket).
+    version_delete_error_code: Option<&'static str>,
+    runtime_role_arn: String,
+}
+
+fn write_json_evidence<T: serde::Serialize>(
+    path: String,
+    value: &T,
+) -> Result<String, &'static str> {
     let mut bytes =
-        serde_json::to_vec_pretty(evidence).map_err(|_| "evidence serialization failed")?;
+        serde_json::to_vec_pretty(value).map_err(|_| "evidence serialization failed")?;
     bytes.push(b'\n');
     let mut file = File::create_new(&path).map_err(|_| "evidence file creation failed")?;
     file.write_all(&bytes)
         .map_err(|_| "evidence file write failed")?;
     Ok(path)
+}
+
+fn write_delete_denial_evidence(
+    run_id: &str,
+    evidence: &DeleteDenialEvidence,
+) -> Result<String, &'static str> {
+    write_json_evidence(
+        format!("pilot/e02/live-delete-denial-{run_id}.json"),
+        evidence,
+    )
+}
+
+fn write_evidence(evidence: &Evidence) -> Result<String, &'static str> {
+    write_json_evidence(
+        format!("pilot/e02/live-preflight-{}.json", evidence.run_id),
+        evidence,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1248,6 +1424,145 @@ async fn live_s3_preflight() {
     if let Err(step) = outcome {
         panic!("live S3 preflight failed at {step}; see {path}");
     }
+}
+
+#[tokio::test]
+async fn live_runtime_principal_cannot_delete_claims() {
+    let profile = match std::env::var(RUNTIME_PROFILE_ENV) {
+        Ok(profile) => profile,
+        Err(_) => {
+            println!(
+                "live S3 delete-denial check skipped: set {RUNTIME_PROFILE_ENV} to a named profile"
+            );
+            return;
+        }
+    };
+    match live_enabled() {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("live S3 delete-denial check skipped: enable live S3 bucket and region");
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch");
+    let run_id = format!("{}-{}", now.as_nanos(), process::id());
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .profile_name(&profile)
+        .region(Region::new(EXPECTED_REGION))
+        .load()
+        .await;
+    let runtime_role_arn = StsClient::new(&config)
+        .get_caller_identity()
+        .send()
+        .await
+        .expect("runtime profile must call GetCallerIdentity")
+        .arn()
+        .expect("runtime identity must include an ARN")
+        .to_owned();
+    assert!(
+        runtime_role_arn.contains(":assumed-role/"),
+        "runtime profile must resolve to an assumed role"
+    );
+
+    // A runtime policy has to deny the production claim prefix. A key under
+    // `e04-delete-denial/` would pass while real claims stayed deletable, so
+    // isolation comes from a unique workspace segment instead of a test prefix.
+    let key = format!("workspace/{run_id}/campaigns/live/work/live/claim.json");
+    let claim = Claim::new(
+        WorkId::new("live".into()).unwrap(),
+        1,
+        ActorId::new("live-runtime".into()).unwrap(),
+        InstanceId::new(run_id.clone()).unwrap(),
+        1,
+        "live-delete-denial".into(),
+        ClaimState::Active {
+            lease_until: now.as_millis() as u64 + 60_000,
+        },
+    )
+    .unwrap();
+    let bytes = claims::encode(&claim).unwrap();
+    let store = S3Store::new(
+        EXPECTED_BUCKET,
+        Region::new(EXPECTED_REGION),
+        Builder::from(&config),
+    );
+    let mut history = AttemptHistory::default();
+    assert!(matches!(
+        store.put_if_absent(&key, bytes.clone(), &mut history).await,
+        MutationOutcome::Committed { .. }
+    ));
+
+    let error_code = match direct_client(&config)
+        .delete_object()
+        .bucket(EXPECTED_BUCKET)
+        .key(&key)
+        .send()
+        .await
+    {
+        Ok(_) => panic!("runtime principal deleted a retained claim"),
+        Err(SdkError::ServiceError(service)) => {
+            assert_eq!(
+                service.err().code(),
+                Some("AccessDenied"),
+                "delete denial must be explicit"
+            );
+            "AccessDenied"
+        }
+        Err(_) => panic!("delete denial was not an S3 service error"),
+    };
+    // On a versioned bucket, s3:DeleteObjectVersion is a separate permission
+    // that can permanently remove a retained claim version; prove it is denied
+    // for the exact version this run created.
+    let version_id = direct_client(&config)
+        .head_object()
+        .bucket(EXPECTED_BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .expect("claim head-object must succeed")
+        .version_id()
+        .map(str::to_owned);
+    let version_delete_error_code = match &version_id {
+        Some(version_id) => match direct_client(&config)
+            .delete_object()
+            .bucket(EXPECTED_BUCKET)
+            .key(&key)
+            .version_id(version_id)
+            .send()
+            .await
+        {
+            Ok(_) => panic!("runtime principal deleted a retained claim version"),
+            Err(SdkError::ServiceError(service)) => {
+                assert_eq!(
+                    service.err().code(),
+                    Some("AccessDenied"),
+                    "version delete denial must be explicit"
+                );
+                Some("AccessDenied")
+            }
+            Err(_) => panic!("version delete denial was not an S3 service error"),
+        },
+        None => None,
+    };
+    match store.get_object(&key, bytes.len()).await {
+        Ok(GetOutcome::Found { bytes: found, .. }) => assert_eq!(found, bytes),
+        Ok(GetOutcome::NotFound) => panic!("denied deletion removed the claim"),
+        Err(_) => panic!("claim reread failed after denied deletion"),
+    }
+
+    let evidence = DeleteDenialEvidence {
+        classification: "access-denied",
+        error_code,
+        version_delete_error_code,
+        runtime_role_arn,
+    };
+    let path = write_delete_denial_evidence(&run_id, &evidence)
+        .expect("delete-denial evidence must be retained");
+    println!("live S3 delete-denial evidence: {path}");
 }
 
 fn test_rule(

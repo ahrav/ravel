@@ -1655,6 +1655,7 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "aws-smithy-runtime",
  "bytes",
  "ciborium",

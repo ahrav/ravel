@@ -45,6 +45,7 @@ aws-config = { version = "=1.10.1", default-features = false, features = [
 aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
   "test-util",
 ] }
+aws-sdk-sts = { version = "=1.110.0", default-features = false }
 aws-smithy-runtime = { version = "=1.12.1", default-features = false, features = [
   "test-util",
 ] }

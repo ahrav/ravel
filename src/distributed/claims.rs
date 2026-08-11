@@ -12,37 +12,24 @@
 //! nonzero; decode performs no clock comparison, so lease policy stays with the
 //! claim-transition operations.
 
+use std::{error::Error, fmt};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    distributed::identity::{ActorId, InstanceId},
-    domain::campaign::{ArtifactRef, ValidationError, validate_identity, validate_key_segment},
-    storage::s3::ETag,
+    distributed::{
+        identity::{ActorId, InstanceId},
+        presence::WorkspaceId,
+    },
+    domain::{
+        campaign::{ArtifactRef, ValidationError, validate_identity},
+        work::{WorkId, WorkRef},
+    },
+    storage::s3::{AttemptHistory, ETag, GetOutcome, MutationOutcome, S3Store},
     sync::{WIRE_VERSION, WireError, event::WireArtifactRef},
 };
 
 const MAX_CLAIM_BYTES: usize = 4 * 1024;
-
-/// Validated identity of one work item.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkId(String);
-
-impl WorkId {
-    /// Validates a work identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ValidationError`] when `value` is empty, exceeds 128 UTF-8 bytes,
-    /// or contains `/`.
-    pub fn new(value: String) -> Result<Self, ValidationError> {
-        validate_key_segment(&value)?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 /// Active lease or terminal immutable result reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,14 +143,189 @@ enum WireClaimState {
     Sealed { result_ref: WireArtifactRef },
 }
 
-/// Couples a validated claim to the opaque ETag observed on the mutation that
-/// wrote it. Only successful claim mutations inside this module construct it;
-/// it implements neither `Clone` nor `Debug`, so the proof cannot be copied or
-/// logged.
-#[allow(dead_code)]
-pub(crate) struct ClaimAuthority {
+/// Couples a validated claim to the opaque ETag observed either on the
+/// mutation that wrote it or on an exact same-key reread of the attempted
+/// canonical bytes. Only this module constructs it; it implements neither
+/// `Clone` nor `Debug`, so the proof cannot be copied or logged.
+pub struct ClaimAuthority {
     claim: Claim,
+    key: String,
+    // Held for the lease renewal/seal CAS path that consumes this authority.
+    #[allow(dead_code)]
     etag: ETag,
+}
+
+impl ClaimAuthority {
+    pub fn claim(&self) -> &Claim {
+        &self.claim
+    }
+
+    /// Claim keys are namespaced by workspace and campaign. A decoded `Claim`
+    /// carries neither namespace, so the caller supplies both and the stored key
+    /// has to match them.
+    #[must_use]
+    pub fn authorizes(&self, work: &WorkRef, workspace: &WorkspaceId, campaign_id: &str) -> bool {
+        let Ok(expected) = claim_key(workspace, campaign_id, work.id()) else {
+            return false;
+        };
+        self.key == expected
+            && self.claim.work_id() == work.id()
+            && self.claim.work_revision() == work.revision()
+    }
+}
+
+pub struct ClaimAttempt {
+    claim: Claim,
+    key: String,
+    canonical_bytes: Vec<u8>,
+}
+
+impl ClaimAttempt {
+    pub fn claim(&self) -> &Claim {
+        &self.claim
+    }
+}
+
+#[must_use]
+pub enum ClaimAcquireOutcome {
+    Acquired(ClaimAuthority),
+    Collision,
+    RetryIdentically(ClaimAttempt),
+    Unresolved(ClaimAttempt),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimPrepareError {
+    InvalidInput,
+    Entropy,
+    Encoding,
+}
+
+impl fmt::Display for ClaimPrepareError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "invalid claim input",
+            Self::Entropy => "claim operation identity generation failed",
+            Self::Encoding => "claim encoding failed",
+        })
+    }
+}
+
+impl Error for ClaimPrepareError {}
+
+pub fn prepare_acquisition(
+    work: &WorkRef,
+    workspace: &WorkspaceId,
+    campaign_id: &str,
+    owner_actor: &ActorId,
+    owner_instance: &InstanceId,
+    lease_until: u64,
+) -> Result<ClaimAttempt, ClaimPrepareError> {
+    let key = claim_key(workspace, campaign_id, work.id())
+        .map_err(|_| ClaimPrepareError::InvalidInput)?;
+    let operation_id = InstanceId::generate()
+        .map_err(|_| ClaimPrepareError::Entropy)?
+        .as_str()
+        .to_owned();
+    let claim = Claim::new(
+        work.id().clone(),
+        work.revision(),
+        owner_actor.clone(),
+        owner_instance.clone(),
+        1,
+        operation_id,
+        ClaimState::Active { lease_until },
+    )
+    .map_err(|_| ClaimPrepareError::InvalidInput)?;
+    let canonical_bytes = encode(&claim).map_err(|_| ClaimPrepareError::Encoding)?;
+    Ok(ClaimAttempt {
+        claim,
+        key,
+        canonical_bytes,
+    })
+}
+
+// Key layout is duplicated in tests/live_s3_ambiguity.rs and
+// tests/live_s3_preflight.rs; keep those literals in sync.
+fn claim_key(
+    workspace: &WorkspaceId,
+    campaign_id: &str,
+    work_id: &WorkId,
+) -> Result<String, ValidationError> {
+    validate_identity(campaign_id)?;
+    if workspace.as_str().contains('/')
+        || campaign_id.contains('/')
+        || work_id.as_str().contains('/')
+    {
+        return Err(ValidationError::InvalidKey);
+    }
+    Ok(format!(
+        "workspace/{}/campaigns/{campaign_id}/work/{}/claim.json",
+        workspace.as_str(),
+        work_id.as_str()
+    ))
+}
+
+/// Safe retries of a returned attempt must reuse the same [`ClaimAttempt`]
+/// and caller-owned [`AttemptHistory`]: identical key, canonical bytes,
+/// operation ID, and `If-None-Match: *` precondition. Acquisition itself
+/// performs no internal write retry.
+pub async fn acquire(
+    store: &S3Store,
+    attempt: ClaimAttempt,
+    history: &mut AttemptHistory,
+) -> ClaimAcquireOutcome {
+    let outcome = store
+        .put_if_absent(&attempt.key, attempt.canonical_bytes.clone(), history)
+        .await;
+    match outcome {
+        MutationOutcome::Committed { etag: Some(etag) } => {
+            ClaimAcquireOutcome::Acquired(ClaimAuthority {
+                claim: attempt.claim,
+                key: attempt.key,
+                etag,
+            })
+        }
+        MutationOutcome::Committed { etag: None }
+        | MutationOutcome::AmbiguousConflict
+        | MutationOutcome::Unknown => resolve(store, attempt).await,
+        // A fresh 412 proves an object already existed when the precondition was
+        // evaluated, and this attempt's random operation ID cannot have produced
+        // it, so it is a final collision. A fresh 409 is a concurrent-upload
+        // conflict that S3 documents as retryable, not proof an existing claim
+        // won; the same-key reread decides between authority, collision, and an
+        // identical retry.
+        MutationOutcome::PreconditionFailed => ClaimAcquireOutcome::Collision,
+        MutationOutcome::Conflict => resolve(store, attempt).await,
+        MutationOutcome::ProvenNotSent => ClaimAcquireOutcome::RetryIdentically(attempt),
+        MutationOutcome::NotFound | MutationOutcome::TooLarge => {
+            ClaimAcquireOutcome::Unresolved(attempt)
+        }
+    }
+}
+
+/// Byte equality against the reread proves this attempt committed: the
+/// canonical bytes embed a 128-bit random operation ID, so no other claimant
+/// can produce them.
+async fn resolve(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcquireOutcome {
+    match store.get_object(&attempt.key, MAX_CLAIM_BYTES).await {
+        Ok(GetOutcome::Found { bytes, etag }) if bytes == attempt.canonical_bytes => {
+            ClaimAcquireOutcome::Acquired(ClaimAuthority {
+                claim: attempt.claim,
+                key: attempt.key,
+                etag,
+            })
+        }
+        Ok(GetOutcome::Found { .. }) => ClaimAcquireOutcome::Collision,
+        // Absence proves the PUT had not landed at read time: retained claim
+        // keys admit no delete path or lifecycle expiration and S3 reads are
+        // strongly consistent after write. A write still in flight is safe to
+        // resend because the reused AttemptHistory turns its 409/412 into
+        // AmbiguousConflict and the same-key byte comparison recovers
+        // authority.
+        Ok(GetOutcome::NotFound) => ClaimAcquireOutcome::RetryIdentically(attempt),
+        Err(_) => ClaimAcquireOutcome::Unresolved(attempt),
+    }
 }
 
 /// Produces compact canonical JSON in the frozen claim field order.
@@ -255,7 +417,13 @@ impl TryFrom<WireClaim> for Claim {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::primitives::SdkBody;
+
+    use crate::storage::s3::test_support::{replay_store, response};
+
     use super::*;
+
+    const TEST_ETAG: &str = "\"claim-token\"";
 
     fn artifact() -> ArtifactRef {
         ArtifactRef::new(
@@ -280,13 +448,6 @@ mod tests {
             state,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn work_id_enforces_shared_boundaries() {
-        assert!(WorkId::new(String::new()).is_err());
-        assert!(WorkId::new("x".repeat(129)).is_err());
-        assert!(WorkId::new("x".repeat(128)).is_ok());
     }
 
     #[test]
@@ -430,5 +591,338 @@ mod tests {
             decode(&vec![b'x'; MAX_CLAIM_BYTES + 1]),
             Err(WireError::LimitExceeded)
         );
+    }
+
+    fn work(id: &str, revision: u64) -> WorkRef {
+        WorkRef::new(WorkId::new(id.into()).unwrap(), revision)
+    }
+
+    fn workspace(id: &str) -> WorkspaceId {
+        WorkspaceId::new(id.into()).unwrap()
+    }
+
+    fn attempt() -> ClaimAttempt {
+        prepare_acquisition(
+            &work("work-17", 4),
+            &workspace("workspace-1"),
+            "campaign-1",
+            &ActorId::new("actor-a".into()).unwrap(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            1_750_000_000_000,
+        )
+        .unwrap()
+    }
+
+    async fn etag(value: &str) -> ETag {
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("content-length", "0"), ("etag", value)],
+            SdkBody::empty(),
+        )]);
+        match store.get_object("etag", 0).await.unwrap() {
+            GetOutcome::Found { etag, .. } => etag,
+            GetOutcome::NotFound => panic!("test ETag is missing"),
+        }
+    }
+
+    #[test]
+    fn preparation_freezes_key_claim_and_operation() {
+        let attempt = attempt();
+        assert_eq!(
+            attempt.key,
+            "workspace/workspace-1/campaigns/campaign-1/work/work-17/claim.json"
+        );
+        assert_eq!(attempt.canonical_bytes, encode(&attempt.claim).unwrap());
+        assert_eq!(attempt.claim.work_id().as_str(), "work-17");
+        assert_eq!(attempt.claim.work_revision(), 4);
+        assert_eq!(attempt.claim.owner_actor().as_str(), "actor-a");
+        assert_eq!(attempt.claim.owner_instance().as_str(), "instance-a");
+        assert_eq!(attempt.claim.fence(), 1);
+        assert_eq!(attempt.claim.operation_id().len(), 32);
+        assert!(
+            attempt
+                .claim
+                .operation_id()
+                .bytes()
+                .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+        );
+        assert!(matches!(
+            attempt.claim.state(),
+            ClaimState::Active {
+                lease_until: 1_750_000_000_000
+            }
+        ));
+    }
+
+    #[test]
+    fn key_segments_cannot_change_the_claim_prefix() {
+        // Workspace and work identities reject the delimiter at construction, so an
+        // ambiguous key cannot be built from them in the first place.
+        assert!(WorkspaceId::new("bad/workspace".into()).is_err());
+        assert!(WorkId::new("bad/work".into()).is_err());
+
+        // A campaign id arrives as a plain string, so claim_key validates it.
+        assert_eq!(
+            claim_key(
+                &workspace("workspace"),
+                "bad/campaign",
+                &WorkId::new("work".into()).unwrap()
+            ),
+            Err(ValidationError::InvalidKey)
+        );
+        assert_eq!(
+            claim_key(
+                &workspace("workspace"),
+                "",
+                &WorkId::new("work".into()).unwrap()
+            ),
+            Err(ValidationError::InvalidIdentity)
+        );
+        assert!(matches!(
+            prepare_acquisition(
+                &work("work", 0),
+                &workspace("workspace"),
+                "campaign",
+                &ActorId::new("actor".into()).unwrap(),
+                &InstanceId::new("instance".into()).unwrap(),
+                0,
+            ),
+            Err(ClaimPrepareError::InvalidInput)
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_create_returns_authority_from_the_response_etag() {
+        let attempt = attempt();
+        let expected_bytes = attempt.canonical_bytes.clone();
+        let expected_key = attempt.key.clone();
+        let (store, client) = replay_store(vec![response(
+            200,
+            &[("etag", TEST_ETAG)],
+            SdkBody::empty(),
+        )]);
+        let mut history = AttemptHistory::default();
+
+        let authority = match acquire(&store, attempt, &mut history).await {
+            ClaimAcquireOutcome::Acquired(authority) => authority,
+            _ => panic!("successful create must return authority"),
+        };
+        assert!(authority.etag == etag(TEST_ETAG).await);
+        assert!(authority.authorizes(&work("work-17", 4), &workspace("workspace-1"), "campaign-1"));
+        assert_eq!(client.actual_requests().count(), 1);
+        let request = client.actual_requests().next().unwrap();
+        assert_eq!(request.headers().get("if-none-match"), Some("*"));
+        assert!(request.headers().get("if-match").is_none());
+        assert_eq!(request.body().bytes(), Some(expected_bytes.as_slice()));
+        assert_eq!(
+            request.uri().parse::<http::Uri>().unwrap().path(),
+            format!("/{expected_key}")
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_create_without_etag_requires_an_exact_reread() {
+        let attempt = attempt();
+        let bytes = attempt.canonical_bytes.clone();
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", TEST_ETAG)], bytes),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        let authority = match acquire(&store, attempt, &mut history).await {
+            ClaimAcquireOutcome::Acquired(authority) => authority,
+            _ => panic!("exact reread must return authority"),
+        };
+        assert!(authority.etag == etag(TEST_ETAG).await);
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_precondition_failure_is_a_collision_without_a_reread() {
+        let (store, client) = replay_store(vec![response(412, &[], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            acquire(&store, attempt(), &mut history).await,
+            ClaimAcquireOutcome::Collision
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_conflict_resolves_from_same_key_bytes() {
+        // (reread outcome, expected result): our bytes -> authority, other
+        // bytes -> collision, absent -> identical retry of the same attempt.
+        for case in ["ours", "other", "absent"] {
+            let attempt = attempt();
+            let mut bytes = attempt.canonical_bytes.clone();
+            if case == "other" {
+                bytes[0] ^= 1;
+            }
+            let reread = if case == "absent" {
+                response(404, &[], SdkBody::empty())
+            } else {
+                response(200, &[("etag", TEST_ETAG)], bytes)
+            };
+            let (store, client) = replay_store(vec![response(409, &[], SdkBody::empty()), reread]);
+            let mut history = AttemptHistory::default();
+            let outcome = acquire(&store, attempt, &mut history).await;
+            match case {
+                "ours" => assert!(matches!(outcome, ClaimAcquireOutcome::Acquired(_))),
+                "other" => assert!(matches!(outcome, ClaimAcquireOutcome::Collision)),
+                _ => assert!(matches!(outcome, ClaimAcquireOutcome::RetryIdentically(_))),
+            }
+            assert_eq!(client.actual_requests().count(), 2, "case {case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_state_resolves_only_from_same_key_bytes() {
+        for exact in [true, false] {
+            let attempt = attempt();
+            let mut bytes = attempt.canonical_bytes.clone();
+            if !exact {
+                bytes[0] ^= 1;
+            }
+            let (store, client) = replay_store(vec![
+                response(500, &[], SdkBody::empty()),
+                response(200, &[("etag", TEST_ETAG)], bytes),
+            ]);
+            let mut history = AttemptHistory::default();
+            let outcome = acquire(&store, attempt, &mut history).await;
+            if exact {
+                assert!(matches!(outcome, ClaimAcquireOutcome::Acquired(_)));
+            } else {
+                assert!(matches!(outcome, ClaimAcquireOutcome::Collision));
+            }
+            assert_eq!(client.actual_requests().count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_conflict_resolves_from_same_key_bytes() {
+        let attempt = attempt();
+        let bytes = attempt.canonical_bytes.clone();
+        let key = attempt.key.clone();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+            response(200, &[("etag", TEST_ETAG)], bytes),
+        ]);
+        let mut history = AttemptHistory::default();
+        // The taint has to come from this claim's own key: one history covers one
+        // object, so tainting through another key would be the misuse the store asserts against.
+        assert!(matches!(
+            store.put_if_absent(&key, Vec::new(), &mut history).await,
+            MutationOutcome::Unknown
+        ));
+        assert!(matches!(
+            acquire(&store, attempt, &mut history).await,
+            ClaimAcquireOutcome::Acquired(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_or_tokenless_rereads_remain_unresolved() {
+        for response_plan in [
+            vec![
+                response(500, &[], SdkBody::empty()),
+                response(500, &[], SdkBody::empty()),
+            ],
+            vec![
+                response(500, &[], SdkBody::empty()),
+                response(200, &[], b"bytes".to_vec()),
+            ],
+        ] {
+            let (store, _) = replay_store(response_plan);
+            let mut history = AttemptHistory::default();
+            assert!(matches!(
+                acquire(&store, attempt(), &mut history).await,
+                ClaimAcquireOutcome::Unresolved(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_reread_preserves_an_identical_retry() {
+        let attempt = attempt();
+        let key = attempt.key.clone();
+        let bytes = attempt.canonical_bytes.clone();
+        let operation_id = attempt.claim.operation_id().to_owned();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(200, &[("etag", TEST_ETAG)], SdkBody::empty()),
+        ]);
+        let mut history = AttemptHistory::default();
+
+        let retry = match acquire(&store, attempt, &mut history).await {
+            ClaimAcquireOutcome::RetryIdentically(attempt) => attempt,
+            _ => panic!("absence after ambiguity permits one identical retry"),
+        };
+        assert_eq!(retry.key, key);
+        assert_eq!(retry.canonical_bytes, bytes);
+        assert_eq!(retry.claim.operation_id(), operation_id);
+        assert!(matches!(
+            acquire(&store, retry, &mut history).await,
+            ClaimAcquireOutcome::Acquired(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 3);
+        for index in [0, 2] {
+            let request = client.actual_requests().nth(index).unwrap();
+            assert_eq!(request.headers().get("if-none-match"), Some("*"));
+            assert_eq!(request.body().bytes(), Some(bytes.as_slice()));
+            assert_eq!(
+                request.uri().parse::<http::Uri>().unwrap().path(),
+                format!("/{key}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_not_found_returns_no_authority_without_a_read() {
+        let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            acquire(&store, attempt(), &mut history).await,
+            ClaimAcquireOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn authority_matches_work_identity_revision_and_namespace() {
+        let authority = ClaimAuthority {
+            claim: claim(ClaimState::Active { lease_until: 1 }),
+            key: claim_key(
+                &workspace("workspace-1"),
+                "campaign-1",
+                work("work-17", 4).id(),
+            )
+            .unwrap(),
+            etag: etag(TEST_ETAG).await,
+        };
+        assert!(authority.authorizes(&work("work-17", 4), &workspace("workspace-1"), "campaign-1"));
+        assert!(!authority.authorizes(
+            &work("other-work", 4),
+            &workspace("workspace-1"),
+            "campaign-1"
+        ));
+        assert!(!authority.authorizes(
+            &work("work-17", 5),
+            &workspace("workspace-1"),
+            "campaign-1"
+        ));
+        assert!(!authority.authorizes(
+            &work("work-17", 4),
+            &workspace("workspace-2"),
+            "campaign-1"
+        ));
+        assert!(!authority.authorizes(
+            &work("work-17", 4),
+            &workspace("workspace-1"),
+            "campaign-2"
+        ));
     }
 }

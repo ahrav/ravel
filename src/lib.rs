@@ -14,6 +14,7 @@ pub mod db {
 
 pub mod domain {
     pub mod campaign;
+    pub mod work;
 }
 
 pub mod distributed;

@@ -169,6 +169,10 @@ struct ObjectFacts<'a> {
     /// predicate is tested for intersection with the whole allowed range rather
     /// than against individual points.
     sizes: (u64, u64),
+    /// When set, `key` names every key under that prefix rather than one
+    /// object: a rule prefix matches when it intersects the namespace, so a
+    /// rule scoped inside it (for example `workspace/prod/`) is still caught.
+    namespace: bool,
 }
 
 impl<'a> ObjectFacts<'a> {
@@ -176,6 +180,7 @@ impl<'a> ObjectFacts<'a> {
         Self {
             key,
             sizes: (size, size),
+            namespace: false,
         }
     }
 
@@ -183,6 +188,26 @@ impl<'a> ObjectFacts<'a> {
         Self {
             key,
             sizes: (low, high),
+            namespace: false,
+        }
+    }
+
+    fn namespace(prefix: &'a str, low: u64, high: u64) -> Self {
+        Self {
+            key: prefix,
+            sizes: (low, high),
+            namespace: true,
+        }
+    }
+
+    /// A rule prefix constrains this object when some key it describes starts
+    /// with the rule prefix: prefix containment either way for a namespace,
+    /// plain `starts_with` for a single key.
+    fn prefix_matches(&self, prefix: &str) -> bool {
+        if self.namespace {
+            self.key.starts_with(prefix) || prefix.starts_with(self.key)
+        } else {
+            self.key.starts_with(prefix)
         }
     }
 }
@@ -545,7 +570,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
             matches: rule
                 .legacy_prefix
                 .as_deref()
-                .is_none_or(|prefix| object.key.starts_with(prefix)),
+                .is_none_or(|prefix| object.prefix_matches(prefix)),
             supported: true,
             reason: if rule.legacy_prefix.is_some() {
                 "legacy-prefix"
@@ -576,7 +601,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
     }
     if let Some(prefix) = &filter.prefix {
         return SelectorDecision {
-            matches: object.key.starts_with(prefix),
+            matches: object.prefix_matches(prefix),
             supported: true,
             reason: "prefix",
         };
@@ -611,7 +636,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
             matches: and
                 .prefix
                 .as_deref()
-                .is_none_or(|prefix| object.key.starts_with(prefix))
+                .is_none_or(|prefix| object.prefix_matches(prefix))
                 && size_match,
             supported: true,
             reason: "and",
@@ -1210,9 +1235,10 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     // match. None of these are created; only the rule predicates read them.
     let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
     let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
-    // A rule scoped to `workspace/` matches the production claim prefix but not a
-    // run-prefixed key, so the unprefixed key is evaluated without being created.
-    let production_claim_key = "workspace/live/campaigns/live/work/live/claim.json";
+    // Claims can be retained under any workspace/campaign/work identity, so
+    // the whole `workspace/` namespace is evaluated as a prefix family: a rule
+    // scoped anywhere inside it (for example `workspace/prod/`) still matches.
+    let claim_namespace = "workspace/";
     // Each key family is described by the full inclusive range of sizes a valid
     // object can take, so a rule whose size window sits strictly between two
     // concrete samples is still detected.
@@ -1225,7 +1251,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         ObjectFacts::family(&keys.event_2, 0, MAX_EVENT_BYTES as u64),
         ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
         ObjectFacts::family(&keys.claim, 0, MAX_CLAIM_BYTES as u64),
-        ObjectFacts::family(production_claim_key, 0, MAX_CLAIM_BYTES as u64),
+        ObjectFacts::namespace(claim_namespace, 0, MAX_CLAIM_BYTES as u64),
         // The sizes this run actually retained, so the evidence names them.
         ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
         ObjectFacts::exact(&keys.event_1, stored_event_1.len() as u64),

@@ -24,12 +24,13 @@ use aws_sdk_s3::{
 use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
 use ravel::{
     distributed::{
-        claims::{self, Claim, ClaimState},
+        claims::{self, ClaimAcquireOutcome},
         identity::{ActorId, InstanceId},
+        presence::WorkspaceId,
     },
     domain::{
         campaign::{Authority, Event, EventContent, EventRef},
-        work::WorkId,
+        work::{WorkId, WorkRef},
     },
     storage::{
         artifacts,
@@ -786,36 +787,52 @@ async fn claim_worker_scenario(
     params: &WorkerParams,
     config: &SdkConfig,
 ) -> Result<WorkerResult, &'static str> {
-    let key = params.claim_key.as_deref().ok_or("worker-claim-key")?;
-    let operation_id = format!("{}-claim-{}", params.run_id, params.worker_id);
-    let claim = Claim::new(
+    params.claim_key.as_deref().ok_or("worker-claim-key")?;
+    let work = WorkRef::new(
         WorkId::new("live-race-work".into()).map_err(|_| "worker-claim-work")?,
         4,
-        ActorId::new(format!("claim-actor-{}", params.worker_id))
-            .map_err(|_| "worker-claim-actor")?,
-        InstanceId::new(format!("claim-instance-{}", params.worker_id))
-            .map_err(|_| "worker-claim-instance")?,
-        1,
-        operation_id.clone(),
-        ClaimState::Active {
-            lease_until: params.creation_time_unix_ms + 60_000,
-        },
+    );
+    let workspace =
+        WorkspaceId::new(params.run_id.clone()).map_err(|_| "worker-claim-workspace")?;
+    let actor = ActorId::new(format!("claim-actor-{}", params.worker_id))
+        .map_err(|_| "worker-claim-actor")?;
+    let instance = InstanceId::new(format!("claim-instance-{}", params.worker_id))
+        .map_err(|_| "worker-claim-instance")?;
+    let attempt = claims::prepare_acquisition(
+        &work,
+        &workspace,
+        "live-race",
+        &actor,
+        &instance,
+        params.creation_time_unix_ms + 60_000,
     )
-    .map_err(|_| "worker-claim")?;
-    let bytes = claims::encode(&claim).map_err(|_| "worker-claim-encode")?;
+    .map_err(|_| "worker-claim-prepare")?;
+    let operation_id = attempt.claim().operation_id().to_owned();
     wait_for_release(params)?;
     let store = clean_store(config);
     let mut history = AttemptHistory::default();
     let outcome = tokio::time::timeout(
         OPERATION_DEADLINE,
-        store.put_if_absent(key, bytes, &mut history),
+        claims::acquire(&store, attempt, &mut history),
     )
     .await
     .map_err(|_| "worker-claim-timeout")?;
     let classification = match outcome {
-        MutationOutcome::Committed { .. } => "claim-committed",
-        MutationOutcome::Conflict | MutationOutcome::PreconditionFailed => "claim-collision",
-        _ => return Err("worker-claim-outcome"),
+        ClaimAcquireOutcome::Acquired(authority) => {
+            // The granted authority must name the work revision and derived key
+            // this worker attempted, not merely any surviving record.
+            if authority.claim().operation_id() != operation_id
+                || !authority.authorizes(&work, &workspace, "live-race")
+                || authority.claim().owner_actor().as_str() != actor.as_str()
+            {
+                return Err("worker-claim-authority");
+            }
+            "claim-committed"
+        }
+        ClaimAcquireOutcome::Collision => "claim-collision",
+        ClaimAcquireOutcome::RetryIdentically(_) | ClaimAcquireOutcome::Unresolved(_) => {
+            return Err("worker-claim-outcome");
+        }
     };
     Ok(WorkerResult {
         classification: classification.into(),

@@ -843,7 +843,8 @@ async fn claim_worker_scenario(
             "claim-committed"
         }
         ClaimAcquireOutcome::Collision => "claim-collision",
-        ClaimAcquireOutcome::Ineligible
+        ClaimAcquireOutcome::AcquiredUnverified
+        | ClaimAcquireOutcome::Ineligible
         | ClaimAcquireOutcome::RetryIdentically(_)
         | ClaimAcquireOutcome::Unresolved(_) => {
             return Err("worker-claim-outcome");

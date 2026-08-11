@@ -382,14 +382,53 @@ async fn prepare(
 }
 
 #[cfg(test)]
+pub(crate) mod test_crash {
+    use std::{io::Write, path::PathBuf, sync::OnceLock, thread};
+
+    static CONFIG: OnceLock<(String, PathBuf)> = OnceLock::new();
+
+    pub(crate) fn install(site: String, control: PathBuf) -> Result<(), ()> {
+        CONFIG.set((site, control)).map_err(|_| ())
+    }
+
+    pub(crate) fn reach(site: &str) {
+        let Some((selected, control)) = CONFIG.get() else {
+            return;
+        };
+        if selected != site {
+            return;
+        }
+
+        let mut file = std::fs::File::create(control).expect("create crash control file");
+        write!(file, "REACHED:{site}").expect("write crash control marker");
+        file.flush().expect("flush crash control marker");
+        loop {
+            thread::park();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use std::{fs, process};
+    use std::{
+        fs,
+        io::{BufRead, Write},
+        os::unix::process::ExitStatusExt,
+        process::{self, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use aws_sdk_s3::primitives::SdkBody;
+    use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
 
     use crate::{
-        db::{projections::tests::snapshot, schema, worker::DbHandle},
+        db::{
+            projections::{self, FAIL_CURSOR_TRIGGER, tests::snapshot},
+            schema,
+            worker::DbHandle,
+        },
         domain::campaign::{ArtifactRef, Authority, Event, EventContent, Head},
         storage::s3::test_support::{replay_store, response},
         sync::{event, head},
@@ -469,6 +508,423 @@ mod tests {
         let reference =
             EventRef::from_digest(event.sequence(), encoded.digest().to_owned()).unwrap();
         (encoded, reference)
+    }
+
+    #[derive(Deserialize, Serialize)]
+    struct CrashParams {
+        database: PathBuf,
+        control: PathBuf,
+        witness: PathBuf,
+        site: String,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct NarrowState {
+        campaigns: i64,
+        workflows: i64,
+        applied_events: i64,
+    }
+
+    fn crash_params(site: &str) -> CrashParams {
+        let database = path(&format!("crash-{site}"));
+        CrashParams {
+            control: database.with_extension("control"),
+            witness: database.with_extension("witness"),
+            database,
+            site: site.to_owned(),
+        }
+    }
+
+    fn clean_crash(params: &CrashParams) {
+        clean(&params.database);
+        let _ = fs::remove_file(&params.control);
+        let _ = fs::remove_file(&params.witness);
+    }
+
+    fn stage_genesis(database: &Path) -> Result<(), &'static str> {
+        clean(database);
+        let mut connection = schema::create(database).map_err(|_| "create staging database")?;
+        projections::apply(
+            &mut connection,
+            &fixture_mutation(GENESIS_BYTES, genesis_ref()),
+        )
+        .map_err(|_| "stage genesis")?;
+        Ok(())
+    }
+
+    fn narrow_state(database: &Path) -> Result<NarrowState, &'static str> {
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|_| "open database for counts")?;
+        let count = |table: &str| {
+            connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|_| "read database counts")
+        };
+        Ok(NarrowState {
+            campaigns: count("campaigns")?,
+            workflows: count("workflows")?,
+            applied_events: count("applied_events")?,
+        })
+    }
+
+    fn is_expected_ready(readiness: &Readiness) -> bool {
+        match readiness {
+            Readiness::Ready {
+                local_cursor,
+                observed_head,
+            } => {
+                *local_cursor == (2, CHILD_DIGEST.to_owned())
+                    && observed_head.head() == &head_value(child_ref())
+            }
+            Readiness::NotReady(_) => false,
+        }
+    }
+
+    fn supervise_crash_child(params: &CrashParams) -> Result<(), &'static str> {
+        let mut child = Command::new(std::env::current_exe().map_err(|_| "find test binary")?)
+            .args([
+                "--exact",
+                "sync::replay::tests::crash_boundary_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "spawn crash child")?;
+
+        let result = (|| {
+            let mut stdin = child.stdin.take().ok_or("open crash child stdin")?;
+            serde_json::to_writer(&mut stdin, params).map_err(|_| "write crash child params")?;
+            stdin
+                .write_all(b"\n")
+                .map_err(|_| "terminate crash child params")?;
+            stdin.flush().map_err(|_| "flush crash child params")?;
+
+            let expected = format!("REACHED:{}", params.site);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match fs::read_to_string(&params.control) {
+                    Ok(marker) if marker == expected => break,
+                    Ok(marker) if expected.starts_with(&marker) => {}
+                    Ok(_) => return Err("unexpected crash control marker"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err("read crash control marker"),
+                }
+                if child.try_wait().map_err(|_| "poll crash child")?.is_some() {
+                    return Err("crash child exited before cut");
+                }
+                if Instant::now() >= deadline {
+                    return Err("crash child cut timeout");
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+
+            if params.witness.exists() {
+                return Err("success preceded crash cut");
+            }
+            thread::sleep(Duration::from_millis(25));
+            if child
+                .try_wait()
+                .map_err(|_| "poll blocked crash child")?
+                .is_some()
+            {
+                return Err("crash child did not remain blocked");
+            }
+            child.kill().map_err(|_| "kill crash child")?;
+            let status = child.wait().map_err(|_| "reap crash child")?;
+            if status.signal() != Some(9) {
+                return Err("crash child was not killed by signal 9");
+            }
+            if params.witness.exists() {
+                return Err("success witness appeared before reap");
+            }
+            Ok(())
+        })();
+
+        if result.is_err() {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+        result
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn crash_boundary_child() {
+        let mut input = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut input)
+            .expect("read crash child params");
+        if input.trim().is_empty() {
+            // Launched by a bare `--ignored`/`--include-ignored` run rather than
+            // by supervise_crash_child; there are no parameters to act on.
+            return;
+        }
+        let params: CrashParams = serde_json::from_str(&input).expect("decode crash child params");
+        assert!(matches!(
+            params.site.as_str(),
+            "before-apply" | "before-commit" | "after-commit"
+        ));
+        test_crash::install(params.site, params.control).expect("install crash cut");
+
+        let handle = DbHandle::open_existing(params.database)
+            .await
+            .expect("open crash database");
+        // Apply directly and write the witness from the apply response itself, so
+        // a crash cut placed after the worker sends the apply outcome is caught
+        // even when a later command (such as a cursor read) would still hang.
+        match handle
+            .apply(fixture_mutation(CHILD_BYTES, child_ref()))
+            .await
+        {
+            Ok(ApplyOutcome::Applied) => {
+                fs::write(params.witness, b"SUCCESS").expect("write crash success witness")
+            }
+            other => panic!("crash child apply did not succeed: {other:?}"),
+        }
+    }
+
+    struct CrashCleanup {
+        baseline: PathBuf,
+        cases: Vec<CrashParams>,
+    }
+
+    impl Drop for CrashCleanup {
+        fn drop(&mut self) {
+            clean(&self.baseline);
+            for params in &self.cases {
+                clean_crash(params);
+            }
+        }
+    }
+
+    async fn run_crash_boundary_matrix(cleanup: &CrashCleanup) -> Result<(), &'static str> {
+        let baseline = DbHandle::spawn(cleanup.baseline.clone())
+            .await
+            .map_err(|_| "start baseline worker")?;
+        let (store, _) = replay_store(vec![
+            head_response(child_ref()),
+            event_response(CHILD_BYTES),
+            event_response(GENESIS_BYTES),
+        ]);
+        if !is_expected_ready(&refresh(&store, &baseline).await) {
+            return Err("build uninterrupted baseline");
+        }
+        if baseline
+            .cursor()
+            .await
+            .map_err(|_| "read baseline cursor")?
+            != (2, Some(CHILD_DIGEST.to_owned()))
+        {
+            return Err("baseline cursor mismatch");
+        }
+        if narrow_state(&cleanup.baseline)?
+            != (NarrowState {
+                campaigns: 1,
+                workflows: 1,
+                applied_events: 2,
+            })
+        {
+            return Err("baseline state mismatch");
+        }
+
+        let mut final_recovered = None;
+        for params in &cleanup.cases {
+            stage_genesis(&params.database)?;
+            supervise_crash_child(params)?;
+            // The worker runs in delete journal mode, so a hot rollback journal survives
+            // only the before-commit cut: before-apply wrote nothing, and commit removes
+            // the journal.
+            if journal_path(&params.database).exists() != (params.site == "before-commit") {
+                return Err("crash journal state mismatch");
+            }
+
+            let handle = DbHandle::open_existing(params.database.clone())
+                .await
+                .map_err(|_| "open database after crash")?;
+            let committed = params.site == "after-commit";
+            let expected_cursor = if committed {
+                (2, Some(CHILD_DIGEST.to_owned()))
+            } else {
+                (1, Some(GENESIS_DIGEST.to_owned()))
+            };
+            if handle.cursor().await.map_err(|_| "read crash cursor")? != expected_cursor {
+                return Err("pre-recovery cursor mismatch");
+            }
+            let expected_state = NarrowState {
+                campaigns: 1,
+                workflows: i64::from(committed),
+                applied_events: if committed { 2 } else { 1 },
+            };
+            if narrow_state(&params.database)? != expected_state {
+                return Err("pre-recovery state mismatch");
+            }
+
+            let responses = if committed {
+                vec![head_response(child_ref())]
+            } else {
+                vec![head_response(child_ref()), event_response(CHILD_BYTES)]
+            };
+            let (store, _) = replay_store(responses);
+            if !is_expected_ready(&refresh(&store, &handle).await) {
+                return Err("crash recovery was not ready");
+            }
+            if handle.cursor().await.map_err(|_| "read recovered cursor")?
+                != (2, Some(CHILD_DIGEST.to_owned()))
+            {
+                return Err("recovered cursor mismatch");
+            }
+            let diagnostics = handle
+                .diagnostics()
+                .await
+                .map_err(|_| "read recovery diagnostics")?;
+            if diagnostics.apply_count != usize::from(!committed) {
+                return Err("recovery apply count mismatch");
+            }
+            if narrow_state(&params.database)?
+                != (NarrowState {
+                    campaigns: 1,
+                    workflows: 1,
+                    applied_events: 2,
+                })
+            {
+                return Err("recovered state mismatch");
+            }
+
+            if committed {
+                final_recovered = Some(handle);
+            } else {
+                // Keep the recovered database file for the canonical snapshot
+                // comparison below; CrashCleanup::drop removes it afterwards.
+                drop(handle);
+            }
+        }
+
+        let final_recovered = final_recovered.ok_or("missing final recovered handle")?;
+        let baseline_ready = baseline
+            .list_ready_work("0000000000000001".into(), Vec::new(), 10, None)
+            .await
+            .map_err(|_| "query baseline ready work")?;
+        let recovered_ready = final_recovered
+            .list_ready_work("0000000000000001".into(), Vec::new(), 10, None)
+            .await
+            .map_err(|_| "query recovered ready work")?;
+        if baseline_ready != recovered_ready {
+            return Err("ready-work recovery mismatch");
+        }
+        // The v1 projection never writes work items, so the comparison is over empty
+        // results; the canonical snapshot carries the row-level equivalence evidence.
+        if !baseline_ready.is_empty() {
+            return Err("unexpected baseline ready work");
+        }
+
+        drop(baseline);
+        drop(final_recovered);
+        let baseline_connection =
+            schema::open_existing(&cleanup.baseline).map_err(|_| "validate baseline")?;
+        let baseline_snapshot = snapshot(&baseline_connection);
+        for params in &cleanup.cases {
+            let recovered = schema::open_existing(&params.database)
+                .map_err(|_| "validate recovered database")?;
+            if snapshot(&recovered) != baseline_snapshot {
+                return Err("canonical recovery mismatch");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crash_boundaries_recover_without_skip_or_duplicate() {
+        let cleanup = CrashCleanup {
+            baseline: path("crash-baseline"),
+            cases: ["before-apply", "before-commit", "after-commit"]
+                .into_iter()
+                .map(crash_params)
+                .collect(),
+        };
+        clean(&cleanup.baseline);
+        for params in &cleanup.cases {
+            clean_crash(params);
+        }
+
+        assert_eq!(run_crash_boundary_matrix(&cleanup).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn injected_write_failure_stays_not_ready_until_clean_replay() {
+        let database = path("injected-readiness");
+        clean(&database);
+        stage_genesis(&database).unwrap();
+
+        // Inject the failure trigger only after open-time validation runs;
+        // existing-projection validation rejects schema objects the fixed
+        // schema never creates, and this test targets apply-time failure.
+        let handle = DbHandle::open_existing(database.clone()).await.unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(FAIL_CURSOR_TRIGGER).unwrap();
+        drop(connection);
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            responses.push(head_response(child_ref()));
+            responses.push(event_response(CHILD_BYTES));
+        }
+        let (store, _) = replay_store(responses);
+        let expected_failure =
+            NotReadyReason::Replay(ReplayError::Apply(ApplyError::DatabaseOperationFailed));
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            expected_failure
+        );
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            expected_failure
+        );
+        assert_eq!(
+            handle.cursor().await.unwrap(),
+            (1, Some(GENESIS_DIGEST.to_owned()))
+        );
+        assert_eq!(apply_count(&handle).await, 2);
+        drop(handle);
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            narrow_state(&database).unwrap(),
+            NarrowState {
+                campaigns: 1,
+                workflows: 0,
+                applied_events: 1,
+            }
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_cursor_update")
+            .unwrap();
+        drop(connection);
+
+        let handle = DbHandle::open_existing(database.clone()).await.unwrap();
+        assert!(is_expected_ready(&refresh(&store, &handle).await));
+        assert_eq!(apply_count(&handle).await, 1);
+        assert_eq!(
+            narrow_state(&database).unwrap(),
+            NarrowState {
+                campaigns: 1,
+                workflows: 1,
+                applied_events: 2,
+            }
+        );
+
+        drop(handle);
+        clean(&database);
     }
 
     #[tokio::test]

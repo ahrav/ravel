@@ -252,7 +252,12 @@ fn run(
                     last_apply_thread = Some(thread::current().id());
                     apply_count += 1;
                 }
-                let _ = respond.send(projections::apply(&mut connection, &mutation));
+                #[cfg(test)]
+                crate::sync::replay::test_crash::reach("before-apply");
+                let outcome = projections::apply(&mut connection, &mutation);
+                #[cfg(test)]
+                crate::sync::replay::test_crash::reach("after-commit");
+                let _ = respond.send(outcome);
             }
             Command::Cursor { respond } => {
                 let _ = respond.send(read_cursor(&connection));

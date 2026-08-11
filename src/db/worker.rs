@@ -104,7 +104,8 @@ impl DbHandle {
     ///
     /// Forwards [`SchemaError`] from schema creation, returns
     /// [`SchemaError::DatabaseOperationFailed`] when the journal mode cannot be configured or
-    /// verified, and returns the same variant when the worker exits before reporting startup.
+    /// verified, when the OS refuses to spawn the worker thread, and when the worker exits
+    /// before reporting startup.
     pub async fn spawn(path: PathBuf) -> Result<Self, SchemaError> {
         match Self::start(path, OpenMode::Create).await {
             Ok(handle) => Ok(handle),
@@ -251,6 +252,8 @@ fn run(
                     last_apply_thread = Some(thread::current().id());
                     apply_count += 1;
                 }
+                #[cfg(test)]
+                crate::sync::replay::test_crash::reach("before-apply");
                 let outcome = projections::apply(&mut connection, &mutation);
                 #[cfg(test)]
                 crate::sync::replay::test_crash::reach("after-commit");

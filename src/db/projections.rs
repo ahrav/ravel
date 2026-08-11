@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::sync::event::{SchedulingEffect, SchedulingMutation};
+use crate::sync::event::{GENESIS_CAMPAIGN_ID, SchedulingEffect, SchedulingMutation};
 
 const MAX_READY_WORK: usize = 1_024;
 
@@ -60,8 +60,9 @@ impl From<rusqlite::Error> for ApplyError {
 ///
 /// Returns [`ApplyError::Conflict`] when the mutation disagrees with local history, the cursor,
 /// or projection state: a sequence gap, a parent that does not name the cursor tail, a parent
-/// carried at the genesis cursor, a digest recorded at another sequence, or a
-/// [`SchedulingEffect::WorkflowStarted`] effect while no campaign row exists.
+/// carried at the genesis cursor, a digest recorded at another sequence, recorded history that
+/// does not cover every sequence through the cursor, or projected rows that do not match the
+/// identities the sequences through the cursor imply.
 /// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite cannot complete an operation
 /// or a sequence cannot be converted between its domain and stored representations.
 pub fn apply(
@@ -98,6 +99,80 @@ pub fn apply(
         return Err(ApplyError::Conflict);
     }
 
+    // History that does not cover `1..=cursor` would permanently skip absent event identities.
+    // Every recorded digest carries 64 lowercase hexadecimal characters.
+    let (recorded_rows, lowest_sequence, highest_sequence, malformed_digests, cursor_row_digest): (
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+    ) = transaction.query_row(
+        "SELECT COUNT(*), COALESCE(MIN(sequence), 1), COALESCE(MAX(sequence), 0), \
+             COALESCE(SUM(length(digest) != 64 OR length(CAST(digest AS BLOB)) != 64 \
+             OR digest GLOB '*[^0-9a-f]*'), 0), \
+             (SELECT digest FROM applied_events WHERE sequence = ?1) FROM applied_events",
+        [stored_cursor_sequence],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if recorded_rows != stored_cursor_sequence
+        || lowest_sequence < 1
+        || highest_sequence != stored_cursor_sequence
+        || malformed_digests != 0
+        || cursor_row_digest.as_deref() != cursor_digest.as_deref()
+    {
+        return Err(ApplyError::Conflict);
+    }
+
+    // Sequence 1 projects one campaign row, and every sequence above 1 projects one workflow
+    // row named by its own sequence. No v1 effect projects an objective, work item, or
+    // dependency, so any such row carries state no applied event implies.
+    let (
+        campaign_rows,
+        genesis_campaign_exists,
+        workflow_rows,
+        implied_workflow_rows,
+        unimplied_rows,
+    ): (i64, bool, i64, i64, i64) = transaction.query_row(
+        "SELECT (SELECT COUNT(*) FROM campaigns), \
+             (SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1)), \
+             (SELECT COUNT(*) FROM workflows), \
+             (SELECT COUNT(*) FROM workflows WHERE length(workflow_id) = 16 \
+             AND length(CAST(workflow_id AS BLOB)) = 16 \
+             AND workflow_id NOT GLOB '*[^0-9]*' \
+             AND CAST(workflow_id AS INTEGER) BETWEEN 2 AND ?2), \
+             (SELECT COUNT(*) FROM objectives) + (SELECT COUNT(*) FROM work_items) \
+             + (SELECT COUNT(*) FROM dependencies)",
+        params![GENESIS_CAMPAIGN_ID, stored_cursor_sequence],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let projected_campaigns = i64::from(cursor_sequence >= 1);
+    let projected_workflows = stored_cursor_sequence.max(1) - 1;
+    if campaign_rows != projected_campaigns
+        || genesis_campaign_exists != (projected_campaigns == 1)
+        || workflow_rows != projected_workflows
+        || implied_workflow_rows != projected_workflows
+        || unimplied_rows != 0
+    {
+        return Err(ApplyError::Conflict);
+    }
+
     let parent_matches = match (cursor_sequence, cursor_digest.as_deref(), mutation.parent()) {
         (0, None, None) => true,
         (cursor_sequence, Some(cursor_digest), Some(parent)) => {
@@ -126,13 +201,6 @@ pub fn apply(
             )?;
         }
         SchedulingEffect::WorkflowStarted { workflow_id } => {
-            let campaign_exists: bool =
-                transaction.query_row("SELECT EXISTS(SELECT 1 FROM campaigns)", [], |row| {
-                    row.get(0)
-                })?;
-            if !campaign_exists {
-                return Err(ApplyError::Conflict);
-            }
             transaction.execute(
                 "INSERT INTO workflows (workflow_id, state) VALUES (?1, 'active')",
                 [workflow_id],
@@ -198,25 +266,39 @@ pub(crate) fn list_ready_work(
          ORDER BY work.workflow_id, work.work_id",
     )?;
     let mut rows = statement.query([campaign_id])?;
-    let mut ready: Vec<(String, String)> = Vec::new();
+    // The query's `ORDER BY workflow_id, work_id` streams keys at or before
+    // `after` (the wrapped tail of the rotation) first and keys after it last.
+    // Retaining at most `limit` keys per bucket bounds result storage, and the
+    // scan stops early once the post-`after` page is full.
+    let mut page: Vec<(String, String)> = Vec::new();
+    let mut wrapped: Vec<(String, String)> = Vec::new();
     while let Some(row) = rows.next()? {
+        if page.len() == limit {
+            break;
+        }
         let required: String = row.get(2)?;
-        if required
+        if !required
             .split_whitespace()
             .all(|token| capabilities.contains(token))
         {
-            ready.push((row.get(0)?, row.get(1)?));
+            continue;
+        }
+        let key = (row.get(0)?, row.get(1)?);
+        match &after {
+            // SQLite's default BINARY collation orders TEXT the same way String's
+            // Ord does, which this comparison requires.
+            Some(after) if key <= *after => {
+                if wrapped.len() < limit {
+                    wrapped.push(key);
+                }
+            }
+            _ => page.push(key),
         }
     }
 
-    if let Some(after) = after {
-        // SQLite's default BINARY collation orders TEXT the same way String's Ord does, which
-        // partition_point requires.
-        let start = ready.partition_point(|key| key <= &after);
-        ready.rotate_left(start);
-    }
-    ready.truncate(limit);
-    Ok(ready)
+    page.append(&mut wrapped);
+    page.truncate(limit);
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -234,6 +316,8 @@ pub(crate) mod tests {
     const DIGEST_1: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const DIGEST_2: &str = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0";
     const DIGEST_3: &str = "23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01";
+    const DIGEST_4: &str = "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012";
+    const DIGEST_5: &str = "456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123";
 
     #[derive(Debug, Eq, PartialEq)]
     pub(crate) struct Snapshot {
@@ -533,6 +617,194 @@ pub(crate) mod tests {
         let before = snapshot(&connection);
 
         assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_next_event_when_the_cursor_row_is_missing() {
+        let path = test_path("missing-cursor-row");
+        let mut connection = schema::create(&path).unwrap();
+        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
+        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
+        connection
+            .execute("DELETE FROM applied_events WHERE sequence = 1", [])
+            .unwrap();
+        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_next_event_over_a_hole_below_the_cursor() {
+        let path = test_path("history-hole");
+        let mut connection = schema::create(&path).unwrap();
+        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
+        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
+        connection
+            .execute(
+                "INSERT INTO applied_events (sequence, digest) VALUES (3, ?1)",
+                [DIGEST_3],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_cursor SET sequence = 3, tail_digest = ?1 WHERE id = 1",
+                [DIGEST_3],
+            )
+            .unwrap();
+        let workflow = mutation(4, DIGEST_4, Some(DIGEST_3), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_workflow_when_only_a_stray_campaign_row_exists() {
+        let path = test_path("stray-campaign");
+        let mut connection = schema::create(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1)",
+                [DIGEST_1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_cursor SET sequence = 1, tail_digest = ?1 WHERE id = 1",
+                [DIGEST_1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO campaigns (campaign_id, state) VALUES ('9999999999999999', 'active')",
+                [],
+            )
+            .unwrap();
+        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_next_event_when_a_projected_workflow_row_is_missing() {
+        let path = test_path("missing-workflow-row");
+        let mut connection = schema::create(&path).unwrap();
+        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
+        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
+        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
+        assert_eq!(apply(&mut connection, &workflow), Ok(ApplyOutcome::Applied));
+        connection
+            .execute(
+                "DELETE FROM workflows WHERE workflow_id = '0000000000000002'",
+                [],
+            )
+            .unwrap();
+        let next = mutation(3, DIGEST_3, Some(DIGEST_2), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        connection
+            .execute(
+                "INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000009', 'active')",
+                [],
+            )
+            .unwrap();
+        let with_stray_row = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), with_stray_row);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_next_event_when_an_interior_workflow_row_is_substituted() {
+        let path = test_path("substituted-workflow-row");
+        let mut connection = schema::create(&path).unwrap();
+        for mutation in [
+            mutation(1, DIGEST_1, None, EventContent::CampaignCreated),
+            mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted),
+            mutation(3, DIGEST_3, Some(DIGEST_2), EventContent::WorkflowStarted),
+            mutation(4, DIGEST_4, Some(DIGEST_3), EventContent::WorkflowStarted),
+        ] {
+            assert_eq!(apply(&mut connection, &mutation), Ok(ApplyOutcome::Applied));
+        }
+        connection
+            .execute_batch(
+                "DELETE FROM workflows WHERE workflow_id = '0000000000000003';\
+                 INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000002a', 'active');",
+            )
+            .unwrap();
+        let next = mutation(5, DIGEST_5, Some(DIGEST_4), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_next_event_when_an_unimplied_row_exists() {
+        let path = test_path("unimplied-row");
+        let mut connection = schema::create(&path).unwrap();
+        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
+        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
+        connection
+            .execute(
+                "INSERT INTO objectives (objective_id) VALUES ('0000000000000007')",
+                [],
+            )
+            .unwrap();
+        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_next_event_when_a_recorded_digest_is_malformed() {
+        let path = test_path("malformed-digest");
+        let mut connection = schema::create(&path).unwrap();
+        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
+        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
+        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
+        assert_eq!(apply(&mut connection, &workflow), Ok(ApplyOutcome::Applied));
+        connection
+            .execute(
+                "UPDATE applied_events SET digest = 'not-a-digest' WHERE sequence = 1",
+                [],
+            )
+            .unwrap();
+        let next = mutation(3, DIGEST_3, Some(DIGEST_2), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
         assert_eq!(snapshot(&connection), before);
 
         drop(connection);

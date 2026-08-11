@@ -813,7 +813,7 @@ async fn claim_worker_scenario(
     let mut history = AttemptHistory::default();
     let outcome = tokio::time::timeout(
         OPERATION_DEADLINE,
-        claims::acquire(&store, attempt, &mut history),
+        claims::acquire(&store, attempt, params.creation_time_unix_ms, &mut history),
     )
     .await
     .map_err(|_| "worker-claim-timeout")?;
@@ -830,7 +830,9 @@ async fn claim_worker_scenario(
             "claim-committed"
         }
         ClaimAcquireOutcome::Collision => "claim-collision",
-        ClaimAcquireOutcome::RetryIdentically(_) | ClaimAcquireOutcome::Unresolved(_) => {
+        ClaimAcquireOutcome::Ineligible
+        | ClaimAcquireOutcome::RetryIdentically(_)
+        | ClaimAcquireOutcome::Unresolved(_) => {
             return Err("worker-claim-outcome");
         }
     };

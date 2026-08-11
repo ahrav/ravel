@@ -193,6 +193,10 @@ impl ClaimAttempt {
 pub enum ClaimAcquireOutcome {
     Acquired(ClaimAuthority),
     Collision,
+    /// The attempt's frozen lease has already expired, so sending it could
+    /// create a claim another worker may immediately reclaim; prepare a fresh
+    /// attempt instead of retrying this one.
+    Ineligible,
     RetryIdentically(ClaimAttempt),
     Unresolved(ClaimAttempt),
 }
@@ -243,12 +247,19 @@ pub(crate) struct ClaimMutation {
 #[allow(dead_code)]
 impl ClaimMutation {
     /// A frozen mutation stays safe to resend only while the facts that made it
-    /// eligible still hold: the same work generation, and for a renewal an
-    /// observed lease that has not expired.
+    /// eligible still hold: the same work generation, for a renewal an observed
+    /// lease that has not expired, and a candidate lease that is still in the
+    /// future — a delayed resend must not install an already-expired claim that
+    /// another worker could immediately reclaim.
     #[must_use]
     fn still_eligible(&self, work: &WorkRef, now: u64) -> bool {
+        let candidate_current = match self.claim.state() {
+            ClaimState::Active { lease_until } => now < *lease_until,
+            ClaimState::Sealed { .. } => true,
+        };
         self.claim.work_id() == work.id()
             && self.prepared_revision == work.revision()
+            && candidate_current
             && self.observed_expiry.is_none_or(|expiry| now < expiry)
     }
 }
@@ -374,12 +385,16 @@ pub(crate) async fn observe(
 
 /// Rejection of a renewal that attempted no mutation.
 ///
-/// `ClaimAuthority` is neither `Clone` nor `Debug`, so a rejection hands the
-/// unspent authority back rather than destroying the only proof the caller holds.
+/// `ClaimAuthority` is neither `Clone` nor `Debug`, so when the authority still
+/// holds — a renewal that would not extend the lease, or a candidate that could
+/// not be built — the rejection hands the unspent authority back. When the
+/// rejection itself proves the authority no longer holds (expired lease, sealed
+/// claim, or stale work/owner/fence identity), the authority is consumed so a
+/// caller cannot keep using a fence the claim no longer backs.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) struct RenewalRejected {
-    pub(crate) authority: ClaimAuthority,
+    pub(crate) authority: Option<ClaimAuthority>,
     pub(crate) error: ClaimPrepareError,
 }
 
@@ -392,17 +407,23 @@ pub(crate) fn prepare_renewal(
     expected_fence: u64,
     now: u64,
 ) -> Result<ClaimMutation, Box<RenewalRejected>> {
-    let reject = |authority| {
+    // A rejection that disproves the authority consumes it; one that leaves the
+    // authority intact hands it back.
+    let forfeit = || {
         Err(Box::new(RenewalRejected {
-            authority,
+            authority: None,
             error: ClaimPrepareError::InvalidInput,
         }))
     };
-    // Every eligibility fact is read through references first, so a rejection can
-    // return the authority intact.
+    let retain = |authority| {
+        Err(Box::new(RenewalRejected {
+            authority: Some(authority),
+            error: ClaimPrepareError::InvalidInput,
+        }))
+    };
     let lease_until = match authority.claim.state() {
         ClaimState::Active { lease_until } => *lease_until,
-        ClaimState::Sealed { .. } => return reject(authority),
+        ClaimState::Sealed { .. } => return forfeit(),
     };
     if authority.claim.work_id() != work.id()
         || authority.claim.work_revision() != work.revision()
@@ -411,13 +432,13 @@ pub(crate) fn prepare_renewal(
         || authority.claim.fence() != expected_fence
         || now >= lease_until
     {
-        return reject(authority);
+        return forfeit();
     }
     let Some(renewed_until) = now
         .checked_add(CLAIM_LEASE_MS)
         .filter(|candidate| *candidate > lease_until)
     else {
-        return reject(authority);
+        return retain(authority);
     };
 
     // The renewed claim is built from copies so that a failure here can still hand
@@ -434,11 +455,11 @@ pub(crate) fn prepare_renewal(
         },
     );
     let Ok(renewed) = renewed else {
-        return reject(authority);
+        return retain(authority);
     };
     let Ok(canonical_bytes) = encode(&renewed) else {
         return Err(Box::new(RenewalRejected {
-            authority,
+            authority: Some(authority),
             error: ClaimPrepareError::Encoding,
         }));
     };
@@ -540,7 +561,9 @@ fn prepare_replacement(
         canonical_bytes,
         etag: observed.etag,
         // Replacement eligibility is an expired lease or an older sealed revision,
-        // neither of which a later clock reading can invalidate.
+        // neither of which a later clock reading can invalidate; the candidate
+        // lease check in `still_eligible` bounds how long the frozen mutation
+        // itself stays sendable.
         observed_expiry: None,
         prepared_revision: work.revision(),
     })
@@ -550,11 +573,22 @@ fn prepare_replacement(
 /// and caller-owned [`AttemptHistory`]: identical key, canonical bytes,
 /// operation ID, and `If-None-Match: *` precondition. Acquisition itself
 /// performs no internal write retry.
+///
+/// `now` gates every send, including retries of a returned attempt: once the
+/// frozen `lease_until` has passed, the attempt is [`ClaimAcquireOutcome::Ineligible`]
+/// and must be prepared again.
 pub async fn acquire(
     store: &S3Store,
     attempt: ClaimAttempt,
+    now: u64,
     history: &mut AttemptHistory,
 ) -> ClaimAcquireOutcome {
+    let ClaimState::Active { lease_until } = attempt.claim.state() else {
+        return ClaimAcquireOutcome::Ineligible;
+    };
+    if now >= *lease_until {
+        return ClaimAcquireOutcome::Ineligible;
+    }
     let outcome = store
         .put_if_absent(&attempt.key, attempt.canonical_bytes.clone(), history)
         .await;
@@ -1077,7 +1111,7 @@ mod tests {
         )]);
         let mut history = AttemptHistory::default();
 
-        let authority = match acquire(&store, attempt, &mut history).await {
+        let authority = match acquire(&store, attempt, 1_749_999_100_000, &mut history).await {
             ClaimAcquireOutcome::Acquired(authority) => authority,
             _ => panic!("successful create must return authority"),
         };
@@ -1104,7 +1138,7 @@ mod tests {
         ]);
         let mut history = AttemptHistory::default();
 
-        let authority = match acquire(&store, attempt, &mut history).await {
+        let authority = match acquire(&store, attempt, 1_749_999_100_000, &mut history).await {
             ClaimAcquireOutcome::Acquired(authority) => authority,
             _ => panic!("exact reread must return authority"),
         };
@@ -1117,7 +1151,7 @@ mod tests {
         let (store, client) = replay_store(vec![response(412, &[], SdkBody::empty())]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            acquire(&store, attempt(), &mut history).await,
+            acquire(&store, attempt(), 1_749_999_100_000, &mut history).await,
             ClaimAcquireOutcome::Collision
         ));
         assert_eq!(client.actual_requests().count(), 1);
@@ -1140,7 +1174,7 @@ mod tests {
             };
             let (store, client) = replay_store(vec![response(409, &[], SdkBody::empty()), reread]);
             let mut history = AttemptHistory::default();
-            let outcome = acquire(&store, attempt, &mut history).await;
+            let outcome = acquire(&store, attempt, 1_749_999_100_000, &mut history).await;
             match case {
                 "ours" => assert!(matches!(outcome, ClaimAcquireOutcome::Acquired(_))),
                 "other" => assert!(matches!(outcome, ClaimAcquireOutcome::Collision)),
@@ -1163,7 +1197,7 @@ mod tests {
                 response(200, &[("etag", TEST_ETAG)], bytes),
             ]);
             let mut history = AttemptHistory::default();
-            let outcome = acquire(&store, attempt, &mut history).await;
+            let outcome = acquire(&store, attempt, 1_749_999_100_000, &mut history).await;
             if exact {
                 assert!(matches!(outcome, ClaimAcquireOutcome::Acquired(_)));
             } else {
@@ -1191,7 +1225,7 @@ mod tests {
             MutationOutcome::Unknown
         ));
         assert!(matches!(
-            acquire(&store, attempt, &mut history).await,
+            acquire(&store, attempt, 1_749_999_100_000, &mut history).await,
             ClaimAcquireOutcome::Acquired(_)
         ));
         assert_eq!(client.actual_requests().count(), 3);
@@ -1212,7 +1246,7 @@ mod tests {
             let (store, _) = replay_store(response_plan);
             let mut history = AttemptHistory::default();
             assert!(matches!(
-                acquire(&store, attempt(), &mut history).await,
+                acquire(&store, attempt(), 1_749_999_100_000, &mut history).await,
                 ClaimAcquireOutcome::Unresolved(_)
             ));
         }
@@ -1231,7 +1265,7 @@ mod tests {
         ]);
         let mut history = AttemptHistory::default();
 
-        let retry = match acquire(&store, attempt, &mut history).await {
+        let retry = match acquire(&store, attempt, 1_749_999_100_000, &mut history).await {
             ClaimAcquireOutcome::RetryIdentically(attempt) => attempt,
             _ => panic!("absence after ambiguity permits one identical retry"),
         };
@@ -1239,7 +1273,7 @@ mod tests {
         assert_eq!(retry.canonical_bytes, bytes);
         assert_eq!(retry.claim.operation_id(), operation_id);
         assert!(matches!(
-            acquire(&store, retry, &mut history).await,
+            acquire(&store, retry, 1_749_999_100_000, &mut history).await,
             ClaimAcquireOutcome::Acquired(_)
         ));
         assert_eq!(client.actual_requests().count(), 3);
@@ -1259,7 +1293,7 @@ mod tests {
         let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            acquire(&store, attempt(), &mut history).await,
+            acquire(&store, attempt(), 1_749_999_100_000, &mut history).await,
             ClaimAcquireOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 1);
@@ -1376,7 +1410,9 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_none()
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1387,7 +1423,9 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_none()
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1398,7 +1436,9 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_none()
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1409,7 +1449,9 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_none()
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1420,7 +1462,9 @@ mod tests {
                 8,
                 200_000,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_none()
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1434,7 +1478,9 @@ mod tests {
                 9,
                 200_000,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_none()
         ));
         for now in [1_000_000, 1_000_001] {
             assert!(matches!(
@@ -1446,7 +1492,9 @@ mod tests {
                     9,
                     now,
                 ),
-                Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+                Err(rejection)
+                    if rejection.error == ClaimPrepareError::InvalidInput
+                        && rejection.authority.is_none()
             ));
         }
         assert!(matches!(
@@ -1461,7 +1509,9 @@ mod tests {
                 9,
                 100,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_some()
         ));
         assert!(matches!(
             prepare_renewal(
@@ -1475,7 +1525,9 @@ mod tests {
                 9,
                 u64::MAX - 1,
             ),
-            Err(rejection) if rejection.error == ClaimPrepareError::InvalidInput
+            Err(rejection)
+                if rejection.error == ClaimPrepareError::InvalidInput
+                    && rejection.authority.is_some()
         ));
     }
 
@@ -1906,11 +1958,51 @@ mod tests {
         };
         assert_eq!(rejection.error, ClaimPrepareError::InvalidInput);
         // The returned authority is intact and still authorizes the same claim.
-        assert!(rejection.authority.authorizes(
-            &work("work-17", 4),
-            &workspace("workspace-1"),
-            "campaign-1"
+        let authority = rejection.authority.expect("early renewal keeps authority");
+        assert!(authority.authorizes(&work("work-17", 4), &workspace("workspace-1"), "campaign-1"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_attempt_is_ineligible_without_a_send() {
+        let (store, client) = replay_store(Vec::new());
+        let mut history = AttemptHistory::default();
+        // attempt() freezes lease_until = prepare-time now + CLAIM_LEASE_MS.
+        let now = 1_749_999_100_000 + CLAIM_LEASE_MS;
+        assert!(matches!(
+            acquire(&store, attempt(), now, &mut history).await,
+            ClaimAcquireOutcome::Ineligible
         ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_with_an_expired_candidate_lease_is_ineligible() {
+        let observed = observed(claim(ClaimState::Active {
+            lease_until: 1_000_000,
+        }))
+        .await;
+        let mutation = prepare_reclamation(
+            observed,
+            &work("work-17", 4),
+            &ActorId::new("reclaimer".into()).unwrap(),
+            &InstanceId::new("instance-b".into()).unwrap(),
+            1_500_000,
+        )
+        .unwrap();
+        let (store, client) = replay_store(Vec::new());
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            apply_mutation(
+                &store,
+                mutation,
+                &work("work-17", 4),
+                1_500_000 + CLAIM_LEASE_MS,
+                &mut history,
+            )
+            .await,
+            ClaimMutationOutcome::Ineligible
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
     }
 
     #[tokio::test]

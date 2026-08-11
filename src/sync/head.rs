@@ -266,8 +266,8 @@ pub async fn append(
     // replay, so committing it would leave every later refresh NotReady;
     // reject it before the CAS and only a retained unreferenced event remains.
     // ArtifactPublished stays appendable: it is frozen v1 chain content proven
-    // by the live E02 suite, and only the v1 scheduling projection lacks a
-    // conversion for it.
+    // by the live ambiguity suite, and only the v1 scheduling projection lacks
+    // a conversion for it.
     match event::scheduling_mutation(publication.event_ref().clone(), tail) {
         Ok(_) | Err(event::ConversionError::UnsupportedContent) => {}
         Err(_) => return Err(AppendError::InvalidInput),

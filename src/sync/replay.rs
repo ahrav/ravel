@@ -123,12 +123,15 @@ impl ReplayedProjection {
 }
 
 /// Ephemeral outcome of one refresh attempt.
-#[derive(Debug, Eq, PartialEq)]
 pub enum Readiness {
     /// Replay succeeded and the local cursor equals the observed head tail.
+    ///
+    /// Carries the full [`ObservedHead`] witness so a caller publishing the next
+    /// event keeps the ETag coupled to the head this readiness was verified
+    /// against, rather than rereading the head and losing that binding.
     Ready {
         local_cursor: (u64, String),
-        observed_head: Head,
+        observed_head: Box<ObservedHead>,
     },
     /// Replay or the final cursor comparison failed.
     NotReady(NotReadyReason),
@@ -137,13 +140,13 @@ pub enum Readiness {
 /// Data-free reason one refresh attempt did not establish readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NotReadyReason {
-    /// Replay failed before its final cursor comparison.
+    /// Replay failed before its cursor comparison.
     Replay(ReplayError),
     /// The post-replay cursor remains behind the observed head.
     Behind,
-    /// The post-replay cursor is ahead of the observed head.
+    /// The local cursor is ahead of the observed head, before or after replay.
     Ahead,
-    /// The post-replay cursor digest differs from the observed head tail.
+    /// The local cursor digest differs from the observed head tail, before or after replay.
     TailMismatch,
 }
 
@@ -155,22 +158,33 @@ struct ReplaySuccess {
 /// Replays one fresh head observation and reports ephemeral readiness.
 pub async fn refresh(store: &S3Store, handle: &DbHandle) -> Readiness {
     match replay_with_limits(store, handle, LIMITS).await {
-        Ok(success) => compare_cursor(success.observed_head.head(), success.local_cursor),
+        Ok(success) => match compare_cursor(success.observed_head.head(), success.local_cursor) {
+            Ok(local_cursor) => Readiness::Ready {
+                local_cursor,
+                observed_head: Box::new(success.observed_head),
+            },
+            Err(reason) => Readiness::NotReady(reason),
+        },
+        // Prepare reports these cursor mismatches before the final comparison runs;
+        // surface them as the dedicated readiness reasons rather than nested replay
+        // errors so callers can tell a cursor mismatch from replay/storage failure.
+        Err(ReplayError::CursorAhead) => Readiness::NotReady(NotReadyReason::Ahead),
+        Err(ReplayError::TailMismatch) => Readiness::NotReady(NotReadyReason::TailMismatch),
         Err(error) => Readiness::NotReady(NotReadyReason::Replay(error)),
     }
 }
 
-fn compare_cursor(observed_head: &Head, local_cursor: (u64, Option<String>)) -> Readiness {
+fn compare_cursor(
+    observed_head: &Head,
+    local_cursor: (u64, Option<String>),
+) -> Result<(u64, String), NotReadyReason> {
     let tail = observed_head.tail().clone();
     match local_cursor.0.cmp(&tail.sequence()) {
-        std::cmp::Ordering::Less => Readiness::NotReady(NotReadyReason::Behind),
-        std::cmp::Ordering::Greater => Readiness::NotReady(NotReadyReason::Ahead),
+        std::cmp::Ordering::Less => Err(NotReadyReason::Behind),
+        std::cmp::Ordering::Greater => Err(NotReadyReason::Ahead),
         std::cmp::Ordering::Equal => match local_cursor.1 {
-            Some(digest) if digest == tail.digest() => Readiness::Ready {
-                local_cursor: (tail.sequence(), digest),
-                observed_head: observed_head.clone(),
-            },
-            _ => Readiness::NotReady(NotReadyReason::TailMismatch),
+            Some(digest) if digest == tail.digest() => Ok((tail.sequence(), digest)),
+            _ => Err(NotReadyReason::TailMismatch),
         },
     }
 }
@@ -279,8 +293,6 @@ async fn replay_with_limits(
     let mut prepared = prepare(store, cursor, observed.head().tail().clone(), limits).await?;
     prepared.reverse();
     for mutation in prepared {
-        #[cfg(test)]
-        test_crash::reach("before-apply");
         match handle.apply(mutation).await {
             Ok(ApplyOutcome::Applied | ApplyOutcome::AlreadyApplied) => {}
             Err(error) => return Err(ReplayError::Apply(error)),
@@ -560,10 +572,16 @@ mod tests {
         })
     }
 
-    fn expected_ready() -> Readiness {
-        Readiness::Ready {
-            local_cursor: (2, CHILD_DIGEST.to_owned()),
-            observed_head: head_value(child_ref()),
+    fn is_expected_ready(readiness: &Readiness) -> bool {
+        match readiness {
+            Readiness::Ready {
+                local_cursor,
+                observed_head,
+            } => {
+                *local_cursor == (2, CHILD_DIGEST.to_owned())
+                    && observed_head.head() == &head_value(child_ref())
+            }
+            Readiness::NotReady(_) => false,
         }
     }
 
@@ -648,6 +666,11 @@ mod tests {
             .lock()
             .read_line(&mut input)
             .expect("read crash child params");
+        if input.trim().is_empty() {
+            // Launched by a bare `--ignored`/`--include-ignored` run rather than
+            // by supervise_crash_child; there are no parameters to act on.
+            return;
+        }
         let params: CrashParams = serde_json::from_str(&input).expect("decode crash child params");
         assert!(matches!(
             params.site.as_str(),
@@ -658,15 +681,17 @@ mod tests {
         let handle = DbHandle::open_existing(params.database)
             .await
             .expect("open crash database");
-        let (store, _) = replay_store(vec![
-            head_response(child_ref()),
-            event_response(CHILD_BYTES),
-        ]);
-        match refresh(&store, &handle).await {
-            Readiness::Ready { .. } => {
+        // Apply directly and write the witness from the apply response itself, so
+        // a crash cut placed after the worker sends the apply outcome is caught
+        // even when a later command (such as a cursor read) would still hang.
+        match handle
+            .apply(fixture_mutation(CHILD_BYTES, child_ref()))
+            .await
+        {
+            Ok(ApplyOutcome::Applied) => {
                 fs::write(params.witness, b"SUCCESS").expect("write crash success witness")
             }
-            Readiness::NotReady(_) => panic!("crash child refresh was not ready"),
+            other => panic!("crash child apply did not succeed: {other:?}"),
         }
     }
 
@@ -693,7 +718,7 @@ mod tests {
             event_response(CHILD_BYTES),
             event_response(GENESIS_BYTES),
         ]);
-        if refresh(&store, &baseline).await != expected_ready() {
+        if !is_expected_ready(&refresh(&store, &baseline).await) {
             return Err("build uninterrupted baseline");
         }
         if baseline
@@ -752,7 +777,7 @@ mod tests {
                 vec![head_response(child_ref()), event_response(CHILD_BYTES)]
             };
             let (store, _) = replay_store(responses);
-            if refresh(&store, &handle).await != expected_ready() {
+            if !is_expected_ready(&refresh(&store, &handle).await) {
                 return Err("crash recovery was not ready");
             }
             if handle.cursor().await.map_err(|_| "read recovered cursor")?
@@ -780,8 +805,9 @@ mod tests {
             if committed {
                 final_recovered = Some(handle);
             } else {
+                // Keep the recovered database file for the canonical snapshot
+                // comparison below; CrashCleanup::drop removes it afterwards.
                 drop(handle);
-                clean_crash(params);
             }
         }
 
@@ -807,10 +833,13 @@ mod tests {
         drop(final_recovered);
         let baseline_connection =
             schema::open_existing(&cleanup.baseline).map_err(|_| "validate baseline")?;
-        let final_connection = schema::open_existing(&cleanup.cases[2].database)
-            .map_err(|_| "validate recovered database")?;
-        if snapshot(&baseline_connection) != snapshot(&final_connection) {
-            return Err("canonical recovery mismatch");
+        let baseline_snapshot = snapshot(&baseline_connection);
+        for params in &cleanup.cases {
+            let recovered = schema::open_existing(&params.database)
+                .map_err(|_| "validate recovered database")?;
+            if snapshot(&recovered) != baseline_snapshot {
+                return Err("canonical recovery mismatch");
+            }
         }
         Ok(())
     }
@@ -837,22 +866,30 @@ mod tests {
         let database = path("injected-readiness");
         clean(&database);
         stage_genesis(&database).unwrap();
+
+        // Inject the failure trigger only after open-time validation runs;
+        // existing-projection validation rejects schema objects the fixed
+        // schema never creates, and this test targets apply-time failure.
+        let handle = DbHandle::open_existing(database.clone()).await.unwrap();
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection.execute_batch(FAIL_CURSOR_TRIGGER).unwrap();
         drop(connection);
-
-        let handle = DbHandle::open_existing(database.clone()).await.unwrap();
         let mut responses = Vec::new();
         for _ in 0..3 {
             responses.push(head_response(child_ref()));
             responses.push(event_response(CHILD_BYTES));
         }
         let (store, _) = replay_store(responses);
-        let expected_failure = Readiness::NotReady(NotReadyReason::Replay(ReplayError::Apply(
-            ApplyError::DatabaseOperationFailed,
-        )));
-        assert_eq!(refresh(&store, &handle).await, expected_failure);
-        assert_eq!(refresh(&store, &handle).await, expected_failure);
+        let expected_failure =
+            NotReadyReason::Replay(ReplayError::Apply(ApplyError::DatabaseOperationFailed));
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            expected_failure
+        );
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            expected_failure
+        );
         assert_eq!(
             handle.cursor().await.unwrap(),
             (1, Some(GENESIS_DIGEST.to_owned()))
@@ -875,7 +912,7 @@ mod tests {
         drop(connection);
 
         let handle = DbHandle::open_existing(database.clone()).await.unwrap();
-        assert_eq!(refresh(&store, &handle).await, expected_ready());
+        assert!(is_expected_ready(&refresh(&store, &handle).await));
         assert_eq!(apply_count(&handle).await, 1);
         assert_eq!(
             narrow_state(&database).unwrap(),
@@ -1192,25 +1229,43 @@ mod tests {
         clean(&path);
     }
 
+    fn not_ready_reason(readiness: Readiness) -> NotReadyReason {
+        match readiness {
+            Readiness::NotReady(reason) => reason,
+            Readiness::Ready { .. } => panic!("expected not ready"),
+        }
+    }
+
+    fn assert_ready(readiness: Readiness, cursor: (u64, &str), expected_head: &Head) {
+        match readiness {
+            Readiness::Ready {
+                local_cursor,
+                observed_head,
+            } => {
+                assert_eq!(local_cursor, (cursor.0, cursor.1.to_owned()));
+                assert_eq!(observed_head.head(), expected_head);
+            }
+            Readiness::NotReady(reason) => panic!("expected ready, got {reason:?}"),
+        }
+    }
+
     #[test]
     fn cursor_comparison_outcomes_are_typed() {
         let observed_head = head_value(child_ref());
         for (local_cursor, expected) in [
-            (
-                (1, Some(GENESIS_DIGEST.to_owned())),
-                Readiness::NotReady(NotReadyReason::Behind),
-            ),
-            (
-                (3, Some("3".repeat(64))),
-                Readiness::NotReady(NotReadyReason::Ahead),
-            ),
+            ((1, Some(GENESIS_DIGEST.to_owned())), NotReadyReason::Behind),
+            ((3, Some("3".repeat(64))), NotReadyReason::Ahead),
             (
                 (2, Some(GENESIS_DIGEST.to_owned())),
-                Readiness::NotReady(NotReadyReason::TailMismatch),
+                NotReadyReason::TailMismatch,
             ),
         ] {
-            assert_eq!(compare_cursor(&observed_head, local_cursor), expected);
+            assert_eq!(compare_cursor(&observed_head, local_cursor), Err(expected));
         }
+        assert_eq!(
+            compare_cursor(&observed_head, (2, Some(CHILD_DIGEST.to_owned()))),
+            Ok((2, CHILD_DIGEST.to_owned()))
+        );
     }
 
     #[tokio::test]
@@ -1224,18 +1279,16 @@ mod tests {
             event_response(CHILD_BYTES),
             event_response(GENESIS_BYTES),
         ]);
-        assert_eq!(
+        assert_ready(
             refresh(&store, &handle).await,
-            Readiness::Ready {
-                local_cursor: (2, CHILD_DIGEST.into()),
-                observed_head: expected_head,
-            }
+            (2, CHILD_DIGEST),
+            &expected_head,
         );
 
         let (store, _) = replay_store(vec![response(404, &[], SdkBody::empty())]);
         assert_eq!(
-            refresh(&store, &handle).await,
-            Readiness::NotReady(NotReadyReason::Replay(ReplayError::CampaignMissing))
+            not_ready_reason(refresh(&store, &handle).await),
+            NotReadyReason::Replay(ReplayError::CampaignMissing)
         );
 
         drop(handle);
@@ -1257,8 +1310,8 @@ mod tests {
             response(404, &[], SdkBody::empty()),
         ]);
         assert_eq!(
-            refresh(&store, &handle).await,
-            Readiness::NotReady(NotReadyReason::Replay(ReplayError::EventMissing))
+            not_ready_reason(refresh(&store, &handle).await),
+            NotReadyReason::Replay(ReplayError::EventMissing)
         );
 
         let expected_head = head_value(child_ref());
@@ -1266,12 +1319,34 @@ mod tests {
             head_response(child_ref()),
             event_response(CHILD_BYTES),
         ]);
-        assert_eq!(
+        assert_ready(
             refresh(&store, &handle).await,
-            Readiness::Ready {
-                local_cursor: (2, CHILD_DIGEST.into()),
-                observed_head: expected_head,
-            }
+            (2, CHILD_DIGEST),
+            &expected_head,
+        );
+
+        drop(handle);
+        clean(&path);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_ahead_of_the_head_reads_as_ahead_not_a_replay_error() {
+        let path = path("ahead-cursor");
+        clean(&path);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        handle
+            .apply(fixture_mutation(GENESIS_BYTES, genesis_ref()))
+            .await
+            .unwrap();
+        handle
+            .apply(fixture_mutation(CHILD_BYTES, child_ref()))
+            .await
+            .unwrap();
+
+        let (store, _) = replay_store(vec![head_response(genesis_ref())]);
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            NotReadyReason::Ahead
         );
 
         drop(handle);
@@ -1311,8 +1386,8 @@ mod tests {
             let handle = DbHandle::spawn(path.clone()).await.unwrap();
             let (store, _) = replay_store(vec![head, event]);
             assert_eq!(
-                refresh(&store, &handle).await,
-                Readiness::NotReady(NotReadyReason::Replay(ReplayError::EventInvalid(expected)))
+                not_ready_reason(refresh(&store, &handle).await),
+                NotReadyReason::Replay(ReplayError::EventInvalid(expected))
             );
             drop(handle);
             clean(&path);
@@ -1474,6 +1549,47 @@ mod tests {
             0
         );
         drop(connection);
+        clean(&path);
+    }
+
+    #[tokio::test]
+    async fn a_stray_ready_work_row_is_rebuilt_rather_than_reported_ready() {
+        let path = path("stray-ready-work");
+        clean(&path);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        handle
+            .apply(fixture_mutation(GENESIS_BYTES, genesis_ref()))
+            .await
+            .unwrap();
+        drop(handle);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000002', 'active');
+                 INSERT INTO work_items
+                     (work_id, workflow_id, state, budget_remaining, required_capabilities)
+                 VALUES ('work', '0000000000000002', 'ready', 1, '');",
+            )
+            .unwrap();
+        drop(connection);
+
+        // The head equals the cursor, so replay prepares and applies no mutation.
+        let (store, _) = replay_store(vec![
+            head_response(genesis_ref()),
+            event_response(GENESIS_BYTES),
+        ]);
+        let replayed = startup(&store, &path).await.unwrap();
+        assert_eq!(replayed.cursor(), (1, Some(GENESIS_DIGEST)));
+        let handle = replayed.into_handle();
+        assert!(
+            handle
+                .list_ready_work("0000000000000001".into(), Vec::new(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(handle);
         clean(&path);
     }
 }

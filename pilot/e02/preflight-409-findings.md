@@ -55,9 +55,18 @@ task's own constraints ("no cleanup", "single PutObject").
 
 AC3 as written is therefore unsatisfiable without violating AC7/AC10.
 The preflight retains the bounded-race evidence and fails closed at that
-step (no emulator or synthesized status is substituted). Every other
-acceptance criterion passed live; see the evidence JSON files beside
-this document.
+step (no emulator or synthesized status is substituted).
+
+The evidence JSON files beside this document are **superseded and are not
+acceptance evidence for the current code**. They were produced by an earlier
+key layout, before immutable objects moved to the canonical keys the retained
+head references, and before the lifecycle evaluator gained size-range, delete-
+marker, and archival-transition handling. The most recent retained run also
+records `"result": "failed:bounded race did not observe live 409"`. Treat them
+as a record of the runs that produced them, nothing more: E02 acceptance
+requires a fresh live run of `live_s3_preflight` against
+`ravel-e02-4c038b2f`, and no criterion should be reported as passing live
+until that run is retained here.
 
 ## Disposition
 

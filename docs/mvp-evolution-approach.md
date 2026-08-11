@@ -9,7 +9,9 @@ remaining Phase 0 task-graph decomposition and disposition work is tracked by
 `ravel-om4`.
 
 Complete the remaining Phase 0 work, then implement Phase 1-and-later authority work
-only on the scoped-v2 path. E01–E04 remain complete, frozen-v1 proofs. All new authority
+only on the scoped-v2 path. E01, E03, and E04 remain complete, frozen-v1 proofs. E02
+(`ravel-aq8`) stays open pending its selected-bucket live preflight (`ravel-aq8.7`),
+which must close or be deferred on its own recorded evidence. All new authority
 work starts at a v2 root `Scope`, and no authoritative chain mixes v1 and v2 events.
 
 The MVP proves the architecture with Distributed Research and Distributed Change. The

@@ -50,8 +50,16 @@ impl Submission {
             return Err(ValidationError::InvalidFence);
         }
         validate_identity(&operation_id)?;
+        // The attempt id becomes a submission key path segment; a value that
+        // decodes as a valid identity but contains `/` would produce retained
+        // evidence with no derivable canonical key.
+        let attempt_id = result_ref.producer_attempt().to_owned();
+        validate_identity(&attempt_id)?;
+        if attempt_id.contains('/') {
+            return Err(ValidationError::InvalidKey);
+        }
         Ok(Self {
-            attempt_id: result_ref.producer_attempt().to_owned(),
+            attempt_id,
             work_id,
             work_revision,
             owner_actor,
@@ -227,6 +235,31 @@ mod tests {
             artifact(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_slash_bearing_attempt_identity_is_rejected_at_construction() {
+        let artifact = ArtifactRef::new(
+            "0".repeat(64),
+            42,
+            "application/json".into(),
+            "attempt/17".into(),
+            1_750_000_000_000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            Submission::new(
+                WorkId::new("work-17".into()).unwrap(),
+                4,
+                ActorId::new("rust-worker".into()).unwrap(),
+                InstanceId::new("instance-a".into()).unwrap(),
+                9,
+                "op-claim-001".into(),
+                artifact,
+            ),
+            Err(ValidationError::InvalidKey)
+        );
     }
 
     #[test]

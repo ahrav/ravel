@@ -104,7 +104,8 @@ impl DbHandle {
     ///
     /// Forwards [`SchemaError`] from schema creation, returns
     /// [`SchemaError::DatabaseOperationFailed`] when the journal mode cannot be configured or
-    /// verified, and returns the same variant when the worker exits before reporting startup.
+    /// verified, when the OS refuses to spawn the worker thread, and when the worker exits
+    /// before reporting startup.
     pub async fn spawn(path: PathBuf) -> Result<Self, SchemaError> {
         match Self::start(path, OpenMode::Create).await {
             Ok(handle) => Ok(handle),
@@ -251,6 +252,8 @@ fn run(
                     last_apply_thread = Some(thread::current().id());
                     apply_count += 1;
                 }
+                #[cfg(test)]
+                crate::sync::replay::test_crash::reach("before-apply");
                 let outcome = projections::apply(&mut connection, &mutation);
                 #[cfg(test)]
                 crate::sync::replay::test_crash::reach("after-commit");
@@ -407,18 +410,20 @@ mod tests {
     async fn queries_ready_work_through_the_owner() {
         let path = path("ready-work");
         let _ = fs::remove_file(&path);
-        let connection = schema::create(&path).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
+        drop(schema::create(&path).unwrap());
+        let handle = DbHandle::open_existing(path.clone()).await.unwrap();
+
+        // Seed the fixture after `DbHandle::open_existing` validates the empty projection.
+        let seed = rusqlite::Connection::open(&path).unwrap();
+        seed.execute_batch(
+            "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
                  INSERT INTO workflows (workflow_id, state) VALUES ('workflow', 'active');
                  INSERT INTO work_items
                      (work_id, workflow_id, state, budget_remaining, required_capabilities)
                  VALUES ('work', 'workflow', 'ready', 1, 'rust');",
-            )
-            .unwrap();
-        drop(connection);
-        let handle = DbHandle::open_existing(path.clone()).await.unwrap();
+        )
+        .unwrap();
+        drop(seed);
 
         assert_eq!(
             handle

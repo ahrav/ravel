@@ -97,7 +97,8 @@ impl DbHandle {
     ///
     /// Forwards [`SchemaError`] from schema creation, returns
     /// [`SchemaError::DatabaseOperationFailed`] when the journal mode cannot be configured or
-    /// verified, and returns the same variant when the worker exits before reporting startup.
+    /// verified, when the OS refuses to spawn the worker thread, and when the worker exits
+    /// before reporting startup.
     pub async fn spawn(path: PathBuf) -> Result<Self, SchemaError> {
         match Self::start(path, OpenMode::Create).await {
             Ok(handle) => Ok(handle),

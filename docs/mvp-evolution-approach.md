@@ -2,8 +2,11 @@
 
 ## Status
 
-Direction adopted 2026-08-10: the scoped v2 path is chosen. E01–E04 remain complete,
-frozen v1 proofs; v2 arrives as a new boundary (new keys, new envelope), never as edits
+Direction adopted 2026-08-10: the scoped v2 path is chosen. E01, E03, and E04 remain
+complete, frozen v1 proofs. E02 (`ravel-aq8`) stays open pending its selected-bucket
+live preflight (`ravel-aq8.7`); the amendment does not settle that live-proof gate,
+which must close or be deferred on its own recorded evidence. v2 arrives as a new
+boundary (new keys, new envelope), never as edits
 to v1. The contract amendment — revising `mvp-outline.md`, `epics.md`, the task graph,
 and the fixture plan together — is tracked by the Phase 0 gate bead `ravel-om4`, which
 blocks all rebind-set work. The active contracts remain `mvp-outline.md`, `epics.md`,

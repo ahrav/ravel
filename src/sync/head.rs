@@ -262,6 +262,14 @@ pub async fn append(
     let publication = event::publish(store, tail, artifact)
         .await
         .map_err(AppendError::Publication)?;
+    // Replay converts every head-chain event through `scheduling_mutation`, so a
+    // committed head whose tail has no scheduling projection (ArtifactPublished,
+    // or a scheduling event at an illegal position) would leave every later
+    // refresh NotReady. Reject it before the CAS; only a retained unreferenced
+    // event remains.
+    if event::scheduling_mutation(publication.event_ref().clone(), tail).is_err() {
+        return Err(AppendError::InvalidInput);
+    }
     // One append is one commit identity. Reconciliation walks retained events and
     // searches the operation id, so a head recording a different id than its tail
     // would be reconciled under two identities for the same logical append.
@@ -1724,6 +1732,36 @@ mod tests {
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(request_path(&client, 0), format!("/{event_key}"));
         assert_eq!(request_path(&client, 1), format!("/{event_key}"));
+    }
+
+    #[tokio::test]
+    async fn append_rejects_a_tail_with_no_scheduling_projection() {
+        // WorkflowStarted at sequence 1 publishes fine but cannot convert during
+        // replay; append must fail before the head CAS.
+        let event = Event::new(
+            "unprojectable-operation".into(),
+            1,
+            None,
+            1,
+            EventContent::WorkflowStarted,
+        )
+        .expect("event is valid");
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            append(
+                &store,
+                HeadParent::Genesis,
+                Authority::unowned(),
+                &event,
+                None,
+                &mut history,
+            )
+            .await,
+            Err(AppendError::InvalidInput)
+        ));
+        // The event PUT went out; no head write followed.
+        assert_eq!(client.actual_requests().count(), 1);
     }
 
     #[tokio::test]

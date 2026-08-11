@@ -2678,17 +2678,20 @@ Acceptance scenarios:
 ```text
 two scopes advance and rebuild independently
 one scope fails replay while the other remains ready
-Machine A controls a scope and admitted work is active
+Machine A controls a scope with fixture-seeded active work and claims
 A is killed
 Machine C verifies the exact ScopeHead and active plan lineage
 C acquires a higher scope_epoch
-existing unexpired claims continue
-C processes sealed submissions
+existing unexpired fixture claims continue
+C processes fixture-sealed submissions
 A returns and cannot commit stale Decisions
 parent and child controller failures remain independent
 ```
 
-The live expired/unsettled-child settlement proof belongs to M6. The exact serialized
+M4 precedes shared admission, grants, and admitted `WorkSpec`s (M6), so the work,
+claims, and sealed submissions in this scenario are fixture-seeded substrate state,
+not admitted work; the live admitted-work failover proof belongs to M6. The live
+expired/unsettled-child settlement proof belongs to M6. The exact serialized
 head, genesis, event suffix, and encoding must be resolved before M4 ships v2 bytes.
 
 ---

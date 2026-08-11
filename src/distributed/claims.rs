@@ -851,6 +851,7 @@ pub async fn acquire(
                     claim: attempt.claim,
                     key: attempt.key,
                     etag,
+                    namespace: store.namespace().to_owned(),
                 }),
                 CandidateRead::Different(_) => ClaimAcquireOutcome::Collision,
                 CandidateRead::Missing | CandidateRead::Failed => {

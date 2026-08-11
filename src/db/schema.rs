@@ -10,6 +10,8 @@ use std::{error::Error, fmt, path::Path};
 
 use rusqlite::OpenFlags;
 
+use crate::db::projections;
+
 const APPLICATION_ID: i32 = 0x5256_4c31; // "RVL1"
 const SCHEMA_VERSION: i32 = 2;
 
@@ -108,6 +110,7 @@ pub(crate) enum ValidateError {
     WrongSchemaVersion,
     IntegrityCheckFailed,
     InvalidHistory,
+    InvalidProjection,
 }
 
 impl fmt::Display for ValidateError {
@@ -118,6 +121,7 @@ impl fmt::Display for ValidateError {
             Self::WrongSchemaVersion => "database schema version does not match",
             Self::IntegrityCheckFailed => "database integrity check failed",
             Self::InvalidHistory => "database history is invalid",
+            Self::InvalidProjection => "database projection rows are invalid",
         })
     }
 }
@@ -157,7 +161,8 @@ pub fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, SchemaErro
 /// # Errors
 ///
 /// Returns [`ValidateError`] for an unreadable database, a format mismatch, a failed
-/// `quick_check`, or cursor and applied-event history that do not form one contiguous prefix.
+/// `quick_check`, cursor and applied-event history that do not form one contiguous prefix, or
+/// projected rows the recorded sequences do not imply.
 pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connection, ValidateError> {
     let connection = rusqlite::Connection::open_with_flags(
         path,
@@ -298,6 +303,12 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
         [(_, sql, kind)]
             if kind == "trigger" && normalized(sql) == normalized(expected_trigger()) => {}
         _ => return Err(ValidateError::InvalidHistory),
+    }
+
+    // A replay whose cursor already equals the observed head applies no mutation, so
+    // `projections::apply` never reaches its row check on this database.
+    if !projections::rows_match_cursor(&connection, stored_sequence).map_err(local_format_error)? {
+        return Err(ValidateError::InvalidProjection);
     }
 
     Ok(connection)
@@ -1040,6 +1051,34 @@ mod tests {
             open_existing(&path).unwrap_err(),
             ValidateError::InvalidHistory
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_projected_row_state_no_event_wrote_is_rebuildable() {
+        let path = test_path("completed-campaign");
+        let connection = create(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO applied_events (sequence, digest) VALUES (1, '{DIGEST}');
+                 UPDATE sync_cursor SET sequence = 1, tail_digest = '{DIGEST}' WHERE id = 1;
+                 INSERT INTO campaigns (campaign_id, state) \
+                     VALUES ('0000000000000001', 'completed');"
+            ))
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidProjection
+        );
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute("UPDATE campaigns SET state = 'active'", [])
+            .unwrap();
+        drop(connection);
+        assert!(open_existing(&path).is_ok());
         fs::remove_file(path).unwrap();
     }
 }

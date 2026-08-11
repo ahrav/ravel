@@ -259,25 +259,39 @@ pub(crate) fn list_ready_work(
          ORDER BY work.workflow_id, work.work_id",
     )?;
     let mut rows = statement.query([campaign_id])?;
-    let mut ready: Vec<(String, String)> = Vec::new();
+    // The query's `ORDER BY workflow_id, work_id` streams keys at or before
+    // `after` (the wrapped tail of the rotation) first and keys after it last.
+    // Retaining at most `limit` keys per bucket bounds result storage, and the
+    // scan stops early once the post-`after` page is full.
+    let mut page: Vec<(String, String)> = Vec::new();
+    let mut wrapped: Vec<(String, String)> = Vec::new();
     while let Some(row) = rows.next()? {
+        if page.len() == limit {
+            break;
+        }
         let required: String = row.get(2)?;
-        if required
+        if !required
             .split_whitespace()
             .all(|token| capabilities.contains(token))
         {
-            ready.push((row.get(0)?, row.get(1)?));
+            continue;
+        }
+        let key = (row.get(0)?, row.get(1)?);
+        match &after {
+            // SQLite's default BINARY collation orders TEXT the same way String's
+            // Ord does, which this comparison requires.
+            Some(after) if key <= *after => {
+                if wrapped.len() < limit {
+                    wrapped.push(key);
+                }
+            }
+            _ => page.push(key),
         }
     }
 
-    if let Some(after) = after {
-        // SQLite's default BINARY collation orders TEXT the same way String's Ord does, which
-        // partition_point requires.
-        let start = ready.partition_point(|key| key <= &after);
-        ready.rotate_left(start);
-    }
-    ready.truncate(limit);
-    Ok(ready)
+    page.append(&mut wrapped);
+    page.truncate(limit);
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -667,7 +681,7 @@ pub(crate) mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO campaigns (campaign_id) VALUES ('9999999999999999')",
+                "INSERT INTO campaigns (campaign_id, state) VALUES ('9999999999999999', 'active')",
                 [],
             )
             .unwrap();
@@ -703,7 +717,7 @@ pub(crate) mod tests {
 
         connection
             .execute(
-                "INSERT INTO workflows (workflow_id) VALUES ('0000000000000009')",
+                "INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000009', 'active')",
                 [],
             )
             .unwrap();
@@ -731,7 +745,7 @@ pub(crate) mod tests {
         connection
             .execute_batch(
                 "DELETE FROM workflows WHERE workflow_id = '0000000000000003';\
-                 INSERT INTO workflows (workflow_id) VALUES ('0000000000000002a');",
+                 INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000002a', 'active');",
             )
             .unwrap();
         let next = mutation(5, DIGEST_5, Some(DIGEST_4), EventContent::WorkflowStarted);

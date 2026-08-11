@@ -901,6 +901,7 @@ pub(crate) async fn apply_mutation(
                     claim: mutation.claim,
                     key: mutation.key,
                     etag,
+                    namespace: store.namespace().to_owned(),
                 }),
                 CandidateRead::Different(_) => ClaimMutationOutcome::Lost,
                 CandidateRead::Missing | CandidateRead::Failed => {
@@ -2333,7 +2334,7 @@ mod tests {
             let mut history = AttemptHistory::default();
             let outcome = apply_mutation(
                 &store,
-                mutation,
+                mutation.attributed_to(store.namespace()),
                 &work("work-17", 4),
                 1_500_000,
                 &mut history,

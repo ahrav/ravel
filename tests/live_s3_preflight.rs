@@ -171,9 +171,11 @@ struct ObjectFacts<'a> {
     /// predicate is tested for intersection with the whole allowed range rather
     /// than against individual points.
     sizes: (u64, u64),
-    /// When set, `key` names every key under that prefix rather than one
-    /// object: a rule prefix matches when it intersects the namespace, so a
-    /// rule scoped inside it (for example `workspace/prod/`) is still caught.
+    /// When set, `key` is a `/`-separated key-shape pattern (`*` = one whole
+    /// segment) naming every key of that shape: a rule prefix matches when some
+    /// key of the shape starts with it, so a rule scoped inside the namespace
+    /// (for example `workspace/prod/`) is caught while a sibling subtree that
+    /// can never hold the shape (for example `workspace/prod/presence/`) is not.
     namespace: bool,
 }
 
@@ -194,24 +196,90 @@ impl<'a> ObjectFacts<'a> {
         }
     }
 
-    fn namespace(prefix: &'a str, low: u64, high: u64) -> Self {
+    fn namespace(pattern: &'a str, low: u64, high: u64) -> Self {
         Self {
-            key: prefix,
+            key: pattern,
             sizes: (low, high),
             namespace: true,
         }
     }
 
     /// A rule prefix constrains this object when some key it describes starts
-    /// with the rule prefix: prefix containment either way for a namespace,
-    /// plain `starts_with` for a single key.
+    /// with the rule prefix: shape admission for a namespace pattern, plain
+    /// `starts_with` for a single key.
     fn prefix_matches(&self, prefix: &str) -> bool {
         if self.namespace {
-            self.key.starts_with(prefix) || prefix.starts_with(self.key)
+            pattern_admits_prefix(self.key, prefix)
         } else {
             self.key.starts_with(prefix)
         }
     }
+}
+
+#[test]
+fn pattern_prefix_admission_respects_the_claim_key_shape() {
+    let pattern = "workspace/*/campaigns/*/work/*/claim.json";
+    for admitted in [
+        "",
+        "work",
+        "workspace/",
+        "workspace/prod",
+        "workspace/prod/",
+        "workspace/prod/campaigns/c1/work/w1/claim.json",
+        "workspace/prod/campaigns/c1/work/w1/claim",
+    ] {
+        assert!(pattern_admits_prefix(pattern, admitted), "{admitted}");
+    }
+    for rejected in [
+        "workspaces/",
+        "workspace//",
+        "workspace/prod/presence/",
+        "workspace/prod/campaigns/c1/submissions/",
+        "workspace/prod/campaigns/c1/work/w1/claim.json/extra",
+        "workspace/prod/campaigns/c1/work/w1/other.json",
+    ] {
+        assert!(!pattern_admits_prefix(pattern, rejected), "{rejected}");
+    }
+}
+
+/// Reports whether some key matching `pattern` starts with `prefix`.
+///
+/// `pattern` is `/`-separated with `*` standing for exactly one non-empty
+/// segment without `/`. The final pattern segment is terminal: a prefix that
+/// descends past it names keys outside the shape.
+fn pattern_admits_prefix(pattern: &str, prefix: &str) -> bool {
+    let pattern: Vec<&str> = pattern.split('/').collect();
+    let mut parts: Vec<&str> = prefix.split('/').collect();
+    // A trailing '/' leaves an empty final part: every named part is complete.
+    let partial_last = match parts.last() {
+        Some(&"") => {
+            parts.pop();
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if parts.len() > pattern.len() {
+        return false;
+    }
+    for (index, part) in parts.iter().enumerate() {
+        let last = index + 1 == parts.len();
+        let segment = pattern[index];
+        let complete = !last || !partial_last;
+        let admits = if segment == "*" {
+            // A complete wildcard segment must be non-empty like every real key
+            // segment; a partial one can extend to any segment value.
+            !complete || !part.is_empty()
+        } else if complete {
+            *part == segment
+        } else {
+            segment.starts_with(part)
+        };
+        if !admits {
+            return false;
+        }
+    }
+    true
 }
 
 struct SelectorDecision {
@@ -1263,10 +1331,12 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
     let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
     // Claims and submissions can be retained under any workspace/campaign
-    // identity, so the whole `workspace/` namespace is evaluated as a prefix
-    // family: a rule scoped anywhere inside it (for example `workspace/prod/`)
-    // still matches. Both families share the same 4 KiB size bound.
-    let claim_namespace = "workspace/";
+    // identity, so each retained key shape is evaluated as a namespace family:
+    // a rule scoped anywhere such a key can live (for example `workspace/prod/`)
+    // matches, while a subtree neither shape can start with (for example a
+    // presence prefix) does not. Both families share the same 4 KiB size bound.
+    let claim_namespace = "workspace/*/campaigns/*/work/*/claim.json";
+    let submission_namespace = "workspace/*/campaigns/*/submissions/*";
     // Each key family is described by the full inclusive range of sizes a valid
     // object can take, so a rule whose size window sits strictly between two
     // concrete samples is still detected.
@@ -1280,6 +1350,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
         ObjectFacts::family(&keys.claim, 0, MAX_CLAIM_BYTES as u64),
         ObjectFacts::namespace(claim_namespace, 0, MAX_CLAIM_BYTES as u64),
+        ObjectFacts::namespace(submission_namespace, 0, MAX_SUBMISSION_BYTES as u64),
         ObjectFacts::family(&keys.submission, 0, MAX_SUBMISSION_BYTES as u64),
         // The sizes this run actually retained, so the evidence names them.
         ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
@@ -1304,6 +1375,9 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
 struct DeleteDenialEvidence {
     classification: &'static str,
     error_code: &'static str,
+    /// One entry per retained kind (claim, submission); `None` when the bucket
+    /// returned no version id (unversioned bucket).
+    version_delete_error_codes: Vec<Option<&'static str>>,
     runtime_role_arn: String,
 }
 
@@ -1462,6 +1536,7 @@ async fn live_runtime_principal_cannot_delete_retained_objects() {
     }
 
     let direct = direct_client(&config);
+    let mut version_delete_error_codes = Vec::new();
     for (kind, key, bytes) in [
         ("claim", &claim_key, &claim_bytes),
         ("submission", &submission_key, &submission_bytes),
@@ -1486,11 +1561,55 @@ async fn live_runtime_principal_cannot_delete_retained_objects() {
             Ok(GetOutcome::NotFound) => panic!("denied deletion removed the retained {kind}"),
             Err(_) => panic!("retained {kind} reread failed after denied deletion"),
         }
+
+        // On a versioned bucket, s3:DeleteObjectVersion is a separate permission
+        // that can permanently remove a retained version; prove it is denied for
+        // the exact version this run created.
+        let version_id = direct
+            .head_object()
+            .bucket(EXPECTED_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("retained {kind} head-object must succeed"))
+            .version_id()
+            .map(str::to_owned);
+        let version_code = match &version_id {
+            Some(version_id) => match direct
+                .delete_object()
+                .bucket(EXPECTED_BUCKET)
+                .key(key)
+                .version_id(version_id)
+                .send()
+                .await
+            {
+                Ok(_) => panic!("runtime principal deleted a retained {kind} version"),
+                Err(SdkError::ServiceError(service)) => {
+                    assert_eq!(
+                        service.err().code(),
+                        Some("AccessDenied"),
+                        "version delete denial must be explicit"
+                    );
+                    Some("AccessDenied")
+                }
+                Err(_) => panic!("version delete denial was not an S3 service error"),
+            },
+            None => None,
+        };
+        match store.get_object(key, bytes.len()).await {
+            Ok(GetOutcome::Found { bytes: found, .. }) => assert_eq!(&found, bytes),
+            Ok(GetOutcome::NotFound) => {
+                panic!("denied version deletion removed the retained {kind}")
+            }
+            Err(_) => panic!("retained {kind} reread failed after denied version deletion"),
+        }
+        version_delete_error_codes.push(version_code);
     }
 
     let evidence = DeleteDenialEvidence {
         classification: "access-denied",
         error_code: "AccessDenied",
+        version_delete_error_codes,
         runtime_role_arn,
     };
     let path = write_delete_denial_evidence(&run_id, &evidence)

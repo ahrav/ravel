@@ -36,6 +36,11 @@ use crate::{
 
 const MAX_CLAIM_BYTES: usize = 4 * 1024;
 const CLAIM_LEASE_MS: u64 = 15 * 60 * 1000;
+/// Minimum lease left before a send: a create that S3 commits after the
+/// embedded expiry grants authority over an immediately reclaimable record.
+// ponytail: fixed margin, not a bound on S3 commit delay; shrink the race
+// window rather than eliminate it. Reprepare-on-retry would remove it fully.
+const CLAIM_SEND_MARGIN_MS: u64 = 30 * 1000;
 #[allow(dead_code)]
 const CLAIM_RENEWAL_CADENCE_MS: u64 = 5 * 60 * 1000;
 
@@ -762,9 +767,10 @@ pub(crate) async fn submit(
 /// operation ID, and `If-None-Match: *` precondition. Acquisition itself
 /// performs no internal write retry.
 ///
-/// `now` gates every send, including retries of a returned attempt: once the
-/// frozen `lease_until` has passed, the attempt is [`ClaimAcquireOutcome::Ineligible`]
-/// and must be prepared again.
+/// `now` gates every send, including retries of a returned attempt: an attempt
+/// within [`CLAIM_SEND_MARGIN_MS`] of its frozen `lease_until` is
+/// [`ClaimAcquireOutcome::Ineligible`] and must be prepared again, so a create
+/// that lands after the embedded expiry is not sent in the first place.
 pub async fn acquire(
     store: &S3Store,
     attempt: ClaimAttempt,
@@ -774,7 +780,7 @@ pub async fn acquire(
     let ClaimState::Active { lease_until } = attempt.claim.state() else {
         return ClaimAcquireOutcome::Ineligible;
     };
-    if now >= *lease_until {
+    if now.saturating_add(CLAIM_SEND_MARGIN_MS) >= *lease_until {
         return ClaimAcquireOutcome::Ineligible;
     }
     let outcome = store
@@ -2157,8 +2163,9 @@ mod tests {
     async fn an_expired_attempt_is_ineligible_without_a_send() {
         let (store, client) = replay_store(Vec::new());
         let mut history = AttemptHistory::default();
-        // attempt() freezes lease_until = prepare-time now + CLAIM_LEASE_MS.
-        let now = 1_749_999_100_000 + CLAIM_LEASE_MS;
+        // attempt() freezes lease_until = prepare-time now + CLAIM_LEASE_MS; the
+        // send margin makes the attempt ineligible before the lease itself lapses.
+        let now = 1_749_999_100_000 + CLAIM_LEASE_MS - CLAIM_SEND_MARGIN_MS;
         assert!(matches!(
             acquire(&store, attempt(), now, &mut history).await,
             ClaimAcquireOutcome::Ineligible

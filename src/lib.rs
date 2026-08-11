@@ -9,6 +9,7 @@
 pub mod db {
     pub mod projections;
     pub mod schema;
+    pub mod worker;
 }
 
 pub mod domain {

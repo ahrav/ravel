@@ -293,8 +293,6 @@ async fn replay_with_limits(
     let mut prepared = prepare(store, cursor, observed.head().tail().clone(), limits).await?;
     prepared.reverse();
     for mutation in prepared {
-        #[cfg(test)]
-        test_crash::reach("before-apply");
         match handle.apply(mutation).await {
             Ok(ApplyOutcome::Applied | ApplyOutcome::AlreadyApplied) => {}
             Err(error) => return Err(ReplayError::Apply(error)),
@@ -574,10 +572,16 @@ mod tests {
         })
     }
 
-    fn expected_ready() -> Readiness {
-        Readiness::Ready {
-            local_cursor: (2, CHILD_DIGEST.to_owned()),
-            observed_head: head_value(child_ref()),
+    fn is_expected_ready(readiness: &Readiness) -> bool {
+        match readiness {
+            Readiness::Ready {
+                local_cursor,
+                observed_head,
+            } => {
+                *local_cursor == (2, CHILD_DIGEST.to_owned())
+                    && observed_head.head() == &head_value(child_ref())
+            }
+            Readiness::NotReady(_) => false,
         }
     }
 
@@ -662,6 +666,11 @@ mod tests {
             .lock()
             .read_line(&mut input)
             .expect("read crash child params");
+        if input.trim().is_empty() {
+            // Launched by a bare `--ignored`/`--include-ignored` run rather than
+            // by supervise_crash_child; there are no parameters to act on.
+            return;
+        }
         let params: CrashParams = serde_json::from_str(&input).expect("decode crash child params");
         assert!(matches!(
             params.site.as_str(),
@@ -672,15 +681,17 @@ mod tests {
         let handle = DbHandle::open_existing(params.database)
             .await
             .expect("open crash database");
-        let (store, _) = replay_store(vec![
-            head_response(child_ref()),
-            event_response(CHILD_BYTES),
-        ]);
-        match refresh(&store, &handle).await {
-            Readiness::Ready { .. } => {
+        // Apply directly and write the witness from the apply response itself, so
+        // a crash cut placed after the worker sends the apply outcome is caught
+        // even when a later command (such as a cursor read) would still hang.
+        match handle
+            .apply(fixture_mutation(CHILD_BYTES, child_ref()))
+            .await
+        {
+            Ok(ApplyOutcome::Applied) => {
                 fs::write(params.witness, b"SUCCESS").expect("write crash success witness")
             }
-            Readiness::NotReady(_) => panic!("crash child refresh was not ready"),
+            other => panic!("crash child apply did not succeed: {other:?}"),
         }
     }
 
@@ -707,7 +718,7 @@ mod tests {
             event_response(CHILD_BYTES),
             event_response(GENESIS_BYTES),
         ]);
-        if refresh(&store, &baseline).await != expected_ready() {
+        if !is_expected_ready(&refresh(&store, &baseline).await) {
             return Err("build uninterrupted baseline");
         }
         if baseline
@@ -766,7 +777,7 @@ mod tests {
                 vec![head_response(child_ref()), event_response(CHILD_BYTES)]
             };
             let (store, _) = replay_store(responses);
-            if refresh(&store, &handle).await != expected_ready() {
+            if !is_expected_ready(&refresh(&store, &handle).await) {
                 return Err("crash recovery was not ready");
             }
             if handle.cursor().await.map_err(|_| "read recovered cursor")?
@@ -794,8 +805,9 @@ mod tests {
             if committed {
                 final_recovered = Some(handle);
             } else {
+                // Keep the recovered database file for the canonical snapshot
+                // comparison below; CrashCleanup::drop removes it afterwards.
                 drop(handle);
-                clean_crash(params);
             }
         }
 
@@ -821,10 +833,13 @@ mod tests {
         drop(final_recovered);
         let baseline_connection =
             schema::open_existing(&cleanup.baseline).map_err(|_| "validate baseline")?;
-        let final_connection = schema::open_existing(&cleanup.cases[2].database)
-            .map_err(|_| "validate recovered database")?;
-        if snapshot(&baseline_connection) != snapshot(&final_connection) {
-            return Err("canonical recovery mismatch");
+        let baseline_snapshot = snapshot(&baseline_connection);
+        for params in &cleanup.cases {
+            let recovered = schema::open_existing(&params.database)
+                .map_err(|_| "validate recovered database")?;
+            if snapshot(&recovered) != baseline_snapshot {
+                return Err("canonical recovery mismatch");
+            }
         }
         Ok(())
     }
@@ -851,22 +866,30 @@ mod tests {
         let database = path("injected-readiness");
         clean(&database);
         stage_genesis(&database).unwrap();
+
+        // Inject the failure trigger only after open-time validation runs;
+        // existing-projection validation rejects schema objects the fixed
+        // schema never creates, and this test targets apply-time failure.
+        let handle = DbHandle::open_existing(database.clone()).await.unwrap();
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection.execute_batch(FAIL_CURSOR_TRIGGER).unwrap();
         drop(connection);
-
-        let handle = DbHandle::open_existing(database.clone()).await.unwrap();
         let mut responses = Vec::new();
         for _ in 0..3 {
             responses.push(head_response(child_ref()));
             responses.push(event_response(CHILD_BYTES));
         }
         let (store, _) = replay_store(responses);
-        let expected_failure = Readiness::NotReady(NotReadyReason::Replay(ReplayError::Apply(
-            ApplyError::DatabaseOperationFailed,
-        )));
-        assert_eq!(refresh(&store, &handle).await, expected_failure);
-        assert_eq!(refresh(&store, &handle).await, expected_failure);
+        let expected_failure =
+            NotReadyReason::Replay(ReplayError::Apply(ApplyError::DatabaseOperationFailed));
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            expected_failure
+        );
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            expected_failure
+        );
         assert_eq!(
             handle.cursor().await.unwrap(),
             (1, Some(GENESIS_DIGEST.to_owned()))
@@ -889,7 +912,7 @@ mod tests {
         drop(connection);
 
         let handle = DbHandle::open_existing(database.clone()).await.unwrap();
-        assert_eq!(refresh(&store, &handle).await, expected_ready());
+        assert!(is_expected_ready(&refresh(&store, &handle).await));
         assert_eq!(apply_count(&handle).await, 1);
         assert_eq!(
             narrow_state(&database).unwrap(),

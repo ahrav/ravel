@@ -16,6 +16,8 @@ pub mod domain {
     pub mod campaign;
 }
 
+pub mod distributed;
+
 pub mod storage {
     pub mod artifacts;
     pub mod s3;

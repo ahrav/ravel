@@ -169,6 +169,10 @@ struct ObjectFacts<'a> {
     /// predicate is tested for intersection with the whole allowed range rather
     /// than against individual points.
     sizes: (u64, u64),
+    /// When set, `key` names every key under that prefix rather than one
+    /// object: a rule prefix matches when it intersects the namespace, so a
+    /// rule scoped inside it (for example `workspace/prod/`) is still caught.
+    namespace: bool,
 }
 
 impl<'a> ObjectFacts<'a> {
@@ -176,6 +180,7 @@ impl<'a> ObjectFacts<'a> {
         Self {
             key,
             sizes: (size, size),
+            namespace: false,
         }
     }
 
@@ -183,6 +188,26 @@ impl<'a> ObjectFacts<'a> {
         Self {
             key,
             sizes: (low, high),
+            namespace: false,
+        }
+    }
+
+    fn namespace(prefix: &'a str, low: u64, high: u64) -> Self {
+        Self {
+            key: prefix,
+            sizes: (low, high),
+            namespace: true,
+        }
+    }
+
+    /// A rule prefix constrains this object when some key it describes starts
+    /// with the rule prefix: prefix containment either way for a namespace,
+    /// plain `starts_with` for a single key.
+    fn prefix_matches(&self, prefix: &str) -> bool {
+        if self.namespace {
+            self.key.starts_with(prefix) || prefix.starts_with(self.key)
+        } else {
+            self.key.starts_with(prefix)
         }
     }
 }
@@ -545,7 +570,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
             matches: rule
                 .legacy_prefix
                 .as_deref()
-                .is_none_or(|prefix| object.key.starts_with(prefix)),
+                .is_none_or(|prefix| object.prefix_matches(prefix)),
             supported: true,
             reason: if rule.legacy_prefix.is_some() {
                 "legacy-prefix"
@@ -576,7 +601,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
     }
     if let Some(prefix) = &filter.prefix {
         return SelectorDecision {
-            matches: object.key.starts_with(prefix),
+            matches: object.prefix_matches(prefix),
             supported: true,
             reason: "prefix",
         };
@@ -611,7 +636,7 @@ fn selector_matches(rule: &RuleProjection, object: ObjectFacts<'_>) -> SelectorD
             matches: and
                 .prefix
                 .as_deref()
-                .is_none_or(|prefix| object.key.starts_with(prefix))
+                .is_none_or(|prefix| object.prefix_matches(prefix))
                 && size_match,
             supported: true,
             reason: "and",
@@ -643,6 +668,17 @@ fn expires_current_version(expiration: &Value) -> bool {
         || !expiration.get("date").is_none_or(Value::is_null)
 }
 
+/// A transition to GLACIER or DEEP_ARCHIVE requires a restore before an ordinary
+/// GET succeeds, so it takes retained objects out of recovery and reconciliation
+/// reads without ever deleting them. GLACIER_IR stays directly readable.
+fn archives_reads(rule: &RuleProjection) -> bool {
+    rule.transitions
+        .iter()
+        .chain(rule.noncurrent_version_transitions.iter())
+        .filter_map(|transition| transition.get("storage_class").and_then(Value::as_str))
+        .any(|class| matches!(class, "GLACIER" | "DEEP_ARCHIVE"))
+}
+
 fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Vec<LifecycleReport> {
     let mut report = Vec::with_capacity(rules.len() * objects.len());
     for rule in rules {
@@ -658,10 +694,12 @@ fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Ve
                 .as_ref()
                 .is_some_and(expires_current_version)
                 || rule.noncurrent_version_expiration.is_some();
+            let archives = archives_reads(rule);
+            let blocks_reads = has_expiration || archives;
             let safe = enabled == Some(false)
                 || (enabled == Some(true)
                     && selector.supported
-                    && (!selector.matches || !has_expiration));
+                    && (!selector.matches || !blocks_reads));
             let reason = if enabled == Some(false) {
                 "disabled"
             } else if enabled.is_none() {
@@ -670,6 +708,8 @@ fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Ve
                 selector.reason
             } else if has_expiration {
                 "matching-expiration"
+            } else if archives {
+                "matching-archival-transition"
             } else {
                 "no-expiration"
             };
@@ -931,16 +971,19 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     let encoded_2 = event::encode(&event_2).map_err(|_| "event 2 encoding failed")?;
     let reference_2 = EventRef::new(2, encoded_2.digest().to_owned(), encoded_2.key().to_owned())
         .map_err(|_| "event 2 reference construction failed")?;
+    // Production builds heads with the tail's operation id, and
+    // HeadTransition::new rejects a divergence, so the retained chain has to carry
+    // the same identities a real commit would.
     let genesis_head = Head::new(
         Authority::unowned(),
         reference_1.clone(),
-        "live-head-genesis".into(),
+        event_1.operation_id().to_owned(),
     )
     .map_err(|_| "genesis head construction failed")?;
     let successor_head = Head::new(
         Authority::unowned(),
         reference_2.clone(),
-        "live-head-successor".into(),
+        event_2.operation_id().to_owned(),
     )
     .map_err(|_| "successor head construction failed")?;
     let genesis_head_bytes =
@@ -1192,9 +1235,10 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     // match. None of these are created; only the rule predicates read them.
     let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
     let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
-    // A rule scoped to `workspace/` matches the production claim prefix but not a
-    // run-prefixed key, so the unprefixed key is evaluated without being created.
-    let production_claim_key = "workspace/live/campaigns/live/work/live/claim.json";
+    // Claims can be retained under any workspace/campaign/work identity, so
+    // the whole `workspace/` namespace is evaluated as a prefix family: a rule
+    // scoped anywhere inside it (for example `workspace/prod/`) still matches.
+    let claim_namespace = "workspace/";
     // Each key family is described by the full inclusive range of sizes a valid
     // object can take, so a rule whose size window sits strictly between two
     // concrete samples is still detected.
@@ -1207,7 +1251,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         ObjectFacts::family(&keys.event_2, 0, MAX_EVENT_BYTES as u64),
         ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
         ObjectFacts::family(&keys.claim, 0, MAX_CLAIM_BYTES as u64),
-        ObjectFacts::family(production_claim_key, 0, MAX_CLAIM_BYTES as u64),
+        ObjectFacts::namespace(claim_namespace, 0, MAX_CLAIM_BYTES as u64),
         // The sizes this run actually retained, so the evidence names them.
         ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
         ObjectFacts::exact(&keys.event_1, stored_event_1.len() as u64),
@@ -1464,6 +1508,39 @@ fn size_windows_are_tested_against_the_whole_allowed_range() {
 
     let above = ObjectFacts::family("artifacts/sha256/abc", 4096, MAX_ARTIFACT_BYTES as u64);
     assert!(!selector_matches(&window, above).matches);
+}
+
+#[test]
+fn archival_transitions_are_unsafe_even_without_expiration() {
+    let object = ObjectFacts::family(HEAD_KEY, 0, MAX_HEAD_BYTES as u64);
+    let mut rule = test_rule("Enabled", None, None);
+    rule.expiration = None;
+
+    for (class, expected_safe) in [
+        ("GLACIER", false),
+        ("DEEP_ARCHIVE", false),
+        ("GLACIER_IR", true),
+        ("STANDARD_IA", true),
+    ] {
+        rule.transitions = vec![json!({
+            "date": Value::Null,
+            "days": 30,
+            "storage_class": class,
+        })];
+        let report = lifecycle_report(&[rule.clone()], &[object]);
+        assert_eq!(report[0].safe, expected_safe, "storage class {class}");
+        if !expected_safe {
+            assert_eq!(report[0].reason, "matching-archival-transition");
+        }
+    }
+
+    // A noncurrent-version transition to archival storage counts too.
+    rule.transitions = Vec::new();
+    rule.noncurrent_version_transitions = vec![json!({
+        "noncurrent_days": 1,
+        "storage_class": "DEEP_ARCHIVE",
+    })];
+    assert!(!lifecycle_report(&[rule], &[object])[0].safe);
 }
 
 #[test]

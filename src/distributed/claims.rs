@@ -150,25 +150,24 @@ enum WireClaimState {
 /// same-key reread of the attempted canonical bytes. Only this module
 /// constructs it; it implements neither `Clone` nor `Debug`, so the proof
 /// cannot be copied or logged.
-#[allow(dead_code)]
-pub(crate) struct ClaimAuthority {
+pub struct ClaimAuthority {
     claim: Claim,
     key: String,
+    // Held for the lease renewal/seal CAS path that consumes this authority.
+    #[allow(dead_code)]
     etag: ETag,
 }
 
-#[allow(dead_code)]
 impl ClaimAuthority {
+    pub fn claim(&self) -> &Claim {
+        &self.claim
+    }
+
     /// Claim keys are namespaced by workspace and campaign. A decoded `Claim`
     /// carries neither namespace, so the caller supplies both and the stored key
     /// has to match them.
     #[must_use]
-    pub(crate) fn authorizes(
-        &self,
-        work: &WorkRef,
-        workspace: &WorkspaceId,
-        campaign_id: &str,
-    ) -> bool {
+    pub fn authorizes(&self, work: &WorkRef, workspace: &WorkspaceId, campaign_id: &str) -> bool {
         let Ok(expected) = claim_key(workspace, campaign_id, work.id()) else {
             return false;
         };
@@ -178,16 +177,20 @@ impl ClaimAuthority {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) struct ClaimAttempt {
+pub struct ClaimAttempt {
     claim: Claim,
     key: String,
     canonical_bytes: Vec<u8>,
 }
 
+impl ClaimAttempt {
+    pub fn claim(&self) -> &Claim {
+        &self.claim
+    }
+}
+
 #[must_use]
-#[allow(dead_code)]
-pub(crate) enum ClaimAcquireOutcome {
+pub enum ClaimAcquireOutcome {
     Acquired(ClaimAuthority),
     Collision,
     RetryIdentically(ClaimAttempt),
@@ -263,7 +266,7 @@ pub(crate) enum ClaimMutationOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ClaimPrepareError {
+pub enum ClaimPrepareError {
     InvalidInput,
     Entropy,
     Encoding,
@@ -281,8 +284,7 @@ impl fmt::Display for ClaimPrepareError {
 
 impl Error for ClaimPrepareError {}
 
-#[allow(dead_code)]
-pub(crate) fn prepare_acquisition(
+pub fn prepare_acquisition(
     work: &WorkRef,
     workspace: &WorkspaceId,
     campaign_id: &str,
@@ -548,8 +550,7 @@ fn prepare_replacement(
 /// and caller-owned [`AttemptHistory`]: identical key, canonical bytes,
 /// operation ID, and `If-None-Match: *` precondition. Acquisition itself
 /// performs no internal write retry.
-#[allow(dead_code)]
-pub(crate) async fn acquire(
+pub async fn acquire(
     store: &S3Store,
     attempt: ClaimAttempt,
     history: &mut AttemptHistory,
@@ -568,9 +569,14 @@ pub(crate) async fn acquire(
         MutationOutcome::Committed { etag: None }
         | MutationOutcome::AmbiguousConflict
         | MutationOutcome::Unknown => resolve_acquisition(store, attempt).await,
-        MutationOutcome::Conflict | MutationOutcome::PreconditionFailed => {
-            ClaimAcquireOutcome::Collision
-        }
+        // A fresh 412 proves an object already existed when the precondition was
+        // evaluated, and this attempt's random operation ID cannot have produced
+        // it, so it is a final collision. A fresh 409 is a concurrent-upload
+        // conflict that S3 documents as retryable, not proof an existing claim
+        // won; the same-key reread decides between authority, collision, and an
+        // identical retry.
+        MutationOutcome::PreconditionFailed => ClaimAcquireOutcome::Collision,
+        MutationOutcome::Conflict => resolve_acquisition(store, attempt).await,
         MutationOutcome::ProvenNotSent => ClaimAcquireOutcome::RetryIdentically(attempt),
         MutationOutcome::NotFound | MutationOutcome::TooLarge => {
             ClaimAcquireOutcome::Unresolved(attempt)
@@ -1107,15 +1113,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_conflicts_are_collisions_without_a_reread() {
-        for status in [409, 412] {
-            let (store, client) = replay_store(vec![response(status, &[], SdkBody::empty())]);
+    async fn a_fresh_precondition_failure_is_a_collision_without_a_reread() {
+        let (store, client) = replay_store(vec![response(412, &[], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            acquire(&store, attempt(), &mut history).await,
+            ClaimAcquireOutcome::Collision
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_conflict_resolves_from_same_key_bytes() {
+        // (reread outcome, expected result): our bytes -> authority, other
+        // bytes -> collision, absent -> identical retry of the same attempt.
+        for case in ["ours", "other", "absent"] {
+            let attempt = attempt();
+            let mut bytes = attempt.canonical_bytes.clone();
+            if case == "other" {
+                bytes[0] ^= 1;
+            }
+            let reread = if case == "absent" {
+                response(404, &[], SdkBody::empty())
+            } else {
+                response(200, &[("etag", TEST_ETAG)], bytes)
+            };
+            let (store, client) = replay_store(vec![response(409, &[], SdkBody::empty()), reread]);
             let mut history = AttemptHistory::default();
-            assert!(matches!(
-                acquire(&store, attempt(), &mut history).await,
-                ClaimAcquireOutcome::Collision
-            ));
-            assert_eq!(client.actual_requests().count(), 1, "status {status}");
+            let outcome = acquire(&store, attempt, &mut history).await;
+            match case {
+                "ours" => assert!(matches!(outcome, ClaimAcquireOutcome::Acquired(_))),
+                "other" => assert!(matches!(outcome, ClaimAcquireOutcome::Collision)),
+                _ => assert!(matches!(outcome, ClaimAcquireOutcome::RetryIdentically(_))),
+            }
+            assert_eq!(client.actual_requests().count(), 2, "case {case}");
         }
     }
 

@@ -798,22 +798,19 @@ async fn claim_worker_scenario(
         .map_err(|_| "worker-claim-actor")?;
     let instance = InstanceId::new(format!("claim-instance-{}", params.worker_id))
         .map_err(|_| "worker-claim-instance")?;
-    let attempt = claims::prepare_acquisition(
-        &work,
-        &workspace,
-        "live-race",
-        &actor,
-        &instance,
-        params.creation_time_unix_ms + 60_000,
-    )
-    .map_err(|_| "worker-claim-prepare")?;
+    // One timestamp serves both preparation and the send gate, so the
+    // committed live claim carries exactly the frozen lease policy.
+    let now = params.creation_time_unix_ms;
+    let attempt =
+        claims::prepare_acquisition(&work, &workspace, "live-race", &actor, &instance, now)
+            .map_err(|_| "worker-claim-prepare")?;
     let operation_id = attempt.claim().operation_id().to_owned();
     wait_for_release(params)?;
     let store = clean_store(config);
     let mut history = AttemptHistory::default();
     let mut outcome = tokio::time::timeout(
         OPERATION_DEADLINE,
-        claims::acquire(&store, attempt, params.creation_time_unix_ms, &mut history),
+        claims::acquire(&store, attempt, now, &mut history),
     )
     .await
     .map_err(|_| "worker-claim-timeout")?;
@@ -823,7 +820,7 @@ async fn claim_worker_scenario(
         outcome = match outcome {
             ClaimAcquireOutcome::RetryIdentically(attempt) => tokio::time::timeout(
                 OPERATION_DEADLINE,
-                claims::acquire(&store, attempt, params.creation_time_unix_ms, &mut history),
+                claims::acquire(&store, attempt, now, &mut history),
             )
             .await
             .map_err(|_| "worker-claim-timeout")?,

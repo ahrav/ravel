@@ -197,6 +197,11 @@ impl ClaimAttempt {
 #[must_use]
 pub enum ClaimAcquireOutcome {
     Acquired(ClaimAuthority),
+    /// The create committed but no usable ETag was recovered, so the claim is
+    /// durable while this caller holds no authority. Re-observe instead of
+    /// retrying: a committed response clears the possible-send history, so a
+    /// resend would misread the caller's own durable claim as a collision.
+    AcquiredUnverified,
     Collision,
     /// The attempt's frozen lease has already expired, so sending it could
     /// create a claim another worker may immediately reclaim; prepare a fresh
@@ -613,9 +618,25 @@ pub async fn acquire(
                 etag,
             })
         }
-        MutationOutcome::Committed { etag: None }
-        | MutationOutcome::AmbiguousConflict
-        | MutationOutcome::Unknown => resolve_acquisition(store, attempt).await,
+        // A committed create without an ETag is durable; only the fresh token
+        // is missing, and the cleared send history means an identical retry
+        // would see the caller's own claim as a fresh collision.
+        MutationOutcome::Committed { etag: None } => {
+            match read_candidate(store, &attempt.key, &attempt.canonical_bytes).await {
+                CandidateRead::Matching(etag) => ClaimAcquireOutcome::Acquired(ClaimAuthority {
+                    claim: attempt.claim,
+                    key: attempt.key,
+                    etag,
+                }),
+                CandidateRead::Different(_) => ClaimAcquireOutcome::Collision,
+                CandidateRead::Missing | CandidateRead::Failed => {
+                    ClaimAcquireOutcome::AcquiredUnverified
+                }
+            }
+        }
+        MutationOutcome::AmbiguousConflict | MutationOutcome::Unknown => {
+            resolve_acquisition(store, attempt).await
+        }
         // A fresh 412 proves an object already existed when the precondition was
         // evaluated, and this attempt's random operation ID cannot have produced
         // it, so it is a final collision. A fresh 409 is a concurrent-upload
@@ -2004,6 +2025,29 @@ mod tests {
             ClaimAcquireOutcome::Ineligible
         ));
         assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_tokenless_committed_create_never_reports_its_own_claim_as_collision() {
+        for reread_found in [true, false] {
+            let attempt = attempt();
+            let expected_bytes = attempt.canonical_bytes.clone();
+            let reread = if reread_found {
+                response(200, &[("etag", TEST_ETAG)], expected_bytes)
+            } else {
+                response(500, &[], SdkBody::empty())
+            };
+            // A 200 PUT response without an ETag header is a committed create
+            // whose fresh token was not returned.
+            let (store, _) = replay_store(vec![response(200, &[], SdkBody::empty()), reread]);
+            let mut history = AttemptHistory::default();
+            let outcome = acquire(&store, attempt, 1_749_999_100_000, &mut history).await;
+            if reread_found {
+                assert!(matches!(outcome, ClaimAcquireOutcome::Acquired(_)));
+            } else {
+                assert!(matches!(outcome, ClaimAcquireOutcome::AcquiredUnverified));
+            }
+        }
     }
 
     #[tokio::test]

@@ -445,7 +445,7 @@ async fn prepare_transition(
             let event_parent = Some(observed.head().tail().clone());
             let authority = observed.head().authority().clone();
             (
-                head::HeadParent::Existing(observed),
+                head::HeadParent::Existing(Box::new(observed)),
                 sequence,
                 event_parent,
                 authority,
@@ -739,7 +739,7 @@ async fn head_worker_scenario(
         OPERATION_DEADLINE,
         head::append(
             &store,
-            head::HeadParent::Existing(observed),
+            head::HeadParent::Existing(Box::new(observed)),
             authority,
             &event,
             Some(&artifact),

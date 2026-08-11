@@ -643,6 +643,17 @@ fn expires_current_version(expiration: &Value) -> bool {
         || !expiration.get("date").is_none_or(Value::is_null)
 }
 
+/// A transition to GLACIER or DEEP_ARCHIVE requires a restore before an ordinary
+/// GET succeeds, so it takes retained objects out of recovery and reconciliation
+/// reads without ever deleting them. GLACIER_IR stays directly readable.
+fn archives_reads(rule: &RuleProjection) -> bool {
+    rule.transitions
+        .iter()
+        .chain(rule.noncurrent_version_transitions.iter())
+        .filter_map(|transition| transition.get("storage_class").and_then(Value::as_str))
+        .any(|class| matches!(class, "GLACIER" | "DEEP_ARCHIVE"))
+}
+
 fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Vec<LifecycleReport> {
     let mut report = Vec::with_capacity(rules.len() * objects.len());
     for rule in rules {
@@ -658,10 +669,12 @@ fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Ve
                 .as_ref()
                 .is_some_and(expires_current_version)
                 || rule.noncurrent_version_expiration.is_some();
+            let archives = archives_reads(rule);
+            let blocks_reads = has_expiration || archives;
             let safe = enabled == Some(false)
                 || (enabled == Some(true)
                     && selector.supported
-                    && (!selector.matches || !has_expiration));
+                    && (!selector.matches || !blocks_reads));
             let reason = if enabled == Some(false) {
                 "disabled"
             } else if enabled.is_none() {
@@ -670,6 +683,8 @@ fn lifecycle_report(rules: &[RuleProjection], objects: &[ObjectFacts<'_>]) -> Ve
                 selector.reason
             } else if has_expiration {
                 "matching-expiration"
+            } else if archives {
+                "matching-archival-transition"
             } else {
                 "no-expiration"
             };
@@ -931,16 +946,19 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     let encoded_2 = event::encode(&event_2).map_err(|_| "event 2 encoding failed")?;
     let reference_2 = EventRef::new(2, encoded_2.digest().to_owned(), encoded_2.key().to_owned())
         .map_err(|_| "event 2 reference construction failed")?;
+    // Production builds heads with the tail's operation id, and
+    // HeadTransition::new rejects a divergence, so the retained chain has to carry
+    // the same identities a real commit would.
     let genesis_head = Head::new(
         Authority::unowned(),
         reference_1.clone(),
-        "live-head-genesis".into(),
+        event_1.operation_id().to_owned(),
     )
     .map_err(|_| "genesis head construction failed")?;
     let successor_head = Head::new(
         Authority::unowned(),
         reference_2.clone(),
-        "live-head-successor".into(),
+        event_2.operation_id().to_owned(),
     )
     .map_err(|_| "successor head construction failed")?;
     let genesis_head_bytes =
@@ -1464,6 +1482,39 @@ fn size_windows_are_tested_against_the_whole_allowed_range() {
 
     let above = ObjectFacts::family("artifacts/sha256/abc", 4096, MAX_ARTIFACT_BYTES as u64);
     assert!(!selector_matches(&window, above).matches);
+}
+
+#[test]
+fn archival_transitions_are_unsafe_even_without_expiration() {
+    let object = ObjectFacts::family(HEAD_KEY, 0, MAX_HEAD_BYTES as u64);
+    let mut rule = test_rule("Enabled", None, None);
+    rule.expiration = None;
+
+    for (class, expected_safe) in [
+        ("GLACIER", false),
+        ("DEEP_ARCHIVE", false),
+        ("GLACIER_IR", true),
+        ("STANDARD_IA", true),
+    ] {
+        rule.transitions = vec![json!({
+            "date": Value::Null,
+            "days": 30,
+            "storage_class": class,
+        })];
+        let report = lifecycle_report(&[rule.clone()], &[object]);
+        assert_eq!(report[0].safe, expected_safe, "storage class {class}");
+        if !expected_safe {
+            assert_eq!(report[0].reason, "matching-archival-transition");
+        }
+    }
+
+    // A noncurrent-version transition to archival storage counts too.
+    rule.transitions = Vec::new();
+    rule.noncurrent_version_transitions = vec![json!({
+        "noncurrent_days": 1,
+        "storage_class": "DEEP_ARCHIVE",
+    })];
+    assert!(!lifecycle_report(&[rule], &[object])[0].safe);
 }
 
 #[test]

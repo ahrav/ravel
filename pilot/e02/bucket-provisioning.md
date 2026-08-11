@@ -2,6 +2,15 @@
 
 Provisioned: 2026-08-09T07:16:17Z (re-verified below at re-capture time)
 
+## Bucket selection
+
+E02 uses `ravel-e02-4c038b2f`, not the `ravel-e01-907331366707` bucket named in
+`pilot/e01/environment.yaml`. The divergence is deliberate: E01's bucket is frozen
+evidence for E01, and E02 needs a bucket whose lifecycle, versioning, and delete
+policy it provisions and proves itself. `EXPECTED_BUCKET` in
+`tests/live_s3_preflight.rs` names this bucket so the suite refuses to run
+against any other, including E01's.
+
 ## Identity
 
 ```json

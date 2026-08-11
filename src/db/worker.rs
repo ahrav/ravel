@@ -405,18 +405,20 @@ mod tests {
     async fn queries_ready_work_through_the_owner() {
         let path = path("ready-work");
         let _ = fs::remove_file(&path);
-        let connection = schema::create(&path).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
+        drop(schema::create(&path).unwrap());
+        let handle = DbHandle::open_existing(path.clone()).await.unwrap();
+
+        // Seed the fixture after `DbHandle::open_existing` validates the empty projection.
+        let seed = rusqlite::Connection::open(&path).unwrap();
+        seed.execute_batch(
+            "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
                  INSERT INTO workflows (workflow_id, state) VALUES ('workflow', 'active');
                  INSERT INTO work_items
                      (work_id, workflow_id, state, budget_remaining, required_capabilities)
                  VALUES ('work', 'workflow', 'ready', 1, 'rust');",
-            )
-            .unwrap();
-        drop(connection);
-        let handle = DbHandle::open_existing(path.clone()).await.unwrap();
+        )
+        .unwrap();
+        drop(seed);
 
         assert_eq!(
             handle

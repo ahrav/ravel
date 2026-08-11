@@ -127,44 +127,7 @@ pub fn apply(
         return Err(ApplyError::Conflict);
     }
 
-    // Sequence 1 projects one campaign row, and every sequence above 1 projects one workflow
-    // row named by its own sequence. No v1 effect projects an objective, work item, or
-    // dependency, so any such row carries state no applied event implies.
-    let (
-        campaign_rows,
-        genesis_campaign_exists,
-        workflow_rows,
-        implied_workflow_rows,
-        unimplied_rows,
-    ): (i64, bool, i64, i64, i64) = transaction.query_row(
-        "SELECT (SELECT COUNT(*) FROM campaigns), \
-             (SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1)), \
-             (SELECT COUNT(*) FROM workflows), \
-             (SELECT COUNT(*) FROM workflows WHERE length(workflow_id) = 16 \
-             AND length(CAST(workflow_id AS BLOB)) = 16 \
-             AND workflow_id NOT GLOB '*[^0-9]*' \
-             AND CAST(workflow_id AS INTEGER) BETWEEN 2 AND ?2), \
-             (SELECT COUNT(*) FROM objectives) + (SELECT COUNT(*) FROM work_items) \
-             + (SELECT COUNT(*) FROM dependencies)",
-        params![GENESIS_CAMPAIGN_ID, stored_cursor_sequence],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
-    )?;
-    let projected_campaigns = i64::from(cursor_sequence >= 1);
-    let projected_workflows = stored_cursor_sequence.max(1) - 1;
-    if campaign_rows != projected_campaigns
-        || genesis_campaign_exists != (projected_campaigns == 1)
-        || workflow_rows != projected_workflows
-        || implied_workflow_rows != projected_workflows
-        || unimplied_rows != 0
-    {
+    if !rows_match_cursor(&transaction, stored_cursor_sequence)? {
         return Err(ApplyError::Conflict);
     }
 
@@ -216,6 +179,51 @@ pub fn apply(
     }
     transaction.commit()?;
     Ok(ApplyOutcome::Applied)
+}
+
+/// Reports whether the projected rows are exactly the ones sequences `1..=cursor` imply.
+///
+/// A cursor at or above 1 implies the genesis campaign row, each sequence above 1 implies one
+/// workflow row named by that sequence, and no sequence implies an objective, work item, or
+/// dependency row.
+pub(crate) fn rows_match_cursor(
+    connection: &rusqlite::Connection,
+    stored_cursor_sequence: i64,
+) -> rusqlite::Result<bool> {
+    let (
+        campaign_rows,
+        genesis_campaign_exists,
+        workflow_rows,
+        implied_workflow_rows,
+        unimplied_rows,
+    ): (i64, bool, i64, i64, i64) = connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM campaigns), \
+             (SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1)), \
+             (SELECT COUNT(*) FROM workflows), \
+             (SELECT COUNT(*) FROM workflows WHERE length(workflow_id) = 16 \
+             AND length(CAST(workflow_id AS BLOB)) = 16 \
+             AND workflow_id NOT GLOB '*[^0-9]*' \
+             AND CAST(workflow_id AS INTEGER) BETWEEN 2 AND ?2), \
+             (SELECT COUNT(*) FROM objectives) + (SELECT COUNT(*) FROM work_items) \
+             + (SELECT COUNT(*) FROM dependencies)",
+        params![GENESIS_CAMPAIGN_ID, stored_cursor_sequence],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let projected_campaigns = i64::from(stored_cursor_sequence >= 1);
+    let projected_workflows = stored_cursor_sequence.max(1) - 1;
+    Ok(campaign_rows == projected_campaigns
+        && genesis_campaign_exists == (projected_campaigns == 1)
+        && workflow_rows == projected_workflows
+        && implied_workflow_rows == projected_workflows
+        && unimplied_rows == 0)
 }
 
 /// Returns ready work in stable workflow/work order, rotated strictly after `after`.

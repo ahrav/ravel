@@ -256,28 +256,55 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
     // constraints would serve reads that cannot come from the event chain.
     let mut definitions = {
         let mut stored = connection
-            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")
+            .prepare("SELECT name, sql, type FROM sqlite_schema WHERE sql IS NOT NULL")
             .map_err(local_format_error)?;
         stored
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(local_format_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(local_format_error)?
     };
-    definitions.retain(|(name, _)| !name.starts_with("sqlite_"));
-    if definitions.len() != PROJECTION_TABLES.len() {
+    definitions.retain(|(name, _, _)| !name.starts_with("sqlite_"));
+    let (tables, others): (Vec<_>, Vec<_>) = definitions
+        .into_iter()
+        .partition(|(_, _, kind)| kind == "table");
+    if tables.len() != PROJECTION_TABLES.len() {
         return Err(ValidateError::InvalidHistory);
     }
-    for (name, sql) in &definitions {
+    for (name, sql, _) in &tables {
         let expected = expected_definition(name).ok_or(ValidateError::InvalidHistory)?;
         if normalized(sql) != normalized(expected) {
             return Err(ValidateError::InvalidHistory);
         }
     }
+    // The fixed schema declares exactly one non-table object: the cursor-singleton
+    // trigger. Any other trigger, view, or index is a schema this projection never
+    // creates and could alter reads or abort applies.
+    match others.as_slice() {
+        [(_, sql, kind)]
+            if kind == "trigger" && normalized(sql) == normalized(expected_trigger()) => {}
+        _ => return Err(ValidateError::InvalidHistory),
+    }
 
     Ok(connection)
+}
+
+/// Recovers the one `CREATE TRIGGER` statement this schema declares.
+fn expected_trigger() -> &'static str {
+    let start = SCHEMA
+        .find("CREATE TRIGGER")
+        .expect("schema declares the cursor-singleton trigger");
+    let length = SCHEMA[start..]
+        .find("END")
+        .expect("trigger body terminates")
+        + "END".len();
+    &SCHEMA[start..start + length]
 }
 
 /// Recovers the `CREATE TABLE` statement this schema declares for `table`.
@@ -756,7 +783,13 @@ mod tests {
     fn rejects_missing_gapped_and_mismatched_history() {
         let path = test_path("missing-cursor");
         let connection = create(&path).unwrap();
+        // The singleton trigger guards production deletes; bypass and restore it so
+        // the only deviation this case validates is the missing cursor row.
+        connection
+            .execute("DROP TRIGGER sync_cursor_is_singleton", [])
+            .unwrap();
         connection.execute("DELETE FROM sync_cursor", []).unwrap();
+        connection.execute(expected_trigger(), []).unwrap();
         drop(connection);
         assert_eq!(
             open_existing(&path).unwrap_err(),
@@ -879,6 +912,26 @@ mod tests {
         connection.execute("DROP TABLE campaigns", []).unwrap();
         connection
             .execute("CREATE TABLE campaigns (id TEXT)", [])
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn an_unexpected_schema_object_is_rebuildable() {
+        let path = test_path("extra-trigger");
+        let connection = create(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TRIGGER extra BEFORE UPDATE ON sync_cursor BEGIN \
+                 SELECT RAISE(ABORT, 'no'); END",
+                [],
+            )
             .unwrap();
         drop(connection);
 

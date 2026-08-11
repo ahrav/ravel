@@ -262,13 +262,15 @@ pub async fn append(
     let publication = event::publish(store, tail, artifact)
         .await
         .map_err(AppendError::Publication)?;
-    // Replay converts every head-chain event through `scheduling_mutation`, so a
-    // committed head whose tail has no scheduling projection (ArtifactPublished,
-    // or a scheduling event at an illegal position) would leave every later
-    // refresh NotReady. Reject it before the CAS; only a retained unreferenced
-    // event remains.
-    if event::scheduling_mutation(publication.event_ref().clone(), tail).is_err() {
-        return Err(AppendError::InvalidInput);
+    // A scheduling event at an illegal position can never convert during
+    // replay, so committing it would leave every later refresh NotReady;
+    // reject it before the CAS and only a retained unreferenced event remains.
+    // ArtifactPublished stays appendable: it is frozen v1 chain content proven
+    // by the live E02 suite, and only the v1 scheduling projection lacks a
+    // conversion for it.
+    match event::scheduling_mutation(publication.event_ref().clone(), tail) {
+        Ok(_) | Err(event::ConversionError::UnsupportedContent) => {}
+        Err(_) => return Err(AppendError::InvalidInput),
     }
     // One append is one commit identity. Reconciliation walks retained events and
     // searches the operation id, so a head recording a different id than its tail

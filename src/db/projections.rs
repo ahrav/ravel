@@ -184,8 +184,8 @@ pub fn apply(
 /// Reports whether the projected rows are exactly the ones sequences `1..=cursor` imply.
 ///
 /// A cursor at or above 1 implies the genesis campaign row, each sequence above 1 implies one
-/// workflow row named by that sequence, and no sequence implies an objective, work item, or
-/// dependency row.
+/// workflow row named by that sequence, both in the `active` state, and no sequence implies an
+/// objective, work item, or dependency row.
 pub(crate) fn rows_match_cursor(
     connection: &rusqlite::Connection,
     stored_cursor_sequence: i64,
@@ -198,12 +198,13 @@ pub(crate) fn rows_match_cursor(
         unimplied_rows,
     ): (i64, bool, i64, i64, i64) = connection.query_row(
         "SELECT (SELECT COUNT(*) FROM campaigns), \
-             (SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1)), \
+             (SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1 AND state = 'active')), \
              (SELECT COUNT(*) FROM workflows), \
              (SELECT COUNT(*) FROM workflows WHERE length(workflow_id) = 16 \
              AND length(CAST(workflow_id AS BLOB)) = 16 \
              AND workflow_id NOT GLOB '*[^0-9]*' \
-             AND CAST(workflow_id AS INTEGER) BETWEEN 2 AND ?2), \
+             AND CAST(workflow_id AS INTEGER) BETWEEN 2 AND ?2 \
+             AND state = 'active'), \
              (SELECT COUNT(*) FROM objectives) + (SELECT COUNT(*) FROM work_items) \
              + (SELECT COUNT(*) FROM dependencies)",
         params![GENESIS_CAMPAIGN_ID, stored_cursor_sequence],

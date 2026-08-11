@@ -1053,4 +1053,32 @@ mod tests {
         );
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn a_projected_row_state_no_event_wrote_is_rebuildable() {
+        let path = test_path("completed-campaign");
+        let connection = create(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO applied_events (sequence, digest) VALUES (1, '{DIGEST}');
+                 UPDATE sync_cursor SET sequence = 1, tail_digest = '{DIGEST}' WHERE id = 1;
+                 INSERT INTO campaigns (campaign_id, state) \
+                     VALUES ('0000000000000001', 'completed');"
+            ))
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidProjection
+        );
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute("UPDATE campaigns SET state = 'active'", [])
+            .unwrap();
+        drop(connection);
+        assert!(open_existing(&path).is_ok());
+        fs::remove_file(path).unwrap();
+    }
 }

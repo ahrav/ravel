@@ -253,13 +253,15 @@ pub(crate) struct ClaimMutation {
 impl ClaimMutation {
     /// A frozen mutation stays safe to resend only while the facts that made it
     /// eligible still hold: the same work generation, for a renewal an observed
-    /// lease that has not expired, and a candidate lease that is still in the
-    /// future — a delayed resend must not install an already-expired claim that
-    /// another worker could immediately reclaim.
+    /// lease that has not expired, and a candidate lease still at least the
+    /// send margin in the future — a delayed resend must not install a claim
+    /// that expires before or immediately after S3 commits it.
     #[must_use]
     fn still_eligible(&self, work: &WorkRef, now: u64) -> bool {
         let candidate_current = match self.claim.state() {
-            ClaimState::Active { lease_until } => now < *lease_until,
+            ClaimState::Active { lease_until } => {
+                now.saturating_add(CLAIM_SEND_MARGIN_MS) < *lease_until
+            }
             ClaimState::Sealed { .. } => true,
         };
         self.claim.work_id() == work.id()
@@ -273,6 +275,11 @@ impl ClaimMutation {
 #[allow(dead_code)]
 pub(crate) enum ClaimMutationOutcome {
     Applied(ClaimAuthority),
+    /// The write committed but no usable ETag was recovered, so the claim is
+    /// durable while this caller holds no authority. Re-observe before any
+    /// further mutation; the frozen mutation must not be resent because its
+    /// pre-write ETag no longer matches the object it just replaced.
+    AppliedUnverified,
     /// The facts that made the mutation eligible no longer hold, so it must be
     /// prepared again from a fresh observation rather than resent.
     Ineligible,
@@ -653,9 +660,26 @@ pub(crate) async fn apply_mutation(
                 etag,
             })
         }
-        MutationOutcome::Committed { etag: None }
-        | MutationOutcome::AmbiguousConflict
-        | MutationOutcome::Unknown => resolve_mutation(store, mutation).await,
+        // A committed write without an ETag is durable; only the fresh token is
+        // missing. The pre-write ETag can no longer match, so a failed reread
+        // must not hand the mutation back for an identical retry that would
+        // misread its own commit as Lost.
+        MutationOutcome::Committed { etag: None } => {
+            match read_candidate(store, &mutation.key, &mutation.canonical_bytes).await {
+                CandidateRead::Matching(etag) => ClaimMutationOutcome::Applied(ClaimAuthority {
+                    claim: mutation.claim,
+                    key: mutation.key,
+                    etag,
+                }),
+                CandidateRead::Different(_) => ClaimMutationOutcome::Lost,
+                CandidateRead::Missing | CandidateRead::Failed => {
+                    ClaimMutationOutcome::AppliedUnverified
+                }
+            }
+        }
+        MutationOutcome::AmbiguousConflict | MutationOutcome::Unknown => {
+            resolve_mutation(store, mutation).await
+        }
         MutationOutcome::PreconditionFailed => ClaimMutationOutcome::Lost,
         MutationOutcome::Conflict => ClaimMutationOutcome::RetryIdentically(mutation),
         MutationOutcome::ProvenNotSent => ClaimMutationOutcome::RetryIdentically(mutation),
@@ -1980,6 +2004,46 @@ mod tests {
             ClaimAcquireOutcome::Ineligible
         ));
         assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_tokenless_committed_mutation_never_retries_its_stale_etag() {
+        for reread_found in [true, false] {
+            let mutation = prepare_reclamation(
+                observed(claim(ClaimState::Active {
+                    lease_until: 1_000_000,
+                }))
+                .await,
+                &work("work-17", 4),
+                &ActorId::new("reclaimer".into()).unwrap(),
+                &InstanceId::new("instance-b".into()).unwrap(),
+                1_500_000,
+            )
+            .unwrap();
+            let expected_bytes = mutation.canonical_bytes.clone();
+            let reread = if reread_found {
+                response(200, &[("etag", NEW_ETAG)], expected_bytes)
+            } else {
+                response(500, &[], SdkBody::empty())
+            };
+            // A 200 PUT response without an ETag header is a committed write
+            // whose fresh token was not returned.
+            let (store, _) = replay_store(vec![response(200, &[], SdkBody::empty()), reread]);
+            let mut history = AttemptHistory::default();
+            let outcome = apply_mutation(
+                &store,
+                mutation,
+                &work("work-17", 4),
+                1_500_000,
+                &mut history,
+            )
+            .await;
+            if reread_found {
+                assert!(matches!(outcome, ClaimMutationOutcome::Applied(_)));
+            } else {
+                assert!(matches!(outcome, ClaimMutationOutcome::AppliedUnverified));
+            }
+        }
     }
 
     #[tokio::test]

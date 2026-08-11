@@ -35,7 +35,8 @@ The configuration is an input to the MVP, not a new product surface. It is versi
 
 ## E02 — Establish the S3 Durable Log and Minimal Rust Runtime
 
-Status: Complete — frozen v1 proof record
+Status: Open — frozen v1 code, pending the selected-bucket live preflight
+(`ravel-aq8.7`), which must close or be deferred on its own recorded evidence
 
 **Description**
 

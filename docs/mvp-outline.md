@@ -2704,7 +2704,10 @@ Implement:
 * Exact fixed model configuration identifier and digest, not a profile registry.
 * Structured outputs as immutable observations.
 * `RunManifest` and `RunTrace`.
-* Admitted `WorkSpec`, live claim, and matching `EffectGrant` checks before contact.
+* A pre-contact authority seam checked against fixture-seeded `WorkSpec`, claim,
+  and grant records; the admitted-`WorkSpec`/live-claim/`EffectGrant` enforcement
+  itself lands with shared admission in M6, which wires real records through this
+  seam without weakening the no-effect-without-grant invariant.
 * Cancellation, provider request IDs, stable operation identity, reported usage, cost
   reconciliation, and explicit unknown outcomes.
 

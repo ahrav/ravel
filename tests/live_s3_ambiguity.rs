@@ -461,12 +461,20 @@ async fn prepare_transition(
             Condition::Create,
         ),
     };
+    // Transition construction rejects scheduling events at illegal positions,
+    // so the genesis tail is CampaignCreated and every later tail is
+    // WorkflowStarted, matching the projectable chain shape.
+    let content = if sequence == 1 {
+        EventContent::CampaignCreated
+    } else {
+        EventContent::WorkflowStarted
+    };
     let event = Event::new(
         format!("{identity}-event"),
         sequence,
         event_parent,
         sequence,
-        EventContent::WorkflowStarted,
+        content,
     )
     .map_err(|_| "prepare-event")?;
     let publication = event::publish(store, &event, None)

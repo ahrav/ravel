@@ -123,12 +123,15 @@ impl ReplayedProjection {
 }
 
 /// Ephemeral outcome of one refresh attempt.
-#[derive(Debug, Eq, PartialEq)]
 pub enum Readiness {
     /// Replay succeeded and the local cursor equals the observed head tail.
+    ///
+    /// Carries the full [`ObservedHead`] witness so a caller publishing the next
+    /// event keeps the ETag coupled to the head this readiness was verified
+    /// against, rather than rereading the head and losing that binding.
     Ready {
         local_cursor: (u64, String),
-        observed_head: Head,
+        observed_head: Box<ObservedHead>,
     },
     /// Replay or the final cursor comparison failed.
     NotReady(NotReadyReason),
@@ -137,13 +140,13 @@ pub enum Readiness {
 /// Data-free reason one refresh attempt did not establish readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NotReadyReason {
-    /// Replay failed before its final cursor comparison.
+    /// Replay failed before its cursor comparison.
     Replay(ReplayError),
     /// The post-replay cursor remains behind the observed head.
     Behind,
-    /// The post-replay cursor is ahead of the observed head.
+    /// The local cursor is ahead of the observed head, before or after replay.
     Ahead,
-    /// The post-replay cursor digest differs from the observed head tail.
+    /// The local cursor digest differs from the observed head tail, before or after replay.
     TailMismatch,
 }
 
@@ -155,22 +158,33 @@ struct ReplaySuccess {
 /// Replays one fresh head observation and reports ephemeral readiness.
 pub async fn refresh(store: &S3Store, handle: &DbHandle) -> Readiness {
     match replay_with_limits(store, handle, LIMITS).await {
-        Ok(success) => compare_cursor(success.observed_head.head(), success.local_cursor),
+        Ok(success) => match compare_cursor(success.observed_head.head(), success.local_cursor) {
+            Ok(local_cursor) => Readiness::Ready {
+                local_cursor,
+                observed_head: Box::new(success.observed_head),
+            },
+            Err(reason) => Readiness::NotReady(reason),
+        },
+        // Prepare reports these cursor mismatches before the final comparison runs;
+        // surface them as the dedicated readiness reasons rather than nested replay
+        // errors so callers can tell a cursor mismatch from replay/storage failure.
+        Err(ReplayError::CursorAhead) => Readiness::NotReady(NotReadyReason::Ahead),
+        Err(ReplayError::TailMismatch) => Readiness::NotReady(NotReadyReason::TailMismatch),
         Err(error) => Readiness::NotReady(NotReadyReason::Replay(error)),
     }
 }
 
-fn compare_cursor(observed_head: &Head, local_cursor: (u64, Option<String>)) -> Readiness {
+fn compare_cursor(
+    observed_head: &Head,
+    local_cursor: (u64, Option<String>),
+) -> Result<(u64, String), NotReadyReason> {
     let tail = observed_head.tail().clone();
     match local_cursor.0.cmp(&tail.sequence()) {
-        std::cmp::Ordering::Less => Readiness::NotReady(NotReadyReason::Behind),
-        std::cmp::Ordering::Greater => Readiness::NotReady(NotReadyReason::Ahead),
+        std::cmp::Ordering::Less => Err(NotReadyReason::Behind),
+        std::cmp::Ordering::Greater => Err(NotReadyReason::Ahead),
         std::cmp::Ordering::Equal => match local_cursor.1 {
-            Some(digest) if digest == tail.digest() => Readiness::Ready {
-                local_cursor: (tail.sequence(), digest),
-                observed_head: observed_head.clone(),
-            },
-            _ => Readiness::NotReady(NotReadyReason::TailMismatch),
+            Some(digest) if digest == tail.digest() => Ok((tail.sequence(), digest)),
+            _ => Err(NotReadyReason::TailMismatch),
         },
     }
 }
@@ -1192,25 +1206,43 @@ mod tests {
         clean(&path);
     }
 
+    fn not_ready_reason(readiness: Readiness) -> NotReadyReason {
+        match readiness {
+            Readiness::NotReady(reason) => reason,
+            Readiness::Ready { .. } => panic!("expected not ready"),
+        }
+    }
+
+    fn assert_ready(readiness: Readiness, cursor: (u64, &str), expected_head: &Head) {
+        match readiness {
+            Readiness::Ready {
+                local_cursor,
+                observed_head,
+            } => {
+                assert_eq!(local_cursor, (cursor.0, cursor.1.to_owned()));
+                assert_eq!(observed_head.head(), expected_head);
+            }
+            Readiness::NotReady(reason) => panic!("expected ready, got {reason:?}"),
+        }
+    }
+
     #[test]
     fn cursor_comparison_outcomes_are_typed() {
         let observed_head = head_value(child_ref());
         for (local_cursor, expected) in [
-            (
-                (1, Some(GENESIS_DIGEST.to_owned())),
-                Readiness::NotReady(NotReadyReason::Behind),
-            ),
-            (
-                (3, Some("3".repeat(64))),
-                Readiness::NotReady(NotReadyReason::Ahead),
-            ),
+            ((1, Some(GENESIS_DIGEST.to_owned())), NotReadyReason::Behind),
+            ((3, Some("3".repeat(64))), NotReadyReason::Ahead),
             (
                 (2, Some(GENESIS_DIGEST.to_owned())),
-                Readiness::NotReady(NotReadyReason::TailMismatch),
+                NotReadyReason::TailMismatch,
             ),
         ] {
-            assert_eq!(compare_cursor(&observed_head, local_cursor), expected);
+            assert_eq!(compare_cursor(&observed_head, local_cursor), Err(expected));
         }
+        assert_eq!(
+            compare_cursor(&observed_head, (2, Some(CHILD_DIGEST.to_owned()))),
+            Ok((2, CHILD_DIGEST.to_owned()))
+        );
     }
 
     #[tokio::test]
@@ -1224,18 +1256,16 @@ mod tests {
             event_response(CHILD_BYTES),
             event_response(GENESIS_BYTES),
         ]);
-        assert_eq!(
+        assert_ready(
             refresh(&store, &handle).await,
-            Readiness::Ready {
-                local_cursor: (2, CHILD_DIGEST.into()),
-                observed_head: expected_head,
-            }
+            (2, CHILD_DIGEST),
+            &expected_head,
         );
 
         let (store, _) = replay_store(vec![response(404, &[], SdkBody::empty())]);
         assert_eq!(
-            refresh(&store, &handle).await,
-            Readiness::NotReady(NotReadyReason::Replay(ReplayError::CampaignMissing))
+            not_ready_reason(refresh(&store, &handle).await),
+            NotReadyReason::Replay(ReplayError::CampaignMissing)
         );
 
         drop(handle);
@@ -1257,8 +1287,8 @@ mod tests {
             response(404, &[], SdkBody::empty()),
         ]);
         assert_eq!(
-            refresh(&store, &handle).await,
-            Readiness::NotReady(NotReadyReason::Replay(ReplayError::EventMissing))
+            not_ready_reason(refresh(&store, &handle).await),
+            NotReadyReason::Replay(ReplayError::EventMissing)
         );
 
         let expected_head = head_value(child_ref());
@@ -1266,12 +1296,34 @@ mod tests {
             head_response(child_ref()),
             event_response(CHILD_BYTES),
         ]);
-        assert_eq!(
+        assert_ready(
             refresh(&store, &handle).await,
-            Readiness::Ready {
-                local_cursor: (2, CHILD_DIGEST.into()),
-                observed_head: expected_head,
-            }
+            (2, CHILD_DIGEST),
+            &expected_head,
+        );
+
+        drop(handle);
+        clean(&path);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_ahead_of_the_head_reads_as_ahead_not_a_replay_error() {
+        let path = path("ahead-cursor");
+        clean(&path);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        handle
+            .apply(fixture_mutation(GENESIS_BYTES, genesis_ref()))
+            .await
+            .unwrap();
+        handle
+            .apply(fixture_mutation(CHILD_BYTES, child_ref()))
+            .await
+            .unwrap();
+
+        let (store, _) = replay_store(vec![head_response(genesis_ref())]);
+        assert_eq!(
+            not_ready_reason(refresh(&store, &handle).await),
+            NotReadyReason::Ahead
         );
 
         drop(handle);
@@ -1311,8 +1363,8 @@ mod tests {
             let handle = DbHandle::spawn(path.clone()).await.unwrap();
             let (store, _) = replay_store(vec![head, event]);
             assert_eq!(
-                refresh(&store, &handle).await,
-                Readiness::NotReady(NotReadyReason::Replay(ReplayError::EventInvalid(expected)))
+                not_ready_reason(refresh(&store, &handle).await),
+                NotReadyReason::Replay(ReplayError::EventInvalid(expected))
             );
             drop(handle);
             clean(&path);

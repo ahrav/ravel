@@ -644,14 +644,23 @@ pub(crate) async fn submit(
             error: SubmitError::InvalidInput,
         });
     }
-    match claim_key(workspace, campaign_id, authority.claim.work_id()) {
-        Ok(key) if key == authority.key => {}
-        _ => {
-            return Err(SubmitFailure {
-                authority,
-                error: SubmitError::InvalidInput,
-            });
-        }
+    // The full scope must match before any I/O: `authorizes` binds the caller's
+    // work id and revision to this authority's key, so a mismatched ClaimScope
+    // is rejected here instead of publishing a submission that apply_mutation
+    // would later refuse as ineligible.
+    if !authority.authorizes(work, workspace, campaign_id) {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::InvalidInput,
+        });
+    }
+    // The artifact was proven durable only in the namespace that minted it; a
+    // claim in this store must not seal a result that store never verified.
+    if published.namespace() != store.namespace() {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::InvalidInput,
+        });
     }
     let result_ref = published.artifact_ref().clone();
     let submission = match Submission::new(
@@ -2368,6 +2377,7 @@ mod tests {
             response(200, &[], SdkBody::empty()),
             response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
         ]);
+        let published = published.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
         let applied = match submit_outcome(
             submit(
@@ -2476,10 +2486,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_foreign_namespace_artifact_is_rejected_before_io() {
+        // published_result() minted its witness against a different store, so
+        // its namespace cannot match the submit store's.
+        let published = published_result().await;
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(Vec::new());
+        let mut history = AttemptHistory::default();
+        let failure = match submit(
+            &store,
+            authority,
+            ClaimScope {
+                work: &work("work-17", 4),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
+            &published,
+            200_000,
+            &mut history,
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("a foreign-namespace artifact must not seal a claim"),
+        };
+        assert_eq!(failure.error(), SubmitError::InvalidInput);
+        let _ = failure.into_authority();
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_work_revision_is_rejected_before_io() {
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(Vec::new());
+        let published = published_result().await.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        let failure = match submit(
+            &store,
+            authority,
+            ClaimScope {
+                work: &work("work-17", 5),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
+            &published,
+            200_000,
+            &mut history,
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("a mismatched work revision must fail before any I/O"),
+        };
+        assert_eq!(failure.error(), SubmitError::InvalidInput);
+        let _ = failure.into_authority();
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
     async fn publication_failure_returns_usable_authority() {
         let published = published_result().await;
         let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
         let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        let published = published.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
         let failure = match submit(
             &store,
@@ -2524,6 +2593,7 @@ mod tests {
             response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
         ]);
+        let published = published.attributed_to(store.namespace());
         let mut seal_history = AttemptHistory::default();
         let mut reclaim_history = AttemptHistory::default();
         let outcomes = [
@@ -2585,6 +2655,7 @@ mod tests {
             response(200, &[], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
         ]);
+        let published = published.attributed_to(store.namespace());
         let mut reclaim_history = AttemptHistory::default();
         assert!(matches!(
             apply_mutation(
@@ -2680,6 +2751,7 @@ mod tests {
             response(200, &[("etag", TEST_ETAG)], expected_submission),
             response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
         ]);
+        let published = published.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
         let outcome = submit_outcome(
             submit(
@@ -2710,6 +2782,7 @@ mod tests {
             response(412, &[], SdkBody::empty()),
             response(200, &[("etag", NEW_ETAG)], encode(&expected).unwrap()),
         ]);
+        let published = published.attributed_to(store.namespace());
         let mut history = AttemptHistory::default();
         // One history covers one object, so the taint comes from the claim's own key.
         let claim_key = claim_key(
@@ -2764,6 +2837,7 @@ mod tests {
                 response(500, &[], SdkBody::empty()),
                 reread,
             ]);
+            let published = published.attributed_to(store.namespace());
             let mut history = AttemptHistory::default();
             let outcome = submit_outcome(
                 submit(

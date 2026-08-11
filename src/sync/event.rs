@@ -218,7 +218,7 @@ pub(crate) const GENESIS_CAMPAIGN_ID: &str = "0000000000000001";
 /// `0000000000000001`; one database projects one chain, which keeps that constant
 /// collision-free. The identity is the event's own 16-digit sequence, matching the padding
 /// the event key already uses, because v1 event payloads carry no identities of their own.
-fn projected_id(sequence: u64) -> String {
+pub(crate) fn projected_id(sequence: u64) -> String {
     format!("{sequence:016}")
 }
 

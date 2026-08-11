@@ -7,7 +7,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::sync::event::{GENESIS_CAMPAIGN_ID, SchedulingEffect, SchedulingMutation};
+use crate::sync::event::{GENESIS_CAMPAIGN_ID, SchedulingEffect, SchedulingMutation, projected_id};
 
 /// Distinguishes a committed mutation from an exact historical replay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,8 +54,8 @@ impl From<rusqlite::Error> for ApplyError {
 /// Returns [`ApplyError::Conflict`] when the mutation disagrees with local history, the cursor,
 /// or projection state: a sequence gap, a parent that does not name the cursor tail, a parent
 /// carried at the genesis cursor, a digest recorded at another sequence, recorded history that
-/// does not cover every sequence through the cursor, or a
-/// [`SchedulingEffect::WorkflowStarted`] effect while the projected campaign row is absent.
+/// does not cover every sequence through the cursor, or projected rows that do not match the
+/// identities the sequences through the cursor imply.
 /// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite cannot complete an operation
 /// or a sequence cannot be converted between its domain and stored representations.
 pub fn apply(
@@ -112,6 +112,36 @@ pub fn apply(
         return Err(ApplyError::Conflict);
     }
 
+    // Sequence 1 projects one campaign row, and every sequence above 1 projects one workflow
+    // row named by its own sequence, so the cursor implies the exact projected identities.
+    let (
+            campaign_rows,
+            genesis_campaign_exists,
+            workflow_rows,
+            lowest_workflow,
+            highest_workflow,
+        ): (i64, bool, i64, String, String) = transaction.query_row(
+            "SELECT (SELECT COUNT(*) FROM campaigns), \
+             (SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1)), \
+             (SELECT COUNT(*) FROM workflows), \
+             (SELECT COALESCE(MIN(workflow_id), '') FROM workflows), \
+             (SELECT COALESCE(MAX(workflow_id), '') FROM workflows)",
+            [GENESIS_CAMPAIGN_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+    let projected_campaigns = i64::from(cursor_sequence >= 1);
+    let projected_workflows = stored_cursor_sequence.max(1) - 1;
+    let workflows_match = workflow_rows == projected_workflows
+        && (projected_workflows == 0
+            || (lowest_workflow == projected_id(2)
+                && highest_workflow == projected_id(cursor_sequence)));
+    if campaign_rows != projected_campaigns
+        || genesis_campaign_exists != (projected_campaigns == 1)
+        || !workflows_match
+    {
+        return Err(ApplyError::Conflict);
+    }
+
     let parent_matches = match (cursor_sequence, cursor_digest.as_deref(), mutation.parent()) {
         (0, None, None) => true,
         (cursor_sequence, Some(cursor_digest), Some(parent)) => {
@@ -140,14 +170,6 @@ pub fn apply(
             )?;
         }
         SchedulingEffect::WorkflowStarted { workflow_id } => {
-            let campaign_exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1)",
-                [GENESIS_CAMPAIGN_ID],
-                |row| row.get(0),
-            )?;
-            if !campaign_exists {
-                return Err(ApplyError::Conflict);
-            }
             transaction.execute(
                 "INSERT INTO workflows (workflow_id) VALUES (?1)",
                 [workflow_id],
@@ -545,6 +567,41 @@ mod tests {
 
         assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
         assert_eq!(snapshot(&connection), before);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_next_event_when_a_projected_workflow_row_is_missing() {
+        let path = test_path("missing-workflow-row");
+        let mut connection = schema::create(&path).unwrap();
+        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
+        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
+        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
+        assert_eq!(apply(&mut connection, &workflow), Ok(ApplyOutcome::Applied));
+        connection
+            .execute(
+                "DELETE FROM workflows WHERE workflow_id = '0000000000000002'",
+                [],
+            )
+            .unwrap();
+        let next = mutation(3, DIGEST_3, Some(DIGEST_2), EventContent::WorkflowStarted);
+        let before = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), before);
+
+        connection
+            .execute(
+                "INSERT INTO workflows (workflow_id) VALUES ('0000000000000009')",
+                [],
+            )
+            .unwrap();
+        let with_stray_row = snapshot(&connection);
+
+        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
+        assert_eq!(snapshot(&connection), with_stray_row);
 
         drop(connection);
         fs::remove_file(path).unwrap();

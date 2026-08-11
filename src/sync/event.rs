@@ -187,7 +187,7 @@ fn projected_mutation(
     // silently project nothing.
     let effect = match (event.content(), event.sequence()) {
         (EventContent::CampaignCreated, 1) => SchedulingEffect::CampaignCreated {
-            campaign_id: projected_id(1),
+            campaign_id: GENESIS_CAMPAIGN_ID.to_owned(),
         },
         (EventContent::WorkflowStarted, sequence) if sequence > 1 => {
             SchedulingEffect::WorkflowStarted {
@@ -208,6 +208,9 @@ fn projected_mutation(
         effect,
     })
 }
+
+/// The one campaign identity a chain projects, since genesis is always sequence 1.
+pub(crate) const GENESIS_CAMPAIGN_ID: &str = "0000000000000001";
 
 /// Derives an identity unique within the single chain tracked by the singleton sync cursor.
 ///

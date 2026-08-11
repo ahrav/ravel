@@ -164,11 +164,30 @@ pub fn scheduling_mutation(
     {
         return Err(ConversionError::ReferenceMismatch);
     }
+    projected_mutation(reference, event)
+}
+
+/// Pairs `reference` with `event`'s row effect without re-deriving the reference.
+///
+/// Apply-layer tests need mutations whose digests collide across sequences or
+/// diverge at one sequence, which [`scheduling_mutation`] rejects by design.
+#[cfg(test)]
+pub(crate) fn scheduling_mutation_unchecked(
+    reference: EventRef,
+    event: &Event,
+) -> Result<SchedulingMutation, ConversionError> {
+    projected_mutation(reference, event)
+}
+
+fn projected_mutation(
+    reference: EventRef,
+    event: &Event,
+) -> Result<SchedulingMutation, ConversionError> {
     // No wildcard arm: a new EventContent variant must fail compilation here rather than
     // silently project nothing.
     let effect = match (event.content(), event.sequence()) {
         (EventContent::CampaignCreated, 1) => SchedulingEffect::CampaignCreated {
-            campaign_id: projected_id(1),
+            campaign_id: GENESIS_CAMPAIGN_ID.to_owned(),
         },
         (EventContent::WorkflowStarted, sequence) if sequence > 1 => {
             SchedulingEffect::WorkflowStarted {
@@ -189,6 +208,9 @@ pub fn scheduling_mutation(
         effect,
     })
 }
+
+/// The one campaign identity a chain projects, since genesis is always sequence 1.
+pub(crate) const GENESIS_CAMPAIGN_ID: &str = "0000000000000001";
 
 /// Derives an identity unique within the single chain tracked by the singleton sync cursor.
 ///

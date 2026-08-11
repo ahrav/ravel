@@ -51,6 +51,8 @@ pub struct ObservedHead {
     head: Head,
     bytes: Vec<u8>,
     etag: ETag,
+    /// Namespace this head was read from.
+    namespace: String,
 }
 
 impl ObservedHead {
@@ -86,7 +88,7 @@ pub enum HeadParent {
     /// No head existed at the observation boundary.
     Genesis,
     /// Validated head and ETag observed together.
-    Existing(ObservedHead),
+    Existing(Box<ObservedHead>),
 }
 
 /// Stable candidate bytes, event bytes, and original CAS boundary for one mutation.
@@ -118,6 +120,10 @@ impl HeadTransition {
             || tail.sequence() != candidate.tail().sequence()
             || encoded.key() != published.key()
             || encoded.digest() != published.digest()
+            // Reconciliation walks retained events and searches the operation id, so a
+            // head recording a different id than its tail is the same append tracked
+            // under two identities.
+            || candidate.operation_id() != tail.operation_id()
         {
             return Err(WireError::InvalidValue);
         }
@@ -185,6 +191,17 @@ impl HeadTransition {
     /// than owning both response queues.
     #[cfg(test)]
     pub(crate) fn attributed_to(mut self, namespace: &str) -> Self {
+        self = self.with_tail_attributed_to(namespace);
+        if let HeadParent::Existing(observed) = &mut self.parent {
+            observed.namespace = namespace.to_owned();
+        }
+        self
+    }
+
+    /// Re-labels only the tail's namespace, leaving the observed parent naming the
+    /// store it was read from.
+    #[cfg(test)]
+    pub(crate) fn with_tail_attributed_to(mut self, namespace: &str) -> Self {
         self.event_namespace = namespace.to_owned();
         self
     }
@@ -278,7 +295,12 @@ pub async fn read(store: &S3Store) -> Result<Option<ObservedHead>, HeadReadError
         GetOutcome::NotFound => Ok(None),
         GetOutcome::Found { bytes, etag } => {
             let head = decode(&bytes).map_err(HeadReadError::Invalid)?;
-            Ok(Some(ObservedHead { head, bytes, etag }))
+            Ok(Some(ObservedHead {
+                head,
+                bytes,
+                etag,
+                namespace: store.namespace().to_owned(),
+            }))
         }
     }
 }
@@ -296,6 +318,14 @@ pub async fn commit(
     // in the store this head is committed through. Committing across namespaces
     // would publish a head whose event object cannot be read back.
     if transition.event_namespace != store.namespace() {
+        return HeadCommitOutcome::Unresolved(transition);
+    }
+    // The observed parent's ETag becomes this store's `If-Match` token, so an
+    // observation from elsewhere could compare-and-swap a head that was never read
+    // in this namespace if the two happen to share an opaque token.
+    if let HeadParent::Existing(observed) = &transition.parent
+        && observed.namespace != store.namespace()
+    {
         return HeadCommitOutcome::Unresolved(transition);
     }
     let outcome = match &transition.parent {
@@ -365,7 +395,7 @@ async fn resolve(store: &S3Store, mut transition: HeadTransition) -> HeadCommitO
         HeadParent::Existing(parent) => parent.bytes == current.bytes,
     };
     if parent_is_current {
-        transition.parent = HeadParent::Existing(current);
+        transition.parent = HeadParent::Existing(Box::new(current));
         return HeadCommitOutcome::RetryIdentically(transition);
     }
 
@@ -565,8 +595,12 @@ mod tests {
     }
 
     fn genesis_event() -> Event {
+        genesis_event_named("event-op-1")
+    }
+
+    fn genesis_event_named(operation_id: &str) -> Event {
         Event::new(
-            "event-op-1".into(),
+            operation_id.into(),
             1,
             None,
             7,
@@ -592,7 +626,7 @@ mod tests {
     }
 
     async fn genesis_transition(authority: Authority, operation_id: &str) -> HeadTransition {
-        let tail = genesis_event();
+        let tail = genesis_event_named(operation_id);
         let publication = publish_event(&tail).await;
         let candidate = Head::new(
             authority,
@@ -635,7 +669,7 @@ mod tests {
     ) -> HeadTransition {
         let parent_ref = parent.head().tail().clone();
         let tail = Event::new(
-            "event-op-2".into(),
+            operation_id.into(),
             parent_ref.sequence() + 1,
             Some(parent_ref),
             8,
@@ -649,8 +683,13 @@ mod tests {
             operation_id.into(),
         )
         .expect("valid candidate head");
-        HeadTransition::new(HeadParent::Existing(parent), candidate, &tail, &publication)
-            .expect("valid successor transition")
+        HeadTransition::new(
+            HeadParent::Existing(Box::new(parent)),
+            candidate,
+            &tail,
+            &publication,
+        )
+        .expect("valid successor transition")
     }
 
     fn request_path(
@@ -870,6 +909,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_head_cannot_record_another_identity_than_its_tail() {
+        let tail = genesis_event();
+        let publication = publish_event(&tail).await;
+        let divergent = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "some-other-operation".into(),
+        )
+        .expect("valid head");
+        assert_ne!(divergent.operation_id(), tail.operation_id());
+
+        // Reconciliation searches retained events by operation id, so the two
+        // identities must not diverge even on the low-level constructor path.
+        rejects_transition(HeadParent::Genesis, divergent, &tail, &publication);
+    }
+
+    #[tokio::test]
     async fn a_tail_published_elsewhere_never_becomes_authoritative() {
         let tail = genesis_event();
         // The tail is published into the default test bucket...
@@ -881,7 +937,7 @@ mod tests {
         let candidate = Head::new(
             Authority::unowned(),
             publication.event_ref().clone(),
-            "head-op-1".into(),
+            tail.operation_id().to_owned(),
         )
         .expect("valid head");
         let transition = HeadTransition::new(HeadParent::Genesis, candidate, &tail, &publication)
@@ -896,6 +952,31 @@ mod tests {
             test_builder(NeverClient::new()),
         );
         assert_ne!(foreign_store.namespace(), publishing_store.namespace());
+        let mut history = AttemptHistory::default();
+
+        assert!(matches!(
+            commit(&foreign_store, transition, &mut history).await,
+            HeadCommitOutcome::Unresolved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_parent_observed_elsewhere_never_authorizes_a_replacement() {
+        let parent = parent_head(Authority::unowned(), "parent-op");
+        // The parent is observed in one store...
+        let observed = read_observed(&parent, OLD_ETAG).await;
+        let transition = successor_transition(observed, Authority::unowned(), "head-op-2").await;
+
+        // ...so its ETag must not become another store's If-Match token. A
+        // NeverClient would hang if the refusal did not precede dispatch.
+        let foreign_store = S3Store::new(
+            "other-bucket",
+            Region::new("us-east-1"),
+            test_builder(NeverClient::new()),
+        );
+        // Only the tail is restated, so the observed parent still names the store it
+        // was read from and the replacement is refused on that ground.
+        let transition = transition.with_tail_attributed_to(foreign_store.namespace());
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
@@ -1032,7 +1113,7 @@ mod tests {
         )
         .expect("valid head");
         rejects_transition(
-            HeadParent::Existing(observed),
+            HeadParent::Existing(Box::new(observed)),
             candidate,
             &sequence_three,
             &publication,
@@ -1058,7 +1139,7 @@ mod tests {
         )
         .expect("valid head");
         rejects_transition(
-            HeadParent::Existing(observed),
+            HeadParent::Existing(Box::new(observed)),
             candidate,
             &tail,
             &publication,
@@ -1085,7 +1166,12 @@ mod tests {
             "head-op-2".into(),
         )
         .expect("valid head");
-        rejects_transition(HeadParent::Existing(observed), lower, &tail, &publication);
+        rejects_transition(
+            HeadParent::Existing(Box::new(observed)),
+            lower,
+            &tail,
+            &publication,
+        );
 
         // A tail published at an older writer fence cannot be adopted by a
         // higher-fence owned head.
@@ -1106,7 +1192,7 @@ mod tests {
         )
         .expect("valid head");
         rejects_transition(
-            HeadParent::Existing(observed),
+            HeadParent::Existing(Box::new(observed)),
             higher,
             &stale_tail,
             &stale_publication,
@@ -1120,7 +1206,7 @@ mod tests {
         )
         .expect("valid head");
         rejects_transition(
-            HeadParent::Existing(observed),
+            HeadParent::Existing(Box::new(observed)),
             unfenced,
             &tail,
             &publication,
@@ -1134,7 +1220,7 @@ mod tests {
         )
         .expect("valid head");
         rejects_transition(
-            HeadParent::Existing(observed),
+            HeadParent::Existing(Box::new(observed)),
             reused_operation,
             &tail,
             &publication,
@@ -1144,11 +1230,17 @@ mod tests {
         let equal = Head::new(
             Authority::owned("owner".into(), "instance".into(), 2, 2).expect("valid authority"),
             publication.event_ref().clone(),
-            "head-op-2".into(),
+            tail.operation_id().to_owned(),
         )
         .expect("valid head");
         assert!(
-            HeadTransition::new(HeadParent::Existing(observed), equal, &tail, &publication).is_ok()
+            HeadTransition::new(
+                HeadParent::Existing(Box::new(observed)),
+                equal,
+                &tail,
+                &publication
+            )
+            .is_ok()
         );
     }
 

@@ -636,11 +636,6 @@ fn prepare_replacement(
     })
 }
 
-/// Publishes immutable evidence before consuming authority in one terminal CAS.
-///
-/// Sealing deliberately has no lease-time check: renewal needs a clock to
-/// calculate an extension, while completion versus reclamation is decided by
-/// the authority-bound key and ETag.
 /// The work generation and claim namespace one submission is scoped to.
 #[allow(dead_code)]
 pub(crate) struct ClaimScope<'a> {
@@ -649,6 +644,11 @@ pub(crate) struct ClaimScope<'a> {
     pub(crate) campaign_id: &'a str,
 }
 
+/// Publishes immutable evidence before consuming authority in one terminal CAS.
+///
+/// Sealing deliberately has no lease-time check: renewal needs a clock to
+/// calculate an extension, while completion versus reclamation is decided by
+/// the authority-bound key and ETag.
 #[allow(dead_code)]
 pub(crate) async fn submit(
     store: &S3Store,

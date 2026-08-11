@@ -55,11 +55,15 @@ impl DbHandle {
     ///
     /// Forwards [`SchemaError`] from schema creation, returns
     /// [`SchemaError::DatabaseOperationFailed`] when the journal mode cannot be configured or
-    /// verified, and returns the same variant when the worker exits before reporting startup.
+    /// verified, when the OS refuses to spawn the worker thread, and when the worker exits
+    /// before reporting startup.
     pub async fn spawn(path: PathBuf) -> Result<Self, SchemaError> {
         let (commands, receiver) = mpsc::channel();
         let (startup_send, startup_receive) = oneshot::channel();
-        let _worker = thread::spawn(move || run(path, receiver, startup_send));
+        let _worker = thread::Builder::new()
+            .name("ravel-db-worker".into())
+            .spawn(move || run(path, receiver, startup_send))
+            .map_err(|_| SchemaError::DatabaseOperationFailed)?;
 
         match startup_receive.await {
             Ok(Ok(())) => Ok(Self { commands }),

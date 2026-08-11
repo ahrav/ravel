@@ -109,6 +109,12 @@ pub fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, SchemaErro
 /// Creates the schema, versions, and genesis cursor as one committed transaction.
 fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
     let mut connection = rusqlite::Connection::open(path)?;
+    // Configure rollback journaling before any schema write so the first commit
+    // never runs in a non-DELETE compile-time default mode (e.g. a WAL default),
+    // which could leave sidecar files behind on an early crash.
+    connection.pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
+        row.get::<_, String>(0)
+    })?;
     let transaction = connection.transaction()?;
     // Stamping RVL1 onto a database that already holds unrelated objects would
     // produce a mixed file that passes quick_check while not being this schema.

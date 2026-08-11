@@ -85,8 +85,9 @@ impl Error for SchemaError {}
 ///
 /// Creation requires a path that does not already hold this schema; this function neither
 /// validates nor rebuilds an existing projection. SQLite honors its reserved filenames,
-/// `:memory:` and `file:` URIs among them, rather than rejecting them. Journal mode, busy
-/// handling, and connection ownership stay with the caller.
+/// `:memory:` and `file:` URIs among them, rather than rejecting them. Creation sets
+/// `journal_mode=DELETE` on a database it accepts; busy handling and connection ownership stay
+/// with the caller.
 ///
 /// # Errors
 ///
@@ -109,6 +110,18 @@ pub fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, SchemaErro
 /// Creates the schema, versions, and genesis cursor as one committed transaction.
 fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
     let mut connection = rusqlite::Connection::open(path)?;
+    // Leaving WAL rewrites the database header and no rollback undoes it, so refuse a database
+    // that already holds objects before reconfiguring its journal mode. The in-transaction check
+    // below still closes the concurrent-writer window.
+    if connection.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+        row.get::<_, i64>(0)
+    })? != 0
+    {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is not empty".into()),
+        ));
+    }
     // Configure rollback journaling before any schema write so the first commit
     // never runs in a non-DELETE compile-time default mode (e.g. a WAL default),
     // which could leave sidecar files behind on an early crash.
@@ -309,6 +322,9 @@ mod tests {
         let path = test_path("non-empty");
         let foreign = rusqlite::Connection::open(&path).unwrap();
         foreign
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+            .unwrap();
+        foreign
             .execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", [])
             .unwrap();
         drop(foreign);
@@ -319,6 +335,14 @@ mod tests {
         );
 
         let inspect = rusqlite::Connection::open(&path).unwrap();
+        // Journal mode lives in the database header, so a refused create that reconfigured it
+        // would leave this unrelated database permanently converted out of WAL.
+        assert_eq!(
+            inspect
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
         assert_eq!(
             inspect
                 .pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))

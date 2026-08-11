@@ -811,12 +811,28 @@ async fn claim_worker_scenario(
     wait_for_release(params)?;
     let store = clean_store(config);
     let mut history = AttemptHistory::default();
-    let outcome = tokio::time::timeout(
+    let mut outcome = tokio::time::timeout(
         OPERATION_DEADLINE,
         claims::acquire(&store, attempt, params.creation_time_unix_ms, &mut history),
     )
     .await
     .map_err(|_| "worker-claim-timeout")?;
+    // Mirror the head worker: a fresh 409 with an absent reread is a valid S3
+    // race that asks for an identical retry, not a worker failure.
+    for _ in 1..3 {
+        outcome = match outcome {
+            ClaimAcquireOutcome::RetryIdentically(attempt) => tokio::time::timeout(
+                OPERATION_DEADLINE,
+                claims::acquire(&store, attempt, params.creation_time_unix_ms, &mut history),
+            )
+            .await
+            .map_err(|_| "worker-claim-timeout")?,
+            terminal => terminal,
+        };
+        if !matches!(outcome, ClaimAcquireOutcome::RetryIdentically(_)) {
+            break;
+        }
+    }
     let classification = match outcome {
         ClaimAcquireOutcome::Acquired(authority) => {
             // The granted authority must name the work revision and derived key

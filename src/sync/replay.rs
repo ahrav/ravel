@@ -1551,4 +1551,45 @@ mod tests {
         drop(connection);
         clean(&path);
     }
+
+    #[tokio::test]
+    async fn a_stray_ready_work_row_is_rebuilt_rather_than_reported_ready() {
+        let path = path("stray-ready-work");
+        clean(&path);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        handle
+            .apply(fixture_mutation(GENESIS_BYTES, genesis_ref()))
+            .await
+            .unwrap();
+        drop(handle);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000002', 'active');
+                 INSERT INTO work_items
+                     (work_id, workflow_id, state, budget_remaining, required_capabilities)
+                 VALUES ('work', '0000000000000002', 'ready', 1, '');",
+            )
+            .unwrap();
+        drop(connection);
+
+        // The head equals the cursor, so replay prepares and applies no mutation.
+        let (store, _) = replay_store(vec![
+            head_response(genesis_ref()),
+            event_response(GENESIS_BYTES),
+        ]);
+        let replayed = startup(&store, &path).await.unwrap();
+        assert_eq!(replayed.cursor(), (1, Some(GENESIS_DIGEST)));
+        let handle = replayed.into_handle();
+        assert!(
+            handle
+                .list_ready_work("0000000000000001".into(), Vec::new(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(handle);
+        clean(&path);
+    }
 }

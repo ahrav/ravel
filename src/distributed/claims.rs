@@ -36,6 +36,11 @@ use crate::{
 
 const MAX_CLAIM_BYTES: usize = 4 * 1024;
 const CLAIM_LEASE_MS: u64 = 15 * 60 * 1000;
+/// Minimum lease left before a send: a create that S3 commits after the
+/// embedded expiry grants authority over an immediately reclaimable record.
+// ponytail: fixed margin, not a bound on S3 commit delay; shrink the race
+// window rather than eliminate it. Reprepare-on-retry would remove it fully.
+const CLAIM_SEND_MARGIN_MS: u64 = 30 * 1000;
 #[allow(dead_code)]
 const CLAIM_RENEWAL_CADENCE_MS: u64 = 5 * 60 * 1000;
 
@@ -161,6 +166,10 @@ pub struct ClaimAuthority {
     // Held for the lease renewal/seal CAS path that consumes this authority.
     #[allow(dead_code)]
     etag: ETag,
+    /// Namespace of the store that minted this authority. The ETag is an
+    /// opaque per-store token, so authority proves nothing about a key in any
+    /// other store even when the tokens happen to collide.
+    namespace: String,
 }
 
 impl ClaimAuthority {
@@ -212,6 +221,8 @@ pub(crate) struct ObservedClaim {
     claim: Claim,
     key: String,
     etag: ETag,
+    /// Namespace of the store this claim was read from.
+    namespace: String,
 }
 
 impl ObservedClaim {
@@ -247,6 +258,8 @@ pub(crate) struct ClaimMutation {
     key: String,
     canonical_bytes: Vec<u8>,
     etag: ETag,
+    /// Namespace of the store whose read minted `etag`.
+    namespace: String,
     /// Expiry of the claim this mutation renews, when it renews one.
     observed_expiry: Option<u64>,
     /// Verified `work.revision()` that made this mutation eligible.
@@ -423,7 +436,12 @@ pub(crate) async fn observe(
         GetOutcome::NotFound => Ok(None),
         GetOutcome::Found { bytes, etag } => {
             let claim = decode(&bytes).map_err(ClaimReadError::Invalid)?;
-            Ok(Some(ObservedClaim { claim, key, etag }))
+            Ok(Some(ObservedClaim {
+                claim,
+                key,
+                etag,
+                namespace: store.namespace().to_owned(),
+            }))
         }
     }
 }
@@ -508,11 +526,17 @@ pub(crate) fn prepare_renewal(
             error: ClaimPrepareError::Encoding,
         }));
     };
-    let ClaimAuthority { key, etag, .. } = authority;
+    let ClaimAuthority {
+        key,
+        etag,
+        namespace,
+        ..
+    } = authority;
     Ok(ClaimMutation {
         claim: renewed,
         key,
         canonical_bytes,
+        namespace,
         etag,
         observed_expiry: Some(lease_until),
         prepared_revision: work.revision(),
@@ -605,6 +629,7 @@ fn prepare_replacement(
         key: observed.key,
         canonical_bytes,
         etag: observed.etag,
+        namespace: observed.namespace,
         // Replacement eligibility is an expired lease or an older sealed revision,
         // neither of which a later clock reading can invalidate; the candidate
         // lease check in `still_eligible` bounds how long the frozen mutation
@@ -660,6 +685,15 @@ pub(crate) async fn submit(
     // The artifact was proven durable only in the namespace that minted it; a
     // claim in this store must not seal a result that store never verified.
     if published.namespace() != store.namespace() {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::InvalidInput,
+        });
+    }
+    // The authority's ETag is likewise an opaque token from the store that
+    // minted it; sending it as If-Match in another store could seal a claim
+    // this store never issued authority for.
+    if authority.namespace != store.namespace() {
         return Err(SubmitFailure {
             authority,
             error: SubmitError::InvalidInput,
@@ -740,7 +774,12 @@ pub(crate) async fn submit(
         });
     }
     let prepared_revision = authority.claim.work_revision();
-    let ClaimAuthority { key, etag, .. } = authority;
+    let ClaimAuthority {
+        key,
+        etag,
+        namespace,
+        ..
+    } = authority;
     Ok(apply_mutation(
         store,
         ClaimMutation {
@@ -748,6 +787,7 @@ pub(crate) async fn submit(
             key,
             canonical_bytes,
             etag,
+            namespace,
             // A seal carries no expiry: the bound ETag CAS already excludes a
             // reclaimer, so a lapsed lease alone must not discard completed work.
             observed_expiry: None,
@@ -765,9 +805,10 @@ pub(crate) async fn submit(
 /// operation ID, and `If-None-Match: *` precondition. Acquisition itself
 /// performs no internal write retry.
 ///
-/// `now` gates every send, including retries of a returned attempt: once the
-/// frozen `lease_until` has passed, the attempt is [`ClaimAcquireOutcome::Ineligible`]
-/// and must be prepared again.
+/// `now` gates every send, including retries of a returned attempt: an attempt
+/// within [`CLAIM_SEND_MARGIN_MS`] of its frozen `lease_until` is
+/// [`ClaimAcquireOutcome::Ineligible`] and must be prepared again, so a create
+/// that lands after the embedded expiry is not sent in the first place.
 pub async fn acquire(
     store: &S3Store,
     attempt: ClaimAttempt,
@@ -777,7 +818,7 @@ pub async fn acquire(
     let ClaimState::Active { lease_until } = attempt.claim.state() else {
         return ClaimAcquireOutcome::Ineligible;
     };
-    if now >= *lease_until {
+    if now.saturating_add(CLAIM_SEND_MARGIN_MS) >= *lease_until {
         return ClaimAcquireOutcome::Ineligible;
     }
     let outcome = store
@@ -789,6 +830,7 @@ pub async fn acquire(
                 claim: attempt.claim,
                 key: attempt.key,
                 etag,
+                namespace: store.namespace().to_owned(),
             })
         }
         MutationOutcome::Committed { etag: None }
@@ -822,6 +864,12 @@ pub(crate) async fn apply_mutation(
     if !mutation.still_eligible(work, now) {
         return ClaimMutationOutcome::Ineligible;
     }
+    // The mutation's ETag was observed in one store; a CAS in any other store
+    // compares against an unrelated token and could replace a claim that was
+    // never read there.
+    if mutation.namespace != store.namespace() {
+        return ClaimMutationOutcome::Ineligible;
+    }
     let outcome = store
         .put_if_match(
             &mutation.key,
@@ -836,6 +884,7 @@ pub(crate) async fn apply_mutation(
                 claim: mutation.claim,
                 key: mutation.key,
                 etag,
+                namespace: store.namespace().to_owned(),
             })
         }
         MutationOutcome::Committed { etag: None }
@@ -877,6 +926,7 @@ async fn resolve_acquisition(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcq
             claim: attempt.claim,
             key: attempt.key,
             etag,
+            namespace: store.namespace().to_owned(),
         }),
         CandidateRead::Different(_) => ClaimAcquireOutcome::Collision,
         // Absence proves the PUT had not landed at read time: retained claim
@@ -896,6 +946,7 @@ async fn resolve_mutation(store: &S3Store, mutation: ClaimMutation) -> ClaimMuta
             claim: mutation.claim,
             key: mutation.key,
             etag,
+            namespace: store.namespace().to_owned(),
         }),
         // An unchanged ETag means nothing else has taken the claim, and a possibly
         // dispatched PUT stays able to land.
@@ -1010,6 +1061,9 @@ mod tests {
     const TEST_ETAG: &str = "\"claim-token\"";
     const NEW_ETAG: &str = "\"claim-token-2\"";
     const TEST_KEY: &str = "workspace/workspace-1/campaigns/campaign-1/work/work-17/claim.json";
+    /// Deliberately unlike any live store namespace so a test that forgets to
+    /// rebind authority to its store fails instead of passing by accident.
+    const TEST_NAMESPACE: &str = "test-claim-namespace";
 
     fn artifact() -> ArtifactRef {
         ArtifactRef::new(
@@ -1216,6 +1270,21 @@ mod tests {
             claim,
             key: TEST_KEY.into(),
             etag: etag(TEST_ETAG).await,
+            namespace: TEST_NAMESPACE.into(),
+        }
+    }
+
+    impl ClaimAuthority {
+        fn attributed_to(mut self, namespace: &str) -> Self {
+            self.namespace = namespace.to_owned();
+            self
+        }
+    }
+
+    impl ClaimMutation {
+        fn attributed_to(mut self, namespace: &str) -> Self {
+            self.namespace = namespace.to_owned();
+            self
         }
     }
 
@@ -1224,6 +1293,7 @@ mod tests {
             claim,
             key: TEST_KEY.into(),
             etag: etag(TEST_ETAG).await,
+            namespace: TEST_NAMESPACE.into(),
         }
     }
 
@@ -1557,7 +1627,7 @@ mod tests {
         let mut history = AttemptHistory::default();
         let refreshed = match apply_mutation(
             &store,
-            mutation,
+            mutation.attributed_to(store.namespace()),
             &work("work-17", 4),
             200_000,
             &mut history,
@@ -1742,8 +1812,14 @@ mod tests {
             .unwrap();
             let (store, client) = replay_store(vec![response(status, &[], SdkBody::empty())]);
             let mut history = AttemptHistory::default();
-            let outcome =
-                apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await;
+            let outcome = apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history,
+            )
+            .await;
             if expect_lost {
                 assert!(
                     matches!(outcome, ClaimMutationOutcome::Lost),
@@ -1776,7 +1852,14 @@ mod tests {
         let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history
+            )
+            .await,
             ClaimMutationOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 1);
@@ -1803,13 +1886,18 @@ mod tests {
                 response(200, &[("etag", NEW_ETAG)], bytes),
             ]);
             let mut history = AttemptHistory::default();
-            let authority =
-                match apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history)
-                    .await
-                {
-                    ClaimMutationOutcome::Applied(authority) => authority,
-                    _ => panic!("exact reread must prove renewal"),
-                };
+            let authority = match apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history,
+            )
+            .await
+            {
+                ClaimMutationOutcome::Applied(authority) => authority,
+                _ => panic!("exact reread must prove renewal"),
+            };
             assert!(authority.etag == etag(NEW_ETAG).await);
             assert!(matches!(
                 authority.claim.state(),
@@ -1839,7 +1927,14 @@ mod tests {
         ]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history
+            )
+            .await,
             ClaimMutationOutcome::Lost
         ));
     }
@@ -1865,7 +1960,14 @@ mod tests {
             let (store, _) = replay_store(vec![response(500, &[], SdkBody::empty()), reread]);
             let mut history = AttemptHistory::default();
             assert!(matches!(
-                apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+                apply_mutation(
+                    &store,
+                    mutation.attributed_to(store.namespace()),
+                    &work("work-17", 4),
+                    200_000,
+                    &mut history
+                )
+                .await,
                 ClaimMutationOutcome::Unresolved(_)
             ));
         }
@@ -1990,8 +2092,22 @@ mod tests {
         let mut first_history = AttemptHistory::default();
         let mut second_history = AttemptHistory::default();
         let outcomes = [
-            apply_mutation(&store, first, &work("work-17", 4), 1, &mut first_history).await,
-            apply_mutation(&store, second, &work("work-17", 4), 1, &mut second_history).await,
+            apply_mutation(
+                &store,
+                first.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                1,
+                &mut first_history,
+            )
+            .await,
+            apply_mutation(
+                &store,
+                second.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                1,
+                &mut second_history,
+            )
+            .await,
         ];
         assert_eq!(
             outcomes
@@ -2160,8 +2276,9 @@ mod tests {
     async fn an_expired_attempt_is_ineligible_without_a_send() {
         let (store, client) = replay_store(Vec::new());
         let mut history = AttemptHistory::default();
-        // attempt() freezes lease_until = prepare-time now + CLAIM_LEASE_MS.
-        let now = 1_749_999_100_000 + CLAIM_LEASE_MS;
+        // attempt() freezes lease_until = prepare-time now + CLAIM_LEASE_MS; the
+        // send margin makes the attempt ineligible before the lease itself lapses.
+        let now = 1_749_999_100_000 + CLAIM_LEASE_MS - CLAIM_SEND_MARGIN_MS;
         assert!(matches!(
             acquire(&store, attempt(), now, &mut history).await,
             ClaimAcquireOutcome::Ineligible
@@ -2188,7 +2305,7 @@ mod tests {
         assert!(matches!(
             apply_mutation(
                 &store,
-                mutation,
+                mutation.attributed_to(store.namespace()),
                 &work("work-17", 4),
                 1_500_000 + CLAIM_LEASE_MS,
                 &mut history,
@@ -2273,7 +2390,14 @@ mod tests {
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
-            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history
+            )
+            .await,
             ClaimMutationOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 2);
@@ -2385,7 +2509,7 @@ mod tests {
         let applied = match submit_outcome(
             submit(
                 &store,
-                authority,
+                authority.attributed_to(store.namespace()),
                 ClaimScope {
                     work: &work("work-17", 4),
                     workspace: &workspace("workspace-1"),
@@ -2498,7 +2622,7 @@ mod tests {
         let mut history = AttemptHistory::default();
         let failure = match submit(
             &store,
-            authority,
+            authority.attributed_to(store.namespace()),
             ClaimScope {
                 work: &work("work-17", 4),
                 workspace: &workspace("workspace-1"),
@@ -2519,7 +2643,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mismatched_work_revision_is_rejected_before_io() {
+    async fn a_foreign_namespace_authority_is_rejected_before_io() {
+        // authority() is bound to TEST_NAMESPACE, not this store's namespace.
         let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
         let (store, client) = replay_store(Vec::new());
         let published = published_result().await.attributed_to(store.namespace());
@@ -2527,6 +2652,54 @@ mod tests {
         let failure = match submit(
             &store,
             authority,
+            ClaimScope {
+                work: &work("work-17", 4),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
+            &published,
+            200_000,
+            &mut history,
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("a foreign-namespace authority must not seal a claim"),
+        };
+        assert_eq!(failure.error(), SubmitError::InvalidInput);
+        let _ = failure.into_authority();
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_namespace_mutation_is_ineligible_without_a_send() {
+        let mutation = prepare_reclamation(
+            observed(claim(ClaimState::Active { lease_until: 1 })).await,
+            &work("work-17", 4),
+            &ActorId::new("reclaimer".into()).unwrap(),
+            &InstanceId::new("instance-b".into()).unwrap(),
+            200_000,
+        )
+        .unwrap();
+        let (store, client) = replay_store(Vec::new());
+        let mut history = AttemptHistory::default();
+        // observed() is bound to TEST_NAMESPACE, not this store's namespace.
+        assert!(matches!(
+            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            ClaimMutationOutcome::Ineligible
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_work_revision_is_rejected_before_io() {
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(Vec::new());
+        let published = published_result().await.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        let failure = match submit(
+            &store,
+            authority.attributed_to(store.namespace()),
             ClaimScope {
                 work: &work("work-17", 5),
                 workspace: &workspace("workspace-1"),
@@ -2555,7 +2728,7 @@ mod tests {
         let mut history = AttemptHistory::default();
         let failure = match submit(
             &store,
-            authority,
+            authority.attributed_to(store.namespace()),
             ClaimScope {
                 work: &work("work-17", 4),
                 workspace: &workspace("workspace-1"),
@@ -2603,7 +2776,7 @@ mod tests {
             submit_outcome(
                 submit(
                     &store,
-                    authority(original).await,
+                    authority(original).await.attributed_to(store.namespace()),
                     ClaimScope {
                         work: &work("work-17", 4),
                         workspace: &workspace("workspace-1"),
@@ -2617,7 +2790,7 @@ mod tests {
             ),
             apply_mutation(
                 &store,
-                reclaim,
+                reclaim.attributed_to(store.namespace()),
                 &work("work-17", 5),
                 200_000,
                 &mut reclaim_history,
@@ -2663,7 +2836,7 @@ mod tests {
         assert!(matches!(
             apply_mutation(
                 &store,
-                reclaim,
+                reclaim.attributed_to(store.namespace()),
                 &work("work-17", 5),
                 200_000,
                 &mut reclaim_history,
@@ -2676,7 +2849,7 @@ mod tests {
             submit_outcome(
                 submit(
                     &store,
-                    authority(original).await,
+                    authority(original).await.attributed_to(store.namespace()),
                     ClaimScope {
                         work: &work("work-17", 4),
                         workspace: &workspace("workspace-1"),
@@ -2759,7 +2932,9 @@ mod tests {
         let outcome = submit_outcome(
             submit(
                 &store,
-                authority(claim(ClaimState::Active { lease_until: 1 })).await,
+                authority(claim(ClaimState::Active { lease_until: 1 }))
+                    .await
+                    .attributed_to(store.namespace()),
                 ClaimScope {
                     work: &work("work-17", 4),
                     workspace: &workspace("workspace-1"),
@@ -2803,7 +2978,9 @@ mod tests {
         let outcome = submit_outcome(
             submit(
                 &store,
-                authority(claim(ClaimState::Active { lease_until: 1 })).await,
+                authority(claim(ClaimState::Active { lease_until: 1 }))
+                    .await
+                    .attributed_to(store.namespace()),
                 ClaimScope {
                     work: &work("work-17", 4),
                     workspace: &workspace("workspace-1"),
@@ -2845,7 +3022,9 @@ mod tests {
             let outcome = submit_outcome(
                 submit(
                     &store,
-                    authority(claim(ClaimState::Active { lease_until: 1 })).await,
+                    authority(claim(ClaimState::Active { lease_until: 1 }))
+                        .await
+                        .attributed_to(store.namespace()),
                     ClaimScope {
                         work: &work("work-17", 4),
                         workspace: &workspace("workspace-1"),
@@ -2880,6 +3059,7 @@ mod tests {
             )
             .unwrap(),
             etag: etag(TEST_ETAG).await,
+            namespace: TEST_NAMESPACE.into(),
         };
         assert!(authority.authorizes(&work("work-17", 4), &workspace("workspace-1"), "campaign-1"));
         assert!(!authority.authorizes(

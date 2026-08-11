@@ -15,6 +15,7 @@
 use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     distributed::{
@@ -22,10 +23,14 @@ use crate::{
         presence::WorkspaceId,
     },
     domain::{
+        attempt::{Submission, encode as encode_submission, submission_key},
         campaign::{ArtifactRef, ValidationError, validate_identity},
         work::{WorkId, WorkRef},
     },
-    storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+    storage::{
+        artifacts::PublishedArtifact,
+        s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+    },
     sync::{WIRE_VERSION, WireError, event::WireArtifactRef},
 };
 
@@ -161,6 +166,10 @@ pub struct ClaimAuthority {
     // Held for the lease renewal/seal CAS path that consumes this authority.
     #[allow(dead_code)]
     etag: ETag,
+    /// Namespace of the store that minted this authority. The ETag is an
+    /// opaque per-store token, so authority proves nothing about a key in any
+    /// other store even when the tokens happen to collide.
+    namespace: String,
 }
 
 impl ClaimAuthority {
@@ -218,6 +227,8 @@ pub(crate) struct ObservedClaim {
     claim: Claim,
     key: String,
     etag: ETag,
+    /// Namespace of the store this claim was read from.
+    namespace: String,
 }
 
 #[derive(Debug)]
@@ -248,6 +259,8 @@ pub(crate) struct ClaimMutation {
     key: String,
     canonical_bytes: Vec<u8>,
     etag: ETag,
+    /// Namespace of the store whose read minted `etag`.
+    namespace: String,
     /// Expiry of the claim this mutation renews, when it renews one.
     observed_expiry: Option<u64>,
     /// Verified `work.revision()` that made this mutation eligible.
@@ -311,6 +324,43 @@ impl fmt::Display for ClaimPrepareError {
 }
 
 impl Error for ClaimPrepareError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum SubmitError {
+    InvalidInput,
+    Encoding,
+    Publication,
+}
+
+impl fmt::Display for SubmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "invalid submission input",
+            Self::Encoding => "submission encoding failed",
+            Self::Publication => "submission publication failed",
+        })
+    }
+}
+
+impl Error for SubmitError {}
+
+#[allow(dead_code)]
+pub(crate) struct SubmitFailure {
+    authority: ClaimAuthority,
+    error: SubmitError,
+}
+
+#[allow(dead_code)]
+impl SubmitFailure {
+    pub(crate) fn error(&self) -> SubmitError {
+        self.error
+    }
+
+    pub(crate) fn into_authority(self) -> ClaimAuthority {
+        self.authority
+    }
+}
 
 pub fn prepare_acquisition(
     work: &WorkRef,
@@ -395,7 +445,12 @@ pub(crate) async fn observe(
         GetOutcome::NotFound => Ok(None),
         GetOutcome::Found { bytes, etag } => {
             let claim = decode(&bytes).map_err(ClaimReadError::Invalid)?;
-            Ok(Some(ObservedClaim { claim, key, etag }))
+            Ok(Some(ObservedClaim {
+                claim,
+                key,
+                etag,
+                namespace: store.namespace().to_owned(),
+            }))
         }
     }
 }
@@ -480,11 +535,17 @@ pub(crate) fn prepare_renewal(
             error: ClaimPrepareError::Encoding,
         }));
     };
-    let ClaimAuthority { key, etag, .. } = authority;
+    let ClaimAuthority {
+        key,
+        etag,
+        namespace,
+        ..
+    } = authority;
     Ok(ClaimMutation {
         claim: renewed,
         key,
         canonical_bytes,
+        namespace,
         etag,
         observed_expiry: Some(lease_until),
         prepared_revision: work.revision(),
@@ -577,6 +638,7 @@ fn prepare_replacement(
         key: observed.key,
         canonical_bytes,
         etag: observed.etag,
+        namespace: observed.namespace,
         // Replacement eligibility is an expired lease or an older sealed revision,
         // neither of which a later clock reading can invalidate; the candidate
         // lease check in `still_eligible` bounds how long the frozen mutation
@@ -584,6 +646,167 @@ fn prepare_replacement(
         observed_expiry: None,
         prepared_revision: work.revision(),
     })
+}
+
+/// The work generation and claim namespace one submission is scoped to.
+#[allow(dead_code)]
+pub(crate) struct ClaimScope<'a> {
+    pub(crate) work: &'a WorkRef,
+    pub(crate) workspace: &'a WorkspaceId,
+    pub(crate) campaign_id: &'a str,
+}
+
+/// Publishes immutable evidence before consuming authority in one terminal CAS.
+///
+/// Sealing deliberately has no lease-time check: renewal needs a clock to
+/// calculate an extension, while completion versus reclamation is decided by
+/// the authority-bound key and ETag.
+#[allow(dead_code)]
+pub(crate) async fn submit(
+    store: &S3Store,
+    authority: ClaimAuthority,
+    scope: ClaimScope<'_>,
+    published: &PublishedArtifact,
+    now: u64,
+    history: &mut AttemptHistory,
+) -> Result<ClaimMutationOutcome, SubmitFailure> {
+    let ClaimScope {
+        work,
+        workspace,
+        campaign_id,
+    } = scope;
+    if !matches!(authority.claim.state(), ClaimState::Active { .. }) {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::InvalidInput,
+        });
+    }
+    // The full scope must match before any I/O: `authorizes` binds the caller's
+    // work id and revision to this authority's key, so a mismatched ClaimScope
+    // is rejected here instead of publishing a submission that apply_mutation
+    // would later refuse as ineligible.
+    if !authority.authorizes(work, workspace, campaign_id) {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::InvalidInput,
+        });
+    }
+    // The artifact was proven durable only in the namespace that minted it; a
+    // claim in this store must not seal a result that store never verified.
+    if published.namespace() != store.namespace() {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::InvalidInput,
+        });
+    }
+    // The authority's ETag is likewise an opaque token from the store that
+    // minted it; sending it as If-Match in another store could seal a claim
+    // this store never issued authority for.
+    if authority.namespace != store.namespace() {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::InvalidInput,
+        });
+    }
+    let result_ref = published.artifact_ref().clone();
+    let submission = match Submission::new(
+        authority.claim.work_id().clone(),
+        authority.claim.work_revision(),
+        authority.claim.owner_actor().clone(),
+        authority.claim.owner_instance().clone(),
+        authority.claim.fence(),
+        authority.claim.operation_id().to_owned(),
+        result_ref.clone(),
+    ) {
+        Ok(submission) => submission,
+        Err(_) => {
+            return Err(SubmitFailure {
+                authority,
+                error: SubmitError::InvalidInput,
+            });
+        }
+    };
+    let submission_key =
+        match submission_key(workspace.as_str(), campaign_id, submission.attempt_id()) {
+            Ok(key) => key,
+            Err(_) => {
+                return Err(SubmitFailure {
+                    authority,
+                    error: SubmitError::InvalidInput,
+                });
+            }
+        };
+    let submission_bytes = match encode_submission(&submission) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(SubmitFailure {
+                authority,
+                error: SubmitError::Encoding,
+            });
+        }
+    };
+    let sealed = match Claim::new(
+        authority.claim.work_id().clone(),
+        authority.claim.work_revision(),
+        authority.claim.owner_actor().clone(),
+        authority.claim.owner_instance().clone(),
+        authority.claim.fence(),
+        authority.claim.operation_id().to_owned(),
+        ClaimState::Sealed { result_ref },
+    ) {
+        Ok(claim) => claim,
+        Err(_) => {
+            return Err(SubmitFailure {
+                authority,
+                error: SubmitError::InvalidInput,
+            });
+        }
+    };
+    let canonical_bytes = match encode(&sealed) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(SubmitFailure {
+                authority,
+                error: SubmitError::Encoding,
+            });
+        }
+    };
+    let digest = format!("{:x}", Sha256::digest(&submission_bytes));
+    if store
+        .publish_immutable(&submission_key, submission_bytes, &digest)
+        .await
+        .is_err()
+    {
+        return Err(SubmitFailure {
+            authority,
+            error: SubmitError::Publication,
+        });
+    }
+    let prepared_revision = authority.claim.work_revision();
+    let ClaimAuthority {
+        key,
+        etag,
+        namespace,
+        ..
+    } = authority;
+    Ok(apply_mutation(
+        store,
+        ClaimMutation {
+            claim: sealed,
+            key,
+            canonical_bytes,
+            etag,
+            namespace,
+            // A seal carries no expiry: the bound ETag CAS already excludes a
+            // reclaimer, so a lapsed lease alone must not discard completed work.
+            observed_expiry: None,
+            prepared_revision,
+        },
+        work,
+        now,
+        history,
+    )
+    .await)
 }
 
 /// Safe retries of a returned attempt must reuse the same [`ClaimAttempt`]
@@ -616,6 +839,7 @@ pub async fn acquire(
                 claim: attempt.claim,
                 key: attempt.key,
                 etag,
+                namespace: store.namespace().to_owned(),
             })
         }
         // A committed create without an ETag is durable; only the fresh token
@@ -627,6 +851,7 @@ pub async fn acquire(
                     claim: attempt.claim,
                     key: attempt.key,
                     etag,
+                    namespace: store.namespace().to_owned(),
                 }),
                 CandidateRead::Different(_) => ClaimAcquireOutcome::Collision,
                 CandidateRead::Missing | CandidateRead::Failed => {
@@ -665,6 +890,12 @@ pub(crate) async fn apply_mutation(
     if !mutation.still_eligible(work, now) {
         return ClaimMutationOutcome::Ineligible;
     }
+    // The mutation's ETag was observed in one store; a CAS in any other store
+    // compares against an unrelated token and could replace a claim that was
+    // never read there.
+    if mutation.namespace != store.namespace() {
+        return ClaimMutationOutcome::Ineligible;
+    }
     let outcome = store
         .put_if_match(
             &mutation.key,
@@ -679,6 +910,7 @@ pub(crate) async fn apply_mutation(
                 claim: mutation.claim,
                 key: mutation.key,
                 etag,
+                namespace: store.namespace().to_owned(),
             })
         }
         // A committed write without an ETag is durable; only the fresh token is
@@ -691,6 +923,7 @@ pub(crate) async fn apply_mutation(
                     claim: mutation.claim,
                     key: mutation.key,
                     etag,
+                    namespace: store.namespace().to_owned(),
                 }),
                 CandidateRead::Different(_) => ClaimMutationOutcome::Lost,
                 CandidateRead::Missing | CandidateRead::Failed => {
@@ -712,9 +945,9 @@ pub(crate) async fn apply_mutation(
 
 /// Byte equality against the reread proves the attempted operation committed:
 /// creation and replacement candidates embed a fresh 128-bit random operation
-/// ID, and a renewal candidate preserves its owner and operation ID while any
-/// competing reclaimer mints a new one, so no other claimant can produce the
-/// expected bytes.
+/// ID, and renewal and sealed candidates preserve their owner and operation ID
+/// while any competing reclaimer mints a new one, so no other claimant can
+/// produce the expected bytes.
 enum CandidateRead {
     Matching(ETag),
     Different(ETag),
@@ -737,6 +970,7 @@ async fn resolve_acquisition(store: &S3Store, attempt: ClaimAttempt) -> ClaimAcq
             claim: attempt.claim,
             key: attempt.key,
             etag,
+            namespace: store.namespace().to_owned(),
         }),
         CandidateRead::Different(_) => ClaimAcquireOutcome::Collision,
         // Absence proves the PUT had not landed at read time: retained claim
@@ -756,6 +990,7 @@ async fn resolve_mutation(store: &S3Store, mutation: ClaimMutation) -> ClaimMuta
             claim: mutation.claim,
             key: mutation.key,
             etag,
+            namespace: store.namespace().to_owned(),
         }),
         // An unchanged ETag means nothing else has taken the claim, and a possibly
         // dispatched PUT stays able to land.
@@ -860,13 +1095,19 @@ impl TryFrom<WireClaim> for Claim {
 mod tests {
     use aws_sdk_s3::primitives::SdkBody;
 
-    use crate::storage::s3::test_support::{replay_store, response};
+    use crate::storage::{
+        artifacts,
+        s3::test_support::{replay_store, response},
+    };
 
     use super::*;
 
     const TEST_ETAG: &str = "\"claim-token\"";
     const NEW_ETAG: &str = "\"claim-token-2\"";
     const TEST_KEY: &str = "workspace/workspace-1/campaigns/campaign-1/work/work-17/claim.json";
+    /// Deliberately unlike any live store namespace so a test that forgets to
+    /// rebind authority to its store fails instead of passing by accident.
+    const TEST_NAMESPACE: &str = "test-claim-namespace";
 
     fn artifact() -> ArtifactRef {
         ArtifactRef::new(
@@ -1073,6 +1314,21 @@ mod tests {
             claim,
             key: TEST_KEY.into(),
             etag: etag(TEST_ETAG).await,
+            namespace: TEST_NAMESPACE.into(),
+        }
+    }
+
+    impl ClaimAuthority {
+        fn attributed_to(mut self, namespace: &str) -> Self {
+            self.namespace = namespace.to_owned();
+            self
+        }
+    }
+
+    impl ClaimMutation {
+        fn attributed_to(mut self, namespace: &str) -> Self {
+            self.namespace = namespace.to_owned();
+            self
         }
     }
 
@@ -1081,6 +1337,7 @@ mod tests {
             claim,
             key: TEST_KEY.into(),
             etag: etag(TEST_ETAG).await,
+            namespace: TEST_NAMESPACE.into(),
         }
     }
 
@@ -1414,7 +1671,7 @@ mod tests {
         let mut history = AttemptHistory::default();
         let refreshed = match apply_mutation(
             &store,
-            mutation,
+            mutation.attributed_to(store.namespace()),
             &work("work-17", 4),
             200_000,
             &mut history,
@@ -1599,8 +1856,14 @@ mod tests {
             .unwrap();
             let (store, client) = replay_store(vec![response(status, &[], SdkBody::empty())]);
             let mut history = AttemptHistory::default();
-            let outcome =
-                apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await;
+            let outcome = apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history,
+            )
+            .await;
             if expect_lost {
                 assert!(
                     matches!(outcome, ClaimMutationOutcome::Lost),
@@ -1633,7 +1896,14 @@ mod tests {
         let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history
+            )
+            .await,
             ClaimMutationOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 1);
@@ -1660,13 +1930,18 @@ mod tests {
                 response(200, &[("etag", NEW_ETAG)], bytes),
             ]);
             let mut history = AttemptHistory::default();
-            let authority =
-                match apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history)
-                    .await
-                {
-                    ClaimMutationOutcome::Applied(authority) => authority,
-                    _ => panic!("exact reread must prove renewal"),
-                };
+            let authority = match apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history,
+            )
+            .await
+            {
+                ClaimMutationOutcome::Applied(authority) => authority,
+                _ => panic!("exact reread must prove renewal"),
+            };
             assert!(authority.etag == etag(NEW_ETAG).await);
             assert!(matches!(
                 authority.claim.state(),
@@ -1696,7 +1971,14 @@ mod tests {
         ]);
         let mut history = AttemptHistory::default();
         assert!(matches!(
-            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history
+            )
+            .await,
             ClaimMutationOutcome::Lost
         ));
     }
@@ -1722,7 +2004,14 @@ mod tests {
             let (store, _) = replay_store(vec![response(500, &[], SdkBody::empty()), reread]);
             let mut history = AttemptHistory::default();
             assert!(matches!(
-                apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+                apply_mutation(
+                    &store,
+                    mutation.attributed_to(store.namespace()),
+                    &work("work-17", 4),
+                    200_000,
+                    &mut history
+                )
+                .await,
                 ClaimMutationOutcome::Unresolved(_)
             ));
         }
@@ -1847,8 +2136,22 @@ mod tests {
         let mut first_history = AttemptHistory::default();
         let mut second_history = AttemptHistory::default();
         let outcomes = [
-            apply_mutation(&store, first, &work("work-17", 4), 1, &mut first_history).await,
-            apply_mutation(&store, second, &work("work-17", 4), 1, &mut second_history).await,
+            apply_mutation(
+                &store,
+                first.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                1,
+                &mut first_history,
+            )
+            .await,
+            apply_mutation(
+                &store,
+                second.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                1,
+                &mut second_history,
+            )
+            .await,
         ];
         assert_eq!(
             outcomes
@@ -2076,7 +2379,7 @@ mod tests {
             let mut history = AttemptHistory::default();
             let outcome = apply_mutation(
                 &store,
-                mutation,
+                mutation.attributed_to(store.namespace()),
                 &work("work-17", 4),
                 1_500_000,
                 &mut history,
@@ -2109,7 +2412,7 @@ mod tests {
         assert!(matches!(
             apply_mutation(
                 &store,
-                mutation,
+                mutation.attributed_to(store.namespace()),
                 &work("work-17", 4),
                 1_500_000 + CLAIM_LEASE_MS,
                 &mut history,
@@ -2194,7 +2497,14 @@ mod tests {
         let mut history = AttemptHistory::default();
 
         assert!(matches!(
-            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            apply_mutation(
+                &store,
+                mutation.attributed_to(store.namespace()),
+                &work("work-17", 4),
+                200_000,
+                &mut history
+            )
+            .await,
             ClaimMutationOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 2);
@@ -2265,6 +2575,586 @@ mod tests {
         ));
     }
 
+    async fn published_result() -> PublishedArtifact {
+        let (store, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        artifacts::publish(
+            &store,
+            b"result".to_vec(),
+            "application/json".into(),
+            "attempt-17".into(),
+            1_750_000_000_000,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn sealed(result_ref: ArtifactRef) -> Claim {
+        claim(ClaimState::Sealed { result_ref })
+    }
+
+    fn submit_outcome(result: Result<ClaimMutationOutcome, SubmitFailure>) -> ClaimMutationOutcome {
+        match result {
+            Ok(outcome) => outcome,
+            Err(failure) => panic!("submit failed: {}", failure.error()),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_publishes_bound_record_then_seals_on_authority_etag() {
+        let published = published_result().await;
+        let expected_result = published.artifact_ref().clone();
+        // lease_until 1 is long expired: sealing consults no clock, only the
+        // bound ETag CAS.
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
+        ]);
+        let published = published.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        let applied = match submit_outcome(
+            submit(
+                &store,
+                authority.attributed_to(store.namespace()),
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace("workspace-1"),
+                    campaign_id: "campaign-1",
+                },
+                &published,
+                200_000,
+                &mut history,
+            )
+            .await,
+        ) {
+            ClaimMutationOutcome::Applied(authority) => authority,
+            _ => panic!("current ETag must seal"),
+        };
+        assert_eq!(applied.claim.work_revision(), 4);
+        assert_eq!(applied.claim.owner_actor().as_str(), "rust-worker");
+        assert_eq!(applied.claim.owner_instance().as_str(), "instance-a");
+        assert_eq!(applied.claim.fence(), 9);
+        assert_eq!(applied.claim.operation_id(), "op-claim-001");
+        assert_eq!(
+            applied.claim.state(),
+            &ClaimState::Sealed {
+                result_ref: expected_result.clone(),
+            }
+        );
+
+        assert_eq!(client.actual_requests().count(), 2);
+        let publication = client.actual_requests().next().unwrap();
+        assert_eq!(publication.headers().get("if-none-match"), Some("*"));
+        assert_eq!(
+            publication.uri().parse::<http::Uri>().unwrap().path(),
+            "/workspace/workspace-1/campaigns/campaign-1/submissions/attempt-17.json"
+        );
+        let record = crate::domain::attempt::decode(publication.body().bytes().unwrap()).unwrap();
+        assert_eq!(record.attempt_id(), "attempt-17");
+        assert_eq!(record.work_id().as_str(), "work-17");
+        assert_eq!(record.work_revision(), 4);
+        assert_eq!(record.owner_actor().as_str(), "rust-worker");
+        assert_eq!(record.owner_instance().as_str(), "instance-a");
+        assert_eq!(record.fence(), 9);
+        assert_eq!(record.operation_id(), "op-claim-001");
+        assert_eq!(record.result_ref(), &expected_result);
+
+        let terminal = client.actual_requests().nth(1).unwrap();
+        assert_eq!(terminal.headers().get("if-match"), Some(TEST_ETAG));
+        assert!(terminal.headers().get("if-none-match").is_none());
+        assert_eq!(
+            terminal.uri().parse::<http::Uri>().unwrap().path(),
+            format!("/{TEST_KEY}")
+        );
+        assert_eq!(
+            decode(terminal.body().bytes().unwrap()).unwrap(),
+            applied.claim
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_terminal_or_mismatched_context_before_io() {
+        let published = published_result().await;
+        for (authority, workspace_id, campaign_id) in [
+            (
+                authority(sealed(published.artifact_ref().clone())).await,
+                "workspace-1",
+                "campaign-1",
+            ),
+            (
+                authority(claim(ClaimState::Active { lease_until: 1 })).await,
+                "other-workspace",
+                "campaign-1",
+            ),
+            (
+                authority(claim(ClaimState::Active { lease_until: 1 })).await,
+                "workspace-1",
+                "other-campaign",
+            ),
+        ] {
+            let (store, client) = replay_store(Vec::new());
+            let mut history = AttemptHistory::default();
+            let failure = match submit(
+                &store,
+                authority,
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace(workspace_id),
+                    campaign_id,
+                },
+                &published,
+                200_000,
+                &mut history,
+            )
+            .await
+            {
+                Err(failure) => failure,
+                Ok(_) => panic!("invalid authority context must fail"),
+            };
+            assert_eq!(failure.error(), SubmitError::InvalidInput);
+            let authority = failure.into_authority();
+            assert_eq!(authority.claim.work_id().as_str(), "work-17");
+            assert_eq!(client.actual_requests().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_namespace_artifact_is_rejected_before_io() {
+        // published_result() minted its witness against a different store, so
+        // its namespace cannot match the submit store's.
+        let published = published_result().await;
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(Vec::new());
+        let mut history = AttemptHistory::default();
+        let failure = match submit(
+            &store,
+            authority.attributed_to(store.namespace()),
+            ClaimScope {
+                work: &work("work-17", 4),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
+            &published,
+            200_000,
+            &mut history,
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("a foreign-namespace artifact must not seal a claim"),
+        };
+        assert_eq!(failure.error(), SubmitError::InvalidInput);
+        let _ = failure.into_authority();
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_namespace_authority_is_rejected_before_io() {
+        // authority() is bound to TEST_NAMESPACE, not this store's namespace.
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(Vec::new());
+        let published = published_result().await.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        let failure = match submit(
+            &store,
+            authority,
+            ClaimScope {
+                work: &work("work-17", 4),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
+            &published,
+            200_000,
+            &mut history,
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("a foreign-namespace authority must not seal a claim"),
+        };
+        assert_eq!(failure.error(), SubmitError::InvalidInput);
+        let _ = failure.into_authority();
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_namespace_mutation_is_ineligible_without_a_send() {
+        let mutation = prepare_reclamation(
+            observed(claim(ClaimState::Active { lease_until: 1 })).await,
+            &work("work-17", 4),
+            &ActorId::new("reclaimer".into()).unwrap(),
+            &InstanceId::new("instance-b".into()).unwrap(),
+            200_000,
+        )
+        .unwrap();
+        let (store, client) = replay_store(Vec::new());
+        let mut history = AttemptHistory::default();
+        // observed() is bound to TEST_NAMESPACE, not this store's namespace.
+        assert!(matches!(
+            apply_mutation(&store, mutation, &work("work-17", 4), 200_000, &mut history).await,
+            ClaimMutationOutcome::Ineligible
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_work_revision_is_rejected_before_io() {
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(Vec::new());
+        let published = published_result().await.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        let failure = match submit(
+            &store,
+            authority.attributed_to(store.namespace()),
+            ClaimScope {
+                work: &work("work-17", 5),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
+            &published,
+            200_000,
+            &mut history,
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("a mismatched work revision must fail before any I/O"),
+        };
+        assert_eq!(failure.error(), SubmitError::InvalidInput);
+        let _ = failure.into_authority();
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn publication_failure_returns_usable_authority() {
+        let published = published_result().await;
+        let authority = authority(claim(ClaimState::Active { lease_until: 1 })).await;
+        let (store, client) = replay_store(vec![response(404, &[], SdkBody::empty())]);
+        let published = published.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        let failure = match submit(
+            &store,
+            authority.attributed_to(store.namespace()),
+            ClaimScope {
+                work: &work("work-17", 4),
+                workspace: &workspace("workspace-1"),
+                campaign_id: "campaign-1",
+            },
+            &published,
+            200_000,
+            &mut history,
+        )
+        .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("failed evidence publication must not seal"),
+        };
+        assert_eq!(failure.error(), SubmitError::Publication);
+        assert!(failure.into_authority().authorizes(
+            &work("work-17", 4),
+            &workspace("workspace-1"),
+            "campaign-1"
+        ));
+        assert_eq!(client.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn completion_and_reclamation_from_one_etag_have_one_winner() {
+        let published = published_result().await;
+        let original = claim(ClaimState::Active { lease_until: 1 });
+        let reclaim = prepare_reclamation(
+            observed(original.clone()).await,
+            &work("work-17", 5),
+            &ActorId::new("replacement".into()).unwrap(),
+            &InstanceId::new("replacement-instance".into()).unwrap(),
+            1,
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+        ]);
+        let published = published.attributed_to(store.namespace());
+        let mut seal_history = AttemptHistory::default();
+        let mut reclaim_history = AttemptHistory::default();
+        let outcomes = [
+            submit_outcome(
+                submit(
+                    &store,
+                    authority(original).await.attributed_to(store.namespace()),
+                    ClaimScope {
+                        work: &work("work-17", 4),
+                        workspace: &workspace("workspace-1"),
+                        campaign_id: "campaign-1",
+                    },
+                    &published,
+                    200_000,
+                    &mut seal_history,
+                )
+                .await,
+            ),
+            apply_mutation(
+                &store,
+                reclaim.attributed_to(store.namespace()),
+                &work("work-17", 5),
+                200_000,
+                &mut reclaim_history,
+            )
+            .await,
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ClaimMutationOutcome::Applied(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ClaimMutationOutcome::Lost))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaimed_generation_leaves_stale_evidence_but_rejects_seal() {
+        let published = published_result().await;
+        let stale_result = published.artifact_ref().clone();
+        let original = claim(ClaimState::Active { lease_until: 1 });
+        let reclaim = prepare_reclamation(
+            observed(original.clone()).await,
+            &work("work-17", 5),
+            &ActorId::new("replacement".into()).unwrap(),
+            &InstanceId::new("replacement-instance".into()).unwrap(),
+            1,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+        ]);
+        let published = published.attributed_to(store.namespace());
+        let mut reclaim_history = AttemptHistory::default();
+        assert!(matches!(
+            apply_mutation(
+                &store,
+                reclaim.attributed_to(store.namespace()),
+                &work("work-17", 5),
+                200_000,
+                &mut reclaim_history,
+            )
+            .await,
+            ClaimMutationOutcome::Applied(_)
+        ));
+        let mut seal_history = AttemptHistory::default();
+        assert!(matches!(
+            submit_outcome(
+                submit(
+                    &store,
+                    authority(original).await.attributed_to(store.namespace()),
+                    ClaimScope {
+                        work: &work("work-17", 4),
+                        workspace: &workspace("workspace-1"),
+                        campaign_id: "campaign-1",
+                    },
+                    &published,
+                    200_000,
+                    &mut seal_history,
+                )
+                .await,
+            ),
+            ClaimMutationOutcome::Lost
+        ));
+        assert_eq!(client.actual_requests().count(), 3);
+        let current = decode(
+            client
+                .actual_requests()
+                .next()
+                .unwrap()
+                .body()
+                .bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current.work_revision(), 5);
+        assert_eq!(current.fence(), 10);
+        assert!(matches!(current.state(), ClaimState::Active { .. }));
+        let stale_candidate = decode(
+            client
+                .actual_requests()
+                .nth(2)
+                .unwrap()
+                .body()
+                .bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stale_candidate.state(),
+            &ClaimState::Sealed {
+                result_ref: stale_result,
+            }
+        );
+        assert_eq!(
+            client
+                .actual_requests()
+                .nth(1)
+                .unwrap()
+                .uri()
+                .parse::<http::Uri>()
+                .unwrap()
+                .path(),
+            "/workspace/workspace-1/campaigns/campaign-1/submissions/attempt-17.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_digest_covers_the_submission_bytes() {
+        let published = published_result().await;
+        let expected_submission = crate::domain::attempt::encode(
+            &crate::domain::attempt::Submission::new(
+                WorkId::new("work-17".into()).unwrap(),
+                4,
+                ActorId::new("rust-worker".into()).unwrap(),
+                InstanceId::new("instance-a".into()).unwrap(),
+                9,
+                "op-claim-001".into(),
+                published.artifact_ref().clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(409, &[], SdkBody::empty()),
+            response(200, &[("etag", TEST_ETAG)], expected_submission),
+            response(200, &[("etag", NEW_ETAG)], SdkBody::empty()),
+        ]);
+        let published = published.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        let outcome = submit_outcome(
+            submit(
+                &store,
+                authority(claim(ClaimState::Active { lease_until: 1 }))
+                    .await
+                    .attributed_to(store.namespace()),
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace("workspace-1"),
+                    campaign_id: "campaign-1",
+                },
+                &published,
+                200_000,
+                &mut history,
+            )
+            .await,
+        );
+        assert!(matches!(outcome, ClaimMutationOutcome::Applied(_)));
+        assert_eq!(client.actual_requests().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn submit_threads_the_caller_owned_history() {
+        let published = published_result().await;
+        let expected = sealed(published.artifact_ref().clone());
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+            response(200, &[("etag", NEW_ETAG)], encode(&expected).unwrap()),
+        ]);
+        let published = published.attributed_to(store.namespace());
+        let mut history = AttemptHistory::default();
+        // One history covers one object, so the taint comes from the claim's own key.
+        let claim_key = claim_key(
+            &workspace("workspace-1"),
+            "campaign-1",
+            work("work-17", 4).id(),
+        )
+        .expect("valid claim key");
+        assert!(matches!(
+            store
+                .put_if_absent(&claim_key, Vec::new(), &mut history)
+                .await,
+            MutationOutcome::Unknown
+        ));
+        let outcome = submit_outcome(
+            submit(
+                &store,
+                authority(claim(ClaimState::Active { lease_until: 1 }))
+                    .await
+                    .attributed_to(store.namespace()),
+                ClaimScope {
+                    work: &work("work-17", 4),
+                    workspace: &workspace("workspace-1"),
+                    campaign_id: "campaign-1",
+                },
+                &published,
+                200_000,
+                &mut history,
+            )
+            .await,
+        );
+        assert!(matches!(outcome, ClaimMutationOutcome::Applied(_)));
+        assert_eq!(client.actual_requests().count(), 4);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_terminal_cas_requires_exact_same_key_bytes() {
+        for case in ["exact", "different", "missing", "failed"] {
+            let published = published_result().await;
+            let expected = sealed(published.artifact_ref().clone());
+            let reread = match case {
+                "exact" => response(200, &[("etag", NEW_ETAG)], encode(&expected).unwrap()),
+                "different" => response(
+                    200,
+                    &[("etag", NEW_ETAG)],
+                    encode(&claim(ClaimState::Active { lease_until: 1 })).unwrap(),
+                ),
+                "missing" => response(404, &[], SdkBody::empty()),
+                "failed" => response(500, &[], SdkBody::empty()),
+                _ => unreachable!(),
+            };
+            let (store, client) = replay_store(vec![
+                response(200, &[], SdkBody::empty()),
+                response(500, &[], SdkBody::empty()),
+                reread,
+            ]);
+            let published = published.attributed_to(store.namespace());
+            let mut history = AttemptHistory::default();
+            let outcome = submit_outcome(
+                submit(
+                    &store,
+                    authority(claim(ClaimState::Active { lease_until: 1 }))
+                        .await
+                        .attributed_to(store.namespace()),
+                    ClaimScope {
+                        work: &work("work-17", 4),
+                        workspace: &workspace("workspace-1"),
+                        campaign_id: "campaign-1",
+                    },
+                    &published,
+                    200_000,
+                    &mut history,
+                )
+                .await,
+            );
+            match case {
+                "exact" => assert!(matches!(outcome, ClaimMutationOutcome::Applied(_))),
+                "different" => assert!(matches!(outcome, ClaimMutationOutcome::Lost)),
+                "missing" | "failed" => {
+                    assert!(matches!(outcome, ClaimMutationOutcome::Unresolved(_)))
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(client.actual_requests().count(), 3);
+        }
+    }
+
     #[tokio::test]
     async fn authority_matches_work_identity_revision_and_namespace() {
         let authority = ClaimAuthority {
@@ -2276,6 +3166,7 @@ mod tests {
             )
             .unwrap(),
             etag: etag(TEST_ETAG).await,
+            namespace: TEST_NAMESPACE.into(),
         };
         assert!(authority.authorizes(&work("work-17", 4), &workspace("workspace-1"), "campaign-1"));
         assert!(!authority.authorizes(

@@ -50,6 +50,7 @@ const MAX_PREFIX_BYTES: usize = 64;
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_HEAD_BYTES: usize = 4 * 1024;
 const MAX_CLAIM_BYTES: usize = 4 * 1024;
+const MAX_SUBMISSION_BYTES: usize = 4 * 1024;
 const RACE_ROUNDS: usize = 4;
 const RACE_CONTENDERS: usize = 16;
 const RACE_BODY_BYTES: usize = 16 * 1024;
@@ -78,6 +79,7 @@ struct ChainKeys {
     event_2: String,
     head: String,
     claim: String,
+    submission: String,
 }
 
 #[derive(Serialize)]
@@ -1072,6 +1074,7 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     )
     .map_err(|_| "claim construction failed")?;
     let claim_bytes = claims::encode(&claim).map_err(|_| "claim encoding failed")?;
+    let submission_bytes = b"retained-submission".to_vec();
 
     // Immutable objects are stored at exactly the keys the retained head
     // references, so production reconciliation traversing this chain resolves the
@@ -1084,6 +1087,10 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         event_2: encoded_2.key().to_owned(),
         head: head_key.clone(),
         claim: physical(prefix, "workspace/live/campaigns/live/work/live/claim.json"),
+        submission: physical(
+            prefix,
+            "workspace/live/campaigns/live/submissions/live-preflight-attempt.json",
+        ),
     };
     evidence.keys = Some(keys.clone());
 
@@ -1129,6 +1136,15 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         &keys.claim,
         &claim_bytes,
         "create-claim",
+        evidence,
+    )
+    .await?;
+    create_object(
+        &direct,
+        EXPECTED_BUCKET,
+        &keys.submission,
+        &submission_bytes,
+        "create-submission",
         evidence,
     )
     .await?;
@@ -1296,6 +1312,17 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     if claims::decode(&stored_claim).map_err(|_| "claim validation failed")? != claim {
         return Err("claim mismatch");
     }
+    let stored_submission = get_found_bytes(
+        &store,
+        &keys.submission,
+        MAX_SUBMISSION_BYTES,
+        "validate-submission",
+        evidence,
+    )
+    .await?;
+    if stored_submission != submission_bytes {
+        return Err("submission mismatch");
+    }
 
     // Rules are evaluated against the whole production key family, not only the
     // keys this run created: `head.json` at the bucket root, a later event
@@ -1303,12 +1330,13 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
     // match. None of these are created; only the rule predicates read them.
     let future_event_key = format!("{:016}-{}.cbor.zst", 3, "a".repeat(64));
     let other_artifact_key = format!("artifacts/sha256/{}", "b".repeat(64));
-    // Claims can be retained under any workspace/campaign/work identity, so
-    // the claim key shape is evaluated as a namespace family: a rule scoped
-    // anywhere a claim can live (for example `workspace/prod/`) matches, while
-    // a subtree no claim key can start with (for example a presence prefix)
-    // does not.
+    // Claims and submissions can be retained under any workspace/campaign
+    // identity, so each retained key shape is evaluated as a namespace family:
+    // a rule scoped anywhere such a key can live (for example `workspace/prod/`)
+    // matches, while a subtree neither shape can start with (for example a
+    // presence prefix) does not. Both families share the same 4 KiB size bound.
     let claim_namespace = "workspace/*/campaigns/*/work/*/claim.json";
+    let submission_namespace = "workspace/*/campaigns/*/submissions/*";
     // Each key family is described by the full inclusive range of sizes a valid
     // object can take, so a rule whose size window sits strictly between two
     // concrete samples is still detected.
@@ -1322,12 +1350,15 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
         ObjectFacts::family(&keys.artifact, 0, MAX_ARTIFACT_BYTES as u64),
         ObjectFacts::family(&keys.claim, 0, MAX_CLAIM_BYTES as u64),
         ObjectFacts::namespace(claim_namespace, 0, MAX_CLAIM_BYTES as u64),
+        ObjectFacts::namespace(submission_namespace, 0, MAX_SUBMISSION_BYTES as u64),
+        ObjectFacts::family(&keys.submission, 0, MAX_SUBMISSION_BYTES as u64),
         // The sizes this run actually retained, so the evidence names them.
         ObjectFacts::exact(&keys.head, final_head_bytes.len() as u64),
         ObjectFacts::exact(&keys.event_1, stored_event_1.len() as u64),
         ObjectFacts::exact(&keys.event_2, stored_event_2.len() as u64),
         ObjectFacts::exact(&keys.artifact, stored_artifact.len() as u64),
         ObjectFacts::exact(&keys.claim, stored_claim.len() as u64),
+        ObjectFacts::exact(&keys.submission, stored_submission.len() as u64),
     ];
     let lifecycle = inspect_lifecycle(&direct, EXPECTED_BUCKET, &objects, evidence).await?;
     let safe = lifecycle.safe;
@@ -1344,8 +1375,9 @@ async fn run_scenario(prefix: &str, evidence: &mut Evidence) -> Result<(), &'sta
 struct DeleteDenialEvidence {
     classification: &'static str,
     error_code: &'static str,
-    /// `None` when the bucket returned no version id (unversioned bucket).
-    version_delete_error_code: Option<&'static str>,
+    /// One entry per retained kind (claim, submission); `None` when the bucket
+    /// returned no version id (unversioned bucket).
+    version_delete_error_codes: Vec<Option<&'static str>>,
     runtime_role_arn: String,
 }
 
@@ -1427,7 +1459,7 @@ async fn live_s3_preflight() {
 }
 
 #[tokio::test]
-async fn live_runtime_principal_cannot_delete_claims() {
+async fn live_runtime_principal_cannot_delete_retained_objects() {
     let profile = match std::env::var(RUNTIME_PROFILE_ENV) {
         Ok(profile) => profile,
         Err(_) => {
@@ -1468,10 +1500,11 @@ async fn live_runtime_principal_cannot_delete_claims() {
         "runtime profile must resolve to an assumed role"
     );
 
-    // A runtime policy has to deny the production claim prefix. A key under
-    // `e04-delete-denial/` would pass while real claims stayed deletable, so
+    // A runtime policy has to deny the production claim and submission prefixes. Keys
+    // under `e04-delete-denial/` would pass while the real objects stayed deletable, so
     // isolation comes from a unique workspace segment instead of a test prefix.
-    let key = format!("workspace/{run_id}/campaigns/live/work/live/claim.json");
+    let claim_key = format!("workspace/{run_id}/campaigns/live/work/live/claim.json");
+    let submission_key = format!("workspace/{run_id}/campaigns/live/submissions/live-attempt.json");
     let claim = Claim::new(
         WorkId::new("live".into()).unwrap(),
         1,
@@ -1484,80 +1517,99 @@ async fn live_runtime_principal_cannot_delete_claims() {
         },
     )
     .unwrap();
-    let bytes = claims::encode(&claim).unwrap();
+    let claim_bytes = claims::encode(&claim).unwrap();
+    let submission_bytes = b"retained-submission".to_vec();
     let store = S3Store::new(
         EXPECTED_BUCKET,
         Region::new(EXPECTED_REGION),
         Builder::from(&config),
     );
-    let mut history = AttemptHistory::default();
-    assert!(matches!(
-        store.put_if_absent(&key, bytes.clone(), &mut history).await,
-        MutationOutcome::Committed { .. }
-    ));
+    for (key, bytes) in [
+        (&claim_key, &claim_bytes),
+        (&submission_key, &submission_bytes),
+    ] {
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            store.put_if_absent(key, bytes.clone(), &mut history).await,
+            MutationOutcome::Committed { .. }
+        ));
+    }
 
-    let error_code = match direct_client(&config)
-        .delete_object()
-        .bucket(EXPECTED_BUCKET)
-        .key(&key)
-        .send()
-        .await
-    {
-        Ok(_) => panic!("runtime principal deleted a retained claim"),
-        Err(SdkError::ServiceError(service)) => {
-            assert_eq!(
-                service.err().code(),
-                Some("AccessDenied"),
-                "delete denial must be explicit"
-            );
-            "AccessDenied"
-        }
-        Err(_) => panic!("delete denial was not an S3 service error"),
-    };
-    // On a versioned bucket, s3:DeleteObjectVersion is a separate permission
-    // that can permanently remove a retained claim version; prove it is denied
-    // for the exact version this run created.
-    let version_id = direct_client(&config)
-        .head_object()
-        .bucket(EXPECTED_BUCKET)
-        .key(&key)
-        .send()
-        .await
-        .expect("claim head-object must succeed")
-        .version_id()
-        .map(str::to_owned);
-    let version_delete_error_code = match &version_id {
-        Some(version_id) => match direct_client(&config)
+    let direct = direct_client(&config);
+    let mut version_delete_error_codes = Vec::new();
+    for (kind, key, bytes) in [
+        ("claim", &claim_key, &claim_bytes),
+        ("submission", &submission_key, &submission_bytes),
+    ] {
+        match direct
             .delete_object()
             .bucket(EXPECTED_BUCKET)
-            .key(&key)
-            .version_id(version_id)
+            .key(key)
             .send()
             .await
         {
-            Ok(_) => panic!("runtime principal deleted a retained claim version"),
-            Err(SdkError::ServiceError(service)) => {
-                assert_eq!(
-                    service.err().code(),
-                    Some("AccessDenied"),
-                    "version delete denial must be explicit"
-                );
-                Some("AccessDenied")
+            Ok(_) => panic!("runtime principal deleted a retained {kind}"),
+            Err(SdkError::ServiceError(service)) => assert_eq!(
+                service.err().code(),
+                Some("AccessDenied"),
+                "delete denial must be explicit"
+            ),
+            Err(_) => panic!("delete denial was not an S3 service error"),
+        }
+        match store.get_object(key, bytes.len()).await {
+            Ok(GetOutcome::Found { bytes: found, .. }) => assert_eq!(&found, bytes),
+            Ok(GetOutcome::NotFound) => panic!("denied deletion removed the retained {kind}"),
+            Err(_) => panic!("retained {kind} reread failed after denied deletion"),
+        }
+
+        // On a versioned bucket, s3:DeleteObjectVersion is a separate permission
+        // that can permanently remove a retained version; prove it is denied for
+        // the exact version this run created.
+        let version_id = direct
+            .head_object()
+            .bucket(EXPECTED_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("retained {kind} head-object must succeed"))
+            .version_id()
+            .map(str::to_owned);
+        let version_code = match &version_id {
+            Some(version_id) => match direct
+                .delete_object()
+                .bucket(EXPECTED_BUCKET)
+                .key(key)
+                .version_id(version_id)
+                .send()
+                .await
+            {
+                Ok(_) => panic!("runtime principal deleted a retained {kind} version"),
+                Err(SdkError::ServiceError(service)) => {
+                    assert_eq!(
+                        service.err().code(),
+                        Some("AccessDenied"),
+                        "version delete denial must be explicit"
+                    );
+                    Some("AccessDenied")
+                }
+                Err(_) => panic!("version delete denial was not an S3 service error"),
+            },
+            None => None,
+        };
+        match store.get_object(key, bytes.len()).await {
+            Ok(GetOutcome::Found { bytes: found, .. }) => assert_eq!(&found, bytes),
+            Ok(GetOutcome::NotFound) => {
+                panic!("denied version deletion removed the retained {kind}")
             }
-            Err(_) => panic!("version delete denial was not an S3 service error"),
-        },
-        None => None,
-    };
-    match store.get_object(&key, bytes.len()).await {
-        Ok(GetOutcome::Found { bytes: found, .. }) => assert_eq!(found, bytes),
-        Ok(GetOutcome::NotFound) => panic!("denied deletion removed the claim"),
-        Err(_) => panic!("claim reread failed after denied deletion"),
+            Err(_) => panic!("retained {kind} reread failed after denied version deletion"),
+        }
+        version_delete_error_codes.push(version_code);
     }
 
     let evidence = DeleteDenialEvidence {
         classification: "access-denied",
-        error_code,
-        version_delete_error_code,
+        error_code: "AccessDenied",
+        version_delete_error_codes,
         runtime_role_arn,
     };
     let path = write_delete_denial_evidence(&run_id, &evidence)

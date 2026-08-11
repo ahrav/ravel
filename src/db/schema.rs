@@ -39,10 +39,17 @@ CREATE TABLE sync_cursor (
             sequence BETWEEN 1 AND 9999999999999999
             AND tail_digest IS NOT NULL
             AND length(tail_digest) = 64
+            AND length(CAST(tail_digest AS BLOB)) = 64
             AND tail_digest NOT GLOB '*[^0-9a-f]*'
         )
     )
 ) STRICT;
+
+CREATE TRIGGER sync_cursor_is_singleton
+BEFORE DELETE ON sync_cursor
+BEGIN
+    SELECT RAISE(ABORT, 'sync_cursor holds exactly one row');
+END;
 
 CREATE TABLE campaigns (
     campaign_id TEXT PRIMARY KEY NOT NULL,
@@ -256,28 +263,55 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
     // constraints would serve reads that cannot come from the event chain.
     let mut definitions = {
         let mut stored = connection
-            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")
+            .prepare("SELECT name, sql, type FROM sqlite_schema WHERE sql IS NOT NULL")
             .map_err(local_format_error)?;
         stored
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(local_format_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(local_format_error)?
     };
-    definitions.retain(|(name, _)| !name.starts_with("sqlite_"));
-    if definitions.len() != PROJECTION_TABLES.len() {
+    definitions.retain(|(name, _, _)| !name.starts_with("sqlite_"));
+    let (tables, others): (Vec<_>, Vec<_>) = definitions
+        .into_iter()
+        .partition(|(_, _, kind)| kind == "table");
+    if tables.len() != PROJECTION_TABLES.len() {
         return Err(ValidateError::InvalidHistory);
     }
-    for (name, sql) in &definitions {
+    for (name, sql, _) in &tables {
         let expected = expected_definition(name).ok_or(ValidateError::InvalidHistory)?;
         if normalized(sql) != normalized(expected) {
             return Err(ValidateError::InvalidHistory);
         }
     }
+    // The fixed schema declares exactly one non-table object: the cursor-singleton
+    // trigger. Any other trigger, view, or index is a schema this projection never
+    // creates and could alter reads or abort applies.
+    match others.as_slice() {
+        [(_, sql, kind)]
+            if kind == "trigger" && normalized(sql) == normalized(expected_trigger()) => {}
+        _ => return Err(ValidateError::InvalidHistory),
+    }
 
     Ok(connection)
+}
+
+/// Recovers the one `CREATE TRIGGER` statement this schema declares.
+fn expected_trigger() -> &'static str {
+    let start = SCHEMA
+        .find("CREATE TRIGGER")
+        .expect("schema declares the cursor-singleton trigger");
+    let length = SCHEMA[start..]
+        .find("END")
+        .expect("trigger body terminates")
+        + "END".len();
+    &SCHEMA[start..start + length]
 }
 
 /// Recovers the `CREATE TABLE` statement this schema declares for `table`.
@@ -328,6 +362,12 @@ fn valid_cursor(sequence: u64, digest: Option<&str>) -> bool {
 /// Creates the schema, versions, and genesis cursor as one committed transaction.
 fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
     let mut connection = rusqlite::Connection::open(path)?;
+    // Configure rollback journaling before any schema write so the first commit
+    // never runs in a non-DELETE compile-time default mode (e.g. a WAL default),
+    // which could leave sidecar files behind on an early crash.
+    connection.pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
+        row.get::<_, String>(0)
+    })?;
     let transaction = connection.transaction()?;
     // Stamping RVL1 onto a database that already holds unrelated objects would
     // produce a mixed file that passes quick_check while not being this schema.
@@ -568,6 +608,41 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_row_cannot_be_deleted() {
+        let path = test_path("cursor-singleton");
+        let connection = create(&path).unwrap();
+
+        let error = connection
+            .execute("DELETE FROM sync_cursor WHERE id = 1", [])
+            .unwrap_err();
+        assert!(
+            matches!(error, rusqlite::Error::SqliteFailure(_, Some(ref m)) if m.contains("exactly one row")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(cursor_rows(&connection), [(1, 0, None)]);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_cursor_digest_hiding_bytes_after_a_nul_is_rejected() {
+        let path = test_path("cursor-nul-digest");
+        let connection = create(&path).unwrap();
+
+        // length() and GLOB both stop at the NUL, so only the byte length sees the rest.
+        let smuggled = format!("{DIGEST}\0trailing");
+        assert_constraint(connection.execute(
+            "UPDATE sync_cursor SET sequence = 1, tail_digest = ?1 WHERE id = 1",
+            [&smuggled],
+        ));
+        assert_eq!(cursor_rows(&connection), [(1, 0, None)]);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rejects_duplicate_identities_and_edges() {
         let path = test_path("identity-constraints");
         let connection = create(&path).unwrap();
@@ -596,7 +671,8 @@ mod tests {
         ] {
             connection.execute(insert, []).unwrap();
             assert_constraint(connection.execute(insert, []));
-            // NOT NULL is load-bearing: a non-INTEGER PRIMARY KEY otherwise accepts NULL.
+            // STRICT makes PRIMARY KEY columns implicitly NOT NULL, so the explicit clause
+            // is belt-and-braces should STRICT ever be dropped.
             assert_constraint(connection.execute(insert_null, []));
         }
         for invalid in [
@@ -656,8 +732,9 @@ mod tests {
             "INSERT INTO dependencies (work_id, depends_on_work_id) VALUES ('work', 'dependency')",
             [],
         ));
-        // A composite primary key is a UNIQUE index, where NULL never compares equal, so
-        // repeated NULL edges would be accepted without the column NOT NULL clauses.
+        // STRICT makes both PRIMARY KEY columns implicitly NOT NULL, so these rows are
+        // rejected before the UNIQUE index compares them; the explicit clauses are
+        // belt-and-braces should STRICT ever be dropped.
         for null_edge in [
             "INSERT INTO dependencies (work_id, depends_on_work_id) VALUES (NULL, 'dependency')",
             "INSERT INTO dependencies (work_id, depends_on_work_id) VALUES ('work', NULL)",
@@ -743,7 +820,13 @@ mod tests {
     fn rejects_missing_gapped_and_mismatched_history() {
         let path = test_path("missing-cursor");
         let connection = create(&path).unwrap();
+        // The singleton trigger guards production deletes; bypass and restore it so
+        // the only deviation this case validates is the missing cursor row.
+        connection
+            .execute("DROP TRIGGER sync_cursor_is_singleton", [])
+            .unwrap();
         connection.execute("DELETE FROM sync_cursor", []).unwrap();
+        connection.execute(expected_trigger(), []).unwrap();
         drop(connection);
         assert_eq!(
             open_existing(&path).unwrap_err(),
@@ -866,6 +949,26 @@ mod tests {
         connection.execute("DROP TABLE campaigns", []).unwrap();
         connection
             .execute("CREATE TABLE campaigns (id TEXT)", [])
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn an_unexpected_schema_object_is_rebuildable() {
+        let path = test_path("extra-trigger");
+        let connection = create(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TRIGGER extra BEFORE UPDATE ON sync_cursor BEGIN \
+                 SELECT RAISE(ABORT, 'no'); END",
+                [],
+            )
             .unwrap();
         drop(connection);
 

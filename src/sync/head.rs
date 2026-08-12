@@ -127,6 +127,16 @@ impl HeadTransition {
         {
             return Err(WireError::InvalidValue);
         }
+        // A scheduling event at an illegal position can never convert during
+        // replay, so committing it would leave every later refresh NotReady;
+        // reject it here so retained transitions built outside append cannot
+        // CAS such a tail either. ArtifactPublished stays constructible: it is
+        // frozen v1 chain content proven by the live ambiguity suite, and only
+        // the v1 scheduling projection lacks a conversion for it.
+        match event::scheduling_mutation(published.clone(), tail) {
+            Ok(_) | Err(event::ConversionError::UnsupportedContent) => {}
+            Err(_) => return Err(WireError::InvalidValue),
+        }
 
         match &parent {
             HeadParent::Genesis => {
@@ -623,6 +633,32 @@ mod tests {
         event::publish(&store, event, None)
             .await
             .expect("event publication resolves")
+    }
+
+    #[tokio::test]
+    async fn a_transition_rejects_a_scheduling_tail_at_an_illegal_position() {
+        // WorkflowStarted at sequence 1 can never convert during replay; the
+        // guard sits in transition construction so a caller bypassing append
+        // cannot CAS it either.
+        let tail = Event::new(
+            "illegal-genesis".into(),
+            1,
+            None,
+            1,
+            EventContent::WorkflowStarted,
+        )
+        .expect("valid event");
+        let publication = publish_event(&tail).await;
+        let candidate = Head::new(
+            Authority::unowned(),
+            publication.event_ref().clone(),
+            "illegal-genesis".into(),
+        )
+        .expect("valid candidate head");
+        assert_eq!(
+            HeadTransition::new(HeadParent::Genesis, candidate, &tail, &publication).err(),
+            Some(WireError::InvalidValue)
+        );
     }
 
     async fn genesis_transition(authority: Authority, operation_id: &str) -> HeadTransition {
@@ -1724,6 +1760,36 @@ mod tests {
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(request_path(&client, 0), format!("/{event_key}"));
         assert_eq!(request_path(&client, 1), format!("/{event_key}"));
+    }
+
+    #[tokio::test]
+    async fn append_rejects_a_tail_with_no_scheduling_projection() {
+        // WorkflowStarted at sequence 1 publishes fine but cannot convert during
+        // replay; append must fail before the head CAS.
+        let event = Event::new(
+            "unprojectable-operation".into(),
+            1,
+            None,
+            1,
+            EventContent::WorkflowStarted,
+        )
+        .expect("event is valid");
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let mut history = AttemptHistory::default();
+        assert!(matches!(
+            append(
+                &store,
+                HeadParent::Genesis,
+                Authority::unowned(),
+                &event,
+                None,
+                &mut history,
+            )
+            .await,
+            Err(AppendError::InvalidInput)
+        ));
+        // The event PUT went out; no head write followed.
+        assert_eq!(client.actual_requests().count(), 1);
     }
 
     #[tokio::test]

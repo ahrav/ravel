@@ -84,3 +84,39 @@ An error occurred (NoSuchLifecycleConfiguration) when calling the GetBucketLifec
     }
 }
 ```
+
+## Runtime principal — E04 claim and submission retention
+
+Runtime access uses a named AWS profile supplied through
+`RAVEL_LIVE_S3_RUNTIME_PROFILE`; credentials are not stored in this repository.
+The principal's effective policy must deny both actions below on the whole
+selected bucket:
+
+```json
+{
+    "Effect": "Deny",
+    "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion"
+    ],
+    "Resource": "arn:aws:s3:::ravel-e02-4c038b2f/*"
+}
+```
+
+The bucket-wide resource covers both claim and immutable-submission keys,
+including both live-test isolation shapes: preflight objects carry a run prefix
+before `workspace/`, and the delete-denial objects use the run id as the
+`workspace/` segment. A claim- or submission-prefix-only resource would not
+cover those objects.
+Denying `s3:PutBucketLifecycleConfiguration` is also recommended because
+retained claims and submissions rely on the absence of matching lifecycle
+expiration.
+The profile must resolve to an assumed role (for example `role_arn` +
+`source_profile`); the evidence check records the assumed-role ARN, so an
+IAM-user profile fails it.
+
+`tests/live_s3_preflight.rs` gates delete-denial evidence on the named runtime
+profile, requires the exact `AccessDenied` error code for both a claim and an
+immutable submission in one session, and rereads both objects byte-for-byte
+after denial. Runtime-principal provisioning and captured evidence are tracked
+by `ravel-nkx`.

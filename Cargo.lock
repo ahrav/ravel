@@ -1655,9 +1655,11 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "aws-smithy-runtime",
  "bytes",
  "ciborium",
+ "getrandom 0.4.3",
  "http 1.4.2",
  "http-body 1.1.0",
  "rusqlite",

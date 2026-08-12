@@ -35,6 +35,16 @@ impl PublishedArtifact {
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
+
+    /// Rebinds the witness to another namespace so store-identity checks can be
+    /// exercised without a second live publication.
+    #[cfg(test)]
+    pub(crate) fn attributed_to(self, namespace: &str) -> Self {
+        Self {
+            reference: self.reference,
+            namespace: namespace.to_owned(),
+        }
+    }
 }
 
 /// Publishes a bytes-only blob and returns metadata authorized to enter an event.
@@ -79,7 +89,7 @@ fn validate_artifact_length(length: usize) -> Result<(), PublicationError> {
     }
 }
 
-fn artifact_key(digest: &str) -> String {
+pub(crate) fn artifact_key(digest: &str) -> String {
     format!("artifacts/sha256/{digest}")
 }
 

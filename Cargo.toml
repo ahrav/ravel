@@ -18,6 +18,8 @@ aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
 ] }
 # The event format uses deterministic v1 CBOR encoding.
 ciborium = "=0.2.2"
+# Instance identity generation reads operating-system randomness.
+getrandom = "=0.4.3"
 # Disposable projections use bundled SQLite on both CI targets.
 rusqlite = { version = "=0.40.2", default-features = false, features = [
   "bundled",
@@ -28,6 +30,8 @@ serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.146"
 # Stored event bytes use SHA-256 digests.
 sha2 = "=0.10.9"
+# The database worker returns each async reply through a one-shot channel.
+tokio = { version = "=1.53.1", default-features = false, features = ["sync"] }
 # Event records use zstd compression.
 zstd = { version = "=0.13.3", default-features = false }
 
@@ -41,6 +45,7 @@ aws-config = { version = "=1.10.1", default-features = false, features = [
 aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
   "test-util",
 ] }
+aws-sdk-sts = { version = "=1.110.0", default-features = false }
 aws-smithy-runtime = { version = "=1.12.1", default-features = false, features = [
   "test-util",
 ] }

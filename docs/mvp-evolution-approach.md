@@ -2,15 +2,21 @@
 
 ## Status
 
-Direction adopted 2026-08-10: the scoped v2 path is chosen. E01, E03, and E04 remain
-complete, frozen v1 proofs. E02 (`ravel-aq8`) stays open pending its selected-bucket
-live preflight (`ravel-aq8.7`); the amendment does not settle that live-proof gate,
-which must close or be deferred on its own recorded evidence. v2 arrives as a new
-boundary (new keys, new envelope), never as edits
-to v1. The contract amendment — revising `mvp-outline.md`, `epics.md`, the task graph,
-and the fixture plan together — is tracked by the Phase 0 gate bead `ravel-om4`, which
-blocks all rebind-set work. The active contracts remain `mvp-outline.md`, `epics.md`,
-Beads, and the frozen durable formats until that amendment lands.
+Adopted scoped-v2 design authority. The active contracts are `mvp-outline.md`,
+`epics.md`, Beads, and the frozen durable formats. The scoped-v2 choice from this design
+has been incorporated into those contracts through the Phase 0 contract amendment;
+remaining Phase 0 task-graph decomposition and disposition work is tracked by
+`ravel-om4`.
+
+Complete the remaining Phase 0 work, then implement Phase 1-and-later authority work
+only on the scoped-v2 path. E01, E03, and E04 remain complete, frozen-v1 proofs. E02
+(`ravel-aq8`) stays open pending its selected-bucket live preflight (`ravel-aq8.7`),
+which must close or be deferred on its own recorded evidence. All new authority
+work starts at a v2 root `Scope`, and no authoritative chain mixes v1 and v2 events.
+
+The MVP proves the architecture with Distributed Research and Distributed Change. The
+CPU-to-GPU rendering campaign in section 14 is post-MVP design guidance and carries no
+contract or task-graph obligation.
 
 ## 1. Working direction
 
@@ -185,6 +191,7 @@ Planning is generative. Admission is deterministic.
 PlanRevision {
     scope_id
     parent_plan_digest
+    proposal_basis
     claim_specs
     work_specs
     child_scope_proposals
@@ -194,8 +201,10 @@ PlanRevision {
 ```
 
 A `PlanRevision` is immutable and content-addressed. Each revision supersedes its
-predecessor. Old observations can inform a new plan but satisfy work only when their
-bindings still match.
+predecessor. `proposal_basis` contains typed references to the objective, configuration,
+observations, or child certificates that informed the proposal. A reference records
+provenance. It does not establish the referenced claim. Old observations can inform a
+new plan but satisfy work only when their bindings still match.
 
 ```mermaid
 flowchart TB
@@ -235,6 +244,7 @@ an admitted plan revision. No workflow API can bypass this boundary.
 Admission validates:
 
 - Exact scope, parent-plan, subject, policy, and configuration bindings.
+- Proposal-basis existence, type, scope, and current bindings.
 - Dependency existence and acyclicity within the admitted graph.
 - Finite depth, fanout, attempt, deadline, effect, and resource bounds.
 - Budget availability and atomic escrow for every child proposal.
@@ -437,23 +447,48 @@ reduce ancestor work but never replace child history.
 
 ## 13. Objective to distributed work
 
-An objective starts planning. It does not authorize execution.
+An objective starts planning. It does not authorize execution. A campaign can start
+with a fixed plan, derive work from observations, or combine both.
 
-For a language port, Research establishes behavior contracts, compatibility oracles,
-dependency boundaries, and unresolved constraints. Planners then propose module work
-or child scopes. Admission accepts only bounded, authorized proposals.
+### Environment-derived work discovery
 
-More agents expand search and review. They do not guarantee an optimal result.
-Evidence, policy, and budget determine what advances.
-
-The loop:
+The [State2State paper](https://arxiv.org/abs/2608.04934) derives tasks from reachable
+state pairs and verifies success against environment state. Ravel uses the broader
+pattern. Environment-derived work discovery is a planning source, not a campaign type
+or a separate authority path.
 
 ```text
-Generator proposes.
-Oracle measures.
-Judge interprets.
-Scoped controller decides.
+campaign evidence
+  -> candidate target
+  -> bounded proposal
+  -> deterministic admission
+  -> execution
+  -> trusted verification
+  -> new evidence or stop
 ```
+
+A generator can be a model, a person, a deterministic analyzer, a search heuristic, or
+an exploration policy. Each candidate must name:
+
+- The parent objective or unresolved `ClaimSpec`.
+- The observations and certificates that form its basis.
+- A target predicate and the verifier that can test it.
+- Proposed `WorkSpec` or child-scope changes and their dependencies.
+- Required effects, resource bounds, failure states, and a stop condition.
+
+Campaign policy defines what can be observed, which discovery actions are legal,
+whether reset or replay is supported, which targets matter, and what each verifier
+establishes. The runtime records the basis, admits or rejects a `PlanRevision`, issues
+bounded grants, and retains the resulting observations.
+
+Exact state equality is one verifier, not the abstraction. A campaign can use tests,
+builds, invariants, metrics, simulations, structured state, or explicit review. A
+completion claim cannot exceed what its verifier checks.
+
+The environment does not remove specification work. Someone must define observable
+state, legal actions, target value, verifier limits, and completion policy. More agents
+can search more candidates. They do not guarantee an optimal plan. Evidence, policy,
+and budget determine what advances.
 
 ## 14. MVP and post-MVP scope
 
@@ -475,15 +510,91 @@ and dependency planners.
 Implement Research and Change before extracting a workflow trait or domain-specific
 language (DSL).
 
+The MVP preserves the environment-derived planning seam without building a curriculum
+engine. It records proposal bases and permits bounded follow-up `PlanRevision`s after
+new observations. Discovery rules and target predicates stay in campaign policy. Do
+not extract a generic discovery interface until materially different campaign types
+show the same contract.
+
+The MVP excludes online model training, learned reward policies, a universal state
+matcher, and unbounded task generation.
+
+### CPU-to-GPU image rendering campaign (post-MVP)
+
+A post-MVP campaign candidate evaluates GPU offload for an existing CPU-only C++ image
+rendering service. It composes Research, Change, and trusted evaluation. The kernel gains
+no GPU-specific types.
+
+This campaign is design guidance only. The MVP proves the architecture with Distributed
+Research and Distributed Change; the active contracts and task graph carry no
+GPU execution obligation. Adopt this campaign through a later contract amendment if the
+recursive substrate is proven and the workload still matters.
+
+The campaign asks:
+
+> Which operations improve end-to-end service performance on the target workload after
+> transfer, launch, synchronization, memory, and fallback costs?
+
+The root scope fixes:
+
+- Source revision, build, CPU, GPU, driver, and library versions.
+- Workload corpus, image sizes, formats, operation mixes, concurrency, and warm or
+  cold state.
+- CPU reference output and exact or tolerance-based correctness rules.
+- Primary end-to-end metrics, diagnostic metrics, and acceptance thresholds.
+- Experiment budget, implementation budget, and stopping rule.
+
+Research profiles the CPU baseline before proposing GPU work. It ranks operations by
+CPU cost, parallelism, arithmetic intensity, data movement, batching, and library
+support. A CPU hotspot alone does not justify offload.
+
+| Operation class | Offload case | Reject when |
+| --- | --- | --- |
+| Convolution, blur, sharpen, and neighborhood filters | Large regular grids expose parallel work and data reuse | Images are small or setup and edge handling dominate |
+| Resize, warp, rotation, and color conversion | Pixels can run independently and remain on the device | A single small stage requires two host-device transfers |
+| Compositing, blending, and tone mapping | Layers share regular per-pixel math | Branching, sparse regions, or small layers limit parallel work |
+| Decode or encode | A supported accelerator preserves required format and quality | Codec support, output parity, or transfer cost fails the contract |
+| Fused rendering stages | Several operations reuse device-resident data | CPU work forces synchronization between stages |
+
+Keep metadata handling, request routing, irregular control flow, and small one-off jobs
+on the CPU unless measurement proves an end-to-end gain.
+
+Experiment sequence:
+
+1. Freeze the workload, correctness contract, hardware, software, and metrics.
+2. Profile the CPU service and select bounded candidate operations.
+3. Build the smallest GPU prototype for each candidate. Keep the CPU path as reference.
+4. Run an A/A control: pass the same CPU artifact through both benchmark labels.
+5. Run CPU and GPU treatments in randomized complete blocks across the target hosts
+   and time windows. Record the seed and reset state between treatments. Each complete
+   block supplies one analysis contrast; requests within a run are subsamples.
+6. Measure total render latency from accepted request to completed output and sustained
+   throughput. Record kernel time, transfer time, synchronization, CPU use, GPU use,
+   memory, failures, and cost as diagnostics.
+7. Retain crashes, timeouts, out-of-memory results, and invalid outputs.
+8. Classify each candidate as `IMPLEMENT`, `REJECT`, or `INCONCLUSIVE`.
+9. Integrate `IMPLEMENT` candidates with a CPU fallback, then rerun correctness,
+   performance, and failure tests on the full service.
+
+The root owns the workload and decision gates. A candidate starts as a `WorkSpec`.
+Use a child scope only when the candidate needs a bounded prototype, correctness proof,
+benchmark, and implementation sequence.
+
+A fast GPU kernel does not pass the campaign if transfers erase the gain. A campaign
+that rejects every candidate is complete when the evidence and accounting close.
+
 ### Post-MVP expansion
 
-After measuring the substrate and both pilots:
+After measuring the substrate and MVP campaigns:
 
 - Objective-to-contract research before implementation begins.
 - Compiling accepted behavioral contracts into versioned work and child scopes.
 - Deeper scope trees when depth two fails measured workloads.
 - Additional concrete Verify, Document, and Search protocols.
 - Scope placement and selective replay tuned from measurements.
+- Generator and candidate-filter comparisons across different campaign types.
+- Offline task datasets from replayable transitions after provenance, privacy, and
+  verifier-quality gates.
 - Empirical generator, judge, and oracle routing.
 
 ## 15. Structural decisions and tunable choices
@@ -499,6 +610,7 @@ Structural decisions:
 - Escrow, settlement, and quarantine conserve budget.
 - Children settle bottom-up.
 - S3 holds durable authority. SQLite provides scope-selective projections.
+- Initial and observation-derived work use the same plan-admission path.
 - Model output is an observation, not authority.
 
 Tunable choices:
@@ -508,6 +620,7 @@ Tunable choices:
 - Scope placement, takeover preference, and scheduling heuristics.
 - SQLite layout and hot-history retention.
 - Certificate indexing and projection compaction.
+- Generator mix and candidate filters.
 - Planner, critic, judge, and model prompts.
 - Lease, batch, concurrency, and replay-window values.
 
@@ -520,7 +633,7 @@ This sequence becomes active only after the plan amendment.
 | 0. Contract amendment | Revise the outline, epics, task graph, identity axis, keys, and v2 envelope together | Recursive protocol is coherent before new scoped payloads |
 | 1. Scoped substrate | Add `ScopeId`, scoped heads, events, claims, work references, and selective projection | Two scopes advance and rebuild independently |
 | 2. Scoped authority | Implement per-scope leases, lazy takeover, and settlement-pressure scheduling | Parent and child controllers fail independently |
-| 3. Recursive admission | Implement plan revisions, shared admission, grants, escrow, sealing, certificates, and settlement | A depth-two Research path completes and conserves budget |
+| 3. Recursive admission | Implement plan revisions with typed proposal bases, shared admission, grants, escrow, sealing, certificates, and settlement | A bounded observation-derived revision completes and conserves budget |
 | 4. Workflow proof | Build Research and Change on the recursive substrate | No flat workflow path requires later replacement |
 | 5. Scale proof | Exercise many scopes and nodes, selective replay, failover, and unknown outcomes | Root and projections avoid global hot paths |
 

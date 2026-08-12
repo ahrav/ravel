@@ -690,7 +690,7 @@ Scoped v2 uses this separate key axis:
 ```text
 workspace/{workspace_id}/campaigns/{campaign_id}/
   scopes/{scope_id}/head
-  scopes/{scope_id}/events/...
+  scopes/{scope_id}/events/{sequence:016}-{digest}.cbor.zst
   scopes/{scope_id}/claims/{work_id}/{work_revision}
   plans/{plan_digest}
   artifacts/{digest}
@@ -713,10 +713,16 @@ scope_epoch
 Fields are required only where the represented object has that relationship; omission
 never aliases a different identity.
 
-The exact v2 event-key suffix, canonical serialization, compression, digest algorithm
-and textual encoding, plan bytes, artifact media-type rules, and serialized
-`ScopeHead` form remain open contract questions. The implementation must settle them
-before shipping v2 bytes and must not infer them from v1.
+Scoped-v2 root events use declaration-order CBOR compressed as one zstd level-3
+frame with declared content size. The lowercase hexadecimal SHA-256 of those stored
+compressed bytes is both the event digest and the digest in the event basename above.
+Decoders require exact CBOR re-encoding and exact zstd recompression. `ScopeHead` uses
+compact declaration-order JSON with every nullable field present as explicit `null`;
+its fixed field order is `version`, `campaign_id`, `scope_id`,
+`controller_instance_id`, `scope_epoch`, `lease_until`, `sequence`,
+`tail_event_digest`, `active_plan_digest`, and `operation_id`. Head `version` is `2`;
+decoders reject every other value. Plan bytes and artifact media-type rules remain open
+contract questions and are not inferred from v1.
 
 A v2 key never reinterprets a v1 object. A v2 `ScopeHead` cannot reference a v1 event,
 and a v1 campaign head cannot reference a v2 event. Future durable changes require a
@@ -842,11 +848,22 @@ child's decision stream.
 A v2 `ScopeHead` never references a v1 event, and a v1 campaign head never references
 a v2 event.
 
-The exact event-key suffix and canonical encoding remain open. The serialized
-`ScopeHead`, root-scope genesis event and CAS protocol, root `scope_id` derivation,
-initial `scope_epoch`, initial plan reference, and child-genesis byte representation
-also remain open contract questions. No v2 durable bytes ship until those forms are
-fixed and covered by positive and cross-version negative fixtures.
+The root-genesis event is declaration-order CBOR containing `{ envelope, payload }`.
+Its envelope version is `2`; the `root_genesis` payload version is `1`. The payload
+contains `campaign_id`, explicit-null `parent_scope_id` and `delegation_digest`, and
+`config_digest`, which is lowercase hexadecimal SHA-256 over nonempty caller-canonical
+admitted-configuration bytes capped at 1 MiB. The root `scope_id` is lowercase
+hexadecimal SHA-256 over `ravel.scope.root.v2\0` followed by declaration-order CBOR of
+`workspace_id` and validated caller-supplied `campaign_id`; configuration bytes do not
+change that identity.
+
+Genesis starts at sequence, writer epoch, and scope epoch `1`, with no event parent,
+controller, lease, or active plan. Its operation ID is `root-genesis:{scope_id}`.
+Positive fixtures live under `tests/fixtures/v2/`, and cross-version negatives prove
+that neither v1 nor v2 events and heads cross-decode. Root-head publication/CAS remains
+owned by the following root-log task. Non-null parent/delegation forms, child genesis,
+and two-scope recovery are post-signal; the root-only MVP rejects them before domain
+conversion.
 
 ---
 
@@ -885,8 +902,9 @@ The scope does not depend on A returning. Parent and child controllers may run o
 separate machines and fail or recover independently. Presence and placement signals do
 not grant authority.
 
-The exact serialized `ScopeHead` and root genesis forms remain open as recorded in
-section 6.2.
+Sections 5.2 and 6.2 fix the serialized `ScopeHead` and root-genesis forms.
+Publication, lease acquisition, renewal, and takeover transitions remain separate
+follow-on contracts.
 
 ---
 
@@ -1459,9 +1477,9 @@ campaign-relative `artifacts/{digest}` key from section 5.2. Both remain immutab
 content-addressed, and fully verified before use. A path or artifact reference is not
 authority by itself.
 
-The scoped-v2 plan and artifact digest algorithm, algorithm tag, textual encoding,
-canonical bytes, compression, and media-type rules remain open contract questions and
-must be fixed before the corresponding keys ship.
+Scoped-v2 plan and artifact keys use lowercase hexadecimal SHA-256 digest text with no
+algorithm tag. Their canonical bytes, compression, and media-type rules remain open
+contract questions and must be fixed before corresponding records ship.
 
 ## 12.1 RunManifest and RunTrace
 

@@ -128,30 +128,36 @@ one authoritative chain never mixes v1 and v2 events.
 
 The scoped-v2 implementation may reuse the v1 algorithms only through explicit v2
 types and bindings. It must never reinterpret, rewrite, migrate, or silently route a v1
-object through v2 code. The exact v2 event suffix, canonical serialization and digest
-encodings, serialized `ScopeHead` and root-genesis forms, and payload schemas remain
-open contract decisions and must be fixed before new durable bytes ship.
+object through v2 code. Root events use declaration-order CBOR, zstd level 3, and a
+lowercase hexadecimal SHA-256 stored-byte digest at
+`events/{sequence:016}-{digest}.cbor.zst`. Root `ScopeHead` uses fixed-order compact
+JSON with explicit nulls. Root scope identity hashes the `ravel.scope.root.v2\0`
+domain separator plus declaration-order CBOR of workspace and campaign identities;
+root genesis separately binds the admitted canonical-configuration digest. Other
+payload schemas remain open until their owning tasks.
 
 ## V2-P1 — Add the Scoped-v2 Substrate
 
 **Description**
 
-Add the scoped-v2 durable substrate beside the frozen-v1 substrate. Reuse immutable
-publication, conditional replacement, exact-chain replay, disposable projection, and
-same-key work-claim algorithms through version-specific v2 types. Do not modify the v1
-paths or fixtures and do not add controller leases, plan admission, grants, escrow,
-certificates, or settlement in this epic.
+Add the root-only scoped-v2 durable substrate beside the frozen-v1 substrate. Reuse
+immutable publication, conditional replacement, exact-chain replay, disposable
+projection, and same-key work-claim algorithms through version-specific v2 types. Do
+not modify the v1 paths or fixtures and do not add controller leases, plan admission,
+grants, escrow, certificates, or settlement in this epic. Recursive child admission
+and two-scope recovery are post-signal work; root-only decoders reject non-null parent
+or delegation identity.
 
 **Acceptance criteria**
 
 - [ ] Every scoped-v2 durable identity uses the exact axis `campaign_id`, `scope_id`, `parent_scope_id`, `delegation_digest`, `plan_digest`, `work_id`, `work_revision`, `claim_fence`, and `scope_epoch`, with fields required only where the represented object has that relationship.
 - [ ] Every scoped-v2 event uses an `EventEnvelope` containing exactly `envelope_version`, `scope_id`, `sequence`, `parent_event`, `writer_epoch`, `operation_id`, `payload_type`, and `payload_version`; envelope and payload versions are validated independently.
-- [ ] Scoped-v2 objects use `workspace/{workspace_id}/campaigns/{campaign_id}/scopes/{scope_id}/head`, `scopes/{scope_id}/events/...`, `scopes/{scope_id}/claims/{work_id}/{work_revision}`, `plans/{plan_digest}`, and `artifacts/{digest}`. The unresolved `events/...` suffix and encoding choices are not inferred from v1.
+- [ ] Scoped-v2 objects use `workspace/{workspace_id}/campaigns/{campaign_id}/scopes/{scope_id}/head`, `scopes/{scope_id}/events/{sequence:016}-{digest}.cbor.zst`, `scopes/{scope_id}/claims/{work_id}/{work_revision}`, `plans/{plan_digest}`, and `artifacts/{digest}`. Root event bytes and digest encoding use the settled v2 contract above rather than interpreting v1 bytes.
 - [ ] Each scope has its own `ScopeHead`, immutable parent-linked event chain, claim keys, verified sequence and tail, active plan reference, and projection cursor. Independent scopes never share a mutable head or replay cursor.
 - [ ] Scope-indexed SQLite projection applies one verified event and advances only that scope's cursor atomically; a gap, digest conflict, wrong-scope event, unknown version, conversion failure, or mixed-version parent leaves that scope unchanged and not ready.
 - [ ] The sync engine supports scope-selective replay and verifies readiness against a freshly read selected `ScopeHead` without using `LIST` as a publication snapshot.
 - [ ] A v2 `ScopeHead` cannot reference a v1 event, a v1 campaign head cannot reference a v2 event, and cross-version negative fixtures fail closed without altering frozen-v1 fixtures.
-- [ ] A two-scope integration proof advances and rebuilds the scopes independently, including one scope failing replay while the other remains valid and ready.
+- [ ] Post-signal recursive proof: a two-scope integration advances and rebuilds the scopes independently, including one scope failing replay while the other remains valid and ready. This is not part of the root-only Phase 1 delivery.
 
 **Dependencies:** E04 — Fence Work Claims and Result Submission
 

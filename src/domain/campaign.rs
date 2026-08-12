@@ -324,7 +324,7 @@ impl fmt::Display for ValidationError {
 
 impl Error for ValidationError {}
 
-fn validate_sequence(sequence: u64) -> Result<(), ValidationError> {
+pub(crate) fn validate_sequence(sequence: u64) -> Result<(), ValidationError> {
     if (1..=MAX_SEQUENCE).contains(&sequence) {
         Ok(())
     } else {
@@ -356,7 +356,7 @@ pub(crate) fn validate_key_segment(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn is_digest(value: &str) -> bool {
+pub(crate) fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

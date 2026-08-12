@@ -33,4 +33,5 @@ pub(crate) mod recovery {
     pub(crate) mod reconcile;
 }
 
+pub mod scoped;
 pub mod sync;

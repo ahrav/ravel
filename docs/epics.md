@@ -1,6 +1,8 @@
 # Ravel MVP Epics
 
-E01–E04 are complete frozen-v1 proof records. E05–E10, together with the scoped-v2
+E01, E03, and E04 are complete frozen-v1 proof records; E02's frozen v1 code is
+complete while its selected-bucket live preflight (`ravel-aq8.7`) remains open.
+E05–E10, together with the scoped-v2
 Phase 1 and Phase 3 structural epics below, define the smallest active implementation
 that can test the MVP thesis. They preserve the hard invariants in `mvp-outline.md`
 while avoiding public frameworks, generic backends, workflow DSLs, campaign profiles,
@@ -117,7 +119,8 @@ Each work claim is its own S3 CAS domain. Claiming, renewal, reclamation, and su
 
 ## Frozen-v1 / scoped-v2 boundary
 
-E01–E04 remain the complete frozen-v1 proof record. Existing v1 event, head, claim,
+E01, E03, and E04 remain complete frozen-v1 proof records, and E02's frozen v1 code
+is complete pending its open live preflight. Existing v1 event, head, claim,
 projection, artifact, key, encoding, and fixture bytes remain unchanged. Scoped v2 is a
 new durable boundary with new scope keys, identities, claims, projections, and
 `EventEnvelope`. A v2 campaign starts with a v2 root `Scope`, not a global sequencer;
@@ -245,7 +248,8 @@ The campaign consists of one root `Scope`, one initial admitted plan, three to f
 independent researchers, one critic round, at most one discriminating follow-up child
 scope for material disagreement, and one synthesis. That bounded follow-up uses the one
 allowed depth-two child scope. The child seals, returns a certificate, and settles before
-root completion, which seals a root certificate. This proves multi-provider distributed
+root completion, which is recorded in the root-completion representation V2-P3
+selects. This proves multi-provider distributed
 judgment without creating a provider SDK, policy engine, adjudication platform, workflow
 trait, campaign profile, or generic discovery interface.
 
@@ -260,7 +264,7 @@ trait, campaign profile, or generic discovery interface.
 - [ ] A worker can disappear and have work reclaimed, and scoped controller authority can move hosts without losing coherent progress, invalidating an unexpired claim, or accepting a stale result.
 - [ ] Material disagreement can inform at most one superseding `PlanRevision` for one evidence-driven discriminating follow-up, admitted as the one allowed depth-two child scope; no direct controller-created work, descendant scope, second critic round, or unbounded model debate is permitted.
 - [ ] Final synthesis records supported conclusions, evidence, rejected explanations, material uncertainty, and unresolved questions with full scope, plan, work, attempt, producer, evaluator, and policy provenance and no routine human approval. The unresolved synthesis payload-shape question is not decided by this epic text.
-- [ ] The follow-up child scope seals, returns a verifier-bounded certificate, and settles idempotently; root completion waits for required claims and settlement, seals a root certificate, and preserves escrow conservation and unknown reserve.
+- [ ] The follow-up child scope seals, returns a verifier-bounded certificate, and settles idempotently; root completion waits for required claims and settlement, records completion in the root-completion representation V2-P3 selects, and preserves escrow conservation and unknown reserve.
 - [ ] Interrupted provider/process tasks are reconciled and reaped under the node lifecycle contract; no detached invocation survives shutdown.
 - [ ] The concrete Research module shares only demonstrated non-authority helpers. No workflow trait, DSL, campaign profile, curriculum engine, online model training, learned reward policy, universal state matcher, generic discovery interface, or unbounded task generation is introduced.
 

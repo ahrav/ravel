@@ -2,9 +2,11 @@
 
 ## Working Plan and MVP Specification v0.2 — Scoped v2
 
-> **Durable-version convention.** E01–E04 are complete frozen-v1 proof records.
-> Existing v1 event, head, claim, projection, artifact, key, encoding, and fixture
-> bytes remain unchanged. Scoped v2 is a new durable boundary with new scope keys,
+> **Durable-version convention.** E01, E03, and E04 are complete frozen-v1 proof
+> records; E02's frozen v1 code is complete while its selected-bucket live preflight
+> (`ravel-aq8.7`) remains open and must close or be deferred on its own recorded
+> evidence. Existing v1 event, head, claim, projection, artifact, key, encoding, and
+> fixture bytes remain unchanged. Scoped v2 is a new durable boundary with new scope keys,
 > identities, claims, projections, and `EventEnvelope`. A v2 campaign starts with a
 > v2 root `Scope`; one authoritative chain never mixes v1 and v2 events.
 >
@@ -468,7 +470,7 @@ The MVP includes:
 
 * Multiple actual machines, including late join and disappearance during active work.
 * Amazon S3 shared authority and disposable local SQLite on every machine.
-* The complete frozen-v1 E01–E04 event, head, claim, projection, artifact, key,
+* The frozen-v1 E01–E04 event, head, claim, projection, artifact, key,
   encoding, and fixture record, unchanged.
 * A separate scoped-v2 durable boundary with no mixed-version authoritative chain.
 * The exact scoped-v2 identity axis:
@@ -1860,10 +1862,10 @@ result is an immutable observation; root policy commits any acceptance and compl
 
 The serialized synthesis payload remains an open contract question. Existing
 obligations must be preserved: conclusions, evidence supporting each conclusion,
-rejected explanations, material uncertainty, and unresolved questions. The active task
-contract currently requires exactly those five sections and forbids `Suggested next
-workflow`, while the frozen outline record included that sixth field. No v2 payload
-ships and no field is removed or added until a human resolves that conflict.
+rejected explanations, material uncertainty, and unresolved questions. The contract
+must still choose between exactly those five semantic sections and the outline-survey
+variant that also retains `Suggested next workflow`. No v2 payload ships and no
+serialized shape is finalized or tested until a human records that ruling.
 
 ---
 
@@ -2762,8 +2764,9 @@ Implement:
 * One admitted critic round.
 * At most one observation-derived discriminating follow-up, in the one allowed
   depth-two child scope.
-* Admitted synthesis work and verifier-bounded root completion sealed as a root
-  certificate.
+* Admitted synthesis work and verifier-bounded root completion recorded in the
+  root-completion representation V2-P3 selects (§7.4 keeps certificate,
+  optional-delegation certificate, and `Decision`-plus-accounting open).
 * Child certificate and settlement for that follow-up child.
 
 Required deployment remains at least three independent machines or VM hosts.

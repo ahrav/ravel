@@ -38,8 +38,6 @@ const MAX_CLAIM_BYTES: usize = 4 * 1024;
 const CLAIM_LEASE_MS: u64 = 15 * 60 * 1000;
 /// Minimum lease left before a send: a create that S3 commits after the
 /// embedded expiry grants authority over an immediately reclaimable record.
-// ponytail: fixed margin, not a bound on S3 commit delay; shrink the race
-// window rather than eliminate it. Reprepare-on-retry would remove it fully.
 const CLAIM_SEND_MARGIN_MS: u64 = 30 * 1000;
 #[allow(dead_code)]
 const CLAIM_RENEWAL_CADENCE_MS: u64 = 5 * 60 * 1000;

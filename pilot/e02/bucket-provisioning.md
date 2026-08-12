@@ -104,8 +104,10 @@ selected bucket:
 ```
 
 The bucket-wide resource covers both claim and immutable-submission keys,
-including isolated live-test objects with a run prefix before `workspace/`.
-A claim- or submission-prefix-only resource would not cover those objects.
+including both live-test isolation shapes: preflight objects carry a run prefix
+before `workspace/`, and the delete-denial objects use the run id as the
+`workspace/` segment. A claim- or submission-prefix-only resource would not
+cover those objects.
 Denying `s3:PutBucketLifecycleConfiguration` is also recommended because
 retained claims and submissions rely on the absence of matching lifecycle
 expiration.

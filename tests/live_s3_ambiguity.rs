@@ -851,8 +851,8 @@ async fn claim_worker_scenario(
             "claim-committed"
         }
         ClaimAcquireOutcome::Collision => "claim-collision",
-        ClaimAcquireOutcome::AcquiredUnverified
-        | ClaimAcquireOutcome::Ineligible
+        ClaimAcquireOutcome::AcquiredUnverified => "claim-committed-unverified",
+        ClaimAcquireOutcome::Ineligible
         | ClaimAcquireOutcome::RetryIdentically(_)
         | ClaimAcquireOutcome::Unresolved(_) => {
             return Err("worker-claim-outcome");
@@ -1216,7 +1216,10 @@ async fn two_process_claim_race(
     let results = race_pair(&listener, &params, evidence)?;
     let committed: Vec<_> = results
         .iter()
-        .filter(|result| result.classification == "claim-committed")
+        .filter(|result| {
+            result.classification == "claim-committed"
+                || result.classification == "claim-committed-unverified"
+        })
         .collect();
     let collisions: Vec<_> = results
         .iter()

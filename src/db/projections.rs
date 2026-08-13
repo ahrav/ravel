@@ -84,7 +84,8 @@ CREATE TABLE applied_scope_events (
     CHECK (writer_epoch > 0),
     CHECK (length(CAST(payload_type AS BLOB)) BETWEEN 1 AND 128
         AND payload_type NOT LIKE '%/%'),
-    CHECK ((sequence = 1 AND payload_type = 'root_genesis')
+    CHECK ((sequence = 1 AND payload_type = 'root_genesis'
+            AND operation_id = 'root-genesis:' || scope_id)
         OR (sequence > 1 AND payload_type <> 'root_genesis'))
 ) STRICT, WITHOUT ROWID;
 ";
@@ -450,7 +451,7 @@ fn validate(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
     let application_id: i32 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .map_err(local_format_error)?;
-    if application_id != APPLICATION_ID && !is_blank(connection)? {
+    if application_id != APPLICATION_ID && !is_blank(connection) {
         return Err(ValidateError::WrongApplicationId);
     }
     let integrity: String = connection
@@ -495,14 +496,14 @@ fn local_format_error(error: rusqlite::Error) -> ValidateError {
     }
 }
 
-fn is_blank(connection: &rusqlite::Connection) -> Result<bool, ValidateError> {
+fn is_blank(connection: &rusqlite::Connection) -> bool {
     connection
         .query_row(
             "SELECT COUNT(*) = 0 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
             [],
             |row| row.get(0),
         )
-        .map_err(local_format_error)
+        .unwrap_or(false)
 }
 
 fn validate_schema(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
@@ -635,13 +636,15 @@ mod tests {
         digest: &str,
         parent: Option<&str>,
     ) -> ScopeProjectionEvent {
-        mutation_with_operation(
-            scope,
-            sequence,
-            digest,
-            parent,
-            &format!("operation-{sequence}"),
-        )
+        mutation_with_operation(scope, sequence, digest, parent, &operation(scope, sequence))
+    }
+
+    fn operation(scope: &ScopeIdentity, sequence: u64) -> String {
+        if sequence == 1 {
+            format!("root-genesis:{}", scope.scope_id().as_str())
+        } else {
+            format!("operation-{sequence}")
+        }
     }
 
     fn mutation_with_operation(
@@ -756,6 +759,40 @@ mod tests {
             ValidateError::IntegrityCheckFailed
         );
         fs::remove_file(garbage).unwrap();
+
+        // A foreign application_id remains WrongApplicationId when bytes 100..4096 are corrupted.
+        let unreadable = path("unreadable");
+        drop(create(&unreadable).unwrap());
+        let foreign = rusqlite::Connection::open(&unreadable).unwrap();
+        foreign
+            .pragma_update(None, "application_id", 0x1234)
+            .unwrap();
+        drop(foreign);
+        let mut bytes = fs::read(&unreadable).unwrap();
+        bytes[100..4096].fill(0xff);
+        fs::write(&unreadable, &bytes).unwrap();
+        assert_eq!(
+            open_existing(&unreadable).unwrap_err(),
+            ValidateError::WrongApplicationId
+        );
+        fs::remove_file(unreadable).unwrap();
+    }
+
+    #[test]
+    fn a_root_row_requires_the_derived_operation_id() {
+        let path = path("root-operation");
+        let mut connection = create(&path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        assert_eq!(
+            apply_scope_event(
+                &mut connection,
+                &mutation_with_operation(&scope, 1, DIGEST_1, None, "bogus-root-op")
+            ),
+            Err(ApplyError::DatabaseOperationFailed)
+        );
+        assert_eq!(scope_cursor(&connection, &scope).unwrap(), (0, None));
+        drop(connection);
+        fs::remove_file(path).unwrap();
     }
 
     fn query_plan(
@@ -918,7 +955,7 @@ mod tests {
             .unwrap();
 
         let after_update_conflict =
-            mutation_with_operation(&first, 2, DIGEST_3, Some(DIGEST_1), "operation-1");
+            mutation_with_operation(&first, 2, DIGEST_3, Some(DIGEST_1), &operation(&first, 1));
         assert_eq!(
             apply_scope_event(&mut connection, &after_update_conflict),
             Err(ApplyError::Conflict)
@@ -940,7 +977,7 @@ mod tests {
             .execute(
                 "INSERT INTO applied_scope_events \
                  (scope_id, sequence, digest, parent_digest, operation_id, writer_epoch, payload_type) \
-                 VALUES (?1, 1, ?2, NULL, 'operation', 1, 'root_genesis')",
+                 VALUES (?1, 1, ?2, NULL, 'root-genesis:' || ?1, 1, 'root_genesis')",
                 params![DIGEST_1, DIGEST_2],
             )
             .unwrap();

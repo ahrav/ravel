@@ -2366,7 +2366,7 @@ The amendment sequence is:
 | Phase | Work | Required proof |
 | --- | --- | --- |
 | 0. Contract amendment | Revise outline, epics, task graph, identity axis, keys, envelope, and fixtures together | Recursive protocol is coherent before new scoped payloads |
-| 1. Scoped substrate | Add scoped heads, events, claims, work references, and selective projection | Two scopes advance and rebuild independently; noncanonical records fail closed |
+| 1. Scoped substrate | Add root scoped head, events, claims, work references, and selective projection | The root scope advances and rebuilds; root decoders reject non-null parent or delegation identity; noncanonical records fail closed. The two-scope independence proof is post-signal work under Phase 2 |
 | 2. Scoped authority | Add per-scope leases, lazy takeover, lifecycle supervision, and settlement-pressure scheduling | Parent and child controllers fail independently |
 | 3. Recursive admission | Add plans, typed proposal bases, shared admission, grants, escrow, sealing, certificates, and settlement | One bounded observation-derived revision completes and conserves budget |
 | 4. Campaign proof | Build Research and Change campaigns on that substrate | No flat workflow authority path requires replacement |

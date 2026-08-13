@@ -2375,7 +2375,7 @@ The amendment sequence is:
 | Phase | Work | Required proof |
 | --- | --- | --- |
 | 0. Contract amendment | Revise outline, epics, task graph, identity axis, keys, envelope, and fixtures together | Recursive protocol is coherent before new scoped payloads |
-| 1. Scoped substrate | Add scoped heads, events, claims, work references, and selective projection | Two scopes advance and rebuild independently; noncanonical records fail closed |
+| 1. Scoped substrate | Add root scoped head, events, claims, work references, and selective projection | The root scope advances and rebuilds; root decoders reject non-null parent or delegation identity; noncanonical records fail closed. The two-scope independence proof is post-signal work under Phase 2 |
 | 2. Scoped authority | Add per-scope leases, lazy takeover, lifecycle supervision, and settlement-pressure scheduling | Parent and child controllers fail independently |
 | 3. Recursive admission | Add plans, typed proposal bases, shared admission, grants, escrow, sealing, certificates, and settlement | One bounded observation-derived revision completes and conserves budget |
 | 4. Campaign proof | Build Research and Change campaigns on that substrate | No flat workflow authority path requires replacement |
@@ -3233,16 +3233,20 @@ ravel/
       status.rs
 ```
 
-The durable protocol lives in `scope.rs`, `sync/event.rs`, `sync/head.rs`, and
-`sync/replay.rs`, with the disposable projection in `db/projections.rs` and its owning
-worker in `db/worker.rs`. Only these ship today; the remaining entries are the planned
+The durable root wire contract lives in `scope.rs` with shared wire errors in
+`sync.rs`; the root log, head transitions, and replay live in `sync/event.rs`,
+`sync/head.rs`, and `sync/replay.rs`, with the disposable projection in
+`db/projections.rs`. They are supported by `domain/validation.rs`,
+`domain/artifact.rs`, `domain/work.rs`, `distributed/identity.rs`,
+`storage/s3.rs`, and `storage/artifacts.rs`. Only these ship today; the remaining
+entries, including `db/worker.rs` and the controller modules, are the planned
 layout for later epics.
 
-Scoped controller authority is implemented in `distributed/scope_controller.rs`.
+Scoped controller authority is planned for `distributed/scope_controller.rs`.
 
-`models/config.rs` records exact fixed model configuration identity and digest. There
-is no `models/profiles.rs`, profile registry, workflow trait, DSL, or generic discovery
-module.
+`models/config.rs` will record exact fixed model configuration identity and digest.
+There is no `models/profiles.rs`, profile registry, workflow trait, DSL, or generic
+discovery module.
 
 Do not split into many crates until dependency boundaries make that useful.
 

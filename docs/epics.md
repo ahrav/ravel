@@ -1,7 +1,7 @@
 # Ravel MVP Epics
 
-E01, E03, and E04 are complete proof records; E02's code is complete while its
-selected-bucket live preflight (`ravel-aq8.7`) remains open. E05–E10, together with the
+E01, E02, E03, and E04 are complete proof records; E02's selected-bucket live
+preflight (`ravel-aq8.7`) closed on its recorded evidence. E05–E10, together with the
 Phase 1 and Phase 3 structural epics below, define the smallest active implementation
 that can test the MVP thesis. They preserve the hard invariants in `mvp-outline.md`
 while avoiding public frameworks, generic backends, workflow DSLs, campaign profiles,
@@ -36,8 +36,12 @@ The configuration is an input to the MVP, not a new product surface. It is versi
 
 ## E02 — Establish the S3 Durable Log and Minimal Rust Runtime
 
-Status: Open — code complete, pending the selected-bucket live preflight
-(`ravel-aq8.7`), which must close or be deferred on its own recorded evidence
+Status: Complete — proof record. The selected-bucket live preflight
+(`ravel-aq8.7`) closed on its recorded evidence: typed `404`/`412` behavior,
+conditional-chain integrity, lifecycle retention, and credential-free default CI.
+Its live harnesses exercised the deleted flat campaign protocol and were removed
+with it; live validation of the canonical root-scope path belongs to
+`ravel-a3j.2`.
 
 **Description**
 

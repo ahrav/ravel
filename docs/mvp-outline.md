@@ -3224,16 +3224,17 @@ ravel/
       status.rs
 ```
 
-The durable protocol lives in `scope.rs`, `sync/event.rs`, `sync/head.rs`, and
-`sync/replay.rs`, with the disposable projection in `db/projections.rs` and its owning
-worker in `db/worker.rs`. Only these ship today; the remaining entries are the planned
-layout for later epics.
+The durable root wire contract lives in `scope.rs` with shared wire errors in
+`sync.rs`, supported by `domain/validation.rs`, `domain/artifact.rs`,
+`domain/work.rs`, `distributed/identity.rs`, `storage/s3.rs`, and
+`storage/artifacts.rs`. Only these ship today; the remaining entries, including the
+`sync/`, `db/`, and controller modules, are the planned layout for later epics.
 
-Scoped controller authority is implemented in `distributed/scope_controller.rs`.
+Scoped controller authority is planned for `distributed/scope_controller.rs`.
 
-`models/config.rs` records exact fixed model configuration identity and digest. There
-is no `models/profiles.rs`, profile registry, workflow trait, DSL, or generic discovery
-module.
+`models/config.rs` will record exact fixed model configuration identity and digest.
+There is no `models/profiles.rs`, profile registry, workflow trait, DSL, or generic
+discovery module.
 
 Do not split into many crates until dependency boundaries make that useful.
 

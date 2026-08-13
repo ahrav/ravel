@@ -339,11 +339,20 @@ async fn resolve(store: &S3Store, mut transition: ScopeHeadTransition) -> ScopeH
     reconcile(store, transition, current).await
 }
 
+pub(crate) fn root_head_supported(head: &ScopeHead) -> bool {
+    matches!(head.authority(), ScopeAuthority::Unowned)
+        && head.scope_epoch().get() == 1
+        && head.active_plan_digest().is_none()
+}
+
 async fn reconcile(
     store: &S3Store,
     transition: ScopeHeadTransition,
     current: ObservedScopeHead,
 ) -> ScopeHeadCommitOutcome {
+    if !root_head_supported(&current.head) {
+        return ScopeHeadCommitOutcome::Unresolved(transition);
+    }
     let boundary = match &transition.parent {
         ScopeHeadParent::Genesis => None,
         ScopeHeadParent::Existing(parent) => Some(parent.head.tail().clone()),
@@ -1181,5 +1190,59 @@ mod tests {
             .await,
             ScopeHeadCommitOutcome::ProvenNotCommitted
         ));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_refuses_an_unsupported_current_head() {
+        let genesis = genesis();
+        let parent = genesis.head().clone();
+        let (_, other_encoded) = successor(genesis.identity(), genesis.event_ref(), 2, "other-op");
+        let owned_current = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::owned(InstanceId::new("controller-a".into()).unwrap(), 1).unwrap(),
+            1,
+            other_encoded.event_ref().clone(),
+            None,
+            "other-op".into(),
+        )
+        .unwrap();
+        let (candidate_envelope, candidate_encoded) =
+            successor(genesis.identity(), genesis.event_ref(), 2, "absent-op");
+        let publication =
+            published(genesis.identity(), &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            publication.event_ref().clone(),
+            None,
+            "absent-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&owned_current).unwrap(),
+            ),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Unresolved(_)
+        ));
+        // The retained walk never starts, so no event read follows the head read.
+        assert_eq!(client.actual_requests().count(), 2);
     }
 }

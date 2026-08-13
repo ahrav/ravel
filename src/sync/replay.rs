@@ -10,7 +10,7 @@ use ciborium::Value;
 
 use crate::{
     db::projections::{self, ApplyError, ApplyOutcome, ScopeProjectionEvent},
-    scope::{Digest, ScopeAuthority, ScopeEventRef, ScopeIdentity, root_event_from_decoded},
+    scope::{Digest, ScopeEventRef, ScopeIdentity, root_event_from_decoded},
     storage::s3::S3Store,
 };
 
@@ -188,10 +188,7 @@ async fn prepare_suffix_with_limits(
             return Err(ScopeReplayError::HeadInvalid(error));
         }
     };
-    if !matches!(observed.head().authority(), ScopeAuthority::Unowned)
-        || observed.head().scope_epoch().get() != 1
-        || observed.head().active_plan_digest().is_some()
-    {
+    if !head::root_head_supported(observed.head()) {
         return Err(ScopeReplayError::HeadInvalid(WireError::InvalidValue));
     }
     let events = prepare_chain(

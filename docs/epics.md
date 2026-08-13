@@ -1,8 +1,7 @@
 # Ravel MVP Epics
 
-E01, E03, and E04 are complete frozen-v1 proof records; E02's frozen v1 code is
-complete while its selected-bucket live preflight (`ravel-aq8.7`) remains open.
-E05–E10, together with the scoped-v2
+E01, E02, E03, and E04 are complete proof records; E02's selected-bucket live
+preflight (`ravel-aq8.7`) closed on its recorded evidence. E05–E10, together with the
 Phase 1 and Phase 3 structural epics below, define the smallest active implementation
 that can test the MVP thesis. They preserve the hard invariants in `mvp-outline.md`
 while avoiding public frameworks, generic backends, workflow DSLs, campaign profiles,
@@ -12,7 +11,7 @@ outcomes and proof obligations.
 
 ## E01 — Fix the Pilot and Experiment Contracts
 
-Status: Complete — frozen v1 proof record
+Status: Complete — proof record
 
 **Description**
 
@@ -37,26 +36,30 @@ The configuration is an input to the MVP, not a new product surface. It is versi
 
 ## E02 — Establish the S3 Durable Log and Minimal Rust Runtime
 
-Status: Open — frozen v1 code, pending the selected-bucket live preflight
-(`ravel-aq8.7`), which must close or be deferred on its own recorded evidence
+Status: Complete — proof record. The selected-bucket live preflight
+(`ravel-aq8.7`) closed on its recorded evidence: typed `404`/`412` behavior,
+conditional-chain integrity, lifecycle retention, and credential-free default CI.
+Its live harnesses exercised the deleted flat campaign protocol and were removed
+with it; live validation of the canonical root-scope path belongs to
+`ravel-a3j.2`.
 
 **Description**
 
 Create one Cargo package producing one node binary and implement the narrow Amazon S3 correctness boundary used by the campaign: immutable create-if-absent objects and one conditionally replaced campaign head. Events and artifacts are immutable; publication authority resides only in the head. The implementation uses the selected AWS SDK directly and does not hide S3 behind a portable object-store abstraction.
 
-Durable records use one explicit v1 event/head envelope and canonical bytes. The campaign is append-only for the MVP: retained history, leaked orphan objects, and bounded single-request artifacts are preferable to unsafe cleanup, compaction, or multipart machinery.
+Durable records use one explicit event/head envelope and canonical bytes. The campaign is append-only for the MVP: retained history, leaked orphan objects, and bounded single-request artifacts are preferable to unsafe cleanup, compaction, or multipart machinery.
 
 **Acceptance criteria**
 
 - [ ] A pinned Rust toolchain, edition, async runtime, target set, and locked dependency set build one binary; CI runs formatting, check, clippy with warnings denied, and tests without repository credentials.
 - [ ] Immutable events and artifacts are created with `If-None-Match: *`; initial head creation uses the same precondition; head replacement uses `If-Match` with the observed ETag.
 - [ ] ETags are treated only as opaque version tokens. Existing immutable keys are accepted only after trusted full-byte SHA-256 and size verification.
-- [ ] The versioned envelope records stable commit/operation identity, sequence, parent sequence/digest/key, writer fence, and canonical content; unknown versions or invalid encodings fail closed before conversion to domain types.
-- [ ] A frozen v1 history fixture proves decode, digest, and chain behavior without introducing a schema framework.
+- [ ] The envelope records stable commit/operation identity, sequence, parent sequence/digest/key, writer fence, and canonical content; invalid encodings and unregistered payload types fail closed before conversion to domain types.
+- [ ] A canonical history fixture proves decode, digest, and chain behavior without introducing a schema framework.
 - [ ] Ambiguous publication checks the current head and, if superseded, walks the complete retained parent chain for the operation identity. A gap remains `UNRESOLVED`, and no object is eagerly deleted.
 - [ ] Two processes racing from one observed head produce at most one authoritative publication; stale ETags, duplicate puts, timeout/reset, lost success, and an ambiguous retry followed by `409` or `412` cannot corrupt the chain.
 - [ ] Live integration tests against the selected general-purpose S3 bucket and pinned SDK exercise typed `404`, `409`, `412`, timeout/reset, and lost-response behavior. Publication retries are disabled or proven to preserve identical bytes, preconditions, and operation identity.
-- [ ] A lower fixture fence cannot replace a higher-fence v1 head. Dynamic controller acquisition was outside E02; scoped-v2 controller acquisition and stale-controller takeover are specified by V2-P1 and E05 without altering this fixture.
+- [ ] A lower fixture fence cannot replace a higher-fence head. Dynamic controller acquisition was outside E02; controller acquisition and stale-controller takeover are specified by P1 and E05 without altering this fixture.
 - [ ] Event, artifact, and head prefixes have no application deletion, GC, compaction, or lifecycle expiration. Pilot artifacts stay below the single-`PutObject` limit; multipart upload is deferred.
 
 **Dependencies:** Fix the Pilot and Experiment Contracts
@@ -65,7 +68,7 @@ Durable records use one explicit v1 event/head envelope and canonical bytes. The
 
 ## E03 — Reconstruct Disposable Local State from Durable History
 
-Status: Complete — frozen v1 proof record
+Status: Complete — proof record
 
 **Description**
 
@@ -76,15 +79,15 @@ A node rebuilds by reading a fresh campaign head and traversing immutable parent
 **Acceptance criteria**
 
 - [ ] A fresh node reconstructs the campaign from the head by traversing the complete immutable parent chain; `LIST` is reserved for diagnosis or orphan accounting.
-- [ ] Event bytes are fetched, version-validated, and digest-verified before opening the apply transaction.
+- [ ] Event bytes are fetched, validated, and digest-verified before opening the apply transaction.
 - [ ] One transaction validates the next sequence and previous digest, applies all event-derived changes, records the unique event identity, and advances the `(sequence, tail_digest)` cursor.
-- [ ] Reapplying the same event is a no-op. A gap, conflicting digest, unknown version, or failed conversion leaves both projection and cursor unchanged and makes readiness fail closed.
+- [ ] Reapplying the same event is a no-op. A gap, conflicting digest, unregistered payload type, or failed conversion leaves both projection and cursor unchanged and makes readiness fail closed.
 - [ ] The projector exposes its verified cursor against a freshly read S3 head. At the same cursor, all event-derived query state is equivalent; cache occupancy, advisory presence, and other ephemeral metadata are excluded.
 - [ ] One daemon-owned writer task/connection serializes SQLite writes. No transaction or database guard crosses an `.await`, network work stays outside transactions, and blocking SQLite work does not run on async executor threads.
 - [ ] The initial implementation uses serialized/default-journal access. WAL is enabled only after measured reader blocking justifies it, with one-host sidecars, writer-owned checkpointing, bounded busy handling, and verification of the linked SQLite version.
-- [ ] The minimal schema has an explicit application/schema version and `NOT NULL` or `UNIQUE` constraints for stable identities, applied events, and cursors. If foreign keys are used, every connection enables and verifies them; rebuilt test databases pass `quick_check` and `foreign_key_check`.
+- [ ] The minimal schema has one neutral application id and `NOT NULL` or `UNIQUE` constraints for stable identities, applied events, and cursors. If foreign keys are used, every connection enables and verifies them; rebuilt test databases pass `quick_check` and `foreign_key_check`.
 - [ ] Only event/cursor and scheduling tables required by the current milestone are created; Research, Change, judgment, and evaluation tables arrive with their owning epics, with no generic projector, checkpoint, or cache-metadata framework.
-- [ ] SQLite contains no uniquely durable state. Version or integrity mismatch stops local users and rebuilds from S3 instead of invoking online/rollback migrations, backup transport, or power-loss durability machinery.
+- [ ] SQLite contains no uniquely durable state. A foreign application id or integrity mismatch stops local users and rebuilds from S3 instead of invoking online/rollback migrations, backup transport, or power-loss durability machinery.
 - [ ] Kill and injected-write-failure tests cover before apply, after row mutation but before commit, and immediately after commit; recovery never skips or duplicates an event and never reports controller readiness from an invalid projection.
 
 **Dependencies:** Establish the S3 Durable Log and Minimal Rust Runtime
@@ -93,7 +96,7 @@ A node rebuilds by reading a fresh campaign head and traversing immutable parent
 
 ## E04 — Fence Work Claims and Result Submission
 
-Status: Complete — frozen v1 proof record
+Status: Complete — proof record
 
 **Description**
 
@@ -117,41 +120,42 @@ Each work claim is its own S3 CAS domain. Claiming, renewal, reclamation, and su
 
 **Priority:** 0
 
-## Frozen-v1 / scoped-v2 boundary
+## Canonical scope protocol
 
-E01, E03, and E04 remain complete frozen-v1 proof records, and E02's frozen v1 code
-is complete pending its open live preflight. Existing v1 event, head, claim,
-projection, artifact, key, encoding, and fixture bytes remain unchanged. Scoped v2 is a
-new durable boundary with new scope keys, identities, claims, projections, and
-`EventEnvelope`. A v2 campaign starts with a v2 root `Scope`, not a global sequencer;
-one authoritative chain never mixes v1 and v2 events.
+The root-scoped protocol is the only durable protocol. There is no second era, no
+compatibility decoder, and no migration path: a durable format change updates this one
+contract, its canonical bytes, and its fixtures together. Objects written by an earlier
+abandoned layout are unsupported and read as malformed input.
 
-The scoped-v2 implementation may reuse the v1 algorithms only through explicit v2
-types and bindings. It must never reinterpret, rewrite, migrate, or silently route a v1
-object through v2 code. The exact v2 event suffix, canonical serialization and digest
-encodings, serialized `ScopeHead` and root-genesis forms, and payload schemas remain
-open contract decisions and must be fixed before new durable bytes ship.
+A campaign starts at a root `Scope` rather than a global sequencer. Root events use
+declaration-order CBOR, zstd level 3, and a lowercase hexadecimal SHA-256 stored-byte
+digest at `events/{sequence:016}-{digest}.cbor.zst`. `ScopeHead` uses fixed-order
+compact JSON with explicit nulls. Root scope identity hashes the `ravel.scope.root\0`
+domain separator plus declaration-order CBOR of workspace and campaign identities;
+root genesis separately binds the admitted canonical-configuration digest. Other
+payload schemas remain open until their owning tasks.
 
-## V2-P1 — Add the Scoped-v2 Substrate
+## P1 — Establish the Root Scope Substrate
 
 **Description**
 
-Add the scoped-v2 durable substrate beside the frozen-v1 substrate. Reuse immutable
-publication, conditional replacement, exact-chain replay, disposable projection, and
-same-key work-claim algorithms through version-specific v2 types. Do not modify the v1
-paths or fixtures and do not add controller leases, plan admission, grants, escrow,
-certificates, or settlement in this epic.
+Establish the root-only durable substrate: immutable publication, conditional
+replacement, exact-chain replay, disposable projection, and same-key work-claim
+algorithms over the canonical scope types. Do not add controller leases, plan
+admission, grants, escrow, certificates, or settlement in this epic. Recursive child
+admission and two-scope recovery are post-signal work; root-only decoders reject
+non-null parent or delegation identity.
 
 **Acceptance criteria**
 
-- [ ] Every scoped-v2 durable identity uses the exact axis `campaign_id`, `scope_id`, `parent_scope_id`, `delegation_digest`, `plan_digest`, `work_id`, `work_revision`, `claim_fence`, and `scope_epoch`, with fields required only where the represented object has that relationship.
-- [ ] Every scoped-v2 event uses an `EventEnvelope` containing exactly `envelope_version`, `scope_id`, `sequence`, `parent_event`, `writer_epoch`, `operation_id`, `payload_type`, and `payload_version`; envelope and payload versions are validated independently.
-- [ ] Scoped-v2 objects use `workspace/{workspace_id}/campaigns/{campaign_id}/scopes/{scope_id}/head`, `scopes/{scope_id}/events/...`, `scopes/{scope_id}/claims/{work_id}/{work_revision}`, `plans/{plan_digest}`, and `artifacts/{digest}`. The unresolved `events/...` suffix and encoding choices are not inferred from v1.
+- [ ] Every durable identity uses the exact axis `campaign_id`, `scope_id`, `parent_scope_id`, `delegation_digest`, `plan_digest`, `work_id`, `work_revision`, `claim_fence`, and `scope_epoch`, with fields required only where the represented object has that relationship.
+- [ ] Every event uses an `EventEnvelope` containing exactly `scope_id`, `sequence`, `parent_event`, `writer_epoch`, `operation_id`, and `payload_type`. The payload type discriminates the payload; no envelope or payload version field exists.
+- [ ] Objects use `workspace/{workspace_id}/campaigns/{campaign_id}/scopes/{scope_id}/head`, `scopes/{scope_id}/events/{sequence:016}-{digest}.cbor.zst`, `scopes/{scope_id}/claims/{work_id}/{work_revision}`, `plans/{plan_digest}`, and `artifacts/{digest}`.
 - [ ] Each scope has its own `ScopeHead`, immutable parent-linked event chain, claim keys, verified sequence and tail, active plan reference, and projection cursor. Independent scopes never share a mutable head or replay cursor.
-- [ ] Scope-indexed SQLite projection applies one verified event and advances only that scope's cursor atomically; a gap, digest conflict, wrong-scope event, unknown version, conversion failure, or mixed-version parent leaves that scope unchanged and not ready.
+- [ ] Scope-indexed SQLite projection applies one verified event and advances only that scope's cursor atomically; a gap, digest conflict, wrong-scope event, unregistered payload type, or conversion failure leaves that scope unchanged and not ready.
 - [ ] The sync engine supports scope-selective replay and verifies readiness against a freshly read selected `ScopeHead` without using `LIST` as a publication snapshot.
-- [ ] A v2 `ScopeHead` cannot reference a v1 event, a v1 campaign head cannot reference a v2 event, and cross-version negative fixtures fail closed without altering frozen-v1 fixtures.
-- [ ] A two-scope integration proof advances and rebuilds the scopes independently, including one scope failing replay while the other remains valid and ready.
+- [ ] Wrong-scope, wrong-key, wrong-digest, unknown-field, noncanonical, and obsolete-shaped bytes all fail closed, and canonical fixtures decode and re-encode byte-identically.
+- [ ] Post-signal recursive proof: a two-scope integration advances and rebuilds the scopes independently, including one scope failing replay while the other remains valid and ready. This is not part of the root-only Phase 1 delivery.
 
 **Dependencies:** E04 — Fence Work Claims and Result Submission
 
@@ -176,22 +180,22 @@ settlement policy.
 
 **Acceptance criteria**
 
-- [ ] Controller instance, lease, monotonic `scope_epoch`, decision tail, active plan lineage, and operation identity reside in one versioned `ScopeHead` authority object.
+- [ ] Controller instance, lease, monotonic `scope_epoch`, decision tail, active plan lineage, and operation identity reside in one `ScopeHead` authority object.
 - [ ] Acquisition, renewal, takeover, and decision publication all CAS the same observed `ScopeHead` ETag; authoritative commit APIs require an opaque scope-authority value and revalidate it in that CAS.
 - [ ] Decision commits preserve the exact scope-local parent chain and cannot regress `scope_epoch`. A stale scope controller cannot commit after a higher epoch has won, even if it retained an older head observation.
-- [ ] Before its first authoritative `Decision`, a replacement controller rebuilds and verifies its scope-selective projection to the exact freshly read `ScopeHead` and active plan lineage. Gaps, mixed versions, unknown versions, and chain failures prevent readiness.
+- [ ] Before its first authoritative `Decision`, a replacement controller rebuilds and verifies its scope-selective projection to the exact freshly read `ScopeHead` and active plan lineage. Gaps, unregistered payload types, and chain failures prevent readiness.
 - [ ] Scoped-controller policy performs no S3, provider, evaluator, Git, or code-host I/O and cannot bypass the fenced commit layer; it only proposes deterministic state transitions from immutable inputs.
 - [ ] Killing an active scope controller allows another host to take over, process sealed submissions, and continue unexpired claims without requiring the old host to return. Parent and child scope controllers fail and recover independently.
 - [ ] The node supervisor bounds every local admission queue and owns every renewal, sync, scheduling, invocation, publication, and reconciliation task. No detached task survives its owner.
-- [ ] The node supervisor owns one bounded per-scope takeover-demand queue. It accepts ordinary routing demand, cancellation/drain demand, and a `SETTLEMENT_PRESSURE` reason without embedding delegation, certificate, or settlement policy. V2-P3 supplies and tests the durable expired/unsettled state that triggers that reason.
+- [ ] The node supervisor owns one bounded per-scope takeover-demand queue. It accepts ordinary routing demand, cancellation/drain demand, and a `SETTLEMENT_PRESSURE` reason without embedding delegation, certificate, or settlement policy. P3 supplies and tests the durable expired/unsettled state that triggers that reason.
 - [ ] Shutdown stops admission, requests loop cancellation, classifies interrupted remote effects as known or unknown, performs required reconciliation, and joins or reaps all tasks before exit.
 - [ ] Fault tests include lost `ScopeHead` CAS success followed by supersession, a delayed stale-scope-controller write after takeover, takeover from stale scope-selective SQLite state, failure during submission processing, independent parent and child controller failure, injected settlement-pressure takeover demand, and restart reconciliation with no eager orphan deletion.
 
-**Dependencies:** V2-P1 — Add the Scoped-v2 Substrate
+**Dependencies:** P1 — Establish the Root Scope Substrate
 
 **Priority:** 0
 
-## V2-P3 — Implement Recursive Admission
+## P3 — Implement Recursive Admission
 
 **Description**
 
@@ -248,7 +252,7 @@ The campaign consists of one root `Scope`, one initial admitted plan, three to f
 independent researchers, one critic round, at most one discriminating follow-up child
 scope for material disagreement, and one synthesis. That bounded follow-up uses the one
 allowed depth-two child scope. The child seals, returns a certificate, and settles before
-root completion, which is recorded in the root-completion representation V2-P3
+root completion, which is recorded in the root-completion representation P3
 selects. This proves multi-provider distributed
 judgment without creating a provider SDK, policy engine, adjudication platform, workflow
 trait, campaign profile, or generic discovery interface.
@@ -264,11 +268,11 @@ trait, campaign profile, or generic discovery interface.
 - [ ] A worker can disappear and have work reclaimed, and scoped controller authority can move hosts without losing coherent progress, invalidating an unexpired claim, or accepting a stale result.
 - [ ] Material disagreement can inform at most one superseding `PlanRevision` for one evidence-driven discriminating follow-up, admitted as the one allowed depth-two child scope; no direct controller-created work, descendant scope, second critic round, or unbounded model debate is permitted.
 - [ ] Final synthesis records supported conclusions, evidence, rejected explanations, material uncertainty, and unresolved questions with full scope, plan, work, attempt, producer, evaluator, and policy provenance and no routine human approval. The unresolved synthesis payload-shape question is not decided by this epic text.
-- [ ] The follow-up child scope seals, returns a verifier-bounded certificate, and settles idempotently; root completion waits for required claims and settlement, records completion in the root-completion representation V2-P3 selects, and preserves escrow conservation and unknown reserve.
+- [ ] The follow-up child scope seals, returns a verifier-bounded certificate, and settles idempotently; root completion waits for required claims and settlement, records completion in the root-completion representation P3 selects, and preserves escrow conservation and unknown reserve.
 - [ ] Interrupted provider/process tasks are reconciled and reaped under the node lifecycle contract; no detached invocation survives shutdown.
 - [ ] The concrete Research module shares only demonstrated non-authority helpers. No workflow trait, DSL, campaign profile, curriculum engine, online model training, learned reward policy, universal state matcher, generic discovery interface, or unbounded task generation is introduced.
 
-**Dependencies:** V2-P3 — Implement Recursive Admission
+**Dependencies:** P3 — Implement Recursive Admission
 
 **Priority:** 1
 
@@ -310,7 +314,7 @@ bundle artifact digest. There is no standalone serialized delta digest.
 - [ ] A fresh repair attempt receives a new attempt and candidate identity. Rebase support and rename detection are omitted from the MVP rather than mutating prior evidence.
 - [ ] Timeout, cancellation, blocked-pipe, and descendant-process tests prove workspace cleanup occurs only after all candidate processes are reaped.
 
-**Dependencies:** V2-P3 — Implement Recursive Admission; Establish the S3 Durable Log and Minimal Rust Runtime; Fix the Pilot and Experiment Contracts
+**Dependencies:** P3 — Implement Recursive Admission; Establish the S3 Durable Log and Minimal Rust Runtime; Fix the Pilot and Experiment Contracts
 
 **Priority:** 0
 
@@ -346,7 +350,7 @@ or second decision surface.
 - [ ] Fault tests cover evaluator timeout/crash, push success with lost response, duplicate PR request, stale check result, grant or claim loss before effect start, and publisher restart without duplicate authoritative integration.
 - [ ] Publisher capability is advisory routing metadata, not a bearer capability. No cryptographic bearer capability, custom CI service, general code-host interface, custom merge queue, review UI, or per-candidate PR fan-out is built.
 
-**Dependencies:** E07 — Isolate Candidates and Construct Immutable Git Artifacts; V2-P3 — Implement Recursive Admission
+**Dependencies:** E07 — Isolate Candidates and Construct Immutable Git Artifacts; P3 — Implement Recursive Admission
 
 **Priority:** 0
 
@@ -414,11 +418,11 @@ results.
 - [ ] Research reports wall time, supported/incorrect/omitted conclusions, useful evidence, discriminating follow-up, provider usage/cost, duplicate work, scope/grant overhead, settlement, quarantined unknown reserve, and scaling efficiency.
 - [ ] Change reports resolved targets, omissions, semantic correction/rejection, conflicts, wasted work, usage/cost per target, utilization, scope/grant overhead, settlement, quarantined unknown reserve, scaling efficiency, and final rediscovery.
 - [ ] Autonomous proof shows that humans supplied only objective/configuration or explicitly configured proposal observations and did not assign work, approve routine conclusions, choose ordinary candidates, mint grants, override admission, or perform routine safe-branch integration.
-- [ ] Correctness evidence references the owning epic tests for frozen-v1 S3 ambiguity, SQLite atomic projection, and claim fencing and for scoped-v2 mixed-version rejection, selective replay, scope authority, scoped controller fencing, admission, grants, escrow, provider unknown outcomes, process cleanup, trusted evaluation, code-host reconciliation, certificates, and settlement.
+- [ ] Correctness evidence references the owning epic tests for S3 ambiguity, SQLite atomic projection, claim fencing, canonical-record rejection, selective replay, scope authority, scoped controller fencing, admission, grants, escrow, provider unknown outcomes, process cleanup, trusted evaluation, code-host reconciliation, certificates, and settlement.
 - [ ] One small offline renderer emits CSV and Markdown with two fixed tables: Research and Change. No metrics service, dashboard, exporter framework, permanent baseline mode, adaptive reruns, or significance claim is added.
 - [ ] The report gives a go/no-go recommendation and answers where distribution helped, where it stopped scaling, whether judge diversity and disagreement added value, what work was duplicated, and whether S3, scoped-controller, admission, settlement, or evaluator paths were bottlenecks.
 - [ ] MVP completion is denied unless the section 43 invariants, recursive architecture gates, escrow equation, verifier-bounded completion, and actual multi-machine/failover requirements are demonstrated; a no-go result remains a valid completed feasibility experiment.
 
-**Dependencies:** E06 — Prove Bounded Distributed Research Decisions; E09 — Prove the Distributed Change Campaign; V2-P3 — Implement Recursive Admission
+**Dependencies:** E06 — Prove Bounded Distributed Research Decisions; E09 — Prove the Distributed Change Campaign; P3 — Implement Recursive Admission
 
 **Priority:** 1

@@ -1,16 +1,4 @@
-//! Versioned wire codecs for events and the authority-bearing head.
-//!
-//! Decoders reject unknown versions, invalid domain values, and alternate byte
-//! representations before returning domain types. Public errors expose only
-//! data-free categories so object contents and keys do not enter diagnostics.
-
 use std::{error::Error, fmt};
-
-pub mod event;
-pub mod head;
-pub mod replay;
-
-pub(crate) const WIRE_VERSION: u64 = 1;
 
 /// Fail-closed category produced by a durable wire codec.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,1 +1,0 @@
-{"version":1,"authority":{"state":"owned","owner":"controller-a","instance":"instance-01","lease_until":1750000000000,"controller_fence":7},"tail":{"sequence":2,"digest":"5454daad2e7a3c4ac66d017f75296647c7b3ebddc4e8d2b19d7cde066239d34c","key":"0000000000000002-5454daad2e7a3c4ac66d017f75296647c7b3ebddc4e8d2b19d7cde066239d34c.cbor.zst"},"operation_id":"op-head-owned-001"}

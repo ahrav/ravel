@@ -219,7 +219,13 @@ pub(crate) fn scope_cursor(
         None => Ok((0, None)),
         Some((campaign_id, sequence, digest)) => {
             if campaign_id != scope.campaign_id().as_str() {
-                return Err(ApplyError::Conflict);
+                // A root scope id derives from its campaign id, so this row belongs to no
+                // reachable scope.
+                connection.execute(
+                    "DELETE FROM scopes WHERE scope_id = ?1",
+                    [scope.scope_id().as_str()],
+                )?;
+                return Ok((0, None));
             }
             Ok((
                 u64::try_from(sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?,
@@ -452,6 +458,9 @@ fn validate(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
     if integrity != "ok" {
         return Err(ValidateError::IntegrityCheckFailed);
     }
+    // `PRAGMA foreign_key_check` errors on a malformed foreign key, so the schema comparison
+    // runs first and classifies such a file as `InvalidSchema`.
+    validate_schema(connection)?;
     let foreign_key_failure = {
         let mut statement = connection
             .prepare("PRAGMA foreign_key_check")
@@ -466,7 +475,6 @@ fn validate(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
     if foreign_key_failure {
         return Err(ValidateError::InvalidHistory);
     }
-    validate_schema(connection)?;
     validate_history(connection)
 }
 
@@ -1005,6 +1013,50 @@ mod tests {
         assert_eq!(
             open_existing(&path).unwrap_err(),
             ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_foreign_key_is_an_invalid_schema_not_an_operation_failure() {
+        let path = path("foreign-key-mismatch");
+        let foreign = rusqlite::Connection::open(&path).unwrap();
+        foreign
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        // `PRAGMA foreign_key_check` errors on this schema instead of reporting rows.
+        foreign
+            .execute_batch(
+                "CREATE TABLE scopes (scope_id TEXT PRIMARY KEY NOT NULL) STRICT; \
+                 CREATE TABLE applied_scope_events (scope_id TEXT NOT NULL, \
+                   FOREIGN KEY (scope_id) REFERENCES scopes(absent_column)) STRICT;",
+            )
+            .unwrap();
+        drop(foreign);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidSchema
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_cursor_row_for_another_campaign_is_dropped_rather_than_conflicting() {
+        let path = path("campaign-mismatch");
+        let mut connection = create(&path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        apply_scope_event(&mut connection, &mutation(&scope, 1, DIGEST_1, None)).unwrap();
+        connection
+            .execute("UPDATE scopes SET campaign_id = 'campaign-b'", [])
+            .unwrap();
+
+        assert_eq!(scope_cursor(&connection, &scope).unwrap(), (0, None));
+        assert_eq!(
+            snapshot(&connection),
+            Snapshot {
+                scopes: vec![],
+                events: vec![]
+            }
         );
         fs::remove_file(path).unwrap();
     }

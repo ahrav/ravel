@@ -1,35 +1,45 @@
 use ciborium::Value;
 use ravel::{
-    distributed::{identity::InstanceId, presence::WorkspaceId},
+    distributed::identity::{InstanceId, WorkspaceId},
     domain::{
-        campaign::{EventRef, ValidationError},
+        validation::ValidationError,
         work::{WorkId, WorkRef},
     },
-    scoped::{
-        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ScopeAuthority, ScopeEventRef,
-        ScopeHead, ScopeId, ScopeIdentity, ScopedClaimIdentity, artifact_key, decode_head,
-        decode_root_event, encode_head, encode_root_event, plan_key, root_genesis, root_scope_id,
-        scope_claim_key, scope_event_key, scope_head_key,
+    scope::{
+        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ScopeAuthority,
+        ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeId, ScopeIdentity, artifact_key,
+        decode_head, decode_root_event, encode_head, encode_root_event, plan_key, root_genesis,
+        root_scope_id, scope_claim_key, scope_event_key, scope_head_key,
     },
-    sync::{WireError, event, head},
+    sync::WireError,
 };
 use sha2::{Digest as _, Sha256};
 
-const SCOPE_ID: &str = "e11c259e5efd73d324a61199a3e4cf5fc16671a8183ddf0c80934dd69b8cb255";
-const EVENT_DIGEST: &str = "6aff38cfb10e241fff708654c0abe75743ed7a5323aa4046be0131b131174307";
+const SCOPE_ID: &str = "0eb5db70036c5eec302d8bb83aae83e6394514453da922747159e92bce51034b";
+const EVENT_DIGEST: &str = "0e180b9203c97f2961404817cef51750a24c0fe2e17e0e63e432ad46c9c12969";
 const EVENT_BASENAME: &str =
-    "0000000000000001-6aff38cfb10e241fff708654c0abe75743ed7a5323aa4046be0131b131174307.cbor.zst";
+    "0000000000000001-0e180b9203c97f2961404817cef51750a24c0fe2e17e0e63e432ad46c9c12969.cbor.zst";
 const EVENT_BYTES: &[u8] = include_bytes!(
-    "fixtures/v2/0000000000000001-6aff38cfb10e241fff708654c0abe75743ed7a5323aa4046be0131b131174307.cbor.zst"
+    "fixtures/wire/0000000000000001-0e180b9203c97f2961404817cef51750a24c0fe2e17e0e63e432ad46c9c12969.cbor.zst"
 );
-const HEAD_BYTES: &[u8] = include_bytes!("fixtures/v2/root-head.json");
-const V1_EVENT_BYTES: &[u8] = include_bytes!(
-    "fixtures/v1/0000000000000001-d10251de219fe17099d74f8f14729b1cbb33bdd73f919d6fb907ef32d5a51648.cbor.zst"
-);
-const V1_EVENT_KEY: &str =
-    "0000000000000001-d10251de219fe17099d74f8f14729b1cbb33bdd73f919d6fb907ef32d5a51648.cbor.zst";
-const V1_HEAD_BYTES: &[u8] = include_bytes!("fixtures/v1/head-unowned.json");
+const HEAD_BYTES: &[u8] = include_bytes!("fixtures/wire/root-head.json");
 const CONFIG_BYTES: &[u8] = br#"{"budget":7,"campaign":"campaign-a"}"#;
+
+const ENVELOPE_FIELDS: [&str; 6] = [
+    "scope_id",
+    "sequence",
+    "parent_event",
+    "writer_epoch",
+    "operation_id",
+    "payload_type",
+];
+
+const PAYLOAD_FIELDS: [&str; 4] = [
+    "campaign_id",
+    "parent_scope_id",
+    "delegation_digest",
+    "config_digest",
+];
 
 fn workspace() -> WorkspaceId {
     WorkspaceId::new("workspace-a".into()).unwrap()
@@ -82,6 +92,16 @@ fn field_mut<'a>(entries: &'a mut [(Value, Value)], name: &str) -> &'a mut Value
         .unwrap_or_else(|| panic!("missing CBOR field {name}"))
 }
 
+fn keys(entries: &[(Value, Value)]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|(key, _)| match key {
+            Value::Text(text) => text.clone(),
+            other => panic!("expected text key, found {other:?}"),
+        })
+        .collect()
+}
+
 fn event_cbor() -> Vec<u8> {
     zstd::bulk::decompress(EVENT_BYTES, 1024 * 1024).unwrap()
 }
@@ -101,6 +121,7 @@ fn root_genesis_fixture_is_deterministic_and_canonical() {
 
     assert_eq!(first, second);
     assert_eq!(first.identity().workspace_id(), &workspace());
+    assert_eq!(first.identity().campaign_id(), &campaign());
     assert_eq!(first.identity().scope_id().as_str(), SCOPE_ID);
     assert_eq!(first.identity().parent_scope_id(), None);
     assert_eq!(first.identity().delegation_digest(), None);
@@ -109,13 +130,9 @@ fn root_genesis_fixture_is_deterministic_and_canonical() {
     assert_eq!(first.head_bytes(), HEAD_BYTES);
     assert_eq!(sha256(EVENT_BYTES), EVENT_DIGEST);
     assert_eq!(first.event_key(), full_event_key());
-    assert_eq!(
-        first.head_key(),
-        format!("workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/head")
-    );
+    assert_eq!(first.head_key(), full_head_key());
 
     let decoded_event = decode_root_event(EVENT_BYTES, &full_event_key(), &scope()).unwrap();
-    assert_eq!(decoded_event.envelope().envelope_version(), 2);
     assert_eq!(decoded_event.envelope().sequence(), 1);
     assert_eq!(decoded_event.envelope().parent_event(), None);
     assert_eq!(decoded_event.envelope().writer_epoch().get(), 1);
@@ -124,7 +141,6 @@ fn root_genesis_fixture_is_deterministic_and_canonical() {
         format!("root-genesis:{SCOPE_ID}")
     );
     assert_eq!(decoded_event.envelope().payload_type(), "root_genesis");
-    assert_eq!(decoded_event.envelope().payload_version(), 1);
     assert_eq!(decoded_event.payload().campaign_id(), &campaign());
     assert_eq!(
         encode_root_event(&decoded_event).unwrap().stored_bytes(),
@@ -142,13 +158,15 @@ fn root_genesis_fixture_is_deterministic_and_canonical() {
     assert!(head_text.contains("\"controller_instance_id\":null"));
     assert!(head_text.contains("\"lease_until\":null"));
     assert!(head_text.contains("\"active_plan_digest\":null"));
+    assert!(!head_text.contains("version"));
 
-    let cbor = zstd::bulk::decompress(EVENT_BYTES, 1024 * 1024).unwrap();
-    let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+    let mut value: Value = ciborium::from_reader(event_cbor().as_slice()).unwrap();
     let root = map_mut(&mut value);
+    assert_eq!(keys(root), ["envelope", "payload"]);
     let envelope = map_mut(field_mut(root, "envelope"));
-    assert_eq!(envelope.len(), 8);
+    assert_eq!(keys(envelope), ENVELOPE_FIELDS);
     let payload = map_mut(field_mut(root, "payload"));
+    assert_eq!(keys(payload), PAYLOAD_FIELDS);
     assert_eq!(field_mut(payload, "parent_scope_id"), &Value::Null);
     assert_eq!(field_mut(payload, "delegation_digest"), &Value::Null);
 }
@@ -176,10 +194,10 @@ fn config_bytes_change_payload_but_not_root_scope_identity() {
 }
 
 #[test]
-fn scoped_keys_cover_the_exact_identity_axis() {
+fn scope_keys_cover_the_exact_identity_axis() {
     let scope = scope();
     let digest = Digest::new("0".repeat(64)).unwrap();
-    let claim = ScopedClaimIdentity::new(
+    let claim = ScopeClaimIdentity::new(
         scope.clone(),
         digest.clone(),
         WorkRef::new(WorkId::new("work-17".into()).unwrap(), 4),
@@ -188,10 +206,7 @@ fn scoped_keys_cover_the_exact_identity_axis() {
     .unwrap();
     let event = ScopeEventRef::new(2, digest.clone()).unwrap();
 
-    assert_eq!(
-        scope_head_key(&scope),
-        format!("workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/head")
-    );
+    assert_eq!(scope_head_key(&scope), full_head_key());
     assert_eq!(
         scope_event_key(&scope, &event),
         format!(
@@ -220,7 +235,7 @@ fn scoped_keys_cover_the_exact_identity_axis() {
         )
     );
     assert_eq!(
-        ScopedClaimIdentity::new(scope, digest, claim.work().clone(), 0),
+        ScopeClaimIdentity::new(scope, digest, claim.work().clone(), 0),
         Err(ValidationError::InvalidFence)
     );
 }
@@ -259,7 +274,6 @@ fn identity_and_numeric_boundaries_fail_closed() {
             0,
             "op".into(),
             "payload".into(),
-            1,
         ),
         Err(ValidationError::InvalidFence)
     );
@@ -281,16 +295,8 @@ fn identity_and_numeric_boundaries_fail_closed() {
 }
 
 #[test]
-fn event_versions_non_root_values_and_invalid_identities_fail_before_key_use() {
+fn non_root_values_and_invalid_identities_fail_before_key_use() {
     for bytes in [
-        mutate_event(|root| {
-            let envelope = map_mut(field_mut(root, "envelope"));
-            *field_mut(envelope, "envelope_version") = Value::Integer(3.into());
-        }),
-        mutate_event(|root| {
-            let envelope = map_mut(field_mut(root, "envelope"));
-            *field_mut(envelope, "payload_version") = Value::Integer(2.into());
-        }),
         mutate_event(|root| {
             let envelope = map_mut(field_mut(root, "envelope"));
             *field_mut(envelope, "payload_type") = Value::Text("future".into());
@@ -327,12 +333,7 @@ fn event_versions_non_root_values_and_invalid_identities_fail_before_key_use() {
             let envelope = map_mut(field_mut(root, "envelope"));
             *field_mut(envelope, "parent_event") = Value::Map(vec![
                 (Value::Text("sequence".into()), Value::Integer(1.into())),
-                (
-                    Value::Text("digest".into()),
-                    Value::Text(
-                        "d10251de219fe17099d74f8f14729b1cbb33bdd73f919d6fb907ef32d5a51648".into(),
-                    ),
-                ),
+                (Value::Text("digest".into()), Value::Text("a".repeat(64))),
             ]);
         }),
         mutate_event(|root| {
@@ -352,7 +353,49 @@ fn event_versions_non_root_values_and_invalid_identities_fail_before_key_use() {
 }
 
 #[test]
-fn event_canonicality_and_version_order_fail_closed() {
+fn unknown_fields_fail_closed_on_events_and_heads() {
+    for bytes in [
+        mutate_event(|root| {
+            root.push((Value::Text("extra".into()), Value::Null));
+        }),
+        mutate_event(|root| {
+            let envelope = map_mut(field_mut(root, "envelope"));
+            envelope.push((Value::Text("extra_envelope".into()), Value::Null));
+        }),
+        mutate_event(|root| {
+            let envelope = map_mut(field_mut(root, "envelope"));
+            envelope.push((Value::Text("writer_fence".into()), Value::Integer(1.into())));
+        }),
+        mutate_event(|root| {
+            let payload = map_mut(field_mut(root, "payload"));
+            payload.push((Value::Text("retention_class".into()), Value::Null));
+        }),
+    ] {
+        assert_eq!(
+            decode_root_event(&bytes, &full_event_key(), &scope()),
+            Err(WireError::InvalidEncoding)
+        );
+    }
+
+    let canonical = std::str::from_utf8(HEAD_BYTES).unwrap();
+    for injected in [
+        r#"{"owner":"nobody","#,
+        r#"{"controller_fence":1,"#,
+        r#"{"authority":null,"#,
+    ] {
+        assert_eq!(
+            decode_head(
+                canonical.replacen('{', injected, 1).as_bytes(),
+                &full_head_key(),
+                &scope()
+            ),
+            Err(WireError::InvalidEncoding)
+        );
+    }
+}
+
+#[test]
+fn event_canonicality_fails_closed_and_payload_type_is_checked_first() {
     let cbor = event_cbor();
     let alternate_level = zstd::bulk::compress(&cbor, 1).unwrap();
     assert_ne!(alternate_level, EVENT_BYTES);
@@ -395,15 +438,15 @@ fn event_canonicality_and_version_order_fail_closed() {
         Err(WireError::NonCanonical)
     );
 
-    let unknown = mutate_event(|root| {
+    let unregistered = mutate_event(|root| {
         let envelope = map_mut(field_mut(root, "envelope"));
-        *field_mut(envelope, "envelope_version") = Value::Integer(3.into());
+        *field_mut(envelope, "payload_type") = Value::Text("future".into());
     });
-    let mut unknown_cbor = zstd::bulk::decompress(&unknown, 1024 * 1024).unwrap();
-    unknown_cbor.push(0);
-    let unknown_noncanonical = zstd::bulk::compress(&unknown_cbor, 3).unwrap();
+    let mut unregistered_cbor = zstd::bulk::decompress(&unregistered, 1024 * 1024).unwrap();
+    unregistered_cbor.push(0);
+    let unregistered_noncanonical = zstd::bulk::compress(&unregistered_cbor, 3).unwrap();
     assert_eq!(
-        decode_root_event(&unknown_noncanonical, "wrong", &scope()),
+        decode_root_event(&unregistered_noncanonical, "wrong", &scope()),
         Err(WireError::InvalidValue)
     );
 }
@@ -422,7 +465,6 @@ fn event_envelope_enforces_parent_linkage() {
             1,
             "op".into(),
             "payload".into(),
-            1,
         )
     };
 
@@ -457,52 +499,22 @@ fn foreign_scope_records_cannot_substitute_for_expected_scope() {
 }
 
 #[test]
-fn head_versions_authority_pairs_and_canonical_form_fail_closed() {
+fn head_authority_pairs_and_canonical_form_fail_closed() {
     let canonical = std::str::from_utf8(HEAD_BYTES).unwrap();
-    assert_eq!(
-        decode_head(
-            canonical
-                .replacen("\"version\":2", "\"version\":3", 1)
-                .as_bytes(),
-            &full_head_key(),
-            &scope()
+    for altered in [
+        canonical.replacen("\"lease_until\":null", "\"lease_until\":1", 1),
+        canonical.replacen(
+            "\"controller_instance_id\":null",
+            "\"controller_instance_id\":\"instance-a\"",
+            1,
         ),
-        Err(WireError::InvalidValue)
-    );
-    assert_eq!(
-        decode_head(
-            canonical
-                .replacen("\"lease_until\":null", "\"lease_until\":1", 1)
-                .as_bytes(),
-            &full_head_key(),
-            &scope()
-        ),
-        Err(WireError::InvalidValue)
-    );
-    assert_eq!(
-        decode_head(
-            canonical
-                .replacen(
-                    "\"controller_instance_id\":null",
-                    "\"controller_instance_id\":\"instance-a\"",
-                    1
-                )
-                .as_bytes(),
-            &full_head_key(),
-            &scope()
-        ),
-        Err(WireError::InvalidValue)
-    );
-    assert_eq!(
-        decode_head(
-            canonical
-                .replacen("\"scope_epoch\":1", "\"scope_epoch\":0", 1)
-                .as_bytes(),
-            &full_head_key(),
-            &scope()
-        ),
-        Err(WireError::InvalidValue)
-    );
+        canonical.replacen("\"scope_epoch\":1", "\"scope_epoch\":0", 1),
+    ] {
+        assert_eq!(
+            decode_head(altered.as_bytes(), &full_head_key(), &scope()),
+            Err(WireError::InvalidValue)
+        );
+    }
     assert_eq!(
         decode_head(
             format!("{canonical}\n").as_bytes(),
@@ -538,25 +550,47 @@ fn head_versions_authority_pairs_and_canonical_form_fail_closed() {
 }
 
 #[test]
-fn frozen_v1_and_scoped_v2_never_cross_decode() {
+fn unrelated_and_obsolete_shaped_bytes_fail_as_malformed_input() {
+    let obsolete_head = br#"{"authority":{"state":"unowned"},"tail":{"sequence":1,"digest":"a"},"operation_id":"op"}"#;
     assert_eq!(
-        decode_head(V1_HEAD_BYTES, &full_head_key(), &scope()),
+        decode_head(obsolete_head, &full_head_key(), &scope()),
         Err(WireError::InvalidEncoding)
     );
-    assert_eq!(
-        event::decode(EVENT_BYTES, V1_EVENT_KEY),
-        Err(WireError::InvalidEncoding)
-    );
-    assert_eq!(head::decode(HEAD_BYTES), Err(WireError::InvalidEncoding));
 
+    let mut obsolete_event_cbor = Vec::new();
+    ciborium::into_writer(
+        &Value::Map(vec![
+            (
+                Value::Text("operation_id".into()),
+                Value::Text("operation-1".into()),
+            ),
+            (Value::Text("sequence".into()), Value::Integer(1.into())),
+            (Value::Text("parent".into()), Value::Null),
+            (Value::Text("writer_fence".into()), Value::Integer(1.into())),
+            (
+                Value::Text("content".into()),
+                Value::Text("campaign_created".into()),
+            ),
+        ]),
+        &mut obsolete_event_cbor,
+    )
+    .unwrap();
+    let obsolete_event = zstd::bulk::compress(&obsolete_event_cbor, 3).unwrap();
     assert_eq!(
-        EventRef::new(1, EVENT_DIGEST.into(), full_event_key()),
-        Err(ValidationError::InvalidKey)
-    );
-    assert_eq!(
-        decode_root_event(V1_EVENT_BYTES, &full_event_key(), &scope()),
+        decode_root_event(&obsolete_event, &full_event_key(), &scope()),
         Err(WireError::InvalidEncoding)
     );
+
+    for unrelated in [b"not-json".as_slice(), b"\x00\x01\x02".as_slice()] {
+        assert_eq!(
+            decode_head(unrelated, &full_head_key(), &scope()),
+            Err(WireError::InvalidEncoding)
+        );
+        assert_eq!(
+            decode_root_event(unrelated, &full_event_key(), &scope()),
+            Err(WireError::InvalidEncoding)
+        );
+    }
 }
 
 #[test]

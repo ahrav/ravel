@@ -1,1094 +1,352 @@
-//! The v1 event encoding is frozen.
+//! Immutable event reads and publication witnesses.
 //!
-//! CBOR is a definite-length map whose declaration-order text keys are
-//! `version`, `operation_id`, `sequence`, `parent`, `writer_fence`, and
-//! `content`. Integers use ciborium's shortest representation. `parent` is
-//! either null or a declaration-order map of `sequence`, `digest`, and `key`.
-//! Content is a text value for `campaign_created` and `workflow_started`, or an
-//! externally tagged `artifact_published` reference map.
-//!
-//! The CBOR is compressed by zstd's bulk encoder at level 3: one standard
-//! frame with content size, no checksum, and no dictionary. SHA-256 covers
-//! these compressed stored bytes. Keys are
-//! `{sequence:016}-{lowercase_sha256}.cbor.zst`. Decoding caps stored bytes at
-//! 256 KiB, decompressed CBOR at 1 MiB, and CBOR recursion at 16, then requires
-//! exact CBOR re-encoding and exact zstd recompression before domain conversion.
-//!
-//! Key values exclude object-store prefixes. The `zstd-sys 2.0.16+zstd.1.5.7`
-//! lockfile pin is byte-affecting. Checked-in event fixtures pin both stored bytes
-//! and their derived keys.
-//!
-//! Event publication requires a matching artifact witness before object-store I/O.
-//! [`scheduling_mutation`] converts one decoded event into durable coordinates and a row effect
-//! for the disposable projection.
+//! Production publication registers root genesis only; test-only successors exercise CAS and retained-chain behavior.
 
-use std::{error::Error, fmt, io::Cursor};
+use std::{error::Error, fmt};
 
-use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use ciborium::Value;
 
 use crate::{
-    domain::campaign::{ArtifactRef, Event, EventContent, EventRef},
-    storage::{
-        artifacts::PublishedArtifact,
-        s3::{PublicationError, S3Store},
+    scope::{
+        DecodedScopeEvent, EncodedScopeEvent, EventEnvelope, MAX_COMPRESSED_BYTES,
+        ROOT_GENESIS_PAYLOAD_TYPE, RootEvent, ScopeEventRef, ScopeIdentity, decode_scope_event,
+        encode_root_event, scope_event_key,
     },
+    storage::s3::{AttemptHistory, GetError, GetOutcome, PublicationError, S3Store},
 };
 
-use super::{WIRE_VERSION, WireError};
+use super::WireError;
 
-pub(crate) const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
-const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
-const CBOR_RECURSION_LIMIT: usize = 16;
-const ZSTD_LEVEL: i32 = 3;
-
-/// Canonical compressed bytes paired with their stored-byte digest reference.
+/// Proves canonical event bytes exist in one object-store namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EncodedEvent {
-    stored_bytes: Vec<u8>,
-    reference: EventRef,
-}
-
-impl EncodedEvent {
-    pub fn stored_bytes(&self) -> &[u8] {
-        &self.stored_bytes
-    }
-
-    pub fn digest(&self) -> &str {
-        self.reference.digest()
-    }
-
-    pub fn key(&self) -> &str {
-        self.reference.key()
-    }
-}
-
-/// Successful creation or full-byte duplicate verification accepts immutable event bytes
-/// at their canonical key.
-///
-/// Only [`publish`] constructs this witness; head transitions require it before CAS.
-#[derive(Debug)]
-pub struct ResolvedEventPublication {
-    reference: EventRef,
+pub struct ResolvedScopeEventPublication {
+    scope: ScopeIdentity,
+    envelope: EventEnvelope,
+    reference: ScopeEventRef,
+    bytes: Vec<u8>,
     namespace: String,
 }
 
-impl ResolvedEventPublication {
-    pub fn event_ref(&self) -> &EventRef {
+impl ResolvedScopeEventPublication {
+    pub fn scope(&self) -> &ScopeIdentity {
+        &self.scope
+    }
+
+    pub fn envelope(&self) -> &EventEnvelope {
+        &self.envelope
+    }
+
+    pub fn event_ref(&self) -> &ScopeEventRef {
         &self.reference
     }
 
-    /// Names the object-store namespace these bytes were published into.
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
-}
 
-/// Row effect a frozen-v1 event produces in the disposable projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SchedulingEffect {
-    CampaignCreated { campaign_id: String },
-    WorkflowStarted { workflow_id: String },
-}
-
-/// Owned durable coordinates and row effect for one apply transaction.
-///
-/// Each effect's ID is the converted event's sequence as 16-digit zero-padded decimal. The
-/// caller must pass a reference whose sequence equals [`Self::reference`]'s sequence.
-/// Consumers use the carried ID rather than deriving it again. The mutation carries no
-/// operation identity and no writer fence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchedulingMutation {
-    reference: EventRef,
-    parent: Option<EventRef>,
-    effect: SchedulingEffect,
-}
-
-impl SchedulingMutation {
-    pub fn reference(&self) -> &EventRef {
-        &self.reference
-    }
-
-    pub fn parent(&self) -> Option<&EventRef> {
-        self.parent.as_ref()
-    }
-
-    pub fn effect(&self) -> &SchedulingEffect {
-        &self.effect
+    #[cfg(test)]
+    pub(crate) fn attributed_to(mut self, namespace: &str) -> Self {
+        self.namespace = namespace.to_owned();
+        self
     }
 }
 
-/// Fail-closed category produced by intrinsic v1 scheduling conversion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConversionError {
-    IllegalPosition,
-    UnsupportedContent,
-    ReferenceMismatch,
+pub enum ScopeEventPublicationError {
+    UnsupportedPayload,
+    Invalid(WireError),
+    Storage(PublicationError),
 }
 
-impl fmt::Display for ConversionError {
+impl fmt::Display for ScopeEventPublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::IllegalPosition => "event content is illegal at this sequence",
-            Self::UnsupportedContent => "event content has no scheduling projection",
-            Self::ReferenceMismatch => "event reference does not name this event",
+            Self::UnsupportedPayload => "scoped event payload is unsupported",
+            Self::Invalid(_) => "scoped event is invalid",
+            Self::Storage(_) => "scoped event publication failed",
         })
     }
 }
 
-impl Error for ConversionError {}
+impl Error for ScopeEventPublicationError {}
 
-/// Converts a verified v1 event into an owned scheduling mutation.
-///
-/// `reference` must name `event` exactly: the sequence, digest, and key are all
-/// re-derived from `event` and compared, so a reference belonging to another event
-/// cannot pair a durable coordinate with this event's row effect.
-///
-/// # Errors
-///
-/// Returns [`ConversionError::ReferenceMismatch`] when `reference` does not name
-/// `event`, or when `event` cannot be re-encoded. Returns
-/// [`ConversionError::IllegalPosition`] for `CampaignCreated` at any sequence other
-/// than 1 and for `WorkflowStarted` at sequence 1. Returns
-/// [`ConversionError::UnsupportedContent`] for `ArtifactPublished`, which has no
-/// scheduling projection.
-pub fn scheduling_mutation(
-    reference: EventRef,
-    event: &Event,
-) -> Result<SchedulingMutation, ConversionError> {
-    let encoded = encode(event).map_err(|_| ConversionError::ReferenceMismatch)?;
-    if reference.sequence() != event.sequence()
-        || reference.digest() != encoded.digest()
-        || reference.key() != encoded.key()
-    {
-        return Err(ConversionError::ReferenceMismatch);
+#[derive(Debug)]
+pub enum ScopeEventReadError {
+    Storage(GetError),
+    Invalid(WireError),
+}
+
+impl fmt::Display for ScopeEventReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Storage(_) => "scoped event read failed",
+            Self::Invalid(_) => "scoped event encoding is invalid",
+        })
     }
-    projected_mutation(reference, event)
 }
 
-/// Pairs `reference` with `event`'s row effect without re-deriving the reference.
-///
-/// Apply-layer tests need mutations whose digests collide across sequences or
-/// diverge at one sequence, which [`scheduling_mutation`] rejects by design.
-#[cfg(test)]
-pub(crate) fn scheduling_mutation_unchecked(
-    reference: EventRef,
-    event: &Event,
-) -> Result<SchedulingMutation, ConversionError> {
-    projected_mutation(reference, event)
-}
+impl Error for ScopeEventReadError {}
 
-fn projected_mutation(
-    reference: EventRef,
-    event: &Event,
-) -> Result<SchedulingMutation, ConversionError> {
-    // No wildcard arm: a new EventContent variant must fail compilation here rather than
-    // silently project nothing.
-    let effect = match (event.content(), event.sequence()) {
-        (EventContent::CampaignCreated, 1) => SchedulingEffect::CampaignCreated {
-            campaign_id: GENESIS_CAMPAIGN_ID.to_owned(),
-        },
-        (EventContent::WorkflowStarted, sequence) if sequence > 1 => {
-            SchedulingEffect::WorkflowStarted {
-                workflow_id: projected_id(sequence),
-            }
-        }
-        (EventContent::CampaignCreated | EventContent::WorkflowStarted, _) => {
-            return Err(ConversionError::IllegalPosition);
-        }
-        (EventContent::ArtifactPublished(_), _) => {
-            return Err(ConversionError::UnsupportedContent);
-        }
-    };
-
-    Ok(SchedulingMutation {
-        reference,
-        parent: event.parent().cloned(),
-        effect,
-    })
-}
-
-/// The one campaign identity a chain projects, since genesis is always sequence 1.
-pub(crate) const GENESIS_CAMPAIGN_ID: &str = "0000000000000001";
-
-/// Derives an identity unique within the single chain tracked by the singleton sync cursor.
-///
-/// Genesis is always sequence 1, so every campaign row carries the constant ID
-/// `0000000000000001`; one database projects one chain, which keeps that constant
-/// collision-free. The identity is the event's own 16-digit sequence, matching the padding
-/// the event key already uses, because v1 event payloads carry no identities of their own.
-fn projected_id(sequence: u64) -> String {
-    format!("{sequence:016}")
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct WireEvent {
-    version: u64,
-    operation_id: String,
-    sequence: u64,
-    parent: Option<WireEventRef>,
-    writer_fence: u64,
-    content: WireContent,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct WireEventRef {
-    sequence: u64,
-    digest: String,
-    key: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WireContent {
-    CampaignCreated,
-    WorkflowStarted,
-    ArtifactPublished(WireArtifactRef),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WireArtifactRef {
-    digest: String,
-    size: u64,
-    media_type: String,
-    producer_attempt: String,
-    creation_time_unix_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    retention_class: Option<String>,
-}
-
-/// Produces frozen zstd-framed bytes and a SHA-256 reference over those bytes.
-///
-/// # Errors
-///
-/// Returns [`WireError`] when CBOR serialization, compression, or derived-reference
-/// validation fails.
-pub fn encode(event: &Event) -> Result<EncodedEvent, WireError> {
-    let wire = WireEvent::from(event);
-    let cbor = encode_cbor(&wire)?;
-    let stored_bytes = compress(&cbor)?;
-    let reference = EventRef::from_digest(event.sequence(), digest(&stored_bytes))
-        .map_err(|_| WireError::InvalidValue)?;
-    Ok(EncodedEvent {
-        stored_bytes,
-        reference,
-    })
-}
-
-/// Publishes canonical event bytes only after any artifact witness matches exactly.
-///
-/// The immutable object is accepted after a successful create or full-byte duplicate
-/// verification. No witness is returned while publication remains ambiguous.
-///
-/// # Errors
-///
-/// Returns [`PublicationError`] for a missing, unexpected, or mismatched artifact
-/// witness; an encoding failure; an object above the 5 GiB single-PUT limit; or
-/// unresolved storage state.
-pub async fn publish(
+pub async fn publish_root(
     store: &S3Store,
-    event: &Event,
-    artifact: Option<&PublishedArtifact>,
-) -> Result<ResolvedEventPublication, PublicationError> {
-    match (event.content(), artifact) {
-        (EventContent::ArtifactPublished(reference), Some(published))
-            if reference == published.artifact_ref()
-                && published.namespace() == store.namespace() => {}
-        (EventContent::CampaignCreated | EventContent::WorkflowStarted, None) => {}
-        _ => return Err(PublicationError::InvalidInput),
-    }
+    scope: &ScopeIdentity,
+    event: &RootEvent,
+    history: &mut AttemptHistory,
+) -> Result<ResolvedScopeEventPublication, ScopeEventPublicationError> {
+    let encoded = encode_root_event(event).map_err(ScopeEventPublicationError::Invalid)?;
+    publish_encoded(store, scope, event.envelope(), encoded, history).await
+}
 
-    let encoded = encode(event).map_err(|error| match error {
-        WireError::LimitExceeded => PublicationError::TooLarge,
-        WireError::InvalidEncoding
-        | WireError::NonCanonical
-        | WireError::InvalidValue
-        | WireError::ReferenceMismatch => PublicationError::InvalidInput,
-    })?;
+pub(crate) async fn publish_encoded(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    envelope: &EventEnvelope,
+    encoded: EncodedScopeEvent,
+    history: &mut AttemptHistory,
+) -> Result<ResolvedScopeEventPublication, ScopeEventPublicationError> {
+    let key = scope_event_key(scope, encoded.event_ref());
+    validate_registered(scope, envelope, &encoded, &key)?;
     store
-        .publish_immutable(
-            encoded.key(),
+        .publish_with_history(
+            &key,
             encoded.stored_bytes().to_vec(),
-            encoded.digest(),
+            encoded.event_ref().digest().as_str(),
+            history,
         )
-        .await?;
-    Ok(ResolvedEventPublication {
-        reference: encoded.reference,
+        .await
+        .map_err(ScopeEventPublicationError::Storage)?;
+    Ok(ResolvedScopeEventPublication {
+        scope: scope.clone(),
+        envelope: envelope.clone(),
+        reference: encoded.event_ref().clone(),
+        bytes: encoded.stored_bytes().to_vec(),
         namespace: store.namespace().to_owned(),
     })
 }
 
-/// Decodes stored bytes only when framing, canonical bytes, digest, and key all agree.
-///
-/// # Errors
-///
-/// Returns [`WireError`] for empty or oversized frames, absent or oversized content
-/// size, malformed CBOR, unknown versions, noncanonical encodings or zstd framing,
-/// key mismatch, or an invalid domain value.
-pub fn decode(stored_bytes: &[u8], expected_key: &str) -> Result<Event, WireError> {
-    if stored_bytes.is_empty() || stored_bytes.len() > MAX_COMPRESSED_BYTES {
-        return Err(WireError::LimitExceeded);
+pub(crate) async fn read_opaque(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    reference: &ScopeEventRef,
+) -> Result<Option<(DecodedScopeEvent<Value>, Vec<u8>)>, ScopeEventReadError> {
+    let key = scope_event_key(scope, reference);
+    let outcome =
+        store
+            .get_object(&key, MAX_COMPRESSED_BYTES)
+            .await
+            .map_err(|error| match error {
+                GetError::TooLarge => ScopeEventReadError::Invalid(WireError::LimitExceeded),
+                other => ScopeEventReadError::Storage(other),
+            })?;
+    match outcome {
+        GetOutcome::NotFound => Ok(None),
+        GetOutcome::Found { bytes, .. } => {
+            let decoded = decode_scope_event(&bytes, &key, scope, None)
+                .map_err(ScopeEventReadError::Invalid)?;
+            Ok(Some((decoded, bytes)))
+        }
     }
-    match zstd::zstd_safe::get_frame_content_size(stored_bytes)
-        .map_err(|_| WireError::InvalidEncoding)?
+}
+
+pub(crate) fn payload_registered(envelope: &EventEnvelope) -> bool {
+    if envelope.payload_type() == ROOT_GENESIS_PAYLOAD_TYPE {
+        return true;
+    }
+    #[cfg(test)]
     {
-        None => return Err(WireError::NonCanonical),
-        Some(0) => return Err(WireError::LimitExceeded),
-        Some(size) if size > MAX_DECOMPRESSED_BYTES as u64 => {
-            return Err(WireError::LimitExceeded);
-        }
-        Some(_) => {}
+        envelope.payload_type() == crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE
     }
-    let cbor = zstd::bulk::decompress(stored_bytes, MAX_DECOMPRESSED_BYTES)
-        .map_err(|_| WireError::InvalidEncoding)?;
-
-    let mut reader = Cursor::new(cbor.as_slice());
-    let wire: WireEvent = from_reader_with_recursion_limit(&mut reader, CBOR_RECURSION_LIMIT)
-        .map_err(|_| WireError::InvalidEncoding)?;
-    if wire.version != WIRE_VERSION {
-        return Err(WireError::InvalidValue);
-    }
-    if reader.position() != cbor.len() as u64 {
-        return Err(WireError::NonCanonical);
-    }
-    let canonical = encode_cbor(&wire)?;
-    if canonical != cbor {
-        return Err(WireError::NonCanonical);
-    }
-    if compress(&canonical)? != stored_bytes {
-        return Err(WireError::NonCanonical);
-    }
-
-    let computed = EventRef::from_digest(wire.sequence, digest(stored_bytes))
-        .map_err(|_| WireError::InvalidValue)?;
-    if computed.key() != expected_key {
-        return Err(WireError::ReferenceMismatch);
-    }
-    wire.try_into()
-}
-
-impl From<&Event> for WireEvent {
-    fn from(event: &Event) -> Self {
-        Self {
-            version: WIRE_VERSION,
-            operation_id: event.operation_id().to_owned(),
-            sequence: event.sequence(),
-            parent: event.parent().map(WireEventRef::from),
-            writer_fence: event.writer_fence(),
-            content: event.content().into(),
-        }
+    #[cfg(not(test))]
+    {
+        false
     }
 }
 
-impl From<&EventRef> for WireEventRef {
-    fn from(event_ref: &EventRef) -> Self {
-        Self {
-            sequence: event_ref.sequence(),
-            digest: event_ref.digest().to_owned(),
-            key: event_ref.key().to_owned(),
-        }
+fn validate_registered(
+    scope: &ScopeIdentity,
+    envelope: &EventEnvelope,
+    encoded: &EncodedScopeEvent,
+    key: &str,
+) -> Result<(), ScopeEventPublicationError> {
+    if !payload_registered(envelope) {
+        return Err(ScopeEventPublicationError::UnsupportedPayload);
     }
-}
-
-impl From<&EventContent> for WireContent {
-    fn from(content: &EventContent) -> Self {
-        match content {
-            EventContent::CampaignCreated => Self::CampaignCreated,
-            EventContent::WorkflowStarted => Self::WorkflowStarted,
-            EventContent::ArtifactPublished(reference) => {
-                Self::ArtifactPublished(WireArtifactRef::from(reference))
-            }
-        }
+    if envelope.payload_type() == ROOT_GENESIS_PAYLOAD_TYPE {
+        let root = crate::scope::decode_root_event(encoded.stored_bytes(), key, scope)
+            .map_err(ScopeEventPublicationError::Invalid)?;
+        return if root.envelope() == envelope {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
     }
-}
-
-impl From<&ArtifactRef> for WireArtifactRef {
-    fn from(reference: &ArtifactRef) -> Self {
-        Self {
-            digest: reference.digest().to_owned(),
-            size: reference.size(),
-            media_type: reference.media_type().to_owned(),
-            producer_attempt: reference.producer_attempt().to_owned(),
-            creation_time_unix_ms: reference.creation_time_unix_ms(),
-            retention_class: reference.retention_class().map(str::to_owned),
-        }
+    #[cfg(test)]
+    if envelope.payload_type() == crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE {
+        let decoded = decode_scope_event::<Value>(encoded.stored_bytes(), key, scope, None)
+            .map_err(ScopeEventPublicationError::Invalid)?;
+        return if decoded.envelope() == envelope && decoded.event_ref() == encoded.event_ref() {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
     }
-}
-
-impl TryFrom<WireEvent> for Event {
-    type Error = WireError;
-
-    fn try_from(wire: WireEvent) -> Result<Self, Self::Error> {
-        let parent = wire.parent.map(EventRef::try_from).transpose()?;
-        Event::new(
-            wire.operation_id,
-            wire.sequence,
-            parent,
-            wire.writer_fence,
-            wire.content.try_into()?,
-        )
-        .map_err(|_| WireError::InvalidValue)
-    }
-}
-
-impl TryFrom<WireEventRef> for EventRef {
-    type Error = WireError;
-
-    fn try_from(wire: WireEventRef) -> Result<Self, Self::Error> {
-        Self::new(wire.sequence, wire.digest, wire.key).map_err(|_| WireError::InvalidValue)
-    }
-}
-
-impl TryFrom<WireArtifactRef> for ArtifactRef {
-    type Error = WireError;
-
-    fn try_from(reference: WireArtifactRef) -> Result<Self, Self::Error> {
-        Self::new(
-            reference.digest,
-            reference.size,
-            reference.media_type,
-            reference.producer_attempt,
-            reference.creation_time_unix_ms,
-            reference.retention_class,
-        )
-        .map_err(|_| WireError::InvalidValue)
-    }
-}
-
-impl TryFrom<WireContent> for EventContent {
-    type Error = WireError;
-
-    fn try_from(content: WireContent) -> Result<Self, Self::Error> {
-        match content {
-            WireContent::CampaignCreated => Ok(Self::CampaignCreated),
-            WireContent::WorkflowStarted => Ok(Self::WorkflowStarted),
-            WireContent::ArtifactPublished(reference) => {
-                Ok(Self::ArtifactPublished(reference.try_into()?))
-            }
-        }
-    }
-}
-
-fn encode_cbor(wire: &WireEvent) -> Result<Vec<u8>, WireError> {
-    let mut cbor = Vec::new();
-    into_writer(wire, &mut cbor).map_err(|_| WireError::InvalidEncoding)?;
-    Ok(cbor)
-}
-
-fn compress(cbor: &[u8]) -> Result<Vec<u8>, WireError> {
-    zstd::bulk::compress(cbor, ZSTD_LEVEL).map_err(|_| WireError::InvalidEncoding)
-}
-
-fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
 }
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_s3::{config::Region, primitives::SdkBody};
-    use aws_smithy_runtime::client::http::test_util::NeverClient;
+    use aws_sdk_s3::primitives::SdkBody;
     use ciborium::Value;
 
-    use crate::storage::{
-        artifacts,
-        s3::test_support::{replay_store, response, test_builder},
+    use crate::{
+        distributed::identity::WorkspaceId,
+        scope::{
+            AdmittedCampaignConfig, CampaignId, EventEnvelope, encode_scope_event, root_genesis,
+        },
+        storage::s3::test_support::{replay_store, response},
     };
 
     use super::*;
 
-    fn reference_for(event: &Event) -> EventRef {
-        let encoded = encode(event).expect("event encodes");
-        EventRef::new(
-            event.sequence(),
-            encoded.digest().to_owned(),
-            encoded.key().to_owned(),
-        )
-        .expect("canonical reference")
-    }
-
-    fn valid_wire() -> WireEvent {
-        WireEvent {
-            version: WIRE_VERSION,
-            operation_id: "op".into(),
-            sequence: 1,
-            parent: None,
-            writer_fence: 7,
-            content: WireContent::CampaignCreated,
-        }
-    }
-
-    fn stored(wire: &WireEvent) -> Vec<u8> {
-        compress(&encode_cbor(wire).unwrap()).unwrap()
-    }
-
-    fn key(stored: &[u8], sequence: u64) -> String {
-        format!("{sequence:016}-{}.cbor.zst", digest(stored))
-    }
-
-    fn decode_cbor(cbor: &[u8], sequence: u64) -> Result<Event, WireError> {
-        let stored = compress(cbor).unwrap();
-        decode(&stored, &key(&stored, sequence))
-    }
-
-    fn mutate_value(mutator: impl FnOnce(&mut Vec<(Value, Value)>)) -> Vec<u8> {
-        let cbor = encode_cbor(&valid_wire()).unwrap();
-        let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
-        let Value::Map(entries) = &mut value else {
-            panic!("event wire value should be a map");
-        };
-        mutator(entries);
-        let mut output = Vec::new();
-        into_writer(&value, &mut output).unwrap();
-        output
-    }
-
-    fn incompressible_bytes(len: usize) -> Vec<u8> {
-        let mut state = 0x4d59_5df4_d0f3_3173_u64;
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state as u8
-            })
-            .collect()
-    }
-
-    fn nested_arrays(depth: usize) -> Vec<u8> {
-        let mut bytes = vec![0x81; depth];
-        bytes.push(0xf6);
-        bytes
-    }
-
-    #[test]
-    fn production_cbor_uses_frozen_map_and_scalar_forms() {
-        let cbor = encode_cbor(&valid_wire()).unwrap();
-        assert!(cbor.starts_with(b"\xa6\x67version\x01\x6coperation_id"));
-        assert!(cbor.ends_with(b"\x67content\x70campaign_created"));
-
-        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let prefix = b"\xa6\x67version\x01\x6coperation_id\x62op\x68sequence\x01\x66parent\xf6\x6cwriter_fence\x07\x67content\xa1\x72artifact_published";
-        let fields = b"\x66digest\x78\x40";
-        let suffix = b"\x64size\x04\x6amedia_type\x78\x18application/octet-stream\x70producer_attempt\x67attempt\x75creation_time_unix_ms\x18\x7b";
-
-        let mut wire = valid_wire();
-        wire.content = WireContent::ArtifactPublished(WireArtifactRef {
-            digest: digest.into(),
-            size: 4,
-            media_type: "application/octet-stream".into(),
-            producer_attempt: "attempt".into(),
-            creation_time_unix_ms: 123,
-            retention_class: None,
-        });
-        let expected = [
-            prefix.as_slice(),
-            b"\xa5".as_slice(),
-            fields.as_slice(),
-            digest.as_bytes(),
-            suffix.as_slice(),
-        ]
-        .concat();
-        assert_eq!(encode_cbor(&wire).unwrap(), expected);
-
-        let WireContent::ArtifactPublished(reference) = &mut wire.content else {
-            unreachable!();
-        };
-        reference.retention_class = Some("pilot".into());
-        let expected = [
-            prefix.as_slice(),
-            b"\xa6".as_slice(),
-            fields.as_slice(),
-            digest.as_bytes(),
-            suffix.as_slice(),
-            b"\x6fretention_class\x65pilot".as_slice(),
-        ]
-        .concat();
-        assert_eq!(encode_cbor(&wire).unwrap(), expected);
-    }
-
-    #[test]
-    fn rejects_noncanonical_zstd_framing() {
-        let cbor = encode_cbor(&valid_wire()).unwrap();
-        let alternate_level = zstd::bulk::compress(&cbor, 1).unwrap();
-        assert_ne!(alternate_level, compress(&cbor).unwrap());
-        assert_eq!(
-            decode(&alternate_level, &key(&alternate_level, 1)),
-            Err(WireError::NonCanonical)
-        );
-
-        let no_content_size = zstd::stream::encode_all(cbor.as_slice(), ZSTD_LEVEL).unwrap();
-        assert!(matches!(
-            zstd::zstd_safe::get_frame_content_size(&no_content_size),
-            Ok(None)
-        ));
-        assert_eq!(
-            decode(&no_content_size, &key(&no_content_size, 1)),
-            Err(WireError::NonCanonical)
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_version_and_invalid_references() {
-        let mut wire = valid_wire();
-        wire.version = 2;
-        let bytes = stored(&wire);
-        assert_eq!(
-            decode(&bytes, &key(&bytes, 1)),
-            Err(WireError::InvalidValue)
-        );
-
-        let digest = "0".repeat(64);
-        wire.version = WIRE_VERSION;
-        wire.sequence = 2;
-        wire.parent = Some(WireEventRef {
-            sequence: 1,
-            digest: "G".repeat(64),
-            key: "bad".into(),
-        });
-        let bytes = stored(&wire);
-        assert_eq!(
-            decode(&bytes, &key(&bytes, 2)),
-            Err(WireError::InvalidValue)
-        );
-
-        wire.parent = Some(WireEventRef {
-            sequence: 1,
-            digest: digest.clone(),
-            key: "bad".into(),
-        });
-        let bytes = stored(&wire);
-        assert_eq!(
-            decode(&bytes, &key(&bytes, 2)),
-            Err(WireError::InvalidValue)
-        );
-
-        wire.sequence = 3;
-        wire.parent = Some(WireEventRef {
-            sequence: 1,
-            key: format!("{:016}-{digest}.cbor.zst", 1),
-            digest,
-        });
-        let bytes = stored(&wire);
-        assert_eq!(
-            decode(&bytes, &key(&bytes, 3)),
-            Err(WireError::InvalidValue)
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_and_noncanonical_cbor() {
-        let bytes = stored(&valid_wire());
-        assert!(decode(&bytes[..bytes.len() - 1], "irrelevant").is_err());
-        assert_eq!(
-            decode(&[1, 2, 3], "irrelevant"),
-            Err(WireError::InvalidEncoding)
-        );
-        let mut corrupted = bytes;
-        let middle = corrupted.len() / 2;
-        corrupted[middle] ^= 1;
-        assert!(decode(&corrupted, "irrelevant").is_err());
-
-        let mut non_shortest = encode_cbor(&valid_wire()).unwrap();
-        assert_eq!(non_shortest[9], 1);
-        non_shortest.splice(9..10, [0x18, 0x01]);
-        assert_eq!(decode_cbor(&non_shortest, 1), Err(WireError::NonCanonical));
-
-        let mut indefinite_map = encode_cbor(&valid_wire()).unwrap();
-        indefinite_map[0] = 0xbf;
-        indefinite_map.push(0xff);
-        assert_eq!(
-            decode_cbor(&indefinite_map, 1),
-            Err(WireError::NonCanonical)
-        );
-
-        let mut trailing = encode_cbor(&valid_wire()).unwrap();
-        trailing.push(0);
-        assert_eq!(decode_cbor(&trailing, 1), Err(WireError::NonCanonical));
-    }
-
-    #[test]
-    fn rejects_unknown_missing_duplicate_and_invalid_wire_fields() {
-        let unknown = mutate_value(|entries| {
-            entries.push((Value::Text("extra".into()), Value::Null));
-        });
-        assert_eq!(decode_cbor(&unknown, 1), Err(WireError::InvalidEncoding));
-
-        let missing = mutate_value(|entries| {
-            entries.retain(|(key, _)| key != &Value::Text("content".into()));
-        });
-        assert_eq!(decode_cbor(&missing, 1), Err(WireError::InvalidEncoding));
-
-        let duplicate = mutate_value(|entries| entries.push(entries[0].clone()));
-        assert_eq!(decode_cbor(&duplicate, 1), Err(WireError::InvalidEncoding));
-
-        let float_version = mutate_value(|entries| entries[0].1 = Value::Float(1.0));
-        assert_eq!(
-            decode_cbor(&float_version, 1),
-            Err(WireError::InvalidEncoding)
-        );
-
-        let unknown_content = mutate_value(|entries| {
-            let (_, content) = entries
-                .iter_mut()
-                .find(|(key, _)| key == &Value::Text("content".into()))
-                .unwrap();
-            *content = Value::Text("future".into());
-        });
-        assert_eq!(
-            decode_cbor(&unknown_content, 1),
-            Err(WireError::InvalidEncoding)
-        );
-
-        let canonical = encode_cbor(&valid_wire()).unwrap();
-        let operation_id = canonical
-            .windows(3)
-            .position(|window| window == b"\x62op")
-            .unwrap();
-        let mut indefinite_text = canonical;
-        indefinite_text.splice(
-            operation_id..operation_id + 3,
-            [0x7f, 0x62, b'o', b'p', 0xff],
-        );
-        assert_eq!(
-            decode_cbor(&indefinite_text, 1),
-            Err(WireError::NonCanonical)
-        );
-    }
-
-    #[test]
-    fn rejects_all_event_size_limits() {
-        assert_eq!(decode(&[], "irrelevant"), Err(WireError::LimitExceeded));
-
-        let payload = incompressible_bytes(320 * 1024);
-        let oversized_frame = compress(&payload).unwrap();
-        assert!(oversized_frame.len() > MAX_COMPRESSED_BYTES);
-        assert_eq!(
-            decode(&oversized_frame, "irrelevant"),
-            Err(WireError::LimitExceeded)
-        );
-
-        let expanded = compress(&vec![0; MAX_DECOMPRESSED_BYTES + 1]).unwrap();
-        assert_eq!(
-            decode(&expanded, "irrelevant"),
-            Err(WireError::LimitExceeded)
-        );
-
-        let empty_payload = compress(&[]).unwrap();
-        assert_eq!(
-            decode(&empty_payload, "irrelevant"),
-            Err(WireError::LimitExceeded)
-        );
-
-        let mut wire = valid_wire();
-        wire.operation_id = "x".repeat(129);
-        let bytes = stored(&wire);
-        assert_eq!(
-            decode(&bytes, &key(&bytes, 1)),
-            Err(WireError::InvalidValue)
-        );
-    }
-
-    #[test]
-    fn derives_workflow_identity_from_the_event_sequence() {
-        let workflow = Event::new(
-            "workflow-op".into(),
-            3,
-            Some(EventRef::from_digest(2, "1".repeat(64)).unwrap()),
-            7,
-            EventContent::WorkflowStarted,
-        )
-        .unwrap();
-        let reference = reference_for(&workflow);
-
-        assert_eq!(
-            scheduling_mutation(reference, &workflow).unwrap().effect(),
-            &SchedulingEffect::WorkflowStarted {
-                workflow_id: "0000000000000003".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_scheduling_content_at_illegal_positions() {
-        let workflow = Event::new(
-            "workflow-op".into(),
-            1,
-            None,
-            7,
-            EventContent::WorkflowStarted,
-        )
-        .unwrap();
-        let workflow_reference = reference_for(&workflow);
-        assert_eq!(
-            scheduling_mutation(workflow_reference, &workflow),
-            Err(ConversionError::IllegalPosition)
-        );
-
-        let campaign = Event::new(
-            "campaign-op".into(),
-            2,
-            Some(EventRef::from_digest(1, "0".repeat(64)).unwrap()),
-            7,
-            EventContent::CampaignCreated,
-        )
-        .unwrap();
-        let campaign_reference = reference_for(&campaign);
-        assert_eq!(
-            scheduling_mutation(campaign_reference, &campaign),
-            Err(ConversionError::IllegalPosition)
-        );
-    }
-
-    #[test]
-    fn rejects_a_reference_with_the_right_sequence_and_wrong_digest() {
-        let campaign = Event::new(
-            "campaign-op".into(),
-            1,
-            None,
-            7,
-            EventContent::CampaignCreated,
-        )
-        .unwrap();
-        let canonical = reference_for(&campaign);
-        let wrong_digest =
-            EventRef::from_digest(canonical.sequence(), "c".repeat(64)).expect("valid reference");
-        assert_eq!(wrong_digest.sequence(), canonical.sequence());
-        assert_ne!(wrong_digest.digest(), canonical.digest());
-
-        assert_eq!(
-            scheduling_mutation(wrong_digest, &campaign),
-            Err(ConversionError::ReferenceMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_a_reference_naming_another_sequence() {
-        let campaign = Event::new(
-            "campaign-op".into(),
-            1,
-            None,
-            7,
-            EventContent::CampaignCreated,
-        )
-        .unwrap();
-        let foreign = EventRef::from_digest(2, "0".repeat(64)).unwrap();
-
-        assert_eq!(
-            scheduling_mutation(foreign, &campaign),
-            Err(ConversionError::ReferenceMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_artifact_content_without_a_scheduling_projection() {
-        let artifact = ArtifactRef::new(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-            4,
-            "application/octet-stream".into(),
-            "attempt".into(),
-            123,
-            None,
-        )
-        .unwrap();
-        let event = Event::new(
-            "artifact-op".into(),
-            1,
-            None,
-            7,
-            EventContent::ArtifactPublished(artifact),
-        )
-        .unwrap();
-        let reference = reference_for(&event);
-
-        assert_eq!(
-            scheduling_mutation(reference, &event),
-            Err(ConversionError::UnsupportedContent)
-        );
-    }
-
-    #[test]
-    fn artifact_content_round_trips_canonically() {
-        for retention_class in [None, Some("pilot".to_owned())] {
-            let artifact = ArtifactRef::new(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-                4,
-                "application/octet-stream".into(),
-                "attempt".into(),
-                123,
-                retention_class,
+    fn genesis() -> crate::scope::RootGenesis {
+        root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-a".into()).unwrap(),
+                b"admitted".to_vec(),
             )
-            .unwrap();
-            let event = Event::new(
-                "artifact-op".into(),
-                1,
-                None,
-                7,
-                EventContent::ArtifactPublished(artifact),
-            )
-            .unwrap();
-            let encoded = encode(&event).unwrap();
-            let decoded = decode(encoded.stored_bytes(), encoded.key()).unwrap();
-            assert_eq!(decoded, event);
-            assert_eq!(encode(&decoded).unwrap(), encoded);
-        }
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn artifact_event_requires_a_matching_publication() {
-        let store = S3Store::new(
-            "test-bucket",
-            Region::new("us-east-1"),
-            test_builder(NeverClient::new()),
-        );
-        let reference = ArtifactRef::new(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-            4,
-            "application/octet-stream".into(),
-            "attempt".into(),
-            1,
-            None,
+    async fn publishes_root_bytes_and_retains_dispatch_history() {
+        let genesis = genesis();
+        let root = crate::scope::decode_root_event(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
         )
         .unwrap();
-        let event = Event::new(
-            "event-op".into(),
-            1,
-            None,
-            1,
-            EventContent::ArtifactPublished(reference),
-        )
-        .unwrap();
-        assert!(matches!(
-            publish(&store, &event, None).await,
-            Err(PublicationError::InvalidInput)
-        ));
-    }
-
-    #[tokio::test]
-    async fn matching_artifact_allows_event_publication_at_the_encoded_key() {
-        let artifact_bytes = b"artifact".to_vec();
-        let (store, client) = replay_store(vec![
-            response(200, &[], SdkBody::empty()),
-            response(200, &[], SdkBody::empty()),
-        ]);
-        let artifact = artifacts::publish(
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let published = publish_root(
             &store,
-            artifact_bytes,
-            "application/octet-stream".into(),
-            "attempt".into(),
-            1,
-            None,
+            genesis.identity(),
+            &root,
+            &mut AttemptHistory::default(),
         )
         .await
         .unwrap();
-        let mismatched = Event::new(
-            "event-op".into(),
-            1,
-            None,
-            1,
-            EventContent::ArtifactPublished(
-                ArtifactRef::new(
-                    artifact.artifact_ref().digest().to_owned(),
-                    artifact.artifact_ref().size(),
-                    artifact.artifact_ref().media_type().to_owned(),
-                    "another-attempt".into(),
-                    1,
-                    None,
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-        assert!(matches!(
-            publish(&store, &mismatched, Some(&artifact)).await,
-            Err(PublicationError::InvalidInput)
-        ));
-        let unit_event =
-            Event::new("unit-op".into(), 1, None, 1, EventContent::CampaignCreated).unwrap();
-        assert!(matches!(
-            publish(&store, &unit_event, Some(&artifact)).await,
-            Err(PublicationError::InvalidInput)
-        ));
+        assert_eq!(published.canonical_bytes(), genesis.event_bytes());
         assert_eq!(client.actual_requests().count(), 1);
 
-        let event = Event::new(
-            "event-op".into(),
-            1,
-            None,
-            1,
-            EventContent::ArtifactPublished(artifact.artifact_ref().clone()),
-        )
-        .unwrap();
-        let encoded = encode(&event).unwrap();
-        let foreign_store = S3Store::new(
-            "other-bucket",
-            Region::new("us-east-1"),
-            test_builder(NeverClient::new()),
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+        ]);
+        let mut history = AttemptHistory::default();
+        assert_eq!(
+            publish_root(&store, genesis.identity(), &root, &mut history).await,
+            Err(ScopeEventPublicationError::Storage(
+                PublicationError::Unresolved
+            ))
         );
-        // A second store sharing the bucket name is still a different store, since
-        // the endpoint and credentials behind that name can differ.
-        let same_name_store = S3Store::new(
-            "test-bucket",
-            Region::new("us-east-1"),
-            test_builder(NeverClient::new()),
-        );
-        assert_ne!(same_name_store.namespace(), store.namespace());
-        assert_ne!(foreign_store.namespace(), store.namespace());
-        assert!(matches!(
-            publish(&same_name_store, &event, Some(&artifact)).await,
-            Err(PublicationError::InvalidInput)
-        ));
-        assert!(matches!(
-            publish(&foreign_store, &event, Some(&artifact)).await,
-            Err(PublicationError::InvalidInput)
-        ));
-        let resolved = publish(&store, &event, Some(&artifact)).await.unwrap();
-        assert_eq!(resolved.event_ref(), &encoded.reference);
-        let uri = client
-            .actual_requests()
-            .nth(1)
-            .expect("event PUT")
-            .uri()
-            .parse::<http::Uri>()
-            .expect("valid request URI");
-        assert_eq!(uri.path(), format!("/{}", encoded.key()));
+        assert!(history.may_have_been_sent());
+        assert_eq!(client.actual_requests().count(), 3);
     }
 
     #[tokio::test]
-    async fn unresolved_storage_does_not_create_an_event_publication() {
-        let (store, _) = replay_store(vec![
-            response(500, &[], SdkBody::empty()),
-            response(500, &[], SdkBody::empty()),
-        ]);
-        let event =
-            Event::new("event-op".into(), 1, None, 1, EventContent::CampaignCreated).unwrap();
+    async fn encoded_bytes_must_match_the_supplied_envelope() {
+        let genesis = genesis();
+        let envelope_a = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "operation-a".into(),
+            crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let envelope_b = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "operation-b".into(),
+            crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let encoded = encode_scope_event(&envelope_b, &Value::Null).unwrap();
+        let (store, client) = replay_store(vec![]);
         assert!(matches!(
-            publish(&store, &event, None).await,
-            Err(PublicationError::Unresolved)
+            publish_encoded(
+                &store,
+                genesis.identity(),
+                &envelope_a,
+                encoded,
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeEventPublicationError::Invalid(_))
         ));
+        assert_eq!(client.actual_requests().count(), 0);
     }
 
-    #[test]
-    fn enforces_cbor_recursion_limit_at_the_codec_boundary() {
-        // WireEvent has no recursive field; serde rejects nested values before this
-        // codec limit matters. This boundary pair pins the decoder setting itself.
-        assert_eq!(CBOR_RECURSION_LIMIT, 16);
-        assert!(
-            from_reader_with_recursion_limit::<Value, _>(
-                nested_arrays(16).as_slice(),
-                CBOR_RECURSION_LIMIT
+    #[tokio::test]
+    async fn unsupported_payload_never_reaches_storage() {
+        let genesis = genesis();
+        let envelope = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "artifact-op".into(),
+            "artifact".into(),
+        )
+        .unwrap();
+        let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+        let (store, client) = replay_store(vec![]);
+        assert_eq!(
+            publish_encoded(
+                &store,
+                genesis.identity(),
+                &envelope,
+                encoded,
+                &mut AttemptHistory::default(),
             )
-            .is_ok()
+            .await,
+            Err(ScopeEventPublicationError::UnsupportedPayload)
         );
-        assert!(
-            from_reader_with_recursion_limit::<Value, _>(
-                nested_arrays(17).as_slice(),
-                CBOR_RECURSION_LIMIT
+        assert_eq!(client.actual_requests().count(), 0);
+
+        let envelope = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "fake-root".into(),
+            ROOT_GENESIS_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+        let (store, client) = replay_store(vec![]);
+        assert!(matches!(
+            publish_encoded(
+                &store,
+                genesis.identity(),
+                &envelope,
+                encoded,
+                &mut AttemptHistory::default(),
             )
-            .is_err()
-        );
+            .await,
+            Err(ScopeEventPublicationError::Invalid(_))
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
     }
 }

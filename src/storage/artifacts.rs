@@ -7,7 +7,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::domain::campaign::ArtifactRef;
+use crate::domain::artifact::ArtifactRef;
 
 use super::s3::{PublicationError, S3Store};
 
@@ -34,16 +34,6 @@ impl PublishedArtifact {
 
     pub fn namespace(&self) -> &str {
         &self.namespace
-    }
-
-    /// Rebinds the witness to another namespace so store-identity checks can be
-    /// exercised without a second live publication.
-    #[cfg(test)]
-    pub(crate) fn attributed_to(self, namespace: &str) -> Self {
-        Self {
-            reference: self.reference,
-            namespace: namespace.to_owned(),
-        }
     }
 }
 

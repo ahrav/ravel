@@ -18,11 +18,10 @@ use std::{
 use tokio::sync::oneshot;
 
 use crate::{
-    db::{
-        projections::{self, ApplyError, ApplyOutcome},
-        schema::{self, SchemaError, ValidateError},
+    db::projections::{
+        self, ApplyError, ApplyOutcome, SchemaError, ScopeProjectionEvent, ValidateError,
     },
-    sync::event::SchedulingMutation,
+    scope::{Digest, ScopeHead, ScopeIdentity},
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
@@ -33,18 +32,21 @@ fn command_channel() -> (SyncSender<Command>, Receiver<Command>) {
 
 enum Command {
     Apply {
-        mutation: SchedulingMutation,
+        mutation: Box<ScopeProjectionEvent>,
         respond: oneshot::Sender<Result<ApplyOutcome, ApplyError>>,
     },
     Cursor {
-        respond: oneshot::Sender<Result<(u64, Option<String>), ApplyError>>,
+        scope: Box<ScopeIdentity>,
+        respond: oneshot::Sender<Result<(u64, Option<Digest>), ApplyError>>,
     },
-    ListReadyWork {
-        campaign_id: String,
-        capabilities: Vec<String>,
-        limit: usize,
-        after: Option<(String, String)>,
-        respond: oneshot::Sender<Result<Vec<(String, String)>, ApplyError>>,
+    ContainsOperation {
+        scope: Box<ScopeIdentity>,
+        operation_id: String,
+        respond: oneshot::Sender<Result<bool, ApplyError>>,
+    },
+    MatchesHead {
+        head: Box<ScopeHead>,
+        respond: oneshot::Sender<Result<bool, ApplyError>>,
     },
     #[cfg(test)]
     Diagnostics {
@@ -113,7 +115,7 @@ impl DbHandle {
     /// [`SchemaError::DatabaseOperationFailed`] when the journal mode cannot be configured or
     /// verified, when the OS refuses to spawn the worker thread, and when the worker exits
     /// before reporting startup.
-    pub async fn spawn(path: PathBuf) -> Result<Self, SchemaError> {
+    pub(crate) async fn spawn(path: PathBuf) -> Result<Self, SchemaError> {
         match Self::start(path, OpenMode::Create).await {
             Ok(handle) => Ok(handle),
             Err(StartError::Create(error)) => Err(error),
@@ -174,7 +176,7 @@ impl DbHandle {
         (Self { commands }, receiver)
     }
 
-    /// Applies one owned scheduling mutation on the SQLite owner thread.
+    /// Applies one owned projection mutation on the SQLite owner thread.
     ///
     /// Dropping the returned future does not revoke a command that was already accepted;
     /// the mutation still applies, and only the response is discarded. A lost response does
@@ -184,50 +186,70 @@ impl DbHandle {
     ///
     /// Returns [`ApplyError::Full`] when admission is saturated,
     /// [`ApplyError::Stopping`] when the worker is disconnected, errors from
-    /// [`projections::apply`], or [`ApplyError::DatabaseOperationFailed`] when an accepted
-    /// command loses its response.
-    pub async fn apply(&self, mutation: SchedulingMutation) -> Result<ApplyOutcome, ApplyError> {
-        self.enqueue(|respond| Command::Apply { mutation, respond })?
-            .await
-            .map_err(|_| ApplyError::DatabaseOperationFailed)?
-    }
-
-    /// Reads the singleton synchronization cursor on the SQLite owner thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApplyError::Full`] when admission is saturated,
-    /// [`ApplyError::Stopping`] when the worker is disconnected, or
-    /// [`ApplyError::DatabaseOperationFailed`] when the query or accepted response fails.
-    pub(crate) async fn cursor(&self) -> Result<(u64, Option<String>), ApplyError> {
-        self.enqueue(|respond| Command::Cursor { respond })?
-            .await
-            .map_err(|_| ApplyError::DatabaseOperationFailed)?
-    }
-
-    /// Queries ready work on the SQLite owner thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApplyError::Full`] when admission is saturated,
-    /// [`ApplyError::Stopping`] when the worker is disconnected, or
-    /// [`ApplyError::DatabaseOperationFailed`] when the query or accepted response fails.
-    pub async fn list_ready_work(
+    /// [`projections::apply_scope_event`], or [`ApplyError::DatabaseOperationFailed`] when an
+    /// accepted command loses its response.
+    pub(crate) async fn apply(
         &self,
-        campaign_id: String,
-        capabilities: Vec<String>,
-        limit: usize,
-        after: Option<(String, String)>,
-    ) -> Result<Vec<(String, String)>, ApplyError> {
-        self.enqueue(|respond| Command::ListReadyWork {
-            campaign_id,
-            capabilities,
-            limit,
-            after,
+        mutation: ScopeProjectionEvent,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        self.enqueue(|respond| Command::Apply {
+            mutation: Box::new(mutation),
             respond,
         })?
         .await
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Reads one scope's projection cursor on the SQLite owner thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`] when admission is saturated,
+    /// [`ApplyError::Stopping`] when the worker is disconnected, or
+    /// [`ApplyError::DatabaseOperationFailed`] when the query or accepted response fails.
+    pub(crate) async fn scope_cursor(
+        &self,
+        scope: &ScopeIdentity,
+    ) -> Result<(u64, Option<Digest>), ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::Cursor { scope, respond })?
+            .await
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Reports whether one scope already recorded `operation_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub(crate) async fn scope_contains_operation(
+        &self,
+        scope: &ScopeIdentity,
+        operation_id: &str,
+    ) -> Result<bool, ApplyError> {
+        let scope = Box::new(scope.clone());
+        let operation_id = operation_id.to_owned();
+        self.enqueue(|respond| Command::ContainsOperation {
+            scope,
+            operation_id,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Reports whether the committed projection row equals `head`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub(crate) async fn scope_matches_head(&self, head: &ScopeHead) -> Result<bool, ApplyError> {
+        let head = Box::new(head.clone());
+        self.enqueue(|respond| Command::MatchesHead { head, respond })?
+            .await
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
     #[cfg(test)]
@@ -267,30 +289,25 @@ fn run(
                     last_apply_thread = Some(thread::current().id());
                     apply_count += 1;
                 }
-                #[cfg(test)]
-                crate::sync::replay::test_crash::reach("before-apply");
-                let outcome = projections::apply(&mut connection, &mutation);
-                #[cfg(test)]
-                crate::sync::replay::test_crash::reach("after-commit");
+                let outcome = projections::apply_scope_event(&mut connection, &mutation);
                 let _ = respond.send(outcome);
             }
-            Command::Cursor { respond } => {
-                let _ = respond.send(read_cursor(&connection));
+            Command::Cursor { scope, respond } => {
+                let _ = respond.send(projections::scope_cursor(&connection, &scope));
             }
-            Command::ListReadyWork {
-                campaign_id,
-                capabilities,
-                limit,
-                after,
+            Command::ContainsOperation {
+                scope,
+                operation_id,
                 respond,
             } => {
-                let _ = respond.send(projections::list_ready_work(
+                let _ = respond.send(projections::scope_contains_operation(
                     &connection,
-                    &campaign_id,
-                    &capabilities,
-                    limit,
-                    after,
+                    &scope,
+                    &operation_id,
                 ));
+            }
+            Command::MatchesHead { head, respond } => {
+                let _ = respond.send(projections::scope_matches_head(&connection, &head));
             }
             #[cfg(test)]
             Command::Diagnostics { respond } => {
@@ -314,8 +331,8 @@ fn configured_connection(
     open_mode: OpenMode,
 ) -> Result<rusqlite::Connection, StartError> {
     let connection = match open_mode {
-        OpenMode::Create => schema::create(path).map_err(StartError::Create)?,
-        OpenMode::Existing => schema::open_existing(path).map_err(StartError::Existing)?,
+        OpenMode::Create => projections::create(path).map_err(StartError::Create)?,
+        OpenMode::Existing => projections::open_existing(path).map_err(StartError::Existing)?,
     };
     let mode = connection
         .pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
@@ -328,17 +345,6 @@ fn configured_connection(
     Ok(connection)
 }
 
-fn read_cursor(connection: &rusqlite::Connection) -> Result<(u64, Option<String>), ApplyError> {
-    let (stored_sequence, digest): (i64, Option<String>) = connection.query_row(
-        "SELECT sequence, tail_digest FROM sync_cursor WHERE id = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let sequence =
-        u64::try_from(stored_sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?;
-    Ok((sequence, digest))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -348,8 +354,8 @@ mod tests {
     };
 
     use crate::{
-        domain::campaign::{Event, EventContent, EventRef},
-        sync::event::{encode, scheduling_mutation},
+        distributed::identity::WorkspaceId,
+        scope::{AdmittedCampaignConfig, CampaignId, RootGenesis, root_genesis},
     };
 
     use super::*;
@@ -358,43 +364,65 @@ mod tests {
         std::env::temp_dir().join(format!("ravel-worker-{}-{label}.sqlite3", process::id()))
     }
 
-    fn test_mutation() -> SchedulingMutation {
-        let event = Event::new(
-            "operation-1".into(),
-            1,
+    fn genesis() -> RootGenesis {
+        root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-a".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn test_mutation() -> ScopeProjectionEvent {
+        let genesis = genesis();
+        let root = crate::scope::decode_root_event(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
+        )
+        .unwrap();
+        ScopeProjectionEvent::new(
+            genesis.identity().clone(),
+            root.envelope().clone(),
+            genesis.event_ref().clone(),
             None,
             1,
-            EventContent::CampaignCreated,
         )
-        .unwrap();
-        let encoded = encode(&event).unwrap();
-        let reference = EventRef::new(
-            event.sequence(),
-            encoded.digest().to_owned(),
-            encoded.key().to_owned(),
-        )
-        .unwrap();
-        scheduling_mutation(reference, &event).unwrap()
+        .unwrap()
     }
 
     #[tokio::test]
     async fn bounded_queue_reports_full_then_stopping_for_every_command() {
+        let genesis = genesis();
         let (handle, receiver) = DbHandle::stalled();
         let mut pending = Vec::with_capacity(COMMAND_QUEUE_CAPACITY);
         for _ in 0..COMMAND_QUEUE_CAPACITY {
             pending.push(
                 handle
-                    .enqueue(|respond| Command::Cursor { respond })
+                    .enqueue(|respond| Command::Cursor {
+                        scope: Box::new(genesis.identity().clone()),
+                        respond,
+                    })
                     .unwrap(),
             );
         }
 
         assert_eq!(handle.apply(test_mutation()).await, Err(ApplyError::Full));
-        assert_eq!(handle.cursor().await, Err(ApplyError::Full));
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await,
+            Err(ApplyError::Full)
+        );
         assert_eq!(
             handle
-                .list_ready_work("campaign".into(), Vec::new(), 1, None)
+                .scope_contains_operation(genesis.identity(), "operation")
                 .await,
+            Err(ApplyError::Full)
+        );
+        assert_eq!(
+            handle.scope_matches_head(genesis.head()).await,
             Err(ApplyError::Full)
         );
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Full));
@@ -402,7 +430,10 @@ mod tests {
         drop(receiver.recv().unwrap());
         drop(
             handle
-                .enqueue(|respond| Command::Cursor { respond })
+                .enqueue(|respond| Command::Cursor {
+                    scope: Box::new(genesis.identity().clone()),
+                    respond,
+                })
                 .expect("admission recovers after one slot drains"),
         );
 
@@ -411,11 +442,18 @@ mod tests {
             handle.apply(test_mutation()).await,
             Err(ApplyError::Stopping)
         );
-        assert_eq!(handle.cursor().await, Err(ApplyError::Stopping));
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await,
+            Err(ApplyError::Stopping)
+        );
         assert_eq!(
             handle
-                .list_ready_work("campaign".into(), Vec::new(), 1, None)
+                .scope_contains_operation(genesis.identity(), "operation")
                 .await,
+            Err(ApplyError::Stopping)
+        );
+        assert_eq!(
+            handle.scope_matches_head(genesis.head()).await,
             Err(ApplyError::Stopping)
         );
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Stopping));
@@ -437,12 +475,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "launched in isolation by stalled_writer_memory_is_bounded"]
     async fn stalled_writer_memory_child() {
+        let genesis = genesis();
         let (handle, receiver) = DbHandle::stalled();
         let mut pending = Vec::with_capacity(COMMAND_QUEUE_CAPACITY);
         for _ in 0..COMMAND_QUEUE_CAPACITY {
             pending.push(
                 handle
-                    .enqueue(|respond| Command::Cursor { respond })
+                    .enqueue(|respond| Command::Cursor {
+                        scope: Box::new(genesis.identity().clone()),
+                        respond,
+                    })
                     .unwrap(),
             );
         }
@@ -522,24 +564,13 @@ mod tests {
     async fn owns_one_delete_journal_connection_on_a_blocking_thread() {
         let path = path("owner");
         let _ = fs::remove_file(&path);
-        let event = Event::new(
-            "operation-1".into(),
-            1,
-            None,
-            1,
-            EventContent::CampaignCreated,
-        )
-        .unwrap();
-        let encoded = encode(&event).unwrap();
-        let reference = EventRef::new(
-            event.sequence(),
-            encoded.digest().to_owned(),
-            encoded.key().to_owned(),
-        )
-        .unwrap();
-        let mutation = scheduling_mutation(reference, &event).unwrap();
+        let genesis = genesis();
+        let mutation = test_mutation();
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
-        assert_eq!(handle.cursor().await.unwrap(), (0, None));
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (0, None)
+        );
         let caller_thread = thread::current().id();
         let diagnostics = handle.diagnostics().await.unwrap();
         assert_ne!(diagnostics.worker_thread, caller_thread);
@@ -555,16 +586,16 @@ mod tests {
                 | (Ok(ApplyOutcome::AlreadyApplied), Ok(ApplyOutcome::Applied))
         ));
         assert_eq!(
-            handle.cursor().await.unwrap(),
-            (1, Some(encoded.digest().to_owned()))
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (1, Some(genesis.event_ref().digest().clone()))
         );
         assert!(
             handle
-                .list_ready_work("0000000000000001".into(), Vec::new(), 10, None)
+                .scope_contains_operation(genesis.identity(), genesis.head().operation_id())
                 .await
                 .unwrap()
-                .is_empty()
         );
+        assert!(handle.scope_matches_head(genesis.head()).await.unwrap());
 
         let diagnostics_after = handle.diagnostics().await.unwrap();
         assert_eq!(diagnostics_after.worker_thread, diagnostics.worker_thread);
@@ -586,58 +617,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queries_ready_work_through_the_owner() {
-        let path = path("ready-work");
-        let _ = fs::remove_file(&path);
-        drop(schema::create(&path).unwrap());
-        let handle = DbHandle::open_existing(path.clone()).await.unwrap();
-
-        // Seed the fixture after `DbHandle::open_existing` validates the empty projection.
-        let seed = rusqlite::Connection::open(&path).unwrap();
-        seed.execute_batch(
-            "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
-                 INSERT INTO workflows (workflow_id, state) VALUES ('workflow', 'active');
-                 INSERT INTO work_items
-                     (work_id, workflow_id, state, budget_remaining, required_capabilities)
-                 VALUES ('work', 'workflow', 'ready', 1, 'rust');",
-        )
-        .unwrap();
-        drop(seed);
-
-        assert_eq!(
-            handle
-                .list_ready_work("campaign".into(), vec!["rust".into()], 10, None)
-                .await
-                .unwrap(),
-            [("workflow".to_owned(), "work".to_owned())]
-        );
-
-        drop(handle);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn opens_valid_existing_projection_and_rejects_invalid_version() {
+    async fn opens_a_valid_existing_projection_and_rejects_a_foreign_file() {
         let valid_path = path("existing-valid");
         let _ = fs::remove_file(&valid_path);
-        drop(schema::create(&valid_path).unwrap());
+        drop(projections::create(&valid_path).unwrap());
         let handle = DbHandle::open_existing(valid_path.clone()).await.unwrap();
-        assert_eq!(handle.cursor().await.unwrap(), (0, None));
+        assert_eq!(
+            handle.scope_cursor(genesis().identity()).await.unwrap(),
+            (0, None)
+        );
         assert_eq!(handle.diagnostics().await.unwrap().journal_mode, "delete");
         drop(handle);
         fs::remove_file(valid_path).unwrap();
 
-        let invalid_path = path("existing-invalid");
-        let _ = fs::remove_file(&invalid_path);
-        let connection = schema::create(&invalid_path).unwrap();
-        connection.pragma_update(None, "user_version", 99).unwrap();
+        let foreign_path = path("existing-foreign");
+        let _ = fs::remove_file(&foreign_path);
+        let connection = projections::create(&foreign_path).unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x1234)
+            .unwrap();
         drop(connection);
         assert_eq!(
-            DbHandle::open_existing(invalid_path.clone()).await.err(),
+            DbHandle::open_existing(foreign_path.clone()).await.err(),
             Some(OpenExistingError::Validation(
-                ValidateError::WrongSchemaVersion
+                ValidateError::WrongApplicationId
             ))
         );
-        fs::remove_file(invalid_path).unwrap();
+        fs::remove_file(foreign_path).unwrap();
     }
 }

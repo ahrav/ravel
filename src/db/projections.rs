@@ -1,57 +1,151 @@
-//! A SQLite transaction applies scheduling mutations to projection tables.
-//!
-//! The transaction validates the current cursor, parent, sequence, and digest, applies one
-//! projection row, records the event identity, and advances the cursor. The single-process
-//! sole-owner worker validates full history and projection consistency when it opens the database.
+//! The projection file is disposable: one neutral application id rejects unrelated files,
+//! and a file that fails validation is rebuilt from durable history rather than migrated.
+//! It persists only unowned epoch-1, plan-stable histories, so the first epoch or plan
+//! transition must relax this schema.
 
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{error::Error, fmt, path::Path};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OpenFlags, OptionalExtension, params};
 
-use crate::sync::event::{GENESIS_CAMPAIGN_ID, SchedulingEffect, SchedulingMutation};
+use crate::{
+    domain::validation::ValidationError,
+    scope::{Digest, EventEnvelope, ScopeEventRef, ScopeHead, ScopeIdentity},
+};
 
-const MAX_READY_WORK: usize = 1_024;
-const CURSOR_SELECT_SQL: &str = "SELECT sequence, tail_digest FROM sync_cursor WHERE id = 1";
-const SEQUENCE_LOOKUP_SQL: &str = "SELECT digest FROM applied_events WHERE sequence = ?1";
-const DIGEST_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_events WHERE digest = ?1)";
-const CURSOR_UPDATE_SQL: &str =
-    "UPDATE sync_cursor SET sequence = ?1, tail_digest = ?2 WHERE id = 1";
+// "RAVL": rejects an unrelated SQLite file without naming a protocol era.
+const APPLICATION_ID: i32 = 0x5241_564c;
+const TABLES: [&str; 2] = ["applied_scope_events", "scopes"];
 
-#[cfg(test)]
-/// Installs the `fail_cursor_update` trigger; removal drops that exact name.
-pub(crate) const FAIL_CURSOR_TRIGGER: &str = "CREATE TRIGGER fail_cursor_update BEFORE UPDATE ON sync_cursor \
-     BEGIN SELECT RAISE(ABORT, 'injected'); END;";
+const SCOPE_SELECT_SQL: &str = "SELECT campaign_id, sequence, tail_event_digest, \
+     active_plan_digest, scope_epoch FROM scopes WHERE scope_id = ?1";
+const EVENT_AT_SEQUENCE_SQL: &str =
+    "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
+const OPERATION_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
+     WHERE scope_id = ?1 AND operation_id = ?2)";
+const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
+     WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
+const SCOPE_UPDATE_SQL: &str =
+    "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2 WHERE scope_id = ?3";
 
-/// Distinguishes a committed mutation from an exact historical replay.
+const SCHEMA: &str = "
+CREATE TABLE scopes (
+    scope_id TEXT PRIMARY KEY NOT NULL,
+    campaign_id TEXT NOT NULL,
+    parent_scope_id TEXT,
+    delegation_digest TEXT,
+    sequence INTEGER NOT NULL,
+    tail_event_digest TEXT NOT NULL,
+    active_plan_digest TEXT,
+    scope_epoch INTEGER NOT NULL,
+    CHECK (length(scope_id) = 64 AND length(CAST(scope_id AS BLOB)) = 64
+        AND scope_id NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(campaign_id) BETWEEN 1 AND 128
+        AND length(CAST(campaign_id AS BLOB)) = length(campaign_id)
+        AND campaign_id NOT LIKE '%/%'),
+    CHECK (parent_scope_id IS NULL),
+    CHECK (delegation_digest IS NULL),
+    CHECK (sequence BETWEEN 1 AND 9999999999999999),
+    CHECK (length(tail_event_digest) = 64
+        AND length(CAST(tail_event_digest AS BLOB)) = 64
+        AND tail_event_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (active_plan_digest IS NULL OR (
+        length(active_plan_digest) = 64
+        AND length(CAST(active_plan_digest AS BLOB)) = 64
+        AND active_plan_digest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (scope_epoch > 0)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE applied_scope_events (
+    scope_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    parent_digest TEXT,
+    operation_id TEXT NOT NULL,
+    writer_epoch INTEGER NOT NULL,
+    payload_type TEXT NOT NULL,
+    PRIMARY KEY (scope_id, sequence),
+    UNIQUE (scope_id, digest),
+    UNIQUE (scope_id, operation_id),
+    FOREIGN KEY (scope_id) REFERENCES scopes(scope_id) ON DELETE CASCADE,
+    CHECK (sequence BETWEEN 1 AND 9999999999999999),
+    CHECK (length(digest) = 64 AND length(CAST(digest AS BLOB)) = 64
+        AND digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK ((sequence = 1 AND parent_digest IS NULL) OR (
+        sequence > 1 AND parent_digest IS NOT NULL
+        AND length(parent_digest) = 64
+        AND length(CAST(parent_digest AS BLOB)) = 64
+        AND parent_digest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 128
+        AND operation_id NOT LIKE '%/%'),
+    CHECK (writer_epoch > 0),
+    CHECK (length(CAST(payload_type AS BLOB)) BETWEEN 1 AND 128
+        AND payload_type NOT LIKE '%/%')
+) STRICT, WITHOUT ROWID;
+";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ApplyOutcome {
-    /// The transaction committed the mutation's row effect, event identity, and cursor advance.
+pub(crate) enum SchemaError {
+    DatabaseOperationFailed,
+    IntegrityCheckFailed,
+}
+
+impl fmt::Display for SchemaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DatabaseOperationFailed => "scope database operation failed",
+            Self::IntegrityCheckFailed => "scope database integrity check failed",
+        })
+    }
+}
+
+impl Error for SchemaError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ValidateError {
+    DatabaseOperationFailed,
+    WrongApplicationId,
+    IntegrityCheckFailed,
+    InvalidSchema,
+    InvalidHistory,
+}
+
+impl fmt::Display for ValidateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DatabaseOperationFailed => "scope database operation failed",
+            Self::WrongApplicationId => "scope database application id does not match",
+            Self::IntegrityCheckFailed => "scope database integrity check failed",
+            Self::InvalidSchema => "scope database schema is invalid",
+            Self::InvalidHistory => "scope database history is invalid",
+        })
+    }
+}
+
+impl Error for ValidateError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplyOutcome {
     Applied,
-    /// The exact (sequence, digest) pair is already recorded; nothing was written.
     AlreadyApplied,
 }
 
-/// `ApplyError` distinguishes projection conflicts, worker admission refusals, and database
-/// failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyError {
-    /// The mutation disagrees with recorded history, the cursor, or projection state.
     Conflict,
     /// Emitted by [`crate::db::worker::DbHandle`] when its queue has no admission slot.
     Full,
     /// Emitted by [`crate::db::worker::DbHandle`] when its receiver is disconnected.
     Stopping,
-    /// SQLite failed, or a sequence overflowed its stored or domain representation.
     DatabaseOperationFailed,
 }
 
 impl fmt::Display for ApplyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Conflict => "mutation conflicts with local projection state",
-            Self::Full => "database command queue is full",
-            Self::Stopping => "database worker is stopping",
-            Self::DatabaseOperationFailed => "database operation failed",
+            Self::Conflict => "scope event conflicts with local projection state",
+            Self::Full => "scope database command queue is full",
+            Self::Stopping => "scope database worker is stopping",
+            Self::DatabaseOperationFailed => "scope database operation failed",
         })
     }
 }
@@ -64,127 +158,152 @@ impl From<rusqlite::Error> for ApplyError {
     }
 }
 
-/// Applies one scheduling mutation in a single SQLite transaction.
-///
-/// An exact historical event returns [`ApplyOutcome::AlreadyApplied`] without writes. A new event
-/// must immediately follow the cursor and name its current tail.
-///
-/// # Errors
-///
-/// Returns [`ApplyError::Conflict`] for a sequence gap, a parent that does not name the cursor
-/// tail, a parent at the genesis cursor, a digest recorded at another sequence, or a conflicting
-/// historical sequence. Full projection validation occurs at database open; the sole owner and
-/// atomic transactions preserve that validated state during normal operation.
-/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite cannot complete an operation or a
-/// sequence cannot be converted between its domain and stored representations. This function
-/// never returns [`ApplyError::Full`] or [`ApplyError::Stopping`]; those come from
-/// [`crate::db::worker::DbHandle`] admission.
-pub fn apply(
-    connection: &mut rusqlite::Connection,
-    mutation: &SchedulingMutation,
-) -> Result<ApplyOutcome, ApplyError> {
-    let transaction = connection.transaction()?;
-    let (stored_cursor_sequence, cursor_digest): (i64, Option<String>) =
-        transaction.query_row(CURSOR_SELECT_SQL, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let cursor_sequence =
-        u64::try_from(stored_cursor_sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?;
-    let sequence = mutation.reference().sequence();
-    let stored_sequence =
-        i64::try_from(sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?;
-
-    let historical_digest: Option<String> = transaction
-        .query_row(SEQUENCE_LOOKUP_SQL, [stored_sequence], |row| row.get(0))
-        .optional()?;
-    if sequence <= cursor_sequence {
-        return if historical_digest.as_deref() == Some(mutation.reference().digest()) {
-            Ok(ApplyOutcome::AlreadyApplied)
-        } else {
-            Err(ApplyError::Conflict)
-        };
-    }
-    if historical_digest.is_some() || cursor_sequence.checked_add(1) != Some(sequence) {
-        return Err(ApplyError::Conflict);
-    }
-
-    let parent_matches = match (cursor_sequence, cursor_digest.as_deref(), mutation.parent()) {
-        (0, None, None) => true,
-        (cursor_sequence, Some(cursor_digest), Some(parent)) => {
-            parent.sequence() == cursor_sequence && parent.digest() == cursor_digest
-        }
-        _ => false,
-    };
-    if !parent_matches {
-        return Err(ApplyError::Conflict);
-    }
-
-    let digest_exists: bool =
-        transaction.query_row(DIGEST_EXISTS_SQL, [mutation.reference().digest()], |row| {
-            row.get(0)
-        })?;
-    if digest_exists {
-        return Err(ApplyError::Conflict);
-    }
-
-    match mutation.effect() {
-        SchedulingEffect::CampaignCreated { campaign_id } => {
-            transaction.execute(
-                "INSERT INTO campaigns (campaign_id, state) VALUES (?1, 'active')",
-                [campaign_id],
-            )?;
-        }
-        SchedulingEffect::WorkflowStarted { workflow_id } => {
-            transaction.execute(
-                "INSERT INTO workflows (workflow_id, state) VALUES (?1, 'active')",
-                [workflow_id],
-            )?;
-        }
-    }
-
-    transaction.execute(
-        "INSERT INTO applied_events (sequence, digest) VALUES (?1, ?2)",
-        params![stored_sequence, mutation.reference().digest()],
-    )?;
-    let updated = transaction.execute(
-        CURSOR_UPDATE_SQL,
-        params![stored_sequence, mutation.reference().digest()],
-    )?;
-    if updated != 1 {
-        return Err(ApplyError::DatabaseOperationFailed);
-    }
-    #[cfg(test)]
-    crate::sync::replay::test_crash::reach("before-commit");
-    transaction.commit()?;
-    Ok(ApplyOutcome::Applied)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScopeProjectionEvent {
+    scope: ScopeIdentity,
+    envelope: EventEnvelope,
+    reference: ScopeEventRef,
+    active_plan_digest: Option<Digest>,
+    scope_epoch: u64,
 }
 
-/// Reports whether the projected rows are exactly the ones sequences `1..=cursor` imply.
-///
-/// A cursor at or above 1 implies the genesis campaign row, each sequence above 1 implies one
-/// workflow row named by that sequence, both in the `active` state, and no sequence implies an
-/// objective, work item, or dependency row.
-pub(crate) fn rows_match_cursor(
+impl ScopeProjectionEvent {
+    pub(crate) fn new(
+        scope: ScopeIdentity,
+        envelope: EventEnvelope,
+        reference: ScopeEventRef,
+        active_plan_digest: Option<Digest>,
+        scope_epoch: u64,
+    ) -> Result<Self, ValidationError> {
+        if envelope.scope_id() != scope.scope_id()
+            || envelope.sequence() != reference.sequence()
+            || envelope.writer_epoch().get() != scope_epoch
+            || scope_epoch != 1
+            || active_plan_digest.is_some()
+        {
+            return Err(ValidationError::InvalidIdentity);
+        }
+        Ok(Self {
+            scope,
+            envelope,
+            reference,
+            active_plan_digest,
+            scope_epoch,
+        })
+    }
+}
+
+pub(crate) fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, SchemaError> {
+    let connection = initialize(path.as_ref()).map_err(|_| SchemaError::DatabaseOperationFailed)?;
+    let integrity: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|_| SchemaError::DatabaseOperationFailed)?;
+    if integrity != "ok" {
+        return Err(SchemaError::IntegrityCheckFailed);
+    }
+    Ok(connection)
+}
+
+pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connection, ValidateError> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    validate(&connection)?;
+    Ok(connection)
+}
+
+pub(crate) fn scope_cursor(
     connection: &rusqlite::Connection,
-    stored_cursor_sequence: i64,
-) -> rusqlite::Result<bool> {
-    let (
-        campaign_rows,
-        genesis_campaign_exists,
-        workflow_rows,
-        implied_workflow_rows,
-        unimplied_rows,
-    ): (i64, bool, i64, i64, i64) = connection.query_row(
-        "SELECT (SELECT COUNT(*) FROM campaigns), \
-             (SELECT EXISTS(SELECT 1 FROM campaigns WHERE campaign_id = ?1 AND state = 'active')), \
-             (SELECT COUNT(*) FROM workflows), \
-             (SELECT COUNT(*) FROM workflows WHERE length(workflow_id) = 16 \
-             AND length(CAST(workflow_id AS BLOB)) = 16 \
-             AND workflow_id NOT GLOB '*[^0-9]*' \
-             AND CAST(workflow_id AS INTEGER) BETWEEN 2 AND ?2 \
-             AND state = 'active'), \
-             (SELECT COUNT(*) FROM objectives) + (SELECT COUNT(*) FROM work_items) \
-             + (SELECT COUNT(*) FROM dependencies)",
-        params![GENESIS_CAMPAIGN_ID, stored_cursor_sequence],
-        |row| {
+    scope: &ScopeIdentity,
+) -> Result<(u64, Option<Digest>), ApplyError> {
+    let stored: Option<(String, i64, String)> = connection
+        .query_row(SCOPE_SELECT_SQL, [scope.scope_id().as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?;
+    match stored {
+        None => Ok((0, None)),
+        Some((campaign_id, sequence, digest)) => {
+            if campaign_id != scope.campaign_id().as_str() {
+                return Err(ApplyError::Conflict);
+            }
+            Ok((
+                u64::try_from(sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                Some(Digest::new(digest).map_err(|_| ApplyError::Conflict)?),
+            ))
+        }
+    }
+}
+
+pub(crate) fn scope_contains_operation(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+    operation_id: &str,
+) -> Result<bool, ApplyError> {
+    connection
+        .query_row(
+            OPERATION_EXISTS_SQL,
+            params![scope.scope_id().as_str(), operation_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+pub(crate) fn scope_matches_head(
+    connection: &rusqlite::Connection,
+    head: &ScopeHead,
+) -> Result<bool, ApplyError> {
+    let stored: Option<(String, i64, String, Option<String>, i64)> = connection
+        .query_row(
+            SCOPE_SELECT_SQL,
+            [head.scope().scope_id().as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(
+        stored.is_some_and(|(campaign, sequence, tail, plan, epoch)| {
+            campaign == head.scope().campaign_id().as_str()
+                && u64::try_from(sequence).ok() == Some(head.tail().sequence())
+                && tail == head.tail().digest().as_str()
+                && plan.as_deref() == head.active_plan_digest().map(Digest::as_str)
+                && u64::try_from(epoch).ok() == Some(head.scope_epoch().get())
+        }),
+    )
+}
+
+pub(crate) fn apply_scope_event(
+    connection: &mut rusqlite::Connection,
+    event: &ScopeProjectionEvent,
+) -> Result<ApplyOutcome, ApplyError> {
+    let transaction = connection.transaction()?;
+    let scope_id = event.scope.scope_id().as_str();
+    let sequence = event.envelope.sequence();
+    let stored_sequence =
+        i64::try_from(sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?;
+    let historical: Option<String> = transaction
+        .query_row(
+            EVENT_AT_SEQUENCE_SQL,
+            params![scope_id, stored_sequence],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let current: Option<(String, i64, String, Option<String>, i64)> = transaction
+        .query_row(SCOPE_SELECT_SQL, [scope_id], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -192,101 +311,251 @@ pub(crate) fn rows_match_cursor(
                 row.get(3)?,
                 row.get(4)?,
             ))
-        },
+        })
+        .optional()?;
+
+    if let Some((_, cursor, tail, _, _)) = &current {
+        let recorded_tail: Option<String> = transaction
+            .query_row(EVENT_AT_SEQUENCE_SQL, params![scope_id, cursor], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if recorded_tail.as_deref() != Some(tail) {
+            return Err(ApplyError::Conflict);
+        }
+    } else if historical.is_some() {
+        return Err(ApplyError::Conflict);
+    }
+    if let Some(digest) = historical {
+        return if digest == event.reference.digest().as_str() {
+            Ok(ApplyOutcome::AlreadyApplied)
+        } else {
+            Err(ApplyError::Conflict)
+        };
+    }
+
+    let parent_digest = event
+        .envelope
+        .parent_event()
+        .map(|parent| parent.digest().as_str());
+    match current {
+        None => {
+            if sequence != 1 || parent_digest.is_some() {
+                return Err(ApplyError::Conflict);
+            }
+            transaction.execute(
+                "INSERT INTO scopes (scope_id, campaign_id, parent_scope_id, delegation_digest, \
+                 sequence, tail_event_digest, active_plan_digest, scope_epoch) \
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6)",
+                params![
+                    scope_id,
+                    event.scope.campaign_id().as_str(),
+                    stored_sequence,
+                    event.reference.digest().as_str(),
+                    event.active_plan_digest.as_ref().map(Digest::as_str),
+                    i64::try_from(event.scope_epoch)
+                        .map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                ],
+            )?;
+        }
+        Some((campaign_id, cursor, tail, active_plan, scope_epoch)) => {
+            if campaign_id != event.scope.campaign_id().as_str()
+                || cursor.checked_add(1) != Some(stored_sequence)
+                || parent_digest != Some(tail.as_str())
+                || active_plan.as_deref() != event.active_plan_digest.as_ref().map(Digest::as_str)
+                || u64::try_from(scope_epoch).ok() != Some(event.scope_epoch)
+            {
+                return Err(ApplyError::Conflict);
+            }
+            let updated = transaction.execute(
+                SCOPE_UPDATE_SQL,
+                params![stored_sequence, event.reference.digest().as_str(), scope_id],
+            )?;
+            if updated != 1 {
+                return Err(ApplyError::DatabaseOperationFailed);
+            }
+        }
+    }
+
+    let duplicate: bool = transaction.query_row(
+        DUPLICATE_EXISTS_SQL,
+        params![
+            scope_id,
+            event.reference.digest().as_str(),
+            event.envelope.operation_id()
+        ],
+        |row| row.get(0),
     )?;
-    let projected_campaigns = i64::from(stored_cursor_sequence >= 1);
-    let projected_workflows = stored_cursor_sequence.max(1) - 1;
-    Ok(campaign_rows == projected_campaigns
-        && genesis_campaign_exists == (projected_campaigns == 1)
-        && workflow_rows == projected_workflows
-        && implied_workflow_rows == projected_workflows
-        && unimplied_rows == 0)
+    if duplicate {
+        return Err(ApplyError::Conflict);
+    }
+    transaction.execute(
+        "INSERT INTO applied_scope_events \
+         (scope_id, sequence, digest, parent_digest, operation_id, writer_epoch, payload_type) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            scope_id,
+            stored_sequence,
+            event.reference.digest().as_str(),
+            parent_digest,
+            event.envelope.operation_id(),
+            i64::try_from(event.envelope.writer_epoch().get())
+                .map_err(|_| ApplyError::DatabaseOperationFailed)?,
+            event.envelope.payload_type(),
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(ApplyOutcome::Applied)
 }
 
-/// Returns ready work in stable workflow/work order, rotated strictly after `after`.
-///
-/// Required capabilities are space-separated tokens; empty text requires no capability.
-///
-/// # Errors
-///
-/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite cannot complete the query.
-pub(crate) fn list_ready_work(
-    connection: &rusqlite::Connection,
-    campaign_id: &str,
-    local_capabilities: &[String],
-    limit: usize,
-    after: Option<(String, String)>,
-) -> Result<Vec<(String, String)>, ApplyError> {
-    let limit = limit.min(MAX_READY_WORK);
-    if limit == 0 {
-        return Ok(Vec::new());
+fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    let mut connection = rusqlite::Connection::open(path)?;
+    if connection.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+        row.get::<_, i64>(0)
+    })? != 0
+    {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is not empty".into()),
+        ));
     }
+    connection.pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
+        row.get::<_, String>(0)
+    })?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    let transaction = connection.transaction()?;
+    let existing: i64 =
+        transaction.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
+    if existing != 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is not empty".into()),
+        ));
+    }
+    transaction.execute_batch(SCHEMA)?;
+    transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+    transaction.commit()?;
+    Ok(connection)
+}
 
-    let capabilities: BTreeSet<&str> = local_capabilities.iter().map(String::as_str).collect();
-    let mut statement = connection.prepare(
-        "SELECT work.workflow_id, work.work_id, work.required_capabilities \
-         FROM work_items AS work \
-         JOIN workflows AS workflow ON workflow.workflow_id = work.workflow_id \
-         WHERE EXISTS (\
-             SELECT 1 FROM campaigns \
-             WHERE campaign_id = ?1 AND state = 'active'\
-         ) \
-         AND workflow.state = 'active' \
-         AND work.state = 'ready' \
-         AND work.budget_remaining > 0 \
-         AND NOT EXISTS (\
-             SELECT 1 FROM dependencies AS dependency \
-             LEFT JOIN work_items AS prerequisite \
-                 ON prerequisite.work_id = dependency.depends_on_work_id \
-             WHERE dependency.work_id = work.work_id \
-             AND (prerequisite.work_id IS NULL OR prerequisite.state != 'done')\
-         ) \
-         ORDER BY work.workflow_id, work.work_id",
-    )?;
-    let mut rows = statement.query([campaign_id])?;
-    // The query's `ORDER BY workflow_id, work_id` streams keys at or before
-    // `after` (the wrapped tail of the rotation) first and keys after it last.
-    // Retaining at most `limit` keys per bucket bounds result storage, and the
-    // scan stops early once the post-`after` page is full.
-    let mut page: Vec<(String, String)> = Vec::new();
-    let mut wrapped: Vec<(String, String)> = Vec::new();
-    while let Some(row) = rows.next()? {
-        if page.len() == limit {
-            break;
-        }
-        let required: String = row.get(2)?;
-        if !required
-            .split_whitespace()
-            .all(|token| capabilities.contains(token))
-        {
-            continue;
-        }
-        let key = (row.get(0)?, row.get(1)?);
-        match &after {
-            // SQLite's default BINARY collation orders TEXT the same way String's
-            // Ord does, which this comparison requires.
-            Some(after) if key <= *after => {
-                if wrapped.len() < limit {
-                    wrapped.push(key);
-                }
-            }
-            _ => page.push(key),
+fn validate(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
+    let application_id: i32 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if application_id != APPLICATION_ID {
+        return Err(ValidateError::WrongApplicationId);
+    }
+    let integrity: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if integrity != "ok" {
+        return Err(ValidateError::IntegrityCheckFailed);
+    }
+    let foreign_key_failure = {
+        let mut statement = connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        statement
+            .query([])
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?
+            .next()
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?
+            .is_some()
+    };
+    if foreign_key_failure {
+        return Err(ValidateError::InvalidHistory);
+    }
+    validate_schema(connection)?;
+    validate_history(connection)
+}
+
+fn validate_schema(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
+    let mut definitions = connection
+        .prepare("SELECT name, sql, type FROM sqlite_schema WHERE sql IS NOT NULL")
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    definitions.retain(|(name, _, _)| !name.starts_with("sqlite_"));
+    if definitions.len() != TABLES.len() || definitions.iter().any(|(_, _, kind)| kind != "table") {
+        return Err(ValidateError::InvalidSchema);
+    }
+    for (name, sql, _) in definitions {
+        let expected = expected_definition(&name).ok_or(ValidateError::InvalidSchema)?;
+        if normalized(&sql) != normalized(expected) {
+            return Err(ValidateError::InvalidSchema);
         }
     }
+    Ok(())
+}
 
-    page.append(&mut wrapped);
-    page.truncate(limit);
-    Ok(page)
+fn validate_history(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
+    let orphans: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM applied_scope_events AS event \
+             LEFT JOIN scopes AS scope ON scope.scope_id = event.scope_id \
+             WHERE scope.scope_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    let broken_parents: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM applied_scope_events AS event \
+             LEFT JOIN applied_scope_events AS parent \
+               ON parent.scope_id = event.scope_id AND parent.sequence = event.sequence - 1 \
+             WHERE (event.sequence = 1 AND event.parent_digest IS NOT NULL) \
+                OR (event.sequence > 1 AND (parent.digest IS NULL OR parent.digest != event.parent_digest))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    let broken_cursors: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM scopes AS scope WHERE \
+             (SELECT COUNT(*) FROM applied_scope_events AS event WHERE event.scope_id = scope.scope_id) != scope.sequence \
+             OR (SELECT MIN(sequence) FROM applied_scope_events AS event WHERE event.scope_id = scope.scope_id) != 1 \
+             OR (SELECT MAX(sequence) FROM applied_scope_events AS event WHERE event.scope_id = scope.scope_id) != scope.sequence \
+             OR (SELECT digest FROM applied_scope_events AS event \
+                 WHERE event.scope_id = scope.scope_id AND event.sequence = scope.sequence) != scope.tail_event_digest \
+             OR EXISTS(SELECT 1 FROM applied_scope_events AS event WHERE event.scope_id = scope.scope_id \
+                 AND event.writer_epoch != scope.scope_epoch)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if orphans != 0 || broken_parents != 0 || broken_cursors != 0 {
+        return Err(ValidateError::InvalidHistory);
+    }
+    Ok(())
+}
+
+fn expected_definition(table: &str) -> Option<&'static str> {
+    SCHEMA.split(';').map(str::trim).find(|statement| {
+        statement
+            .strip_prefix("CREATE TABLE ")
+            .is_some_and(|rest| rest.starts_with(table) && rest[table.len()..].starts_with(" ("))
+    })
+}
+
+fn normalized(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::{fs, path::PathBuf, process};
 
     use crate::{
-        db::schema,
-        domain::campaign::{Event, EventContent, EventRef},
-        sync::event::scheduling_mutation_unchecked,
+        distributed::identity::WorkspaceId,
+        scope::{CampaignId, EventEnvelope, ScopeEventRef, ScopeIdentity},
     };
 
     use super::*;
@@ -294,126 +563,133 @@ pub(crate) mod tests {
     const DIGEST_1: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const DIGEST_2: &str = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0";
     const DIGEST_3: &str = "23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01";
-    const DIGEST_4: &str = "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012";
 
-    #[derive(Debug, Eq, PartialEq)]
-    pub(crate) struct Snapshot {
-        applied_events: Vec<(i64, String)>,
-        sync_cursor: Vec<(i64, i64, Option<String>)>,
-        campaigns: Vec<(String, String)>,
-        objectives: Vec<String>,
-        workflows: Vec<(String, String)>,
-        work_items: Vec<(String, String, String, i64, String)>,
-        dependencies: Vec<(String, String)>,
-    }
-
-    fn test_path(label: &str) -> PathBuf {
+    fn path(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "ravel-projections-{}-{label}.sqlite3",
+            "ravel-scope-projection-{}-{label}.sqlite3",
             process::id()
         ));
         let _ = fs::remove_file(&path);
         path
     }
 
-    fn mutation(
-        sequence: u64,
-        digest: &str,
-        parent_digest: Option<&str>,
-        content: EventContent,
-    ) -> SchedulingMutation {
-        let parent = parent_digest
-            .map(|digest| EventRef::from_digest(sequence - 1, digest.to_owned()).unwrap());
-        let event = Event::new(
-            format!("operation-{sequence}"),
-            sequence,
-            parent,
-            1,
-            content,
-        )
-        .unwrap();
-        scheduling_mutation_unchecked(
-            EventRef::from_digest(sequence, digest.to_owned()).unwrap(),
-            &event,
+    fn scope(workspace: &str, campaign: &str) -> ScopeIdentity {
+        ScopeIdentity::root(
+            WorkspaceId::new(workspace.into()).unwrap(),
+            CampaignId::new(campaign.into()).unwrap(),
         )
         .unwrap()
     }
 
-    fn string_rows(connection: &rusqlite::Connection, query: &str) -> Vec<String> {
-        let mut statement = connection.prepare(query).unwrap();
-        let rows = statement
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>();
-        rows.unwrap()
+    fn mutation(
+        scope: &ScopeIdentity,
+        sequence: u64,
+        digest: &str,
+        parent: Option<&str>,
+    ) -> ScopeProjectionEvent {
+        mutation_with_operation(
+            scope,
+            sequence,
+            digest,
+            parent,
+            &format!("operation-{sequence}"),
+        )
     }
 
-    pub(crate) fn snapshot(connection: &rusqlite::Connection) -> Snapshot {
-        let applied_events = connection
-            .prepare("SELECT sequence, digest FROM applied_events ORDER BY sequence, digest")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let sync_cursor = connection
-            .prepare("SELECT id, sequence, tail_digest FROM sync_cursor ORDER BY id")
+    fn mutation_with_operation(
+        scope: &ScopeIdentity,
+        sequence: u64,
+        digest: &str,
+        parent: Option<&str>,
+        operation_id: &str,
+    ) -> ScopeProjectionEvent {
+        let parent = parent.map(|digest| {
+            ScopeEventRef::new(sequence - 1, Digest::new(digest.into()).unwrap()).unwrap()
+        });
+        let envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            sequence,
+            parent,
+            1,
+            operation_id.into(),
+            if sequence == 1 {
+                "root_genesis"
+            } else {
+                "successor"
+            }
+            .into(),
+        )
+        .unwrap();
+        ScopeProjectionEvent::new(
+            scope.clone(),
+            envelope,
+            ScopeEventRef::new(sequence, Digest::new(digest.into()).unwrap()).unwrap(),
+            None,
+            1,
+        )
+        .unwrap()
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct Snapshot {
+        scopes: Vec<(String, i64, String)>,
+        events: Vec<(String, i64, String)>,
+    }
+
+    fn snapshot(connection: &rusqlite::Connection) -> Snapshot {
+        let scopes = connection
+            .prepare("SELECT scope_id, sequence, tail_event_digest FROM scopes ORDER BY scope_id")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let dependencies = connection
-            .prepare(
-                "SELECT work_id, depends_on_work_id FROM dependencies \
-                 ORDER BY work_id, depends_on_work_id",
-            )
+        let events = connection
+            .prepare("SELECT scope_id, sequence, digest FROM applied_scope_events ORDER BY scope_id, sequence")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        Snapshot {
-            applied_events,
-            sync_cursor,
-            campaigns: connection
-                .prepare("SELECT campaign_id, state FROM campaigns ORDER BY campaign_id")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
+        Snapshot { scopes, events }
+    }
+
+    #[test]
+    fn creates_the_projection_schema_and_rejects_an_unrelated_file() {
+        let db_path = path("schema");
+        let connection = create(&db_path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))
                 .unwrap(),
-            objectives: string_rows(
-                connection,
-                "SELECT objective_id FROM objectives ORDER BY objective_id",
-            ),
-            workflows: connection
-                .prepare("SELECT workflow_id, state FROM workflows ORDER BY workflow_id")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            work_items: connection
-                .prepare(
-                    "SELECT work_id, workflow_id, state, budget_remaining, \
-                         required_capabilities FROM work_items ORDER BY work_id",
-                )
-                .unwrap()
-                .query_map([], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            dependencies,
-        }
+            APPLICATION_ID
+        );
+        assert_eq!(
+            snapshot(&connection),
+            Snapshot {
+                scopes: vec![],
+                events: vec![]
+            }
+        );
+        drop(connection);
+        drop(open_existing(&db_path).unwrap());
+        fs::remove_file(db_path).unwrap();
+
+        // An unrelated SQLite file carries a different application id.
+        let unrelated = path("unrelated");
+        let foreign = rusqlite::Connection::open(&unrelated).unwrap();
+        foreign
+            .pragma_update(None, "application_id", 0x1234)
+            .unwrap();
+        foreign
+            .execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY) STRICT")
+            .unwrap();
+        drop(foreign);
+        assert_eq!(
+            open_existing(&unrelated).unwrap_err(),
+            ValidateError::WrongApplicationId
+        );
+        fs::remove_file(unrelated).unwrap();
     }
 
     fn query_plan(
@@ -436,15 +712,26 @@ pub(crate) mod tests {
 
     #[test]
     fn apply_lookup_statements_avoid_table_scans() {
-        let path = test_path("query-plans");
-        let connection = schema::create(&path).unwrap();
+        let db_path = path("query-plans");
+        let connection = create(&db_path).unwrap();
+        let scope_id = DIGEST_1;
         let sequence = 1_i64;
-        let digest = DIGEST_1;
+        let digest = DIGEST_2;
+        let operation = "operation-1";
         let plans = [
-            query_plan(&connection, CURSOR_SELECT_SQL, &[]),
-            query_plan(&connection, SEQUENCE_LOOKUP_SQL, &[&sequence]),
-            query_plan(&connection, DIGEST_EXISTS_SQL, &[&digest]),
-            query_plan(&connection, CURSOR_UPDATE_SQL, &[&sequence, &digest]),
+            query_plan(&connection, SCOPE_SELECT_SQL, &[&scope_id]),
+            query_plan(&connection, EVENT_AT_SEQUENCE_SQL, &[&scope_id, &sequence]),
+            query_plan(&connection, OPERATION_EXISTS_SQL, &[&scope_id, &operation]),
+            query_plan(
+                &connection,
+                DUPLICATE_EXISTS_SQL,
+                &[&scope_id, &digest, &operation],
+            ),
+            query_plan(
+                &connection,
+                SCOPE_UPDATE_SQL,
+                &[&sequence, &digest, &scope_id],
+            ),
         ];
         assert!(plans.iter().all(|details| !details.is_empty()));
         for detail in plans
@@ -458,455 +745,120 @@ pub(crate) mod tests {
         }
 
         drop(connection);
-        fs::remove_file(path).unwrap();
+        fs::remove_file(db_path).unwrap();
     }
 
     #[test]
-    fn applies_genesis_and_workflow_to_projection_and_cursor() {
-        let path = test_path("success");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        assert_eq!(apply(&mut connection, &workflow), Ok(ApplyOutcome::Applied));
+    fn applies_idempotently_and_rejects_gaps_without_mutation() {
+        let path = path("apply");
+        let mut connection = create(&path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        let genesis = mutation(&scope, 1, DIGEST_1, None);
         assert_eq!(
-            snapshot(&connection),
-            Snapshot {
-                applied_events: vec![(1, DIGEST_1.into()), (2, DIGEST_2.into())],
-                sync_cursor: vec![(1, 2, Some(DIGEST_2.into()))],
-                campaigns: vec![("0000000000000001".into(), "active".into())],
-                objectives: vec![],
-                workflows: vec![("0000000000000002".into(), "active".into())],
-                work_items: vec![],
-                dependencies: vec![],
-            }
+            apply_scope_event(&mut connection, &genesis),
+            Ok(ApplyOutcome::Applied)
         );
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn exact_replay_is_a_noop_before_and_after_later_events() {
-        let path = test_path("idempotency");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        let before_immediate_replay = snapshot(&connection);
+        let after_genesis = snapshot(&connection);
         assert_eq!(
-            apply(&mut connection, &genesis),
+            apply_scope_event(&mut connection, &genesis),
             Ok(ApplyOutcome::AlreadyApplied)
         );
-        assert_eq!(snapshot(&connection), before_immediate_replay);
-
-        assert_eq!(apply(&mut connection, &workflow), Ok(ApplyOutcome::Applied));
-        let before_historical_replay = snapshot(&connection);
+        assert_eq!(snapshot(&connection), after_genesis);
+        let gap = mutation(&scope, 3, DIGEST_3, Some(DIGEST_2));
         assert_eq!(
-            apply(&mut connection, &genesis),
-            Ok(ApplyOutcome::AlreadyApplied)
-        );
-        assert_eq!(snapshot(&connection), before_historical_replay);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_sequence_gap_without_mutation() {
-        let path = test_path("gap");
-        let mut connection = schema::create(&path).unwrap();
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_wrong_parent_without_mutation() {
-        let path = test_path("wrong-parent");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_3), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_same_sequence_with_another_digest_without_mutation() {
-        let path = test_path("sequence-conflict");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        let conflicting = mutation(1, DIGEST_2, None, EventContent::CampaignCreated);
-        let before = snapshot(&connection);
-
-        assert_eq!(
-            apply(&mut connection, &conflicting),
+            apply_scope_event(&mut connection, &gap),
             Err(ApplyError::Conflict)
         );
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_digest_reused_at_another_sequence_without_mutation() {
-        let path = test_path("digest-conflict");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        let workflow = mutation(2, DIGEST_1, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_sequence_ahead_of_cursor_holding_another_digest() {
-        let path = test_path("ahead-of-cursor");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        connection
-            .execute(
-                "INSERT INTO applied_events (sequence, digest) VALUES (2, ?1)",
-                [DIGEST_3],
-            )
-            .unwrap();
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_missing_historical_row_without_mutation() {
-        let path = test_path("missing-history");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        connection
-            .execute("DELETE FROM applied_events WHERE sequence = 1", [])
-            .unwrap();
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &genesis), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn open_rejects_missing_campaign_projection() {
-        let path = test_path("missing-campaign");
-        let connection = schema::create(&path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1)",
-                [DIGEST_1],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE sync_cursor SET sequence = 1, tail_digest = ?1 WHERE id = 1",
-                [DIGEST_1],
-            )
-            .unwrap();
-        drop(connection);
-
+        assert_eq!(snapshot(&connection), after_genesis);
+        let successor = mutation(&scope, 2, DIGEST_2, Some(DIGEST_1));
         assert_eq!(
-            schema::open_existing(&path).err(),
-            Some(schema::ValidateError::InvalidProjection)
+            apply_scope_event(&mut connection, &successor),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 2);
+        assert!(
+            scope_matches_head(
+                &connection,
+                &ScopeHead::new(
+                    scope.clone(),
+                    crate::scope::ScopeAuthority::Unowned,
+                    1,
+                    successor.reference.clone(),
+                    None,
+                    successor.envelope.operation_id().into(),
+                )
+                .unwrap()
+            )
+            .unwrap()
         );
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn open_rejects_stray_campaign_projection() {
-        let path = test_path("stray-campaign");
-        let connection = schema::create(&path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1)",
-                [DIGEST_1],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE sync_cursor SET sequence = 1, tail_digest = ?1 WHERE id = 1",
-                [DIGEST_1],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO campaigns (campaign_id, state) VALUES ('9999999999999999', 'active')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
+    fn sqlite_failure_rolls_back_and_scopes_are_isolated() {
+        let path = path("rollback");
+        let mut connection = create(&path).unwrap();
+        let first = scope("workspace-a", "campaign-a");
+        let second = scope("workspace-b", "campaign-b");
         assert_eq!(
-            schema::open_existing(&path).err(),
-            Some(schema::ValidateError::InvalidProjection)
+            apply_scope_event(&mut connection, &mutation(&first, 1, DIGEST_1, None)),
+            Ok(ApplyOutcome::Applied)
         );
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn open_rejects_missing_workflow_projection() {
-        let path = test_path("missing-workflow-row");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        assert_eq!(apply(&mut connection, &workflow), Ok(ApplyOutcome::Applied));
-        connection
-            .execute(
-                "DELETE FROM workflows WHERE workflow_id = '0000000000000002'",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
         assert_eq!(
-            schema::open_existing(&path).err(),
-            Some(schema::ValidateError::InvalidProjection)
+            apply_scope_event(&mut connection, &mutation(&second, 1, DIGEST_2, None)),
+            Ok(ApplyOutcome::Applied)
         );
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn open_rejects_substituted_workflow_projection() {
-        let path = test_path("substituted-workflow-row");
-        let mut connection = schema::create(&path).unwrap();
-        for mutation in [
-            mutation(1, DIGEST_1, None, EventContent::CampaignCreated),
-            mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted),
-            mutation(3, DIGEST_3, Some(DIGEST_2), EventContent::WorkflowStarted),
-            mutation(4, DIGEST_4, Some(DIGEST_3), EventContent::WorkflowStarted),
-        ] {
-            assert_eq!(apply(&mut connection, &mutation), Ok(ApplyOutcome::Applied));
-        }
+        let before = snapshot(&connection);
         connection
             .execute_batch(
-                "DELETE FROM workflows WHERE workflow_id = '0000000000000003';\
-                 INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000002a', 'active');",
+                "CREATE TRIGGER fail_scope_cursor BEFORE UPDATE ON scopes \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .unwrap();
-        drop(connection);
-
         assert_eq!(
-            schema::open_existing(&path).err(),
-            Some(schema::ValidateError::InvalidProjection)
-        );
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn open_rejects_unimplied_projection_row() {
-        let path = test_path("unimplied-row");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        connection
-            .execute(
-                "INSERT INTO objectives (objective_id) VALUES ('0000000000000007')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
-        assert_eq!(
-            schema::open_existing(&path).err(),
-            Some(schema::ValidateError::InvalidProjection)
-        );
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn sqlite_failure_rolls_back_projection_and_event_rows() {
-        let path = test_path("rollback");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        connection.execute_batch(FAIL_CURSOR_TRIGGER).unwrap();
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(
-            apply(&mut connection, &workflow),
+            apply_scope_event(
+                &mut connection,
+                &mutation(&first, 2, DIGEST_3, Some(DIGEST_1))
+            ),
             Err(ApplyError::DatabaseOperationFailed)
         );
         assert_eq!(snapshot(&connection), before);
+        connection
+            .execute_batch("DROP TRIGGER fail_scope_cursor")
+            .unwrap();
 
-        drop(connection);
+        let after_update_conflict =
+            mutation_with_operation(&first, 2, DIGEST_3, Some(DIGEST_1), "operation-1");
+        assert_eq!(
+            apply_scope_event(&mut connection, &after_update_conflict),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(snapshot(&connection), before);
+        assert_eq!(scope_cursor(&connection, &second).unwrap().0, 1);
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn ready_work_requires_every_scheduling_predicate_and_rotates_once() {
-        let path = test_path("ready-work");
-        let connection = schema::create(&path).unwrap();
+    fn validation_rejects_orphaned_history() {
+        let path = path("orphan");
+        drop(create(&path).unwrap());
+        let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch(
-                "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
-                     INSERT INTO workflows (workflow_id, state) VALUES
-                         ('wf-a', 'active'), ('wf-b', 'active'), ('wf-z', 'completed');
-                     INSERT INTO work_items
-                         (work_id, workflow_id, state, budget_remaining, required_capabilities)
-                     VALUES
-                         ('a-ready', 'wf-a', 'ready', 1, 'gpu rust'),
-                         ('b-capability', 'wf-a', 'ready', 1, 'gpu secret'),
-                         ('c-budget', 'wf-a', 'ready', 0, ''),
-                         ('d-cancelled', 'wf-a', 'cancelled', 1, ''),
-                         ('e-inactive-workflow', 'wf-z', 'ready', 1, ''),
-                         ('f-missing-dependency', 'wf-a', 'ready', 1, ''),
-                         ('g-unsatisfied-dependency', 'wf-a', 'ready', 1, ''),
-                         ('h-satisfied', 'wf-a', 'ready', 1, ''),
-                         ('i-other-workflow', 'wf-b', 'ready', 1, ''),
-                         ('prerequisite-done', 'wf-a', 'done', 0, ''),
-                         ('prerequisite-pending', 'wf-a', 'cancelled', 0, ''),
-                         ('a-late-insert', 'wf-b', 'ready', 1, '');
-                     INSERT INTO dependencies (work_id, depends_on_work_id) VALUES
-                         ('f-missing-dependency', 'absent'),
-                         ('g-unsatisfied-dependency', 'prerequisite-pending'),
-                         ('h-satisfied', 'prerequisite-done');",
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO applied_scope_events \
+                 (scope_id, sequence, digest, parent_digest, operation_id, writer_epoch, payload_type) \
+                 VALUES (?1, 1, ?2, NULL, 'operation', 1, 'root_genesis')",
+                params![DIGEST_1, DIGEST_2],
             )
             .unwrap();
-        let capabilities = vec!["rust".into(), "gpu".into(), "gpu".into()];
-        // 'a-late-insert' is inserted last yet sorts between the wf-a rows and
-        // 'i-other-workflow', so insertion order and work_id-only order both differ from the
-        // required (workflow_id, work_id) order.
-        let expected = vec![
-            ("wf-a".to_owned(), "a-ready".to_owned()),
-            ("wf-a".to_owned(), "h-satisfied".to_owned()),
-            ("wf-b".to_owned(), "a-late-insert".to_owned()),
-            ("wf-b".to_owned(), "i-other-workflow".to_owned()),
-        ];
-
-        assert_eq!(
-            list_ready_work(&connection, "campaign", &capabilities, 10, None).unwrap(),
-            expected
-        );
-        assert!(
-            list_ready_work(&connection, "other", &capabilities, 10, None)
-                .unwrap()
-                .is_empty()
-        );
-        connection
-            .execute("UPDATE campaigns SET state = 'completed'", [])
-            .unwrap();
-        assert!(
-            list_ready_work(&connection, "campaign", &capabilities, 10, None)
-                .unwrap()
-                .is_empty()
-        );
-        connection
-            .execute("UPDATE campaigns SET state = 'active'", [])
-            .unwrap();
-
-        assert_eq!(
-            list_ready_work(
-                &connection,
-                "campaign",
-                &capabilities,
-                10,
-                Some(("wf-a".into(), "a-ready".into())),
-            )
-            .unwrap(),
-            vec![
-                expected[1].clone(),
-                expected[2].clone(),
-                expected[3].clone(),
-                expected[0].clone(),
-            ]
-        );
-        // A page smaller than the qualifying count proves truncation happens after rotation.
-        assert_eq!(
-            list_ready_work(
-                &connection,
-                "campaign",
-                &capabilities,
-                2,
-                Some(("wf-a".into(), "a-ready".into())),
-            )
-            .unwrap(),
-            vec![expected[1].clone(), expected[2].clone()]
-        );
-        assert_eq!(
-            list_ready_work(
-                &connection,
-                "campaign",
-                &capabilities,
-                1,
-                Some(("zz".into(), "zz".into())),
-            )
-            .unwrap(),
-            vec![expected[0].clone()]
-        );
-        assert!(
-            list_ready_work(&connection, "campaign", &capabilities, 0, None)
-                .unwrap()
-                .is_empty()
-        );
-
         drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn ready_work_limit_is_capped() {
-        let path = test_path("ready-limit");
-        let mut connection = schema::create(&path).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO campaigns (campaign_id, state) VALUES ('campaign', 'active');
-                     INSERT INTO workflows (workflow_id, state) VALUES ('workflow', 'active');",
-            )
-            .unwrap();
-        let transaction = connection.transaction().unwrap();
-        for index in 0..=MAX_READY_WORK {
-            transaction
-                .execute(
-                    "INSERT INTO work_items
-                         (work_id, workflow_id, state, budget_remaining, required_capabilities)
-                         VALUES (?1, 'workflow', 'ready', 1, '')",
-                    [format!("work-{index:04}")],
-                )
-                .unwrap();
-        }
-        transaction.commit().unwrap();
-
-        let ready = list_ready_work(&connection, "campaign", &[], usize::MAX, None).unwrap();
-        assert_eq!(ready.len(), MAX_READY_WORK);
-        assert_eq!(ready.iter().collect::<BTreeSet<_>>().len(), MAX_READY_WORK);
-        assert_eq!(ready.first().unwrap().1, "work-0000");
-        assert_eq!(ready.last().unwrap().1, "work-1023");
-
-        drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
         fs::remove_file(path).unwrap();
     }
 }

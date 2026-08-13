@@ -10,6 +10,7 @@
 use std::{
     error::Error,
     fmt,
+    num::NonZeroU64,
     path::PathBuf,
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
@@ -21,6 +22,7 @@ use crate::{
     db::projections::{
         self, ApplyError, ApplyOutcome, SchemaError, ScopeProjectionEvent, ValidateError,
     },
+    domain::work::{WorkId, WorkRef},
     scope::{Digest, ScopeEventRef, ScopeHead, ScopeIdentity},
 };
 
@@ -48,6 +50,30 @@ enum Command {
     MatchesHead {
         head: Box<ScopeHead>,
         respond: oneshot::Sender<Result<bool, ApplyError>>,
+    },
+    AdmitWork {
+        scope: Box<ScopeIdentity>,
+        work: WorkRef,
+        dependencies: Vec<WorkId>,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
+    RecordClaim {
+        scope: Box<ScopeIdentity>,
+        work: WorkRef,
+        claim_fence: NonZeroU64,
+        lease_until: NonZeroU64,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
+    RecordTerminal {
+        scope: Box<ScopeIdentity>,
+        work: WorkRef,
+        result: Digest,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
+    ReadyWork {
+        scope: Box<ScopeIdentity>,
+        now_ms: u64,
+        respond: oneshot::Sender<Result<Vec<WorkRef>, ApplyError>>,
     },
     #[cfg(test)]
     Diagnostics {
@@ -262,6 +288,96 @@ impl DbHandle {
             .await
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
+
+    /// Dependency edges may name work ids that are not admitted yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub async fn admit_work(
+        &self,
+        scope: &ScopeIdentity,
+        work: WorkRef,
+        dependencies: Vec<WorkId>,
+    ) -> Result<(), ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::AdmitWork {
+            scope,
+            work,
+            dependencies,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Conflict`] for an unknown, terminal, or fence-regressing
+    /// revision, [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub async fn record_claim(
+        &self,
+        scope: &ScopeIdentity,
+        work: WorkRef,
+        claim_fence: NonZeroU64,
+        lease_until: NonZeroU64,
+    ) -> Result<(), ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::RecordClaim {
+            scope,
+            work,
+            claim_fence,
+            lease_until,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Conflict`] for an unknown revision or conflicting evidence,
+    /// [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub async fn record_terminal(
+        &self,
+        scope: &ScopeIdentity,
+        work: WorkRef,
+        result: Digest,
+    ) -> Result<(), ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::RecordTerminal {
+            scope,
+            work,
+            result,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Readiness is derived per call; it is never stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub async fn ready_work(
+        &self,
+        scope: &ScopeIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<WorkRef>, ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::ReadyWork {
+            scope,
+            now_ms,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
 }
 
 fn run(
@@ -314,6 +430,54 @@ fn run(
             }
             Command::MatchesHead { head, respond } => {
                 let _ = respond.send(projections::scope_matches_head(&connection, &head));
+            }
+            Command::AdmitWork {
+                scope,
+                work,
+                dependencies,
+                respond,
+            } => {
+                let _ = respond.send(projections::admit_work(
+                    &mut connection,
+                    &scope,
+                    &work,
+                    &dependencies,
+                ));
+            }
+            Command::RecordClaim {
+                scope,
+                work,
+                claim_fence,
+                lease_until,
+                respond,
+            } => {
+                let _ = respond.send(projections::record_claim(
+                    &connection,
+                    &scope,
+                    &work,
+                    claim_fence,
+                    lease_until,
+                ));
+            }
+            Command::RecordTerminal {
+                scope,
+                work,
+                result,
+                respond,
+            } => {
+                let _ = respond.send(projections::record_terminal(
+                    &connection,
+                    &scope,
+                    &work,
+                    &result,
+                ));
+            }
+            Command::ReadyWork {
+                scope,
+                now_ms,
+                respond,
+            } => {
+                let _ = respond.send(projections::ready_work(&connection, &scope, now_ms));
             }
             #[cfg(test)]
             Command::Diagnostics { respond } => {
@@ -432,6 +596,10 @@ mod tests {
             Err(ApplyError::Full)
         );
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Full));
+        assert_eq!(
+            work_commands(&handle, &genesis).await,
+            [Err(ApplyError::Full); 4]
+        );
 
         drop(receiver.recv().unwrap());
         drop(
@@ -463,7 +631,29 @@ mod tests {
             Err(ApplyError::Stopping)
         );
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Stopping));
+        assert_eq!(
+            work_commands(&handle, &genesis).await,
+            [Err(ApplyError::Stopping); 4]
+        );
         drop(pending);
+    }
+
+    /// Admission for the four work commands, which return `()` so one array compares them all.
+    async fn work_commands(
+        handle: &DbHandle,
+        genesis: &crate::scope::RootGenesis,
+    ) -> [Result<(), ApplyError>; 4] {
+        let scope = genesis.identity();
+        let work = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
+        let fence = NonZeroU64::new(1).unwrap();
+        [
+            handle.admit_work(scope, work.clone(), Vec::new()).await,
+            handle.record_claim(scope, work.clone(), fence, fence).await,
+            handle
+                .record_terminal(scope, work.clone(), genesis.config_digest().clone())
+                .await,
+            handle.ready_work(scope, 1).await.map(|_| ()),
+        ]
     }
 
     #[cfg(target_os = "linux")]

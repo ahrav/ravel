@@ -19,9 +19,9 @@ use aws_sdk_s3::{
     primitives::ByteStream,
 };
 use ravel::{
-    distributed::identity::{InstanceId, WorkspaceId},
+    distributed::identity::WorkspaceId,
     scope::{
-        AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeHead, ScopeIdentity,
+        AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeIdentity,
         decode_head, decode_root_event, encode_head, root_genesis, scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
@@ -29,7 +29,7 @@ use ravel::{
         event::publish_root,
         head::{
             ObservedScopeHead, ScopeAppendError, ScopeHeadCommitOutcome, ScopeHeadParent,
-            ScopeHeadTransition, append_root, read,
+            append_root, read,
         },
     },
 };
@@ -259,51 +259,8 @@ async fn head_create_cas_and_transition_validation_hold_against_the_live_bucket(
         genesis.event_key()
     );
 
-    // A successor cannot reuse the observed tail as its own tail.
-    assert!(
-        ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&store, scope).await)),
-            ScopeHead::new(
-                scope.clone(),
-                ScopeAuthority::Unowned,
-                1,
-                genesis.event_ref().clone(),
-                None,
-                "reused-tail".into(),
-            )
-            .expect("candidate head is valid"),
-            publish_root(&store, scope, &root, &mut AttemptHistory::default())
-                .await
-                .expect("republish succeeds"),
-        )
-        .is_err(),
-        "a successor must not reuse the observed tail"
-    );
-
-    // Root transitions remain unowned at epoch 1.
-    assert!(
-        ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&store, scope).await)),
-            ScopeHead::new(
-                scope.clone(),
-                ScopeAuthority::owned(
-                    InstanceId::new("live-controller".into()).expect("instance id is valid"),
-                    1,
-                )
-                .expect("owned authority is valid"),
-                1,
-                genesis.event_ref().clone(),
-                None,
-                "owned-successor".into(),
-            )
-            .expect("candidate head is valid"),
-            publish_root(&store, scope, &root, &mut AttemptHistory::default())
-                .await
-                .expect("republish succeeds"),
-        )
-        .is_err(),
-        "an owned root head must be rejected"
-    );
+    // Transition binding negatives are proven by unit tests; a read alone cannot mint the
+    // fenced boundary those cases would need.
 
     // The head still holds exactly the canonical genesis bytes after every rejection.
     let final_head = observed(&store, scope).await;

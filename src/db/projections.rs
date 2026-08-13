@@ -1,14 +1,26 @@
 //! The projection file is disposable: one neutral application id rejects unrelated files,
 //! and a file that fails validation is rebuilt from durable history rather than migrated.
-//! It persists only unowned epoch-1, plan-stable histories, so the first epoch or plan
-//! transition must relax this schema.
+//! It persists plan-stable histories at any controller epoch: a scope row's `scope_epoch`
+//! advances monotonically and may lead its applied events, because authority transitions
+//! advance the epoch without publishing an event.
+//!
+//! Work readiness is derived by query from admitted work, dependencies, revision, claim
+//! state, and terminal evidence; it is never stored as a flag. A reopened file keeps its work
+//! rows; a rebuilt file has none until they are re-admitted, because no event payload writes
+//! them yet. Claim leases and readiness clocks are Unix-epoch milliseconds on one shared base.
+//! commentlint: allow(JUDGE)
+//!
+//! The epoch ordering rule lives in `sync::head`.
 
-use std::{error::Error, fmt, path::Path};
+use std::{error::Error, fmt, num::NonZeroU64, path::Path};
 
 use rusqlite::{OpenFlags, OptionalExtension, params};
 
 use crate::{
-    domain::validation::ValidationError,
+    domain::{
+        validation::ValidationError,
+        work::{WorkId, WorkRef},
+    },
     scope::{
         Digest, EventEnvelope, ScopeEventRef, ScopeHead, ScopeIdentity, payload_type_registered,
     },
@@ -16,7 +28,13 @@ use crate::{
 
 // "RAVL": rejects an unrelated SQLite file without naming a protocol era.
 const APPLICATION_ID: i32 = 0x5241_564c;
-const TABLES: [&str; 2] = ["applied_scope_events", "scopes"];
+const MAX_STORED_INTEGER: u64 = 9_999_999_999_999_999;
+const TABLES: [&str; 4] = [
+    "admitted_work",
+    "applied_scope_events",
+    "scopes",
+    "work_dependencies",
+];
 
 const SCOPE_SELECT_SQL: &str = "SELECT campaign_id, sequence, tail_event_digest, \
      active_plan_digest, scope_epoch FROM scopes WHERE scope_id = ?1";
@@ -32,8 +50,53 @@ const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_
      WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
 const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
-const SCOPE_UPDATE_SQL: &str =
-    "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2 WHERE scope_id = ?3";
+const SCOPE_UPDATE_SQL: &str = "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2, \
+     scope_epoch = ?3 WHERE scope_id = ?4";
+const TAIL_WRITER_EPOCH_SQL: &str = "SELECT writer_epoch FROM applied_scope_events \
+     WHERE scope_id = ?1 AND sequence = ?2";
+const ADMIT_WORK_SQL: &str = "INSERT INTO admitted_work \
+     (scope_id, work_id, work_revision, claim_fence, claim_lease_until, terminal_result_digest) \
+     VALUES (?1, ?2, ?3, NULL, NULL, NULL) ON CONFLICT DO NOTHING";
+const CLEAR_DEPENDENCIES_SQL: &str = "DELETE FROM work_dependencies \
+     WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3";
+const ADMIT_DEPENDENCY_SQL: &str = "INSERT INTO work_dependencies \
+     (scope_id, work_id, work_revision, depends_on_work_id) VALUES (?1, ?2, ?3, ?4) \
+     ON CONFLICT DO NOTHING";
+/// A recorded fence never regresses; an equal fence only extends its lease, preventing
+/// duplicate or reordered claim records from shortening a live lease and releasing work twice.
+const RECORD_CLAIM_SQL: &str = "UPDATE admitted_work \
+     SET claim_fence = ?4, claim_lease_until = ?5 \
+     WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
+       AND terminal_result_digest IS NULL \
+       AND (claim_fence IS NULL OR claim_fence < ?4 \
+            OR (claim_fence = ?4 AND claim_lease_until <= ?5))";
+const RECORD_TERMINAL_SQL: &str = "UPDATE admitted_work SET terminal_result_digest = ?4 \
+     WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
+       AND (terminal_result_digest IS NULL OR terminal_result_digest = ?4)";
+
+/// Readiness is a query, not a stored flag: an admitted revision is ready when it is the
+/// highest admitted revision of its work id, carries no terminal evidence, holds no claim
+/// whose lease is still live at `?2`, and every dependency's own highest admitted revision
+/// carries terminal evidence.
+const READY_WORK_SQL: &str = "SELECT work_id, work_revision FROM admitted_work AS ready \
+     WHERE ready.scope_id = ?1 \
+       AND ready.terminal_result_digest IS NULL \
+       AND (ready.claim_lease_until IS NULL OR ready.claim_lease_until <= ?2) \
+       AND ready.work_revision = (SELECT MAX(newer.work_revision) FROM admitted_work AS newer \
+             WHERE newer.scope_id = ready.scope_id AND newer.work_id = ready.work_id) \
+       AND NOT EXISTS (SELECT 1 FROM work_dependencies AS dependency \
+             WHERE dependency.scope_id = ready.scope_id \
+               AND dependency.work_id = ready.work_id \
+               AND dependency.work_revision = ready.work_revision \
+               AND NOT EXISTS (SELECT 1 FROM admitted_work AS resolved \
+                     WHERE resolved.scope_id = dependency.scope_id \
+                       AND resolved.work_id = dependency.depends_on_work_id \
+                       AND resolved.terminal_result_digest IS NOT NULL \
+                       AND resolved.work_revision = (SELECT MAX(latest.work_revision) \
+                             FROM admitted_work AS latest \
+                             WHERE latest.scope_id = resolved.scope_id \
+                               AND latest.work_id = resolved.work_id))) \
+     ORDER BY work_id";
 
 const SCHEMA: &str = "
 CREATE TABLE scopes (
@@ -56,7 +119,7 @@ CREATE TABLE scopes (
         AND length(CAST(tail_event_digest AS BLOB)) = 64
         AND tail_event_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (active_plan_digest IS NULL),
-    CHECK (scope_epoch = 1)
+    CHECK (scope_epoch BETWEEN 1 AND 9999999999999999)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE applied_scope_events (
@@ -87,6 +150,39 @@ CREATE TABLE applied_scope_events (
     CHECK ((sequence = 1 AND payload_type = 'root_genesis'
             AND operation_id = 'root-genesis:' || scope_id)
         OR (sequence > 1 AND payload_type <> 'root_genesis'))
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE admitted_work (
+    scope_id TEXT NOT NULL,
+    work_id TEXT NOT NULL,
+    work_revision INTEGER NOT NULL,
+    claim_fence INTEGER,
+    claim_lease_until INTEGER,
+    terminal_result_digest TEXT,
+    PRIMARY KEY (scope_id, work_id, work_revision),
+    FOREIGN KEY (scope_id) REFERENCES scopes(scope_id) ON DELETE CASCADE,
+    CHECK (length(CAST(work_id AS BLOB)) BETWEEN 1 AND 128
+        AND instr(CAST(work_id AS BLOB), CAST('/' AS BLOB)) = 0),
+    CHECK (work_revision BETWEEN 0 AND 9999999999999999),
+    CHECK ((claim_fence IS NULL AND claim_lease_until IS NULL)
+        OR (claim_fence BETWEEN 1 AND 9999999999999999
+            AND claim_lease_until BETWEEN 1 AND 9999999999999999)),
+    CHECK (terminal_result_digest IS NULL OR (length(terminal_result_digest) = 64
+        AND length(CAST(terminal_result_digest AS BLOB)) = 64
+        AND terminal_result_digest NOT GLOB '*[^0-9a-f]*'))
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE work_dependencies (
+    scope_id TEXT NOT NULL,
+    work_id TEXT NOT NULL,
+    work_revision INTEGER NOT NULL,
+    depends_on_work_id TEXT NOT NULL,
+    PRIMARY KEY (scope_id, work_id, work_revision, depends_on_work_id),
+    FOREIGN KEY (scope_id, work_id, work_revision)
+        REFERENCES admitted_work(scope_id, work_id, work_revision) ON DELETE CASCADE,
+    CHECK (length(CAST(depends_on_work_id AS BLOB)) BETWEEN 1 AND 128
+        AND instr(CAST(depends_on_work_id AS BLOB), CAST('/' AS BLOB)) = 0),
+    CHECK (depends_on_work_id <> work_id)
 ) STRICT, WITHOUT ROWID;
 ";
 
@@ -182,10 +278,12 @@ impl ScopeProjectionEvent {
         active_plan_digest: Option<Digest>,
         scope_epoch: u64,
     ) -> Result<Self, ValidationError> {
+        // Authority transitions advance the epoch without publishing an event, so an event's
+        // writer epoch may lag the head epoch. An event above that epoch is not projectable.
         if envelope.scope_id() != scope.scope_id()
             || envelope.sequence() != reference.sequence()
-            || envelope.writer_epoch().get() != scope_epoch
-            || scope_epoch != 1
+            || envelope.writer_epoch().get() > scope_epoch
+            || scope_epoch > MAX_STORED_INTEGER
             || active_plan_digest.is_some()
         {
             return Err(ValidationError::InvalidIdentity);
@@ -304,10 +402,151 @@ pub(crate) fn scope_matches_head(
                 && u64::try_from(sequence).ok() == Some(head.tail().sequence())
                 && tail == head.tail().digest().as_str()
                 && plan.as_deref() == head.active_plan_digest().map(Digest::as_str)
-                && u64::try_from(epoch).ok() == Some(head.scope_epoch().get())
+                // The projected epoch may lag an eventless authority transition, but a head
+                // below the projected epoch is stale evidence.
+                && u64::try_from(epoch).is_ok_and(|epoch| epoch <= head.scope_epoch().get())
                 && operation == head.operation_id()
         }),
     )
+}
+
+/// Re-admitting a revision replaces its dependency edges, so a shrunk edge set cannot leave
+/// a stale edge that withholds the revision forever.
+///
+/// Dependency edges name work ids, so a dependency may be admitted after the revision that
+/// requires it. The scope's own projected row must already exist.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::Conflict`] when a dependency names the revision's own work id, and
+/// [`ApplyError::DatabaseOperationFailed`] when the scope has no projected row or SQLite fails.
+pub(crate) fn admit_work(
+    connection: &mut rusqlite::Connection,
+    scope: &ScopeIdentity,
+    work: &WorkRef,
+    dependencies: &[WorkId],
+) -> Result<(), ApplyError> {
+    if dependencies
+        .iter()
+        .any(|dependency| dependency == work.id())
+    {
+        return Err(ApplyError::Conflict);
+    }
+    let revision = stored_u64(work.revision())?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        ADMIT_WORK_SQL,
+        params![scope.scope_id().as_str(), work.id().as_str(), revision],
+    )?;
+    transaction.execute(
+        CLEAR_DEPENDENCIES_SQL,
+        params![scope.scope_id().as_str(), work.id().as_str(), revision],
+    )?;
+    for dependency in dependencies {
+        transaction.execute(
+            ADMIT_DEPENDENCY_SQL,
+            params![
+                scope.scope_id().as_str(),
+                work.id().as_str(),
+                revision,
+                dependency.as_str()
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// # Errors
+///
+/// Returns [`ApplyError::Conflict`] when the revision is unknown, already carries terminal
+/// evidence, or would regress its fence, and [`ApplyError::DatabaseOperationFailed`] when SQLite
+/// fails or a value exceeds the stored-integer bound.
+pub(crate) fn record_claim(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+    work: &WorkRef,
+    claim_fence: NonZeroU64,
+    lease_until: NonZeroU64,
+) -> Result<(), ApplyError> {
+    let updated = connection.execute(
+        RECORD_CLAIM_SQL,
+        params![
+            scope.scope_id().as_str(),
+            work.id().as_str(),
+            stored_u64(work.revision())?,
+            stored_u64(claim_fence.get())?,
+            stored_u64(lease_until.get())?,
+        ],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(ApplyError::Conflict)
+    }
+}
+
+/// # Errors
+///
+/// Returns [`ApplyError::Conflict`] when the revision is unknown or already carries
+/// different terminal evidence, and [`ApplyError::DatabaseOperationFailed`] when SQLite fails or
+/// a value exceeds the stored-integer bound.
+pub(crate) fn record_terminal(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+    work: &WorkRef,
+    result: &Digest,
+) -> Result<(), ApplyError> {
+    let updated = connection.execute(
+        RECORD_TERMINAL_SQL,
+        params![
+            scope.scope_id().as_str(),
+            work.id().as_str(),
+            stored_u64(work.revision())?,
+            result.as_str(),
+        ],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(ApplyError::Conflict)
+    }
+}
+
+/// Derives one scope's ready set from admitted work, dependencies, revision, claim state,
+/// and terminal evidence as of `now_ms`.
+///
+/// The same rows and `now_ms` always produce the same ordered set, so a restart cannot
+/// release a revision that is claimed or already terminal.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a stored row cannot be
+/// converted back into a validated work reference.
+pub(crate) fn ready_work(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+    now_ms: u64,
+) -> Result<Vec<WorkRef>, ApplyError> {
+    let mut statement = connection.prepare(READY_WORK_SQL)?;
+    let rows = statement
+        .query_map(
+            params![scope.scope_id().as_str(), stored_u64(now_ms)?],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(work_id, revision)| {
+            Ok(WorkRef::new(
+                WorkId::new(work_id).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                u64::try_from(revision).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+            ))
+        })
+        .collect()
+}
+
+fn stored_u64(value: u64) -> Result<i64, ApplyError> {
+    i64::try_from(value).map_err(|_| ApplyError::DatabaseOperationFailed)
 }
 
 pub(crate) fn apply_scope_event(
@@ -377,23 +616,40 @@ pub(crate) fn apply_scope_event(
                     stored_sequence,
                     event.reference.digest().as_str(),
                     event.active_plan_digest.as_ref().map(Digest::as_str),
-                    i64::try_from(event.scope_epoch)
-                        .map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                    stored_u64(event.scope_epoch)?,
                 ],
             )?;
         }
         Some((campaign_id, cursor, tail, active_plan, scope_epoch)) => {
+            // The projected epoch only advances: a mutation carrying an older epoch than the
+            // projected row was produced under superseded authority.
             if campaign_id != event.scope.campaign_id().as_str()
                 || cursor.checked_add(1) != Some(stored_sequence)
                 || parent_digest != Some(tail.as_str())
                 || active_plan.as_deref() != event.active_plan_digest.as_ref().map(Digest::as_str)
-                || u64::try_from(scope_epoch).ok() != Some(event.scope_epoch)
+                || !u64::try_from(scope_epoch).is_ok_and(|epoch| epoch <= event.scope_epoch)
+            {
+                return Err(ApplyError::Conflict);
+            }
+            // The applied tail's writer epoch bounds this event's, which keeps the chain
+            // non-decreasing across replay batches, not only within one batch.
+            let tail_writer_epoch: i64 =
+                transaction.query_row(TAIL_WRITER_EPOCH_SQL, params![scope_id, cursor], |row| {
+                    row.get(0)
+                })?;
+            if !u64::try_from(tail_writer_epoch)
+                .is_ok_and(|epoch| epoch <= event.envelope.writer_epoch().get())
             {
                 return Err(ApplyError::Conflict);
             }
             let updated = transaction.execute(
                 SCOPE_UPDATE_SQL,
-                params![stored_sequence, event.reference.digest().as_str(), scope_id],
+                params![
+                    stored_sequence,
+                    event.reference.digest().as_str(),
+                    stored_u64(event.scope_epoch)?,
+                    scope_id,
+                ],
             )?;
             if updated != 1 {
                 return Err(ApplyError::DatabaseOperationFailed);
@@ -536,7 +792,12 @@ fn validate_text(connection: &rusqlite::Connection) -> Result<(), ValidateError>
              UNION ALL SELECT CAST(parent_digest AS BLOB) FROM applied_scope_events \
                WHERE parent_digest IS NOT NULL \
              UNION ALL SELECT CAST(operation_id AS BLOB) FROM applied_scope_events \
-             UNION ALL SELECT CAST(payload_type AS BLOB) FROM applied_scope_events",
+             UNION ALL SELECT CAST(payload_type AS BLOB) FROM applied_scope_events \
+             UNION ALL SELECT CAST(work_id AS BLOB) FROM admitted_work \
+             UNION ALL SELECT CAST(terminal_result_digest AS BLOB) FROM admitted_work \
+               WHERE terminal_result_digest IS NOT NULL \
+             UNION ALL SELECT CAST(work_id AS BLOB) FROM work_dependencies \
+             UNION ALL SELECT CAST(depends_on_work_id AS BLOB) FROM work_dependencies",
         )
         .map_err(|_| ValidateError::DatabaseOperationFailed)?;
     let mut rows = statement
@@ -613,7 +874,8 @@ fn validate_history(connection: &rusqlite::Connection) -> Result<(), ValidateErr
              LEFT JOIN applied_scope_events AS parent \
                ON parent.scope_id = event.scope_id AND parent.sequence = event.sequence - 1 \
              WHERE (event.sequence = 1 AND event.parent_digest IS NOT NULL) \
-                OR (event.sequence > 1 AND (parent.digest IS NULL OR parent.digest != event.parent_digest))",
+                OR (event.sequence > 1 AND (parent.digest IS NULL OR parent.digest != event.parent_digest)) \
+                OR (event.sequence > 1 AND parent.writer_epoch > event.writer_epoch)",
             [],
             |row| row.get(0),
         )
@@ -627,7 +889,7 @@ fn validate_history(connection: &rusqlite::Connection) -> Result<(), ValidateErr
              OR (SELECT digest FROM applied_scope_events AS event \
                  WHERE event.scope_id = scope.scope_id AND event.sequence = scope.sequence) != scope.tail_event_digest \
              OR EXISTS(SELECT 1 FROM applied_scope_events AS event WHERE event.scope_id = scope.scope_id \
-                 AND event.writer_epoch != scope.scope_epoch)",
+                 AND event.writer_epoch > scope.scope_epoch)",
             [],
             |row| row.get(0),
         )
@@ -901,6 +1163,8 @@ mod tests {
         let sequence = 1_i64;
         let digest = DIGEST_2;
         let operation = "operation-1";
+        let work_id = "work-17";
+        let revision = 3_i64;
         let plans = [
             query_plan(&connection, SCOPE_SELECT_SQL, &[&scope_id]),
             query_plan(&connection, SCOPE_HEAD_MATCH_SQL, &[&scope_id]),
@@ -918,8 +1182,19 @@ mod tests {
             query_plan(
                 &connection,
                 SCOPE_UPDATE_SQL,
-                &[&sequence, &digest, &scope_id],
+                &[&sequence, &digest, &scope_id, &sequence],
             ),
+            query_plan(
+                &connection,
+                RECORD_CLAIM_SQL,
+                &[&scope_id, &work_id, &revision, &sequence, &sequence],
+            ),
+            query_plan(
+                &connection,
+                RECORD_TERMINAL_SQL,
+                &[&scope_id, &work_id, &revision, &digest],
+            ),
+            query_plan(&connection, READY_WORK_SQL, &[&scope_id, &sequence]),
         ];
         assert!(plans.iter().all(|details| !details.is_empty()));
         for detail in plans
@@ -1213,5 +1488,367 @@ mod tests {
             ValidateError::InvalidHistory
         );
         fs::remove_file(path).unwrap();
+    }
+
+    fn mutation_at_epoch(
+        scope: &ScopeIdentity,
+        sequence: u64,
+        digest: &str,
+        parent: Option<&str>,
+        writer_epoch: u64,
+        scope_epoch: u64,
+    ) -> ScopeProjectionEvent {
+        let parent = parent.map(|digest| {
+            ScopeEventRef::new(sequence - 1, Digest::new(digest.into()).unwrap()).unwrap()
+        });
+        let envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            sequence,
+            parent,
+            writer_epoch,
+            operation(scope, sequence),
+            crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        ScopeProjectionEvent::new(
+            scope.clone(),
+            envelope,
+            ScopeEventRef::new(sequence, Digest::new(digest.into()).unwrap()).unwrap(),
+            None,
+            scope_epoch,
+        )
+        .unwrap()
+    }
+
+    fn projected_epoch(connection: &rusqlite::Connection, scope: &ScopeIdentity) -> i64 {
+        connection
+            .query_row(
+                "SELECT scope_epoch FROM scopes WHERE scope_id = ?1",
+                [scope.scope_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn stored_claim(
+        connection: &rusqlite::Connection,
+        scope: &ScopeIdentity,
+        work: &WorkRef,
+    ) -> (Option<i64>, Option<i64>) {
+        connection
+            .query_row(
+                "SELECT claim_fence, claim_lease_until FROM admitted_work \
+                 WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3",
+                params![
+                    scope.scope_id().as_str(),
+                    work.id().as_str(),
+                    work.revision() as i64
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn stored_terminal(
+        connection: &rusqlite::Connection,
+        scope: &ScopeIdentity,
+        work: &WorkRef,
+    ) -> Option<String> {
+        connection
+            .query_row(
+                "SELECT terminal_result_digest FROM admitted_work \
+                 WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3",
+                params![
+                    scope.scope_id().as_str(),
+                    work.id().as_str(),
+                    work.revision() as i64
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn work(id: &str, revision: u64) -> WorkRef {
+        WorkRef::new(WorkId::new(id.into()).unwrap(), revision)
+    }
+
+    fn ready(connection: &rusqlite::Connection, scope: &ScopeIdentity, now_ms: u64) -> Vec<String> {
+        ready_work(connection, scope, now_ms)
+            .unwrap()
+            .into_iter()
+            .map(|work| format!("{}@{}", work.id().as_str(), work.revision()))
+            .collect()
+    }
+
+    fn admitted_scope(label: &str) -> (PathBuf, rusqlite::Connection, ScopeIdentity) {
+        let db_path = path(label);
+        let mut connection = create(&db_path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        apply_scope_event(&mut connection, &mutation(&scope, 1, DIGEST_1, None)).unwrap();
+        (db_path, connection, scope)
+    }
+
+    #[test]
+    fn readiness_follows_dependencies_revisions_claims_and_terminal_evidence() {
+        let (db_path, mut connection, scope) = admitted_scope("ready-work");
+        let first = WorkId::new("work-a".into()).unwrap();
+
+        admit_work(&mut connection, &scope, &work("work-a", 1), &[]).unwrap();
+        admit_work(
+            &mut connection,
+            &scope,
+            &work("work-b", 1),
+            std::slice::from_ref(&first),
+        )
+        .unwrap();
+        // An unsatisfied dependency withholds the dependent revision.
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-a@1"]);
+
+        // Re-admission is idempotent.
+        admit_work(&mut connection, &scope, &work("work-a", 1), &[]).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-a@1"]);
+
+        let result = Digest::new(DIGEST_2.into()).unwrap();
+        record_terminal(&connection, &scope, &work("work-a", 1), &result).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
+
+        let fence = NonZeroU64::new(1).unwrap();
+        let lease = NonZeroU64::new(31_000).unwrap();
+        record_claim(&connection, &scope, &work("work-b", 1), fence, lease).unwrap();
+        // A live claim withholds the revision; an expired one makes it reclaimable.
+        assert!(ready(&connection, &scope, 1_000).is_empty());
+        assert_eq!(ready(&connection, &scope, 31_000), vec!["work-b@1"]);
+
+        // A higher admitted revision supersedes its predecessor and its claim.
+        admit_work(&mut connection, &scope, &work("work-b", 2), &[first]).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@2"]);
+
+        // Terminal evidence removes the revision from the ready set.
+        record_terminal(&connection, &scope, &work("work-b", 2), &result).unwrap();
+        assert!(ready(&connection, &scope, 1_000).is_empty());
+
+        // Work that was never admitted is never ready.
+        assert_eq!(
+            record_claim(&connection, &scope, &work("work-c", 1), fence, lease),
+            Err(ApplyError::Conflict)
+        );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn a_reopened_projection_rebuilds_the_same_ready_set() {
+        let (db_path, mut connection, scope) = admitted_scope("ready-restart");
+        let blocker = WorkId::new("work-a".into()).unwrap();
+        admit_work(&mut connection, &scope, &work("work-a", 1), &[]).unwrap();
+        admit_work(&mut connection, &scope, &work("work-b", 1), &[blocker]).unwrap();
+        admit_work(&mut connection, &scope, &work("work-c", 1), &[]).unwrap();
+        record_claim(
+            &connection,
+            &scope,
+            &work("work-c", 1),
+            NonZeroU64::new(4).unwrap(),
+            NonZeroU64::new(31_000).unwrap(),
+        )
+        .unwrap();
+        let before = ready(&connection, &scope, 1_000);
+        assert_eq!(before, vec!["work-a@1"]);
+        drop(connection);
+
+        let reopened = open_existing(&db_path).unwrap();
+        assert_eq!(ready(&reopened, &scope, 1_000), before);
+        // Past the recorded lease the claimed revision is reclaimable exactly once, and the
+        // restart cannot hand it out under a regressed fence or a shortened lease.
+        assert_eq!(
+            ready(&reopened, &scope, 31_000),
+            vec!["work-a@1", "work-c@1"]
+        );
+        assert_eq!(
+            record_claim(
+                &reopened,
+                &scope,
+                &work("work-c", 1),
+                NonZeroU64::new(3).unwrap(),
+                NonZeroU64::new(61_000).unwrap()
+            ),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(
+            stored_claim(&reopened, &scope, &work("work-c", 1)),
+            (Some(4), Some(31_000))
+        );
+
+        drop(reopened);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn a_dependency_is_resolved_only_at_its_highest_admitted_revision() {
+        let (db_path, mut connection, scope) = admitted_scope("dependency-supersession");
+        let blocker = WorkId::new("work-a".into()).unwrap();
+        let result = Digest::new(DIGEST_2.into()).unwrap();
+        admit_work(&mut connection, &scope, &work("work-a", 1), &[]).unwrap();
+        admit_work(
+            &mut connection,
+            &scope,
+            &work("work-b", 1),
+            std::slice::from_ref(&blocker),
+        )
+        .unwrap();
+        record_terminal(&connection, &scope, &work("work-a", 1), &result).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
+
+        // A newer open revision of the dependency withdraws the terminal evidence.
+        admit_work(&mut connection, &scope, &work("work-a", 2), &[]).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-a@2"]);
+
+        record_terminal(&connection, &scope, &work("work-a", 2), &result).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn claim_and_terminal_records_never_regress() {
+        let (db_path, mut connection, scope) = admitted_scope("record-guards");
+        let target = work("work-a", 1);
+        admit_work(&mut connection, &scope, &target, &[]).unwrap();
+        let high = NonZeroU64::new(4).unwrap();
+        let low = NonZeroU64::new(3).unwrap();
+        let lease = NonZeroU64::new(31_000).unwrap();
+        let short_lease = NonZeroU64::new(2_000).unwrap();
+        record_claim(&connection, &scope, &target, high, lease).unwrap();
+
+        // A lower fence, and an equal fence that would shorten the live lease, are refused.
+        assert_eq!(
+            record_claim(&connection, &scope, &target, low, lease),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(
+            record_claim(&connection, &scope, &target, high, short_lease),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(
+            stored_claim(&connection, &scope, &target),
+            (Some(4), Some(31_000))
+        );
+        // An equal fence may extend its own lease.
+        record_claim(
+            &connection,
+            &scope,
+            &target,
+            high,
+            NonZeroU64::new(41_000).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stored_claim(&connection, &scope, &target),
+            (Some(4), Some(41_000))
+        );
+
+        let first = Digest::new(DIGEST_2.into()).unwrap();
+        let second = Digest::new(DIGEST_3.into()).unwrap();
+        record_terminal(&connection, &scope, &target, &first).unwrap();
+        // Repeating the same evidence is idempotent; different evidence conflicts.
+        record_terminal(&connection, &scope, &target, &first).unwrap();
+        assert_eq!(
+            record_terminal(&connection, &scope, &target, &second),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(
+            stored_terminal(&connection, &scope, &target).as_deref(),
+            Some(DIGEST_2)
+        );
+        // A claim cannot be recorded against terminal work.
+        assert_eq!(
+            record_claim(
+                &connection,
+                &scope,
+                &target,
+                NonZeroU64::new(9).unwrap(),
+                lease
+            ),
+            Err(ApplyError::Conflict)
+        );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn re_admission_replaces_dependency_edges_and_rejects_a_self_edge() {
+        let (db_path, mut connection, scope) = admitted_scope("dependency-replacement");
+        let blocker = WorkId::new("work-a".into()).unwrap();
+        admit_work(
+            &mut connection,
+            &scope,
+            &work("work-b", 1),
+            std::slice::from_ref(&blocker),
+        )
+        .unwrap();
+        assert!(ready(&connection, &scope, 1_000).is_empty());
+
+        admit_work(&mut connection, &scope, &work("work-b", 1), &[]).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
+
+        assert_eq!(
+            admit_work(
+                &mut connection,
+                &scope,
+                &work("work-b", 2),
+                &[WorkId::new("work-b".into()).unwrap()]
+            ),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn an_event_below_the_projected_epoch_or_tail_writer_epoch_is_refused() {
+        let db_path = path("epoch-regression");
+        let mut connection = create(&db_path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        apply_scope_event(&mut connection, &mutation(&scope, 1, DIGEST_1, None)).unwrap();
+        apply_scope_event(
+            &mut connection,
+            &mutation_at_epoch(&scope, 2, DIGEST_2, Some(DIGEST_1), 5, 5),
+        )
+        .unwrap();
+        assert_eq!(projected_epoch(&connection, &scope), 5);
+
+        // A head epoch below the projected epoch is superseded authority.
+        assert_eq!(
+            apply_scope_event(
+                &mut connection,
+                &mutation_at_epoch(&scope, 3, DIGEST_3, Some(DIGEST_2), 4, 4)
+            ),
+            Err(ApplyError::Conflict)
+        );
+        // A writer epoch below the applied tail's writer epoch cannot extend the chain.
+        assert_eq!(
+            apply_scope_event(
+                &mut connection,
+                &mutation_at_epoch(&scope, 3, DIGEST_3, Some(DIGEST_2), 4, 6)
+            ),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 2);
+        assert_eq!(projected_epoch(&connection, &scope), 5);
+
+        // The same suffix at the projected epoch applies.
+        apply_scope_event(
+            &mut connection,
+            &mutation_at_epoch(&scope, 3, DIGEST_3, Some(DIGEST_2), 5, 6),
+        )
+        .unwrap();
+        assert_eq!(projected_epoch(&connection, &scope), 6);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
     }
 }

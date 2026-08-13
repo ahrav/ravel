@@ -2,6 +2,7 @@
 //!
 //! Ready output carries the observed head whose tail matches the committed local row.
 //! Remote validation completes before the first projection write.
+//! A writer epoch may lag the head epoch but never exceeds it or its own child's.
 //! Replay limits are 4,096 unseen events and 64 MiB of stored event bytes.
 
 use std::{collections::HashSet, error::Error, fmt, path::Path};
@@ -305,6 +306,8 @@ async fn prepare_chain(
     let mut current = tail;
     let mut total_bytes = 0;
     let mut operations = HashSet::new();
+    // The walk runs newest to oldest, so each event's writer epoch bounds its parent's.
+    let mut highest_epoch = scope_epoch;
     let mut prepared = Vec::with_capacity(unseen as usize);
     for hop in 0..unseen {
         let (decoded, bytes) = match read_opaque(store, scope, &current).await {
@@ -317,12 +320,14 @@ async fn prepare_chain(
         };
         total_bytes = checked_total(total_bytes, bytes.len(), limits.bytes)?;
         if decoded.event_ref() != &current
-            || decoded.envelope().writer_epoch().get() != scope_epoch
+            || decoded.envelope().writer_epoch().get() > scope_epoch
+            || decoded.envelope().writer_epoch().get() > highest_epoch
             || !operations.insert(decoded.envelope().operation_id().to_owned())
             || (hop == 0 && decoded.envelope().operation_id() != head_operation)
         {
             return Err(ScopeReplayError::HistoryConflict);
         }
+        highest_epoch = decoded.envelope().writer_epoch().get();
         if !payload_registered(decoded.envelope()) {
             return Err(ScopeReplayError::UnsupportedPayload);
         }
@@ -645,35 +650,15 @@ mod tests {
             (0, None)
         );
 
-        let invalid_heads = [
-            ScopeHead::new(
-                genesis.identity().clone(),
-                ScopeAuthority::owned(InstanceId::new("instance-a".into()).unwrap(), 1).unwrap(),
-                1,
-                genesis.event_ref().clone(),
-                None,
-                "invalid-owned-head".into(),
-            )
-            .unwrap(),
-            ScopeHead::new(
-                genesis.identity().clone(),
-                ScopeAuthority::Unowned,
-                2,
-                genesis.event_ref().clone(),
-                None,
-                "invalid-epoch-head".into(),
-            )
-            .unwrap(),
-            ScopeHead::new(
-                genesis.identity().clone(),
-                ScopeAuthority::Unowned,
-                1,
-                genesis.event_ref().clone(),
-                Some(Digest::new("a".repeat(64)).unwrap()),
-                "invalid-plan-head".into(),
-            )
-            .unwrap(),
-        ];
+        let invalid_heads = [ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            "invalid-plan-head".into(),
+        )
+        .unwrap()];
         for head in invalid_heads {
             let (store, client) = replay_store(vec![head_response(encode_head(&head).unwrap())]);
             assert!(matches!(
@@ -990,5 +975,154 @@ mod tests {
             minimums.last().unwrap().as_nanos() < minimums.first().unwrap().as_nanos() * 32,
             "replay endpoint growth exceeded 32x: sizes={SIZES:?} minimum-ms={minimum_millis:?}"
         );
+    }
+
+    /// A controller that acquires and renews authority advances the scope epoch without
+    /// publishing an event, so the genesis writer epoch legitimately lags the head epoch.
+    #[tokio::test]
+    async fn a_head_at_a_higher_epoch_replays_a_lagging_writer_epoch() {
+        let genesis = genesis();
+        let path = path("epoch-lag");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let owned = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::owned(InstanceId::new("instance-a".into()).unwrap(), 31_000).unwrap(),
+            3,
+            genesis.event_ref().clone(),
+            None,
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&owned).unwrap()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, genesis.identity()).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (1, Some(genesis.event_ref().digest().clone()))
+        );
+
+        // A relinquished head at the same epoch keeps the projection ready.
+        let relinquished = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            4,
+            genesis.event_ref().clone(),
+            None,
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![head_response(encode_head(&relinquished).unwrap())]);
+        assert!(matches!(
+            refresh(&store, &handle, genesis.identity()).await,
+            ScopeReadiness::Ready { .. }
+        ));
+
+        // A head below the projected epoch is stale evidence.
+        let (store, _) = replay_store(vec![head_response(genesis.head_bytes().to_vec())]);
+        assert!(matches!(
+            refresh(&store, &handle, genesis.identity()).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
+        ));
+
+        drop(handle);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_event_above_the_head_epoch_fails_closed() {
+        let genesis = genesis();
+        let path = path("epoch-ahead");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let envelope = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            5,
+            "ahead-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::owned(InstanceId::new("instance-a".into()).unwrap(), 31_000).unwrap(),
+            4,
+            encoded.event_ref().clone(),
+            None,
+            "ahead-op".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            event_response(encoded.stored_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, genesis.identity()).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
+        ));
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (0, None)
+        );
+        drop(handle);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The chain is walked newest to oldest, so a parent whose writer epoch exceeds its child's
+    /// is a superseded writer spliced under a newer event.
+    #[tokio::test]
+    async fn a_parent_above_its_child_writer_epoch_fails_closed() {
+        let genesis = genesis();
+        let path = path("epoch-inversion");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let first = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            1,
+            None,
+            3,
+            "inverted-root".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let first_encoded = encode_scope_event(&first, &Value::Null).unwrap();
+        let second = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            2,
+            Some(first_encoded.event_ref().clone()),
+            2,
+            "inverted-child".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let second_encoded = encode_scope_event(&second, &Value::Null).unwrap();
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::owned(InstanceId::new("instance-a".into()).unwrap(), 31_000).unwrap(),
+            3,
+            second_encoded.event_ref().clone(),
+            None,
+            "inverted-child".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            event_response(second_encoded.stored_bytes().to_vec()),
+            event_response(first_encoded.stored_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, genesis.identity()).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
+        ));
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (0, None)
+        );
+        drop(handle);
+        fs::remove_file(path).unwrap();
     }
 }

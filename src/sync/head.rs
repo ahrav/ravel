@@ -1,6 +1,15 @@
 //! Root-only scoped head transitions and retained-chain reconciliation.
 //!
-//! Accepts only unowned epoch-1 transitions with an unchanged active plan digest.
+//! Epoch ordering rule (`docs/mvp-outline.md` §7.2): a head's `scope_epoch` is at least the
+//! projected scope epoch, which is at least any applied event's `writer_epoch`, and a
+//! `writer_epoch` never decreases from an event to its child. An authority transition raises the
+//! epoch without publishing an event, so events lag the head; an event append leaves the epoch
+//! alone and commits under it. Append time enforces the equality here; replay enforces the event
+//! bounds in `sync::replay::prepare_chain`; apply and open enforce the projected bounds in
+//! `db::projections`.
+//! commentlint: allow(JUDGE)
+//!
+//! Root heads reject active plan digests.
 //! Retained walks stop at 4,096 events or 64 MiB of stored event bytes.
 
 use std::{collections::HashSet, error::Error, fmt};
@@ -34,12 +43,29 @@ pub struct ObservedScopeHead {
 }
 
 impl ObservedScopeHead {
+    pub(crate) fn proven(head: ScopeHead, bytes: Vec<u8>, etag: ETag, namespace: String) -> Self {
+        Self {
+            head,
+            bytes,
+            etag,
+            namespace,
+        }
+    }
+
     pub fn head(&self) -> &ScopeHead {
         &self.head
     }
 
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn etag(&self) -> &ETag {
+        &self.etag
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
     }
 }
 
@@ -65,7 +91,34 @@ pub enum ScopeHeadParent {
     /// Create the first head with no observed predecessor.
     Genesis,
     /// Replace exactly this observed head by ETag.
-    Existing(Box<ObservedScopeHead>),
+    Existing(FencedParent),
+}
+
+impl ScopeHeadParent {
+    pub(crate) fn existing(observed: Box<ObservedScopeHead>) -> Self {
+        Self::Existing(FencedParent(observed))
+    }
+}
+
+/// Observed head that a fenced controller authorized as a transition boundary.
+///
+/// Outside this crate the only source is `ControllerAuthority::into_parent`, so a caller holding
+/// no authority cannot replace an existing head. Inside the crate `ScopeHeadParent::existing`
+/// accepts any observed head and its callers must supply a fenced one.
+pub struct FencedParent(Box<ObservedScopeHead>);
+
+impl std::ops::Deref for FencedParent {
+    type Target = ObservedScopeHead;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FencedParent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 /// Validated event/head unit consumed by [`commit`].
@@ -79,13 +132,15 @@ pub struct ScopeHeadTransition {
 impl ScopeHeadTransition {
     /// Binds one canonical event publication to its candidate head and parent boundary.
     ///
-    /// Root transitions remain unowned at epoch 1. Genesis requires sequence 1, no
-    /// parent, and no active plan. Successors require the exact observed tail, a new
-    /// operation ID, and an unchanged active plan.
+    /// A successor candidate carries the observed controller, lease, and epoch unchanged, a new
+    /// operation ID, the observed tail as its event parent, the next sequence, and an unchanged
+    /// active plan; its event's `writer_epoch` equals that epoch. Genesis is instead unowned at
+    /// epoch 1, sequence 1, with no event parent and no active plan.
     ///
     /// # Errors
     ///
-    /// Returns [`WireError`] when any binding or canonical encoding check fails.
+    /// Returns [`WireError::InvalidValue`] when any of those bindings fails, or another
+    /// [`WireError`] when the candidate head cannot be canonically encoded.
     pub fn new(
         parent: ScopeHeadParent,
         candidate: ScopeHead,
@@ -96,9 +151,7 @@ impl ScopeHeadTransition {
             || candidate.tail() != event.event_ref()
             || candidate.operation_id() != envelope.operation_id()
             || envelope.scope_id() != candidate.scope().scope_id()
-            || !matches!(candidate.authority(), ScopeAuthority::Unowned)
-            || candidate.scope_epoch().get() != 1
-            || envelope.writer_epoch().get() != 1
+            || envelope.writer_epoch() != candidate.scope_epoch()
         {
             return Err(WireError::InvalidValue);
         }
@@ -107,6 +160,8 @@ impl ScopeHeadTransition {
                 if envelope.sequence() != 1
                     || envelope.parent_event().is_some()
                     || candidate.active_plan_digest().is_some()
+                    || !matches!(candidate.authority(), ScopeAuthority::Unowned)
+                    || candidate.scope_epoch().get() != 1
                 {
                     return Err(WireError::InvalidValue);
                 }
@@ -119,8 +174,8 @@ impl ScopeHeadTransition {
                     .checked_add(1)
                     .ok_or(WireError::InvalidValue)?;
                 if candidate.scope() != observed.head.scope()
-                    || !matches!(observed.head.authority(), ScopeAuthority::Unowned)
-                    || observed.head.scope_epoch().get() != 1
+                    || candidate.authority() != observed.head.authority()
+                    || candidate.scope_epoch() != observed.head.scope_epoch()
                     || envelope.sequence() != expected
                     || envelope.parent_event() != Some(observed.head.tail())
                     || candidate.operation_id() == observed.head.operation_id()
@@ -184,7 +239,10 @@ impl Error for ScopeAppendError {}
 
 /// Publishes immutable event bytes before validating or mutating the head.
 ///
-/// A later head-validation failure can leave an unreferenced immutable event.
+/// The event's `writer_epoch` must equal the parent head's `scope_epoch`, which is 1 at genesis;
+/// a mismatch returns [`ScopeAppendError::InvalidInput`] before any bytes are published. Every
+/// remaining binding check runs after publication, so a failure there can leave an unreferenced
+/// immutable event.
 ///
 /// # Errors
 ///
@@ -198,13 +256,24 @@ pub async fn append_root(
     event_history: &mut AttemptHistory,
     head_history: &mut AttemptHistory,
 ) -> Result<ScopeHeadCommitOutcome, ScopeAppendError> {
+    let (authority, scope_epoch) = match &parent {
+        ScopeHeadParent::Genesis => (ScopeAuthority::Unowned, 1),
+        ScopeHeadParent::Existing(observed) => (
+            observed.head().authority().clone(),
+            observed.head().scope_epoch().get(),
+        ),
+    };
+    // The pre-publication epoch check prevents a mismatched writer epoch from leaving an unreferenced immutable event behind.
+    if event.envelope().writer_epoch().get() != scope_epoch {
+        return Err(ScopeAppendError::InvalidInput);
+    }
     let publication = publish_root(store, scope, event, event_history)
         .await
         .map_err(ScopeAppendError::Publication)?;
     let candidate = ScopeHead::new(
         scope.clone(),
-        ScopeAuthority::Unowned,
-        1,
+        authority,
+        scope_epoch,
         publication.event_ref().clone(),
         None,
         event.envelope().operation_id().to_owned(),
@@ -327,7 +396,7 @@ async fn resolve(store: &S3Store, mut transition: ScopeHeadTransition) -> ScopeH
         ScopeHeadParent::Existing(parent) => parent.bytes == current.bytes,
     };
     if parent_is_current {
-        transition.parent = ScopeHeadParent::Existing(Box::new(current));
+        transition.parent = ScopeHeadParent::existing(Box::new(current));
         return ScopeHeadCommitOutcome::RetryIdentically(transition);
     }
     if let ScopeHeadParent::Existing(parent) = &transition.parent
@@ -340,9 +409,7 @@ async fn resolve(store: &S3Store, mut transition: ScopeHeadTransition) -> ScopeH
 }
 
 pub(crate) fn root_head_supported(head: &ScopeHead) -> bool {
-    matches!(head.authority(), ScopeAuthority::Unowned)
-        && head.scope_epoch().get() == 1
-        && head.active_plan_digest().is_none()
+    head.active_plan_digest().is_none()
 }
 
 async fn reconcile(
@@ -500,17 +567,40 @@ mod tests {
         sequence: u64,
         operation: &str,
     ) -> (EventEnvelope, crate::scope::EncodedScopeEvent) {
+        successor_at(scope, parent, sequence, operation, 1)
+    }
+
+    fn successor_at(
+        scope: &ScopeIdentity,
+        parent: &ScopeEventRef,
+        sequence: u64,
+        operation: &str,
+        writer_epoch: u64,
+    ) -> (EventEnvelope, crate::scope::EncodedScopeEvent) {
         let envelope = EventEnvelope::new(
             scope.scope_id().clone(),
             sequence,
             Some(parent.clone()),
-            1,
+            writer_epoch,
             operation.into(),
             TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
         )
         .unwrap();
         let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
         (envelope, encoded)
+    }
+
+    fn owned_parent(genesis: &crate::scope::RootGenesis, owner: &str, epoch: u64) -> ScopeHead {
+        ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::owned(InstanceId::new(owner.into()).unwrap(), 1_700_000_030_000)
+                .unwrap(),
+            epoch,
+            genesis.event_ref().clone(),
+            None,
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -567,7 +657,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
             candidate,
             publication,
         )
@@ -606,7 +696,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
             candidate,
             publication,
         )
@@ -679,7 +769,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+            ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
             candidate,
             publication,
         )
@@ -715,7 +805,7 @@ mod tests {
             .unwrap();
             let candidate_bytes = encode_head(&candidate).unwrap();
             let transition = ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 candidate,
                 publication,
             )
@@ -763,7 +853,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+            ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
             candidate,
             publication,
         )
@@ -812,7 +902,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 bad_tail,
                 publication,
             )
@@ -832,7 +922,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 wrong_operation,
                 publication,
             )
@@ -853,7 +943,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 candidate,
                 publication,
             )
@@ -879,7 +969,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 candidate,
                 publication,
             )
@@ -899,7 +989,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 bad_authority,
                 publication,
             )
@@ -919,7 +1009,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 bad_epoch,
                 publication,
             )
@@ -948,7 +1038,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 epoch_candidate,
                 epoch_publication,
             )
@@ -1000,7 +1090,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 reused_head,
                 reused_publication,
             )
@@ -1020,7 +1110,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(genesis.head()).await)),
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 bad_plan,
                 publication,
             )
@@ -1054,7 +1144,7 @@ mod tests {
         .unwrap();
         assert!(
             ScopeHeadTransition::new(
-                ScopeHeadParent::Existing(Box::new(observed(&owned_parent).await)),
+                ScopeHeadParent::existing(Box::new(observed(&owned_parent).await)),
                 candidate,
                 publication,
             )
@@ -1102,7 +1192,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
             candidate_head,
             publication,
         )
@@ -1168,7 +1258,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
             candidate_head,
             publication,
         )
@@ -1226,7 +1316,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
             candidate_head,
             publication,
         )
@@ -1280,7 +1370,7 @@ mod tests {
         )
         .unwrap();
         let transition = ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
             candidate_head,
             publication,
         )
@@ -1362,5 +1452,247 @@ mod tests {
             ScopeHeadCommitOutcome::Unresolved(_)
         ));
         assert_eq!(client.actual_requests().count(), 4);
+    }
+
+    #[tokio::test]
+    async fn an_owned_successor_carries_the_observed_authority_and_epoch() {
+        let genesis = genesis();
+        let parent = owned_parent(&genesis, "instance-a", 4);
+        let (envelope, encoded) =
+            successor_at(genesis.identity(), genesis.event_ref(), 2, "owned-op", 4);
+        let event_ref = encoded.event_ref().clone();
+        let publication = published(genesis.identity(), &envelope, encoded).await;
+        let candidate = ScopeHead::new(
+            genesis.identity().clone(),
+            parent.authority().clone(),
+            4,
+            event_ref,
+            None,
+            "owned-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate,
+            publication,
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Committed
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_candidate_that_moves_ownership_or_epoch_is_refused() {
+        let genesis = genesis();
+        let successor_owner = InstanceId::new("instance-b".into()).unwrap();
+        let parent = owned_parent(&genesis, "instance-a", 4);
+        let refused = [
+            // A different controller.
+            (
+                ScopeAuthority::owned(successor_owner, 1_700_000_030_000).unwrap(),
+                4,
+                4,
+            ),
+            // An advanced epoch.
+            (parent.authority().clone(), 5, 5),
+            // A stale writer epoch under the observed epoch.
+            (parent.authority().clone(), 4, 3),
+            // A relinquished head.
+            (ScopeAuthority::Unowned, 4, 4),
+        ];
+        for (index, (authority, epoch, writer_epoch)) in refused.into_iter().enumerate() {
+            let operation = format!("refused-op-{index}");
+            let (envelope, encoded) = successor_at(
+                genesis.identity(),
+                genesis.event_ref(),
+                2,
+                &operation,
+                writer_epoch,
+            );
+            let event_ref = encoded.event_ref().clone();
+            let publication = published(genesis.identity(), &envelope, encoded).await;
+            let candidate = ScopeHead::new(
+                genesis.identity().clone(),
+                authority,
+                epoch,
+                event_ref,
+                None,
+                operation,
+            )
+            .unwrap();
+            assert!(
+                ScopeHeadTransition::new(
+                    ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+                    candidate,
+                    publication,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_controller_commit_does_not_replace_a_higher_epoch_head() {
+        let genesis = genesis();
+        let winner = InstanceId::new("instance-b".into()).unwrap();
+        let parent = owned_parent(&genesis, "instance-a", 4);
+        let superseding = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::owned(winner, 1_700_000_060_000).unwrap(),
+            5,
+            genesis.event_ref().clone(),
+            None,
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap();
+        let (envelope, encoded) =
+            successor_at(genesis.identity(), genesis.event_ref(), 2, "stale-op", 4);
+        let event_ref = encoded.event_ref().clone();
+        let publication = published(genesis.identity(), &envelope, encoded).await;
+        let candidate = ScopeHead::new(
+            genesis.identity().clone(),
+            parent.authority().clone(),
+            4,
+            event_ref,
+            None,
+            "stale-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate,
+            publication,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(412, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"superseding\"")],
+                encode_head(&superseding).unwrap(),
+            ),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn append_root_refuses_a_mismatched_writer_epoch_before_publishing() {
+        let genesis = genesis();
+        let root = crate::scope::decode_root_event(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
+        )
+        .unwrap();
+        let parent = owned_parent(&genesis, "instance-a", 4);
+
+        // The genesis event carries writer epoch 1, so an epoch-4 parent refuses it before
+        // publishing any immutable bytes.
+        let (store, client) = replay_store(vec![response(
+            200,
+            &[("etag", "\"parent\"")],
+            encode_head(&parent).unwrap(),
+        )]);
+        let observed_parent = read(&store, genesis.identity()).await.unwrap().unwrap();
+        assert!(matches!(
+            append_root(
+                &store,
+                ScopeHeadParent::existing(Box::new(observed_parent)),
+                genesis.identity(),
+                &root,
+                &mut AttemptHistory::default(),
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert!(
+            client
+                .actual_requests()
+                .all(|request| request.method() == "GET")
+        );
+
+        // Reverting the parent-derived epoch would let this attempt publish immutable bytes
+        // before its refusal, so the dispatch record above is the guard.
+    }
+
+    /// The relaxed head support lets an owned current head enter retained reconciliation, which
+    /// the earlier operation-identity shortcut never reached.
+    #[tokio::test]
+    async fn an_owned_superseding_head_reconciles_the_retained_chain() {
+        let genesis = genesis();
+        let winner = InstanceId::new("instance-b".into()).unwrap();
+        let parent = owned_parent(&genesis, "instance-a", 4);
+        let (envelope, encoded) =
+            successor_at(genesis.identity(), genesis.event_ref(), 2, "stale-op", 4);
+        let event_ref = encoded.event_ref().clone();
+        let publication = published(genesis.identity(), &envelope, encoded).await;
+        let candidate = ScopeHead::new(
+            genesis.identity().clone(),
+            parent.authority().clone(),
+            4,
+            event_ref,
+            None,
+            "stale-op".into(),
+        )
+        .unwrap();
+        let (winning_envelope, winning_encoded) =
+            successor_at(genesis.identity(), genesis.event_ref(), 2, "winning-op", 5);
+        let superseding = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::owned(winner, 1_700_000_060_000).unwrap(),
+            5,
+            winning_encoded.event_ref().clone(),
+            None,
+            "winning-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate,
+            publication,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(412, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"superseding\"")],
+                encode_head(&superseding).unwrap(),
+            ),
+            response(
+                200,
+                &[("etag", "\"winning-event\"")],
+                winning_encoded.stored_bytes().to_vec(),
+            ),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::ProvenNotCommitted
+        ));
+        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(winning_envelope.writer_epoch().get(), 5);
     }
 }

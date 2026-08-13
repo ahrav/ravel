@@ -6,6 +6,10 @@
 //! chain. No protocol path deletes objects. S3 ETags are opaque compare-and-swap
 //! tokens.
 
+pub mod db {
+    pub mod projections;
+}
+
 pub mod domain {
     pub mod artifact;
     pub mod validation;

@@ -1,5 +1,9 @@
 use std::{error::Error, fmt};
 
+pub mod event;
+pub mod head;
+pub mod replay;
+
 /// Fail-closed category produced by a durable wire codec.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WireError {

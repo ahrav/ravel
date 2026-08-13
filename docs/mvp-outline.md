@@ -1189,6 +1189,10 @@ application id so unrelated files are rejected, and contains no uniquely durable
 authority. Because the file is disposable it has no schema-version field and no
 migration path: a projection that fails validation is rebuilt from durable history.
 
+The schema persists the root-only epoch-1, unowned, plan-stable phase; the first epoch or
+plan transition must deliberately relax it. Any async owner for the projection file must
+use a bounded intake queue from its first release.
+
 Each projected scope records:
 
 ```text
@@ -1200,8 +1204,10 @@ verified sequence
 verified tail_event_digest
 active plan_digest
 scope_epoch
-readiness state
 ```
+
+Readiness is derived for each replay attempt by comparing that scope row's cursor with
+the exact `ScopeHead` observation carried by the attempt; it is never stored in SQLite.
 
 The sync engine:
 
@@ -1215,8 +1221,11 @@ The sync engine:
    `ScopeHead`.
 
 A gap, wrong-scope event, unregistered payload type, digest conflict, or conversion
-failure leaves the affected scope projection and cursor unchanged and fails that scope's
-readiness closed. It does not invalidate an independent scope.
+failure detected before the first projection write leaves the affected scope projection
+and cursor unchanged and fails that scope's readiness closed. A database failure while
+applying an already-validated suffix may retain a transactionally valid committed prefix;
+that scope remains not ready until replay completes. Neither failure invalidates an
+independent scope.
 
 Scoped projections support:
 
@@ -3225,10 +3234,13 @@ ravel/
 ```
 
 The durable root wire contract lives in `scope.rs` with shared wire errors in
-`sync.rs`, supported by `domain/validation.rs`, `domain/artifact.rs`,
-`domain/work.rs`, `distributed/identity.rs`, `storage/s3.rs`, and
-`storage/artifacts.rs`. Only these ship today; the remaining entries, including the
-`sync/`, `db/`, and controller modules, are the planned layout for later epics.
+`sync.rs`; the root log, head transitions, and replay live in `sync/event.rs`,
+`sync/head.rs`, and `sync/replay.rs`, with the disposable projection in
+`db/projections.rs`. They are supported by `domain/validation.rs`,
+`domain/artifact.rs`, `domain/work.rs`, `distributed/identity.rs`,
+`storage/s3.rs`, and `storage/artifacts.rs`. Only these ship today; the remaining
+entries, including `db/worker.rs` and the controller modules, are the planned
+layout for later epics.
 
 Scoped controller authority is planned for `distributed/scope_controller.rs`.
 

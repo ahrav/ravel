@@ -9,26 +9,26 @@
 use std::{io::Cursor, num::NonZeroU64};
 
 use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     distributed::identity::{InstanceId, WorkspaceId},
     domain::{
-        validation::{
-            ValidationError, is_digest, validate_identity, validate_key_segment, validate_sequence,
-        },
+        validation::{ValidationError, is_digest, validate_key_segment, validate_sequence},
         work::WorkRef,
     },
     sync::WireError,
 };
 
-const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
+pub(crate) const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
+#[cfg(test)]
+pub(crate) const TEST_SUCCESSOR_PAYLOAD_TYPE: &str = "test_successor";
 const ROOT_SCOPE_DOMAIN: &[u8] = b"ravel.scope.root\0";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
-const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
-const MAX_HEAD_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_HEAD_BYTES: usize = 4 * 1024;
 const CBOR_RECURSION_LIMIT: usize = 16;
 const ZSTD_LEVEL: i32 = 3;
 
@@ -255,8 +255,8 @@ impl EventEnvelope {
             (_, Some(_)) => return Err(ValidationError::InvalidParent),
         }
         let writer_epoch = NonZeroU64::new(writer_epoch).ok_or(ValidationError::InvalidFence)?;
-        validate_identity(&operation_id)?;
-        validate_identity(&payload_type)?;
+        validate_key_segment(&operation_id)?;
+        validate_key_segment(&payload_type)?;
         Ok(Self {
             scope_id,
             sequence,
@@ -382,7 +382,7 @@ impl ScopeHead {
         operation_id: String,
     ) -> Result<Self, ValidationError> {
         let scope_epoch = NonZeroU64::new(scope_epoch).ok_or(ValidationError::InvalidFence)?;
-        validate_identity(&operation_id)?;
+        validate_key_segment(&operation_id)?;
         Ok(Self {
             scope,
             authority,
@@ -661,9 +661,9 @@ pub fn root_genesis(config: &AdmittedCampaignConfig) -> Result<RootGenesis, Wire
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WireRootEvent {
+struct WireScopeEvent<P> {
     envelope: WireEventEnvelope,
-    payload: WireRootGenesisPayload,
+    payload: P,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -693,13 +693,43 @@ struct WireRootGenesisPayload {
     config_digest: String,
 }
 
-/// Encodes one validated root-genesis event as exact CBOR and zstd level-3 bytes.
+/// Canonically decoded scoped event before payload-specific domain conversion.
+///
+/// `P` must serialize back to the exact payload bytes it decoded from. Opaque
+/// [`ciborium::Value`] traversal preserves map order and tags; typed conversion remains
+/// the final gate before projection.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DecodedScopeEvent<P> {
+    envelope: EventEnvelope,
+    reference: ScopeEventRef,
+    payload: P,
+}
+
+impl<P> DecodedScopeEvent<P> {
+    pub(crate) fn envelope(&self) -> &EventEnvelope {
+        &self.envelope
+    }
+
+    pub(crate) fn event_ref(&self) -> &ScopeEventRef {
+        &self.reference
+    }
+}
+
+/// Encodes a validated envelope and serializable payload using the canonical framing.
 ///
 /// # Errors
 ///
-/// Returns [`WireError`] for serialization, compression, or size-limit failures.
-pub fn encode_root_event(event: &RootEvent) -> Result<EncodedScopeEvent, WireError> {
-    let cbor = encode_event_cbor(&WireRootEvent::from(event))?;
+/// Returns [`WireError`] when serialization or compression fails or either size limit
+/// would be exceeded.
+pub(crate) fn encode_scope_event<P: Serialize>(
+    envelope: &EventEnvelope,
+    payload: &P,
+) -> Result<EncodedScopeEvent, WireError> {
+    let wire = WireScopeEvent {
+        envelope: WireEventEnvelope::from(envelope),
+        payload,
+    };
+    let cbor = encode_event_cbor(&wire)?;
     if cbor.len() > MAX_DECOMPRESSED_BYTES {
         return Err(WireError::LimitExceeded);
     }
@@ -708,7 +738,7 @@ pub fn encode_root_event(event: &RootEvent) -> Result<EncodedScopeEvent, WireErr
         return Err(WireError::LimitExceeded);
     }
     let reference = ScopeEventRef::new(
-        event.envelope().sequence(),
+        envelope.sequence(),
         Digest::new(sha256(&stored_bytes)).map_err(|_| WireError::InvalidValue)?,
     )
     .map_err(|_| WireError::InvalidValue)?;
@@ -718,18 +748,42 @@ pub fn encode_root_event(event: &RootEvent) -> Result<EncodedScopeEvent, WireErr
     })
 }
 
-/// Decodes only the exact root-genesis event for `expected_scope` at `expected_key`.
+/// Decodes the canonical framing and validates scope, reference, and envelope.
+///
+/// `P` must deserialize and serialize to byte-identical payload CBOR.
 ///
 /// # Errors
 ///
-/// Returns [`WireError`] for framing and size failures, malformed or noncanonical bytes,
-/// an unregistered payload type, non-root or invalid identities, wrong-scope bytes, or a
-/// key mismatch. The payload type is rejected before canonicality checks.
-pub fn decode_root_event(
+/// Returns [`WireError`] for invalid framing, a payload type other than `expected_payload`,
+/// noncanonical bytes, identities, scope binding, digest, or key.
+pub(crate) fn decode_scope_event<P>(
     stored_bytes: &[u8],
     expected_key: &str,
     expected_scope: &ScopeIdentity,
-) -> Result<RootEvent, WireError> {
+    expected_payload: Option<&str>,
+) -> Result<DecodedScopeEvent<P>, WireError>
+where
+    P: Serialize + DeserializeOwned,
+{
+    decode_scope_event_inner(
+        stored_bytes,
+        expected_key,
+        expected_scope,
+        expected_payload,
+        true,
+    )
+}
+
+fn decode_scope_event_inner<P>(
+    stored_bytes: &[u8],
+    expected_key: &str,
+    expected_scope: &ScopeIdentity,
+    expected_payload: Option<&str>,
+    validate_key: bool,
+) -> Result<DecodedScopeEvent<P>, WireError>
+where
+    P: Serialize + DeserializeOwned,
+{
     if stored_bytes.is_empty() || stored_bytes.len() > MAX_COMPRESSED_BYTES {
         return Err(WireError::LimitExceeded);
     }
@@ -746,9 +800,10 @@ pub fn decode_root_event(
     let cbor = zstd::bulk::decompress(stored_bytes, MAX_DECOMPRESSED_BYTES)
         .map_err(|_| WireError::InvalidEncoding)?;
     let mut reader = Cursor::new(cbor.as_slice());
-    let wire: WireRootEvent = from_reader_with_recursion_limit(&mut reader, CBOR_RECURSION_LIMIT)
-        .map_err(|_| WireError::InvalidEncoding)?;
-    if wire.envelope.payload_type != ROOT_GENESIS_PAYLOAD_TYPE {
+    let wire: WireScopeEvent<P> =
+        from_reader_with_recursion_limit(&mut reader, CBOR_RECURSION_LIMIT)
+            .map_err(|_| WireError::InvalidEncoding)?;
+    if expected_payload.is_some_and(|payload_type| wire.envelope.payload_type != payload_type) {
         return Err(WireError::InvalidValue);
     }
     if reader.position() != cbor.len() as u64 {
@@ -759,44 +814,146 @@ pub fn decode_root_event(
         return Err(WireError::NonCanonical);
     }
 
-    let event = root_event_from_wire(wire, expected_scope)?;
+    let parent_event = wire
+        .envelope
+        .parent_event
+        .map(|parent| {
+            let digest = Digest::new(parent.digest).map_err(|_| WireError::InvalidValue)?;
+            ScopeEventRef::new(parent.sequence, digest).map_err(|_| WireError::InvalidValue)
+        })
+        .transpose()?;
+    let scope_id = ScopeId::new(wire.envelope.scope_id).map_err(|_| WireError::InvalidValue)?;
+    if &scope_id != expected_scope.scope_id() {
+        return Err(WireError::InvalidValue);
+    }
+    let envelope = EventEnvelope::new(
+        scope_id,
+        wire.envelope.sequence,
+        parent_event,
+        wire.envelope.writer_epoch,
+        wire.envelope.operation_id,
+        wire.envelope.payload_type,
+    )
+    .map_err(|_| WireError::InvalidValue)?;
     let reference = ScopeEventRef::new(
-        event.envelope().sequence(),
+        envelope.sequence(),
         Digest::new(sha256(stored_bytes)).map_err(|_| WireError::InvalidValue)?,
     )
     .map_err(|_| WireError::InvalidValue)?;
+    if validate_key && scope_event_key(expected_scope, &reference) != expected_key {
+        return Err(WireError::ReferenceMismatch);
+    }
+    Ok(DecodedScopeEvent {
+        envelope,
+        reference,
+        payload: wire.payload,
+    })
+}
+
+/// Encodes one validated root-genesis event as exact CBOR and zstd level-3 bytes.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for serialization, compression, or size-limit failures.
+pub fn encode_root_event(event: &RootEvent) -> Result<EncodedScopeEvent, WireError> {
+    encode_scope_event(
+        event.envelope(),
+        &WireRootGenesisPayload {
+            campaign_id: event.payload().campaign_id().as_str().to_owned(),
+            parent_scope_id: None,
+            delegation_digest: None,
+            config_digest: event.payload().config_digest().as_str().to_owned(),
+        },
+    )
+}
+
+/// Decodes only the exact root-genesis event for `expected_scope` at `expected_key`.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for framing and size failures, malformed or noncanonical bytes,
+/// a payload type other than root-genesis, non-root or invalid identities, wrong-scope bytes,
+/// or a key mismatch. The decoder rejects the payload type before canonicality checks.
+pub fn decode_root_event(
+    stored_bytes: &[u8],
+    expected_key: &str,
+    expected_scope: &ScopeIdentity,
+) -> Result<RootEvent, WireError> {
+    // Root domain validation precedes key comparison so malformed root payloads cannot be reported as reference mismatches.
+    let decoded = decode_scope_event_inner::<ciborium::Value>(
+        stored_bytes,
+        expected_key,
+        expected_scope,
+        Some(ROOT_GENESIS_PAYLOAD_TYPE),
+        false,
+    )?;
+    let reference = decoded.reference.clone();
+    let event = root_event_from_decoded(decoded, expected_scope)?;
     if scope_event_key(expected_scope, &reference) != expected_key {
         return Err(WireError::ReferenceMismatch);
     }
     Ok(event)
 }
 
-impl From<&RootEvent> for WireRootEvent {
-    fn from(event: &RootEvent) -> Self {
+pub(crate) fn payload_type_registered(payload_type: &str) -> bool {
+    if payload_type == ROOT_GENESIS_PAYLOAD_TYPE {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        payload_type == TEST_SUCCESSOR_PAYLOAD_TYPE
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+pub(crate) fn root_event_from_decoded(
+    decoded: DecodedScopeEvent<ciborium::Value>,
+    expected_scope: &ScopeIdentity,
+) -> Result<RootEvent, WireError> {
+    if decoded.envelope.payload_type() != ROOT_GENESIS_PAYLOAD_TYPE {
+        return Err(WireError::InvalidValue);
+    }
+    let mut original = Vec::new();
+    into_writer(&decoded.payload, &mut original).map_err(|_| WireError::InvalidEncoding)?;
+    let payload: WireRootGenesisPayload = decoded
+        .payload
+        .deserialized()
+        .map_err(|_| WireError::InvalidEncoding)?;
+    let mut canonical = Vec::new();
+    into_writer(&payload, &mut canonical).map_err(|_| WireError::InvalidEncoding)?;
+    if original != canonical {
+        return Err(WireError::NonCanonical);
+    }
+    root_event_from_wire(
+        WireScopeEvent {
+            envelope: WireEventEnvelope::from(&decoded.envelope),
+            payload,
+        },
+        expected_scope,
+    )
+}
+
+impl From<&EventEnvelope> for WireEventEnvelope {
+    fn from(envelope: &EventEnvelope) -> Self {
         Self {
-            envelope: WireEventEnvelope {
-                scope_id: event.envelope().scope_id().as_str().to_owned(),
-                sequence: event.envelope().sequence(),
-                parent_event: event.envelope().parent_event().map(|parent| WireEventRef {
-                    sequence: parent.sequence(),
-                    digest: parent.digest().as_str().to_owned(),
-                }),
-                writer_epoch: event.envelope().writer_epoch().get(),
-                operation_id: event.envelope().operation_id().to_owned(),
-                payload_type: event.envelope().payload_type().to_owned(),
-            },
-            payload: WireRootGenesisPayload {
-                campaign_id: event.payload().campaign_id().as_str().to_owned(),
-                parent_scope_id: None,
-                delegation_digest: None,
-                config_digest: event.payload().config_digest().as_str().to_owned(),
-            },
+            scope_id: envelope.scope_id().as_str().to_owned(),
+            sequence: envelope.sequence(),
+            parent_event: envelope.parent_event().map(|parent| WireEventRef {
+                sequence: parent.sequence(),
+                digest: parent.digest().as_str().to_owned(),
+            }),
+            writer_epoch: envelope.writer_epoch().get(),
+            operation_id: envelope.operation_id().to_owned(),
+            payload_type: envelope.payload_type().to_owned(),
         }
     }
 }
 
 fn root_event_from_wire(
-    wire: WireRootEvent,
+    wire: WireScopeEvent<WireRootGenesisPayload>,
     expected_scope: &ScopeIdentity,
 ) -> Result<RootEvent, WireError> {
     if wire.envelope.sequence != 1
@@ -945,7 +1102,7 @@ pub fn decode_head(
     .map_err(|_| WireError::InvalidValue)
 }
 
-fn encode_event_cbor(wire: &WireRootEvent) -> Result<Vec<u8>, WireError> {
+fn encode_event_cbor<P: Serialize>(wire: &WireScopeEvent<P>) -> Result<Vec<u8>, WireError> {
     let mut cbor = Vec::new();
     into_writer(wire, &mut cbor).map_err(|_| WireError::InvalidEncoding)?;
     Ok(cbor)
@@ -957,4 +1114,78 @@ fn compress(cbor: &[u8]) -> Result<Vec<u8>, WireError> {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use ciborium::Value;
+
+    use crate::distributed::identity::WorkspaceId;
+
+    use super::*;
+
+    fn fixture() -> RootGenesis {
+        root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-a".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn map(value: &mut Value) -> &mut Vec<(Value, Value)> {
+        match value {
+            Value::Map(entries) => entries,
+            _ => panic!("expected map"),
+        }
+    }
+
+    fn reordered(genesis: &RootGenesis, field: &str) -> Vec<u8> {
+        let cbor = zstd::bulk::decompress(genesis.event_bytes(), MAX_DECOMPRESSED_BYTES).unwrap();
+        let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+        let root = map(&mut value);
+        let nested = root
+            .iter_mut()
+            .find_map(|(key, value)| (key == &Value::Text(field.into())).then_some(value))
+            .unwrap();
+        map(nested).swap(0, 1);
+        let mut changed = Vec::new();
+        into_writer(&value, &mut changed).unwrap();
+        compress(&changed).unwrap()
+    }
+
+    #[test]
+    fn typed_root_decoder_rejects_permuted_envelope_and_payload_keys() {
+        let genesis = fixture();
+        for bytes in [
+            reordered(&genesis, "envelope"),
+            reordered(&genesis, "payload"),
+        ] {
+            assert_eq!(
+                decode_root_event(&bytes, genesis.event_key(), genesis.identity()),
+                Err(WireError::NonCanonical)
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_codec_round_trips_fixture_bytes_exactly() {
+        let genesis = fixture();
+        let decoded = decode_scope_event::<Value>(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            encode_scope_event(decoded.envelope(), &decoded.payload)
+                .unwrap()
+                .stored_bytes(),
+            genesis.event_bytes()
+        );
+    }
 }

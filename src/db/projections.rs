@@ -28,8 +28,8 @@ const SCOPE_HEAD_MATCH_SQL: &str = "SELECT scope.campaign_id, scope.sequence, \
      WHERE scope.scope_id = ?1";
 const EVENT_AT_SEQUENCE_SQL: &str =
     "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
-const OPERATION_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
-     WHERE scope_id = ?1 AND operation_id = ?2)";
+const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
+     WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
 const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
 const SCOPE_UPDATE_SQL: &str =
@@ -256,15 +256,23 @@ pub(crate) fn scope_cursor(
     }
 }
 
-pub(crate) fn scope_contains_operation(
+pub(crate) fn scope_conflicting_operation(
     connection: &rusqlite::Connection,
     scope: &ScopeIdentity,
     operation_id: &str,
+    reference: &ScopeEventRef,
 ) -> Result<bool, ApplyError> {
+    let sequence =
+        i64::try_from(reference.sequence()).map_err(|_| ApplyError::DatabaseOperationFailed)?;
     connection
         .query_row(
-            OPERATION_EXISTS_SQL,
-            params![scope.scope_id().as_str(), operation_id],
+            OPERATION_CONFLICT_SQL,
+            params![
+                scope.scope_id().as_str(),
+                operation_id,
+                sequence,
+                reference.digest().as_str()
+            ],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -897,7 +905,11 @@ mod tests {
             query_plan(&connection, SCOPE_SELECT_SQL, &[&scope_id]),
             query_plan(&connection, SCOPE_HEAD_MATCH_SQL, &[&scope_id]),
             query_plan(&connection, EVENT_AT_SEQUENCE_SQL, &[&scope_id, &sequence]),
-            query_plan(&connection, OPERATION_EXISTS_SQL, &[&scope_id, &operation]),
+            query_plan(
+                &connection,
+                OPERATION_CONFLICT_SQL,
+                &[&scope_id, &operation, &sequence, &digest],
+            ),
             query_plan(
                 &connection,
                 DUPLICATE_EXISTS_SQL,

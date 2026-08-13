@@ -21,7 +21,7 @@ use crate::{
     db::projections::{
         self, ApplyError, ApplyOutcome, SchemaError, ScopeProjectionEvent, ValidateError,
     },
-    scope::{Digest, ScopeHead, ScopeIdentity},
+    scope::{Digest, ScopeEventRef, ScopeHead, ScopeIdentity},
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
@@ -39,9 +39,10 @@ enum Command {
         scope: Box<ScopeIdentity>,
         respond: oneshot::Sender<Result<(u64, Option<Digest>), ApplyError>>,
     },
-    ContainsOperation {
+    ConflictingOperation {
         scope: Box<ScopeIdentity>,
         operation_id: String,
+        reference: ScopeEventRef,
         respond: oneshot::Sender<Result<bool, ApplyError>>,
     },
     MatchesHead {
@@ -217,22 +218,25 @@ impl DbHandle {
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Reports whether one scope already recorded `operation_id`.
+    /// Reports whether one scope recorded `operation_id` for an event other than `reference`.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
-    pub(crate) async fn scope_contains_operation(
+    pub(crate) async fn scope_conflicting_operation(
         &self,
         scope: &ScopeIdentity,
         operation_id: &str,
+        reference: &ScopeEventRef,
     ) -> Result<bool, ApplyError> {
         let scope = Box::new(scope.clone());
         let operation_id = operation_id.to_owned();
-        self.enqueue(|respond| Command::ContainsOperation {
+        let reference = reference.clone();
+        self.enqueue(|respond| Command::ConflictingOperation {
             scope,
             operation_id,
+            reference,
             respond,
         })?
         .await
@@ -295,15 +299,17 @@ fn run(
             Command::Cursor { scope, respond } => {
                 let _ = respond.send(projections::scope_cursor(&connection, &scope));
             }
-            Command::ContainsOperation {
+            Command::ConflictingOperation {
                 scope,
                 operation_id,
+                reference,
                 respond,
             } => {
-                let _ = respond.send(projections::scope_contains_operation(
+                let _ = respond.send(projections::scope_conflicting_operation(
                     &connection,
                     &scope,
                     &operation_id,
+                    &reference,
                 ));
             }
             Command::MatchesHead { head, respond } => {
@@ -417,7 +423,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .scope_contains_operation(genesis.identity(), "operation")
+                .scope_conflicting_operation(genesis.identity(), "operation", genesis.event_ref())
                 .await,
             Err(ApplyError::Full)
         );
@@ -448,7 +454,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .scope_contains_operation(genesis.identity(), "operation")
+                .scope_conflicting_operation(genesis.identity(), "operation", genesis.event_ref())
                 .await,
             Err(ApplyError::Stopping)
         );
@@ -590,8 +596,23 @@ mod tests {
             (1, Some(genesis.event_ref().digest().clone()))
         );
         assert!(
+            !handle
+                .scope_conflicting_operation(
+                    genesis.identity(),
+                    genesis.head().operation_id(),
+                    genesis.event_ref()
+                )
+                .await
+                .unwrap()
+        );
+        let reused = ScopeEventRef::new(2, genesis.event_ref().digest().clone()).unwrap();
+        assert!(
             handle
-                .scope_contains_operation(genesis.identity(), genesis.head().operation_id())
+                .scope_conflicting_operation(
+                    genesis.identity(),
+                    genesis.head().operation_id(),
+                    &reused
+                )
                 .await
                 .unwrap()
         );

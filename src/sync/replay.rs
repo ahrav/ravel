@@ -211,7 +211,11 @@ pub(crate) async fn apply_suffix(
 ) -> Result<((u64, Digest), ObservedScopeHead), ScopeReplayError> {
     for event in &prepared.events {
         if handle
-            .scope_contains_operation(scope, event.decoded.envelope().operation_id())
+            .scope_conflicting_operation(
+                scope,
+                event.decoded.envelope().operation_id(),
+                event.decoded.event_ref(),
+            )
             .await
             .map_err(ScopeReplayError::Apply)?
         {
@@ -491,6 +495,46 @@ mod tests {
         assert_eq!(client.actual_requests().count(), 1);
         assert_eq!(row_counts(&path), before);
         drop(handle);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Two `refresh` calls sharing cloned handles can both read one stale cursor and prepare
+    /// the same suffix. The second must still report ready once the first commits it.
+    #[tokio::test]
+    async fn a_suffix_another_caller_already_committed_replays_ready() {
+        let genesis = genesis();
+        let path = path("concurrent-suffix");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let other = handle.clone();
+        let cursor = handle.scope_cursor(genesis.identity()).await.unwrap();
+        assert_eq!(cursor, (0, None));
+
+        let mut prepared = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (store, _) = replay_store(vec![
+                head_response(genesis.head_bytes().to_vec()),
+                event_response(genesis.event_bytes().to_vec()),
+            ]);
+            prepared.push(
+                prepare_suffix(&store, genesis.identity(), cursor.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let second = prepared.pop().unwrap();
+        let first = prepared.pop().unwrap();
+
+        let (first_cursor, _) = apply_suffix(&handle, genesis.identity(), first)
+            .await
+            .unwrap();
+        let rows = row_counts(&path);
+        let (second_cursor, _) = apply_suffix(&other, genesis.identity(), second)
+            .await
+            .expect("a suffix the first caller committed is not a history conflict");
+
+        assert_eq!(second_cursor, first_cursor);
+        assert_eq!(row_counts(&path), rows);
+        drop((handle, other));
         fs::remove_file(path).unwrap();
     }
 

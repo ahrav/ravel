@@ -13,6 +13,7 @@ pub(crate) mod controller {
 pub mod db {
     pub mod projections;
     pub mod schema;
+    pub mod scope_projections;
     pub mod worker;
 }
 

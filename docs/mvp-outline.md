@@ -1383,8 +1383,11 @@ S3 is not queried for ordinary task-graph reads.
 
 ## 11.2 Scoped-v2 projections
 
-Scoped v2 adds scope-indexed tables and cursors beside the frozen-v1 projection.
-SQLite remains disposable and contains no uniquely durable authority.
+Scoped v2 uses a separate disposable SQLite file identified by application ID `RVL2`;
+the frozen-v1 `RVL1` file and schema remain unchanged. RVL2 schema version 1 persists
+the root-only epoch-1, unowned, plan-stable phase; the first epoch or plan transition
+must bump or deliberately relax that format. Any future async owner for the scoped file
+must use a bounded intake queue from its first release.
 
 Each projected scope records:
 
@@ -1397,8 +1400,10 @@ verified sequence
 verified tail_event_digest
 active plan_digest
 scope_epoch
-readiness state
 ```
+
+Readiness is derived for each replay attempt by comparing that scope row's cursor with
+the exact `ScopeHead` observation carried by the attempt; it is never stored in SQLite.
 
 The sync engine:
 
@@ -1412,8 +1417,11 @@ The sync engine:
    `ScopeHead`.
 
 A gap, mixed-version parent, wrong-scope event, unknown version, digest conflict, or
-conversion failure leaves the affected scope projection and cursor unchanged and fails
-that scope's readiness closed. It does not invalidate an independent scope.
+conversion failure detected before the first projection write leaves the affected
+scope projection and cursor unchanged and fails that scope's readiness closed. A database
+failure while applying an already-validated suffix may retain a transactionally valid
+committed prefix; that scope remains not ready until replay completes. Neither failure
+invalidates an independent scope.
 
 Scoped projections support:
 

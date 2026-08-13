@@ -9,7 +9,9 @@ use rusqlite::{OpenFlags, OptionalExtension, params};
 
 use crate::{
     domain::validation::ValidationError,
-    scope::{Digest, EventEnvelope, ScopeEventRef, ScopeHead, ScopeIdentity},
+    scope::{
+        Digest, EventEnvelope, ScopeEventRef, ScopeHead, ScopeIdentity, payload_type_registered,
+    },
 };
 
 // "RAVL": rejects an unrelated SQLite file without naming a protocol era.
@@ -18,6 +20,12 @@ const TABLES: [&str; 2] = ["applied_scope_events", "scopes"];
 
 const SCOPE_SELECT_SQL: &str = "SELECT campaign_id, sequence, tail_event_digest, \
      active_plan_digest, scope_epoch FROM scopes WHERE scope_id = ?1";
+const SCOPE_HEAD_MATCH_SQL: &str = "SELECT scope.campaign_id, scope.sequence, \
+     scope.tail_event_digest, scope.active_plan_digest, scope.scope_epoch, event.operation_id \
+     FROM scopes AS scope \
+     JOIN applied_scope_events AS event \
+       ON event.scope_id = scope.scope_id AND event.sequence = scope.sequence \
+     WHERE scope.scope_id = ?1";
 const EVENT_AT_SEQUENCE_SQL: &str =
     "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
 const OPERATION_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
@@ -39,8 +47,7 @@ CREATE TABLE scopes (
     scope_epoch INTEGER NOT NULL,
     CHECK (length(scope_id) = 64 AND length(CAST(scope_id AS BLOB)) = 64
         AND scope_id NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(campaign_id) BETWEEN 1 AND 128
-        AND length(CAST(campaign_id AS BLOB)) = length(campaign_id)
+    CHECK (length(CAST(campaign_id AS BLOB)) BETWEEN 1 AND 128
         AND campaign_id NOT LIKE '%/%'),
     CHECK (parent_scope_id IS NULL),
     CHECK (delegation_digest IS NULL),
@@ -48,11 +55,8 @@ CREATE TABLE scopes (
     CHECK (length(tail_event_digest) = 64
         AND length(CAST(tail_event_digest AS BLOB)) = 64
         AND tail_event_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (active_plan_digest IS NULL OR (
-        length(active_plan_digest) = 64
-        AND length(CAST(active_plan_digest AS BLOB)) = 64
-        AND active_plan_digest NOT GLOB '*[^0-9a-f]*')),
-    CHECK (scope_epoch > 0)
+    CHECK (active_plan_digest IS NULL),
+    CHECK (scope_epoch = 1)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE applied_scope_events (
@@ -79,7 +83,9 @@ CREATE TABLE applied_scope_events (
         AND operation_id NOT LIKE '%/%'),
     CHECK (writer_epoch > 0),
     CHECK (length(CAST(payload_type AS BLOB)) BETWEEN 1 AND 128
-        AND payload_type NOT LIKE '%/%')
+        AND payload_type NOT LIKE '%/%'),
+    CHECK ((sequence = 1 AND payload_type = 'root_genesis')
+        OR (sequence > 1 AND payload_type <> 'root_genesis'))
 ) STRICT, WITHOUT ROWID;
 ";
 
@@ -260,9 +266,9 @@ pub(crate) fn scope_matches_head(
     connection: &rusqlite::Connection,
     head: &ScopeHead,
 ) -> Result<bool, ApplyError> {
-    let stored: Option<(String, i64, String, Option<String>, i64)> = connection
+    let stored: Option<(String, i64, String, Option<String>, i64, String)> = connection
         .query_row(
-            SCOPE_SELECT_SQL,
+            SCOPE_HEAD_MATCH_SQL,
             [head.scope().scope_id().as_str()],
             |row| {
                 Ok((
@@ -271,17 +277,19 @@ pub(crate) fn scope_matches_head(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
     Ok(
-        stored.is_some_and(|(campaign, sequence, tail, plan, epoch)| {
+        stored.is_some_and(|(campaign, sequence, tail, plan, epoch, operation)| {
             campaign == head.scope().campaign_id().as_str()
                 && u64::try_from(sequence).ok() == Some(head.tail().sequence())
                 && tail == head.tail().digest().as_str()
                 && plan.as_deref() == head.active_plan_digest().map(Digest::as_str)
                 && u64::try_from(epoch).ok() == Some(head.scope_epoch().get())
+                && operation == head.operation_id()
         }),
     )
 }
@@ -441,13 +449,13 @@ fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
 fn validate(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
     let application_id: i32 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
-        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
-    if application_id != APPLICATION_ID {
+        .map_err(local_format_error)?;
+    if application_id != APPLICATION_ID && !is_blank(connection)? {
         return Err(ValidateError::WrongApplicationId);
     }
     let integrity: String = connection
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        .map_err(local_format_error)?;
     if integrity != "ok" {
         return Err(ValidateError::IntegrityCheckFailed);
     }
@@ -467,6 +475,34 @@ fn validate(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
     }
     validate_schema(connection)?;
     validate_history(connection)
+}
+
+fn local_format_error(error: rusqlite::Error) -> ValidateError {
+    match error.sqlite_error_code() {
+        Some(
+            rusqlite::ErrorCode::SystemIoFailure
+            | rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::CannotOpen
+            | rusqlite::ErrorCode::PermissionDenied
+            | rusqlite::ErrorCode::ReadOnly
+            | rusqlite::ErrorCode::DiskFull
+            | rusqlite::ErrorCode::OutOfMemory
+            | rusqlite::ErrorCode::OperationInterrupted
+            | rusqlite::ErrorCode::FileLockingProtocolFailed,
+        ) => ValidateError::DatabaseOperationFailed,
+        _ => ValidateError::IntegrityCheckFailed,
+    }
+}
+
+fn is_blank(connection: &rusqlite::Connection) -> Result<bool, ValidateError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) = 0 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(local_format_error)
 }
 
 fn validate_schema(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
@@ -531,7 +567,19 @@ fn validate_history(connection: &rusqlite::Connection) -> Result<(), ValidateErr
             |row| row.get(0),
         )
         .map_err(|_| ValidateError::DatabaseOperationFailed)?;
-    if orphans != 0 || broken_parents != 0 || broken_cursors != 0 {
+    let unregistered = {
+        let mut statement = connection
+            .prepare("SELECT DISTINCT payload_type FROM applied_scope_events")
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        let mut rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        rows.retain(|payload_type| !payload_type_registered(payload_type));
+        !rows.is_empty()
+    };
+    if orphans != 0 || broken_parents != 0 || broken_cursors != 0 || unregistered {
         return Err(ValidateError::InvalidHistory);
     }
     Ok(())
@@ -613,9 +661,9 @@ mod tests {
             1,
             operation_id.into(),
             if sequence == 1 {
-                "root_genesis"
+                crate::scope::ROOT_GENESIS_PAYLOAD_TYPE
             } else {
-                "successor"
+                crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE
             }
             .into(),
         )
@@ -690,6 +738,24 @@ mod tests {
             ValidateError::WrongApplicationId
         );
         fs::remove_file(unrelated).unwrap();
+
+        let blank = path("blank");
+        let empty = rusqlite::Connection::open(&blank).unwrap();
+        empty.pragma_update(None, "application_id", 0x1234).unwrap();
+        drop(empty);
+        assert_eq!(
+            open_existing(&blank).unwrap_err(),
+            ValidateError::InvalidSchema
+        );
+        fs::remove_file(blank).unwrap();
+
+        let garbage = path("garbage");
+        fs::write(&garbage, b"not-a-database".repeat(512)).unwrap();
+        assert_eq!(
+            open_existing(&garbage).unwrap_err(),
+            ValidateError::IntegrityCheckFailed
+        );
+        fs::remove_file(garbage).unwrap();
     }
 
     fn query_plan(
@@ -720,6 +786,7 @@ mod tests {
         let operation = "operation-1";
         let plans = [
             query_plan(&connection, SCOPE_SELECT_SQL, &[&scope_id]),
+            query_plan(&connection, SCOPE_HEAD_MATCH_SQL, &[&scope_id]),
             query_plan(&connection, EVENT_AT_SEQUENCE_SQL, &[&scope_id, &sequence]),
             query_plan(&connection, OPERATION_EXISTS_SQL, &[&scope_id, &operation]),
             query_plan(
@@ -752,6 +819,7 @@ mod tests {
     fn applies_idempotently_and_rejects_gaps_without_mutation() {
         let path = path("apply");
         let mut connection = create(&path).unwrap();
+        let multibyte = scope("workspace-a", "campagne-café");
         let scope = scope("workspace-a", "campaign-a");
         let genesis = mutation(&scope, 1, DIGEST_1, None);
         assert_eq!(
@@ -791,6 +859,28 @@ mod tests {
             )
             .unwrap()
         );
+        assert!(
+            !scope_matches_head(
+                &connection,
+                &ScopeHead::new(
+                    scope.clone(),
+                    crate::scope::ScopeAuthority::Unowned,
+                    1,
+                    successor.reference.clone(),
+                    None,
+                    "other-operation".into(),
+                )
+                .unwrap()
+            )
+            .unwrap()
+        );
+
+        // A campaign id is bounded by bytes, so a multibyte identity projects.
+        assert_eq!(
+            apply_scope_event(&mut connection, &mutation(&multibyte, 1, DIGEST_3, None)),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(scope_cursor(&connection, &multibyte).unwrap().0, 1);
         fs::remove_file(path).unwrap();
     }
 
@@ -855,6 +945,35 @@ mod tests {
             )
             .unwrap();
         drop(connection);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_an_unregistered_projected_payload() {
+        let path = path("unregistered-payload");
+        let mut connection = create(&path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        apply_scope_event(&mut connection, &mutation(&scope, 1, DIGEST_1, None)).unwrap();
+        apply_scope_event(
+            &mut connection,
+            &mutation(&scope, 2, DIGEST_2, Some(DIGEST_1)),
+        )
+        .unwrap();
+        drop(connection);
+        drop(open_existing(&path).unwrap());
+
+        let mutated = rusqlite::Connection::open(&path).unwrap();
+        mutated
+            .execute(
+                "UPDATE applied_scope_events SET payload_type = 'artifact' WHERE sequence = 2",
+                [],
+            )
+            .unwrap();
+        drop(mutated);
         assert_eq!(
             open_existing(&path).unwrap_err(),
             ValidateError::InvalidHistory

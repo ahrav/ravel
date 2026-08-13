@@ -355,7 +355,7 @@ async fn bounded_reads_reject_oversized_objects() {
 }
 
 #[tokio::test]
-async fn append_reports_publication_errors_without_losing_dispatch_evidence() {
+async fn append_reports_publication_errors_with_exact_dispatch_evidence() {
     if !ready() {
         return;
     }
@@ -386,7 +386,7 @@ async fn append_reports_publication_errors_without_losing_dispatch_evidence() {
         "an unwritable bucket must surface a publication error"
     );
     assert!(
-        event_history.may_have_been_sent(),
-        "a dispatched attempt must retain its possible-send evidence"
+        !event_history.may_have_been_sent(),
+        "an absent bucket answers with a proven 404, which must not claim a possible send"
     );
 }

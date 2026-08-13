@@ -10,7 +10,7 @@ use ciborium::Value;
 
 use crate::{
     db::{
-        projections::{ApplyError, ApplyOutcome, ScopeProjectionEvent},
+        projections::{ApplyError, ApplyOutcome, ScopeProjectionEvent, ValidateError},
         worker::{DbHandle, OpenExistingError},
     },
     scope::{Digest, ScopeAuthority, ScopeEventRef, ScopeIdentity, root_event_from_decoded},
@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     WireError,
-    event::{ScopeEventReadError, payload_registered, read_opaque},
+    event::{ScopeEventReadError, payload_registered, read_opaque, root_domain_valid},
     head::{self, ObservedScopeHead, ScopeHeadReadError},
 };
 
@@ -112,7 +112,8 @@ pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) 
 }
 
 /// Replaces the file after deterministic local format or history validation failures.
-/// Database-operation failures leave the existing file intact.
+/// A foreign application id is a refusal, not a rebuild: it can belong to unrelated
+/// local data. Database-operation failures leave the existing file intact.
 ///
 /// # Errors
 ///
@@ -132,10 +133,14 @@ pub async fn open_projection(path: &Path) -> Result<DbHandle, ScopeReplayError> 
     }
     match DbHandle::open_existing(path.to_path_buf()).await {
         Ok(handle) => Ok(handle),
-        Err(OpenExistingError::DatabaseOperationFailed) => {
+        Err(OpenExistingError::Validation(
+            ValidateError::IntegrityCheckFailed
+            | ValidateError::InvalidSchema
+            | ValidateError::InvalidHistory,
+        )) => rebuild_projection(path).await,
+        Err(OpenExistingError::DatabaseOperationFailed | OpenExistingError::Validation(_)) => {
             Err(ScopeReplayError::DatabaseUnavailable)
         }
-        Err(OpenExistingError::Validation(_)) => rebuild_projection(path).await,
     }
 }
 
@@ -316,6 +321,9 @@ async fn prepare_chain(
         }
         if !payload_registered(decoded.envelope()) {
             return Err(ScopeReplayError::UnsupportedPayload);
+        }
+        if !root_domain_valid(decoded.envelope()) {
+            return Err(ScopeReplayError::EventInvalid(WireError::InvalidValue));
         }
         let final_hop = hop + 1 == unseen;
         if final_hop {
@@ -559,13 +567,12 @@ mod tests {
         let (store, client) = replay_store(vec![
             head_response(encode_head(&invalid_root_head).unwrap()),
             event_response(invalid_root.stored_bytes().to_vec()),
-            event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
-            ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(_))
+            ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(WireError::InvalidValue))
         ));
-        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -666,9 +673,25 @@ mod tests {
         ));
         drop(handle);
 
-        let corrupt = rusqlite::Connection::open(&path).unwrap();
-        corrupt.pragma_update(None, "application_id", 0).unwrap();
-        drop(corrupt);
+        // A foreign application id is unrelated local data, so the file survives.
+        let foreign = rusqlite::Connection::open(&path).unwrap();
+        foreign
+            .pragma_update(None, "application_id", 0x1234)
+            .unwrap();
+        drop(foreign);
+        assert!(matches!(
+            open_projection(&path).await,
+            Err(ScopeReplayError::DatabaseUnavailable)
+        ));
+        assert_eq!(
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))
+                .unwrap(),
+            0x1234
+        );
+
+        fs::write(&path, b"not-a-database".repeat(512)).unwrap();
         let sidecars = [
             PathBuf::from(format!("{}-journal", path.display())),
             PathBuf::from(format!("{}-wal", path.display())),
@@ -819,7 +842,7 @@ mod tests {
             1,
             references[size - 1].clone(),
             None,
-            format!("benchmark-head-{size}"),
+            format!("benchmark-operation-{size}"),
         )
         .unwrap();
         let mut responses = Vec::with_capacity(size + 1);

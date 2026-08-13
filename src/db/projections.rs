@@ -200,6 +200,9 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
         .pragma_update(None, "foreign_keys", true)
         .map_err(|_| ValidateError::DatabaseOperationFailed)?;
     validate(&connection)?;
+    // Run `set_rollback_journal` after `validate` so journal-mode failures do not mask
+    // validation failures.
+    set_rollback_journal(&connection).map_err(|_| ValidateError::DatabaseOperationFailed)?;
     Ok(connection)
 }
 
@@ -421,9 +424,7 @@ fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
             Some("database is not empty".into()),
         ));
     }
-    connection.pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
-        row.get::<_, String>(0)
-    })?;
+    set_rollback_journal(&connection)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     let transaction = connection.transaction()?;
     let existing: i64 =
@@ -489,14 +490,62 @@ fn local_format_error(error: rusqlite::Error) -> ValidateError {
     }
 }
 
+/// `GLOB`, not `LIKE`: `_` is a single-character wildcard in `LIKE`, so a file whose only
+/// user table is named `sqliteXfoo` reads as blank under `LIKE 'sqlite_%'`.
 fn is_blank(connection: &rusqlite::Connection) -> bool {
     connection
         .query_row(
-            "SELECT COUNT(*) = 0 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            "SELECT COUNT(*) = 0 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
             [],
             |row| row.get(0),
         )
         .unwrap_or(false)
+}
+
+/// Invalid UTF-8 passes the byte-oriented CHECKs and then fails the read that converts the
+/// column to a Rust `String`, so it is rejected here as invalid history.
+fn validate_text(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT CAST(scope_id AS BLOB) FROM scopes \
+             UNION ALL SELECT CAST(campaign_id AS BLOB) FROM scopes \
+             UNION ALL SELECT CAST(tail_event_digest AS BLOB) FROM scopes \
+             UNION ALL SELECT CAST(scope_id AS BLOB) FROM applied_scope_events \
+             UNION ALL SELECT CAST(digest AS BLOB) FROM applied_scope_events \
+             UNION ALL SELECT CAST(parent_digest AS BLOB) FROM applied_scope_events \
+               WHERE parent_digest IS NOT NULL \
+             UNION ALL SELECT CAST(operation_id AS BLOB) FROM applied_scope_events \
+             UNION ALL SELECT CAST(payload_type AS BLOB) FROM applied_scope_events",
+        )
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    let mut rows = statement
+        .query([])
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?
+    {
+        let bytes: Vec<u8> = row
+            .get(0)
+            .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(ValidateError::InvalidHistory);
+        }
+    }
+    Ok(())
+}
+
+/// Journal mode persists in the file, so every open sets `journal_mode` to `DELETE`.
+fn set_rollback_journal(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mode: String =
+        connection.pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!("journal mode is {mode}, not delete")),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_schema(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
@@ -527,6 +576,7 @@ fn validate_schema(connection: &rusqlite::Connection) -> Result<(), ValidateErro
 }
 
 fn validate_history(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
+    validate_text(connection)?;
     let orphans: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM applied_scope_events AS event \
@@ -735,6 +785,22 @@ mod tests {
         );
         fs::remove_file(unrelated).unwrap();
 
+        // `sqliteXfoo` is a user table that matches `LIKE 'sqlite_%'`.
+        let wildcard = path("wildcard-internal-name");
+        let foreign = rusqlite::Connection::open(&wildcard).unwrap();
+        foreign
+            .pragma_update(None, "application_id", 0x1234)
+            .unwrap();
+        foreign
+            .execute_batch("CREATE TABLE sqliteXfoo (id INTEGER PRIMARY KEY) STRICT")
+            .unwrap();
+        drop(foreign);
+        assert_eq!(
+            open_existing(&wildcard).unwrap_err(),
+            ValidateError::WrongApplicationId
+        );
+        fs::remove_file(wildcard).unwrap();
+
         let blank = path("blank");
         let empty = rusqlite::Connection::open(&blank).unwrap();
         empty.pragma_update(None, "application_id", 0x1234).unwrap();
@@ -942,6 +1008,55 @@ mod tests {
             open_existing(&path).unwrap_err(),
             ValidateError::InvalidHistory
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_invalid_utf8_in_projected_text() {
+        let path = path("invalid-utf8");
+        let mut connection = create(&path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        apply_scope_event(&mut connection, &mutation(&scope, 1, DIGEST_1, None)).unwrap();
+        drop(connection);
+        drop(open_existing(&path).unwrap());
+
+        // Byte length and the '/' test both pass for 0xff, and STRICT stores it as TEXT.
+        let corrupted = rusqlite::Connection::open(&path).unwrap();
+        corrupted
+            .execute("UPDATE scopes SET campaign_id = CAST(x'ff' AS TEXT)", [])
+            .unwrap();
+        drop(corrupted);
+        assert_eq!(
+            open_existing(&path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opening_an_existing_projection_restores_the_rollback_journal() {
+        let path = path("journal-mode");
+        drop(create(&path).unwrap());
+        let switched = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            switched
+                .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        drop(switched);
+
+        let connection = open_existing(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        drop(connection);
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push("-wal");
+        assert!(!PathBuf::from(sidecar).exists());
         fs::remove_file(path).unwrap();
     }
 

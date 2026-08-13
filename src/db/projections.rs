@@ -18,6 +18,23 @@ use crate::{
 const APPLICATION_ID: i32 = 0x5241_564c;
 const TABLES: [&str; 2] = ["applied_scope_events", "scopes"];
 
+const SCOPE_SELECT_SQL: &str = "SELECT campaign_id, sequence, tail_event_digest, \
+     active_plan_digest, scope_epoch FROM scopes WHERE scope_id = ?1";
+const SCOPE_HEAD_MATCH_SQL: &str = "SELECT scope.campaign_id, scope.sequence, \
+     scope.tail_event_digest, scope.active_plan_digest, scope.scope_epoch, event.operation_id \
+     FROM scopes AS scope \
+     JOIN applied_scope_events AS event \
+       ON event.scope_id = scope.scope_id AND event.sequence = scope.sequence \
+     WHERE scope.scope_id = ?1";
+const EVENT_AT_SEQUENCE_SQL: &str =
+    "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
+const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
+     WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
+const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
+     WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
+const SCOPE_UPDATE_SQL: &str =
+    "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2 WHERE scope_id = ?3";
+
 const SCHEMA: &str = "
 CREATE TABLE scopes (
     scope_id TEXT PRIMARY KEY NOT NULL,
@@ -122,6 +139,10 @@ pub(crate) enum ApplyOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyError {
     Conflict,
+    /// Emitted by [`crate::db::worker::DbHandle`] when its queue has no admission slot.
+    Full,
+    /// Emitted by [`crate::db::worker::DbHandle`] when its receiver is disconnected.
+    Stopping,
     DatabaseOperationFailed,
 }
 
@@ -129,6 +150,8 @@ impl fmt::Display for ApplyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Conflict => "scope event conflicts with local projection state",
+            Self::Full => "scope database command queue is full",
+            Self::Stopping => "scope database worker is stopping",
             Self::DatabaseOperationFailed => "scope database operation failed",
         })
     }
@@ -209,11 +232,9 @@ pub(crate) fn scope_cursor(
     scope: &ScopeIdentity,
 ) -> Result<(u64, Option<Digest>), ApplyError> {
     let stored: Option<(String, i64, String)> = connection
-        .query_row(
-            "SELECT campaign_id, sequence, tail_event_digest FROM scopes WHERE scope_id = ?1",
-            [scope.scope_id().as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+        .query_row(SCOPE_SELECT_SQL, [scope.scope_id().as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .optional()?;
     match stored {
         None => Ok((0, None)),
@@ -235,16 +256,23 @@ pub(crate) fn scope_cursor(
     }
 }
 
-pub(crate) fn scope_contains_operation(
+pub(crate) fn scope_conflicting_operation(
     connection: &rusqlite::Connection,
     scope: &ScopeIdentity,
     operation_id: &str,
+    reference: &ScopeEventRef,
 ) -> Result<bool, ApplyError> {
+    let sequence =
+        i64::try_from(reference.sequence()).map_err(|_| ApplyError::DatabaseOperationFailed)?;
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
-             WHERE scope_id = ?1 AND operation_id = ?2)",
-            params![scope.scope_id().as_str(), operation_id],
+            OPERATION_CONFLICT_SQL,
+            params![
+                scope.scope_id().as_str(),
+                operation_id,
+                sequence,
+                reference.digest().as_str()
+            ],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -256,12 +284,7 @@ pub(crate) fn scope_matches_head(
 ) -> Result<bool, ApplyError> {
     let stored: Option<(String, i64, String, Option<String>, i64, String)> = connection
         .query_row(
-            "SELECT scope.campaign_id, scope.sequence, scope.tail_event_digest, \
-             scope.active_plan_digest, scope.scope_epoch, event.operation_id \
-             FROM scopes AS scope \
-             JOIN applied_scope_events AS event \
-               ON event.scope_id = scope.scope_id AND event.sequence = scope.sequence \
-             WHERE scope.scope_id = ?1",
+            SCOPE_HEAD_MATCH_SQL,
             [head.scope().scope_id().as_str()],
             |row| {
                 Ok((
@@ -298,35 +321,28 @@ pub(crate) fn apply_scope_event(
         i64::try_from(sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?;
     let historical: Option<String> = transaction
         .query_row(
-            "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2",
+            EVENT_AT_SEQUENCE_SQL,
             params![scope_id, stored_sequence],
             |row| row.get(0),
         )
         .optional()?;
     let current: Option<(String, i64, String, Option<String>, i64)> = transaction
-        .query_row(
-            "SELECT campaign_id, sequence, tail_event_digest, active_plan_digest, scope_epoch \
-             FROM scopes WHERE scope_id = ?1",
-            [scope_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
+        .query_row(SCOPE_SELECT_SQL, [scope_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
         .optional()?;
 
     if let Some((_, cursor, tail, _, _)) = &current {
         let recorded_tail: Option<String> = transaction
-            .query_row(
-                "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2",
-                params![scope_id, cursor],
-                |row| row.get(0),
-            )
+            .query_row(EVENT_AT_SEQUENCE_SQL, params![scope_id, cursor], |row| {
+                row.get(0)
+            })
             .optional()?;
         if recorded_tail.as_deref() != Some(tail) {
             return Err(ApplyError::Conflict);
@@ -376,7 +392,7 @@ pub(crate) fn apply_scope_event(
                 return Err(ApplyError::Conflict);
             }
             let updated = transaction.execute(
-                "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2 WHERE scope_id = ?3",
+                SCOPE_UPDATE_SQL,
                 params![stored_sequence, event.reference.digest().as_str(), scope_id],
             )?;
             if updated != 1 {
@@ -386,8 +402,7 @@ pub(crate) fn apply_scope_event(
     }
 
     let duplicate: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
-         WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))",
+        DUPLICATE_EXISTS_SQL,
         params![
             scope_id,
             event.reference.digest().as_str(),
@@ -858,6 +873,67 @@ mod tests {
         assert_eq!(scope_cursor(&connection, &scope).unwrap(), (0, None));
         drop(connection);
         fs::remove_file(path).unwrap();
+    }
+
+    fn query_plan(
+        connection: &rusqlite::Connection,
+        sql: &str,
+        parameters: &[&dyn rusqlite::ToSql],
+    ) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        statement
+            .query_map(
+                rusqlite::params_from_iter(parameters.iter().copied()),
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_lookup_statements_avoid_table_scans() {
+        let db_path = path("query-plans");
+        let connection = create(&db_path).unwrap();
+        let scope_id = DIGEST_1;
+        let sequence = 1_i64;
+        let digest = DIGEST_2;
+        let operation = "operation-1";
+        let plans = [
+            query_plan(&connection, SCOPE_SELECT_SQL, &[&scope_id]),
+            query_plan(&connection, SCOPE_HEAD_MATCH_SQL, &[&scope_id]),
+            query_plan(&connection, EVENT_AT_SEQUENCE_SQL, &[&scope_id, &sequence]),
+            query_plan(
+                &connection,
+                OPERATION_CONFLICT_SQL,
+                &[&scope_id, &operation, &sequence, &digest],
+            ),
+            query_plan(
+                &connection,
+                DUPLICATE_EXISTS_SQL,
+                &[&scope_id, &digest, &operation],
+            ),
+            query_plan(
+                &connection,
+                SCOPE_UPDATE_SQL,
+                &[&sequence, &digest, &scope_id],
+            ),
+        ];
+        assert!(plans.iter().all(|details| !details.is_empty()));
+        for detail in plans
+            .iter()
+            .flatten()
+            .filter(|detail| detail.starts_with("SCAN"))
+        {
+            // A constant-row scan touches no projection table; it is the only accepted
+            // SCAN plan from the bundled SQLite engine used by this test.
+            assert_eq!(detail, "SCAN CONSTANT ROW");
+        }
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
     }
 
     #[test]

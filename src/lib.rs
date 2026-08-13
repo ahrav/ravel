@@ -8,6 +8,7 @@
 
 pub mod db {
     pub mod projections;
+    pub mod worker;
 }
 
 pub mod domain {

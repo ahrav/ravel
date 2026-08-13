@@ -9,7 +9,10 @@ use std::{collections::HashSet, error::Error, fmt, path::Path};
 use ciborium::Value;
 
 use crate::{
-    db::projections::{self, ApplyError, ApplyOutcome, ScopeProjectionEvent},
+    db::{
+        projections::{ApplyError, ApplyOutcome, ScopeProjectionEvent, ValidateError},
+        worker::{DbHandle, OpenExistingError},
+    },
     scope::{Digest, ScopeEventRef, ScopeIdentity, root_event_from_decoded},
     storage::s3::S3Store,
 };
@@ -87,20 +90,17 @@ struct Prepared {
     decoded: crate::scope::DecodedScopeEvent<Value>,
 }
 
-/// # Blocking
+/// Replays the unseen suffix through the projection-owning worker.
 ///
-/// Executes cursor reads and projection transactions on the calling thread.
-pub async fn refresh_blocking(
-    store: &S3Store,
-    connection: &mut rusqlite::Connection,
-    scope: &ScopeIdentity,
-) -> ScopeReadiness {
-    let cursor = match projections::scope_cursor(connection, scope) {
+/// Remote reads and validation complete before the first projection write; the worker
+/// applies one event per transaction and advances that scope's cursor atomically.
+pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) -> ScopeReadiness {
+    let cursor = match handle.scope_cursor(scope).await {
         Ok(cursor) => cursor,
         Err(error) => return ScopeReadiness::NotReady(ScopeReplayError::Apply(error)),
     };
     match prepare_suffix(store, scope, cursor).await {
-        Ok(prepared) => match apply_suffix(connection, scope, prepared) {
+        Ok(prepared) => match apply_suffix(handle, scope, prepared).await {
             Ok((local_cursor, observed_head)) => ScopeReadiness::Ready {
                 local_cursor,
                 observed_head: Box::new(observed_head),
@@ -115,15 +115,11 @@ pub async fn refresh_blocking(
 /// A foreign application id is a refusal, not a rebuild: it can belong to unrelated
 /// local data. Database-operation failures leave the existing file intact.
 ///
-/// # Blocking
-///
-/// Executes filesystem and SQLite work on the calling thread.
-///
 /// # Errors
 ///
 /// Returns [`ScopeReplayError::DatabaseUnavailable`] for `:memory:` or `file:` URIs,
 /// file I/O failures, and SQLite operation failures.
-pub fn open_projection(path: &Path) -> Result<rusqlite::Connection, ScopeReplayError> {
+pub async fn open_projection(path: &Path) -> Result<DbHandle, ScopeReplayError> {
     if is_sqlite_uri(path) {
         return Err(ScopeReplayError::DatabaseUnavailable);
     }
@@ -131,30 +127,33 @@ pub fn open_projection(path: &Path) -> Result<rusqlite::Connection, ScopeReplayE
         .try_exists()
         .map_err(|_| ScopeReplayError::DatabaseUnavailable)?
     {
-        return projections::create(path).map_err(|_| ScopeReplayError::DatabaseUnavailable);
+        return DbHandle::spawn(path.to_path_buf())
+            .await
+            .map_err(|_| ScopeReplayError::DatabaseUnavailable);
     }
-    match projections::open_existing(path) {
-        Ok(connection) => Ok(connection),
-        Err(
-            projections::ValidateError::DatabaseOperationFailed
-            | projections::ValidateError::WrongApplicationId,
-        ) => Err(ScopeReplayError::DatabaseUnavailable),
-        Err(
-            projections::ValidateError::IntegrityCheckFailed
-            | projections::ValidateError::InvalidSchema
-            | projections::ValidateError::InvalidHistory,
-        ) => rebuild_projection(path),
+    match DbHandle::open_existing(path.to_path_buf()).await {
+        Ok(handle) => Ok(handle),
+        Err(OpenExistingError::Validation(
+            ValidateError::IntegrityCheckFailed
+            | ValidateError::InvalidSchema
+            | ValidateError::InvalidHistory,
+        )) => rebuild_projection(path).await,
+        Err(OpenExistingError::DatabaseOperationFailed | OpenExistingError::Validation(_)) => {
+            Err(ScopeReplayError::DatabaseUnavailable)
+        }
     }
 }
 
-fn rebuild_projection(path: &Path) -> Result<rusqlite::Connection, ScopeReplayError> {
+async fn rebuild_projection(path: &Path) -> Result<DbHandle, ScopeReplayError> {
     for suffix in ["-journal", "-wal", "-shm"] {
         let mut sidecar = path.as_os_str().to_owned();
         sidecar.push(suffix);
         remove_if_exists(Path::new(&sidecar))?;
     }
     remove_if_exists(path)?;
-    projections::create(path).map_err(|_| ScopeReplayError::DatabaseUnavailable)
+    DbHandle::spawn(path.to_path_buf())
+        .await
+        .map_err(|_| ScopeReplayError::DatabaseUnavailable)
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), ScopeReplayError> {
@@ -204,24 +203,21 @@ async fn prepare_suffix_with_limits(
     Ok(PreparedSuffix { observed, events })
 }
 
-/// Converts the prepared suffix, then applies its events on the calling thread.
-///
-/// # Blocking
-///
-/// Runs rollback-journal SQLite transactions and belongs on the projection-owning
-/// blocking thread.
-pub(crate) fn apply_suffix(
-    connection: &mut rusqlite::Connection,
+/// Converts the prepared suffix, then applies its events through the worker.
+pub(crate) async fn apply_suffix(
+    handle: &DbHandle,
     scope: &ScopeIdentity,
     mut prepared: PreparedSuffix,
 ) -> Result<((u64, Digest), ObservedScopeHead), ScopeReplayError> {
     for event in &prepared.events {
-        if projections::scope_contains_operation(
-            connection,
-            scope,
-            event.decoded.envelope().operation_id(),
-        )
-        .map_err(ScopeReplayError::Apply)?
+        if handle
+            .scope_conflicting_operation(
+                scope,
+                event.decoded.envelope().operation_id(),
+                event.decoded.event_ref(),
+            )
+            .await
+            .map_err(ScopeReplayError::Apply)?
         {
             return Err(ScopeReplayError::HistoryConflict);
         }
@@ -263,12 +259,14 @@ pub(crate) fn apply_suffix(
         .collect::<Result<Vec<_>, _>>()?;
 
     for mutation in mutations {
-        match projections::apply_scope_event(connection, &mutation) {
+        match handle.apply(mutation).await {
             Ok(ApplyOutcome::Applied | ApplyOutcome::AlreadyApplied) => {}
             Err(error) => return Err(ScopeReplayError::Apply(error)),
         }
     }
-    if !projections::scope_matches_head(connection, prepared.observed.head())
+    if !handle
+        .scope_matches_head(prepared.observed.head())
+        .await
         .map_err(ScopeReplayError::Apply)?
     {
         return Err(ScopeReplayError::HistoryConflict);
@@ -372,13 +370,19 @@ fn is_sqlite_uri(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::ffi::OsStringExt, path::PathBuf, process};
+    use std::{
+        fs,
+        os::unix::ffi::OsStringExt,
+        path::PathBuf,
+        process,
+        time::{Duration, Instant},
+    };
 
     use aws_sdk_s3::primitives::SdkBody;
     use ciborium::Value;
 
     use crate::{
-        db::projections,
+        db::{projections, worker::DbHandle},
         distributed::identity::{InstanceId, WorkspaceId},
         scope::{
             AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ROOT_GENESIS_PAYLOAD_TYPE,
@@ -428,6 +432,27 @@ mod tests {
         .unwrap()
     }
 
+    /// Runs one statement over a short-lived connection while the worker is idle.
+    fn side_execute(path: &Path, sql: &str, params: &[&dyn rusqlite::ToSql]) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(sql, rusqlite::params_from_iter(params.iter().copied()))
+            .unwrap();
+    }
+
+    /// Reads projection rows over a short-lived connection while the worker is idle.
+    fn row_counts(path: &Path) -> (i64, i64) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM scopes), \
+                 (SELECT COUNT(*) FROM applied_scope_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     fn head_response(bytes: Vec<u8>) -> http::Response<SdkBody> {
         response(200, &[("etag", "\"head\"")], bytes)
     }
@@ -440,12 +465,12 @@ mod tests {
     async fn replay_is_idempotent_and_returns_the_observed_head_witness() {
         let genesis = genesis();
         let path = path("idempotent");
-        let mut connection = projections::create(&path).unwrap();
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, client) = replay_store(vec![
             head_response(genesis.head_bytes().to_vec()),
             event_response(genesis.event_bytes().to_vec()),
         ]);
-        match refresh_blocking(&store, &mut connection, genesis.identity()).await {
+        match refresh(&store, &handle, genesis.identity()).await {
             ScopeReadiness::Ready {
                 local_cursor,
                 observed_head,
@@ -457,36 +482,59 @@ mod tests {
             ScopeReadiness::NotReady(_) => panic!("genesis must replay"),
         }
         assert_eq!(
-            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
             (1, Some(genesis.event_ref().digest().clone()))
         );
         assert_eq!(client.actual_requests().count(), 2);
-        let before: (i64, i64) = connection
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM scopes), \
-                 (SELECT COUNT(*) FROM applied_scope_events)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let before = row_counts(&path);
         let (store, client) = replay_store(vec![head_response(genesis.head_bytes().to_vec())]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::Ready { .. }
         ));
         assert_eq!(client.actual_requests().count(), 1);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM scopes), \
-                     (SELECT COUNT(*) FROM applied_scope_events)",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .unwrap(),
-            before
-        );
-        drop(connection);
+        assert_eq!(row_counts(&path), before);
+        drop(handle);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Two `refresh` calls sharing cloned handles can both read one stale cursor and prepare
+    /// the same suffix. The second must still report ready once the first commits it.
+    #[tokio::test]
+    async fn a_suffix_another_caller_already_committed_replays_ready() {
+        let genesis = genesis();
+        let path = path("concurrent-suffix");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let other = handle.clone();
+        let cursor = handle.scope_cursor(genesis.identity()).await.unwrap();
+        assert_eq!(cursor, (0, None));
+
+        let mut prepared = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (store, _) = replay_store(vec![
+                head_response(genesis.head_bytes().to_vec()),
+                event_response(genesis.event_bytes().to_vec()),
+            ]);
+            prepared.push(
+                prepare_suffix(&store, genesis.identity(), cursor.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let second = prepared.pop().unwrap();
+        let first = prepared.pop().unwrap();
+
+        let (first_cursor, _) = apply_suffix(&handle, genesis.identity(), first)
+            .await
+            .unwrap();
+        let rows = row_counts(&path);
+        let (second_cursor, _) = apply_suffix(&other, genesis.identity(), second)
+            .await
+            .expect("a suffix the first caller committed is not a history conflict");
+
+        assert_eq!(second_cursor, first_cursor);
+        assert_eq!(row_counts(&path), rows);
+        drop((handle, other));
         fs::remove_file(path).unwrap();
     }
 
@@ -494,17 +542,17 @@ mod tests {
     async fn invalid_suffix_and_event_count_limit_apply_nothing() {
         let genesis = genesis();
         let path = path("invalid");
-        let mut connection = projections::create(&path).unwrap();
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(genesis.head_bytes().to_vec()),
             event_response(b"not-zstd".to_vec()),
         ]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(_))
         ));
         assert_eq!(
-            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
         );
 
@@ -532,12 +580,12 @@ mod tests {
             event_response(successor.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::UnsupportedPayload)
         ));
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(
-            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
         );
 
@@ -565,12 +613,12 @@ mod tests {
             event_response(invalid_root.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(WireError::InvalidValue))
         ));
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(
-            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
         );
 
@@ -588,12 +636,12 @@ mod tests {
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(
-            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
         );
 
@@ -629,12 +677,12 @@ mod tests {
         for head in invalid_heads {
             let (store, client) = replay_store(vec![head_response(encode_head(&head).unwrap())]);
             assert!(matches!(
-                refresh_blocking(&store, &mut connection, genesis.identity()).await,
+                refresh(&store, &handle, genesis.identity()).await,
                 ScopeReadiness::NotReady(ScopeReplayError::HeadInvalid(WireError::InvalidValue))
             ));
             assert_eq!(client.actual_requests().count(), 1);
             assert_eq!(
-                projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+                handle.scope_cursor(genesis.identity()).await.unwrap(),
                 (0, None)
             );
         }
@@ -651,15 +699,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![head_response(encode_head(&head).unwrap())]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::Overflow)
         ));
         assert_eq!(client.actual_requests().count(), 1);
         assert_eq!(
-            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
         );
-        drop(connection);
+        drop(handle);
         fs::remove_file(path).unwrap();
     }
 
@@ -667,32 +715,30 @@ mod tests {
     async fn cursor_conflicts_fail_closed_and_invalid_projection_rebuilds() {
         let genesis = genesis();
         let path = path("cursor-conflicts");
-        let mut connection = projections::create(&path).unwrap();
-        projections::apply_scope_event(&mut connection, &root_mutation(&genesis)).unwrap();
-        connection
-            .execute(
-                "UPDATE scopes SET tail_event_digest = ?1 WHERE scope_id = ?2",
-                rusqlite::params!["f".repeat(64), genesis.identity().scope_id().as_str()],
-            )
-            .unwrap();
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        handle.apply(root_mutation(&genesis)).await.unwrap();
+        side_execute(
+            &path,
+            "UPDATE scopes SET tail_event_digest = ?1 WHERE scope_id = ?2",
+            &[&"f".repeat(64), &genesis.identity().scope_id().as_str()],
+        );
         let (store, _) = replay_store(vec![head_response(genesis.head_bytes().to_vec())]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::TailMismatch)
         ));
 
-        connection
-            .execute(
-                "UPDATE scopes SET sequence = 2 WHERE scope_id = ?1",
-                [genesis.identity().scope_id().as_str()],
-            )
-            .unwrap();
+        side_execute(
+            &path,
+            "UPDATE scopes SET sequence = 2 WHERE scope_id = ?1",
+            &[&genesis.identity().scope_id().as_str()],
+        );
         let (store, _) = replay_store(vec![head_response(genesis.head_bytes().to_vec())]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::CursorAhead)
         ));
-        drop(connection);
+        drop(handle);
 
         // A foreign application id is unrelated local data, so the file survives.
         let foreign = rusqlite::Connection::open(&path).unwrap();
@@ -701,7 +747,7 @@ mod tests {
             .unwrap();
         drop(foreign);
         assert!(matches!(
-            open_projection(&path),
+            open_projection(&path).await,
             Err(ScopeReplayError::DatabaseUnavailable)
         ));
         assert_eq!(
@@ -721,15 +767,21 @@ mod tests {
         for sidecar in &sidecars {
             fs::write(sidecar, b"stale").unwrap();
         }
-        let rebuilt = open_projection(&path).unwrap();
+        let rebuilt = open_projection(&path).await.unwrap();
+        // A rebuilt projection is empty and carries the neutral application id.
         assert_eq!(
-            rebuilt
+            rebuilt.scope_cursor(genesis.identity()).await.unwrap(),
+            (0, None)
+        );
+        assert!(sidecars.iter().all(|sidecar| !sidecar.exists()));
+        drop(rebuilt);
+        assert_eq!(
+            rusqlite::Connection::open(&path)
+                .unwrap()
                 .pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))
                 .unwrap(),
             0x5241_564c
         );
-        assert!(sidecars.iter().all(|sidecar| !sidecar.exists()));
-        drop(rebuilt);
         fs::remove_file(path).unwrap();
     }
 
@@ -737,8 +789,9 @@ mod tests {
     async fn database_failure_keeps_a_valid_committed_prefix_not_ready() {
         let genesis = genesis();
         let path = path("committed-prefix");
-        let mut connection = projections::create(&path).unwrap();
-        connection
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
             .execute_batch(
                 "CREATE TRIGGER fail_second_event BEFORE INSERT ON applied_scope_events \
                  WHEN NEW.sequence = 2 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
@@ -769,23 +822,25 @@ mod tests {
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
-            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::Apply(ApplyError::DatabaseOperationFailed))
         ));
         assert_eq!(
-            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
             (1, Some(genesis.event_ref().digest().clone()))
         );
-        connection
+        drop(handle);
+        rusqlite::Connection::open(&path)
+            .unwrap()
             .execute_batch("DROP TRIGGER fail_second_event")
             .unwrap();
-        drop(connection);
+        // The committed prefix is still a valid projection after the injected failure.
         drop(projections::open_existing(&path).unwrap());
         fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn byte_limit_is_inclusive_and_errors_do_not_echo_inputs() {
+    #[tokio::test]
+    async fn byte_limit_is_inclusive_and_errors_do_not_echo_inputs() {
         assert_eq!(
             checked_total(64 * 1024 * 1024 - 1, 1, LIMITS.bytes),
             Ok(LIMITS.bytes)
@@ -799,10 +854,141 @@ mod tests {
                 .to_string()
                 .contains("malicious/internal/key")
         );
-        assert!(open_projection(Path::new(":memory:")).is_err());
-        assert!(open_projection(Path::new("file:scope.sqlite3")).is_err());
+        assert!(open_projection(Path::new(":memory:")).await.is_err());
+        assert!(
+            open_projection(Path::new("file:scope.sqlite3"))
+                .await
+                .is_err()
+        );
         let non_utf8 = std::ffi::OsString::from_vec(b"file:scope.sqlite3?mode=memory\xff".to_vec());
         assert!(is_sqlite_uri(Path::new(&non_utf8)));
-        assert!(open_projection(Path::new(&non_utf8)).is_err());
+        assert!(open_projection(Path::new(&non_utf8)).await.is_err());
+    }
+
+    /// Builds one canonical chain of `LIMITS.events` events: root genesis at sequence 1 and
+    /// test-only successors above it.
+    #[cfg(target_os = "linux")]
+    fn benchmark_chain(
+        genesis: &crate::scope::RootGenesis,
+    ) -> (Vec<Vec<u8>>, Vec<crate::scope::ScopeEventRef>) {
+        let mut bytes = Vec::with_capacity(LIMITS.events as usize);
+        let mut references = Vec::with_capacity(LIMITS.events as usize);
+        bytes.push(genesis.event_bytes().to_vec());
+        references.push(genesis.event_ref().clone());
+        for sequence in 2..=LIMITS.events {
+            let parent = references[(sequence - 2) as usize].clone();
+            let envelope = EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                sequence,
+                Some(parent),
+                1,
+                format!("benchmark-operation-{sequence}"),
+                TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+            )
+            .unwrap();
+            let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+            bytes.push(encoded.stored_bytes().to_vec());
+            references.push(encoded.event_ref().clone());
+        }
+        (bytes, references)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn benchmark_sample(
+        genesis: &crate::scope::RootGenesis,
+        size: usize,
+        sample: &str,
+        bytes: &[Vec<u8>],
+        references: &[crate::scope::ScopeEventRef],
+    ) -> Duration {
+        let path = PathBuf::from(format!(
+            "/dev/shm/ravel-scope-replay-growth-{}-{size}-{sample}.sqlite3",
+            process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            references[size - 1].clone(),
+            None,
+            format!("benchmark-operation-{size}"),
+        )
+        .unwrap();
+        let mut responses = Vec::with_capacity(size + 1);
+        responses.push(head_response(encode_head(&head).unwrap()));
+        responses.extend(
+            (0..size)
+                .rev()
+                .map(|index| event_response(bytes[index].clone())),
+        );
+        let (store, _) = replay_store(responses);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+
+        let started = Instant::now();
+        let readiness = refresh(&store, &handle, genesis.identity()).await;
+        let elapsed = started.elapsed();
+        match readiness {
+            ScopeReadiness::Ready { local_cursor, .. } => {
+                assert_eq!(local_cursor.0, size as u64);
+                assert_eq!(local_cursor.1, *references[size - 1].digest());
+            }
+            ScopeReadiness::NotReady(error) => panic!("benchmark replay failed: {error}"),
+        }
+
+        drop(handle);
+        let _ = fs::remove_file(&path);
+        elapsed
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn replay_growth_stays_subquadratic() {
+        const SIZES: [usize; 5] = [256, 512, 1_024, 2_048, 4_096];
+        assert_eq!(SIZES.last().copied(), Some(LIMITS.events as usize));
+        // Tmpfs keeps fixed filesystem latency from hiding history-dependent growth. Minimums
+        // reduce one-sided scheduler noise. Quadratic work approaches 4x per doubling and 256x
+        // end-to-end; the gates leave margin around the expected 2x and 16x linear growth.
+        let probe = PathBuf::from(format!(
+            "/dev/shm/ravel-scope-replay-growth-probe-{}",
+            process::id()
+        ));
+        if fs::write(&probe, b"probe").is_err() {
+            eprintln!("skipping replay growth gate: /dev/shm is unavailable or unwritable");
+            return;
+        }
+        let _ = fs::remove_file(probe);
+
+        let genesis = genesis();
+        let (bytes, references) = benchmark_chain(&genesis);
+        let _ = benchmark_sample(&genesis, 256, "warmup", &bytes, &references).await;
+        let mut minimums = Vec::with_capacity(SIZES.len());
+        for size in SIZES {
+            let mut samples = Vec::with_capacity(3);
+            for sample in 0..3 {
+                samples.push(
+                    benchmark_sample(
+                        &genesis,
+                        size,
+                        &format!("sample-{sample}"),
+                        &bytes,
+                        &references,
+                    )
+                    .await,
+                );
+            }
+            minimums.push(samples.into_iter().min().unwrap());
+        }
+        let minimum_millis: Vec<u128> = minimums.iter().map(Duration::as_millis).collect();
+        assert!(
+            minimums
+                .windows(2)
+                .all(|pair| pair[1].as_nanos() < pair[0].as_nanos() * 3),
+            "replay growth exceeded 3x: sizes={SIZES:?} minimum-ms={minimum_millis:?}"
+        );
+        assert!(
+            minimums.last().unwrap().as_nanos() < minimums.first().unwrap().as_nanos() * 32,
+            "replay endpoint growth exceeded 32x: sizes={SIZES:?} minimum-ms={minimum_millis:?}"
+        );
     }
 }

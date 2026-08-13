@@ -1,6 +1,24 @@
 //! Validated actor and process-incarnation identities.
 
-use crate::domain::campaign::{ValidationError, validate_key_segment};
+use crate::domain::validation::{ValidationError, validate_key_segment};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceId(String);
+
+impl WorkspaceId {
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when `value` is empty, exceeds 128 UTF-8 bytes,
+    /// or contains `/`.
+    pub fn new(value: String) -> Result<Self, ValidationError> {
+        validate_key_segment(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Identity of a logical claimant, stable across process restarts.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,21 +79,28 @@ impl InstanceId {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActorId, InstanceId};
+    use super::{ActorId, InstanceId, WorkspaceId};
 
     #[test]
     fn identities_enforce_shared_boundaries() {
         for value in [String::new(), "x".repeat(129)] {
+            assert!(WorkspaceId::new(value.clone()).is_err());
             assert!(ActorId::new(value.clone()).is_err());
             assert!(InstanceId::new(value).is_err());
         }
+        assert!(WorkspaceId::new("x".repeat(128)).is_ok());
         assert!(ActorId::new("x".repeat(128)).is_ok());
         assert!(InstanceId::new("x".repeat(128)).is_ok());
     }
 
     #[test]
     fn identities_reject_the_key_delimiter() {
+        // `(w, a/b, c)` and `(w, a, b/c)` would otherwise derive one key.
         for value in ["a/b", "/leading", "trailing/", "/"] {
+            assert!(
+                WorkspaceId::new(value.to_owned()).is_err(),
+                "workspace {value:?}"
+            );
             assert!(ActorId::new(value.to_owned()).is_err(), "actor {value:?}");
             assert!(
                 InstanceId::new(value.to_owned()).is_err(),

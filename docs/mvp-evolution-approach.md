@@ -2,17 +2,17 @@
 
 ## Status
 
-Adopted scoped-v2 design authority. The active contracts are `mvp-outline.md`,
-`epics.md`, Beads, and the frozen durable formats. The scoped-v2 choice from this design
+Adopted root-scope design authority. The active contracts are `mvp-outline.md`,
+`epics.md`, Beads, and the canonical durable format. The scope choice from this design
 has been incorporated into those contracts through the Phase 0 contract amendment;
 remaining Phase 0 task-graph decomposition and disposition work is tracked by
 `ravel-om4`.
 
-Complete the remaining Phase 0 work, then implement Phase 1-and-later authority work
-only on the scoped-v2 path. E01, E03, and E04 remain complete, frozen-v1 proofs. E02
-(`ravel-aq8`) stays open pending its selected-bucket live preflight (`ravel-aq8.7`),
-which must close or be deferred on its own recorded evidence. All new authority
-work starts at a v2 root `Scope`, and no authoritative chain mixes v1 and v2 events.
+Complete the remaining Phase 0 work, then implement Phase 1-and-later authority work on
+the canonical scope path. E01, E03, and E04 remain complete proofs. E02 (`ravel-aq8`)
+stays open pending its selected-bucket live preflight (`ravel-aq8.7`), which must close
+or be deferred on its own recorded evidence. All authority work starts at a root
+`Scope`.
 
 The MVP proves the architecture with Distributed Research and Distributed Change. The
 CPU-to-GPU rendering campaign in section 14 is post-MVP design guidance and carries no
@@ -137,9 +137,9 @@ escrowed
 
 Unknown reserve stays unavailable after the child seals.
 
-## 5. Durable identity and versioning
+## 5. Durable identity
 
-Scoped v2 identity:
+Durable identity axis:
 
 ```text
 campaign_id
@@ -153,18 +153,16 @@ claim_fence
 scope_epoch
 ```
 
-The envelope version is independent of payload versions:
+The payload type discriminates the payload; the envelope carries no version field:
 
 ```text
 EventEnvelope {
-    envelope_version
     scope_id
     sequence
     parent_event
     writer_epoch
     operation_id
     payload_type
-    payload_version
 }
 ```
 
@@ -180,10 +178,11 @@ active plan lineage
 The campaign root is a scope, not a global sequencer. Campaign metadata identifies the
 root and its immutable configuration. Child decisions use child heads.
 
-Keep existing v1 event, head, claim, and projection fixtures unchanged. A v2 campaign
-starts with a v2 root scope. One authoritative chain never mixes v1 and v2 events.
+A campaign starts with a root scope. One canonical contract governs every event, head,
+claim, and projection fixture; a durable format change updates that contract and its
+fixtures together rather than adding a second era.
 
-## 6. Versioned planning and admission
+## 6. Planning and admission
 
 Planning is generative. Admission is deterministic.
 
@@ -419,7 +418,7 @@ code-host publishers remain separate trust domains.
 
 S3 holds shared durable authority. SQLite is a disposable local projection.
 
-Scoped v2 key axis:
+Durable key axis:
 
 ```text
 workspace/{workspace_id}/campaigns/{campaign_id}/
@@ -430,7 +429,7 @@ workspace/{workspace_id}/campaigns/{campaign_id}/
   artifacts/{digest}
 ```
 
-The v2 contract fixes exact suffixes and encodings. Independent scopes do not share a
+The contract fixes exact suffixes and encodings. Independent scopes do not share a
 mutable head or replay cursor.
 
 Local projection uses:
@@ -630,7 +629,7 @@ This sequence becomes active only after the plan amendment.
 
 | Phase | Work | Required proof |
 | --- | --- | --- |
-| 0. Contract amendment | Revise the outline, epics, task graph, identity axis, keys, and v2 envelope together | Recursive protocol is coherent before new scoped payloads |
+| 0. Contract amendment | Revise the outline, epics, task graph, identity axis, keys, and envelope together | Recursive protocol is coherent before new scoped payloads |
 | 1. Scoped substrate | Add `ScopeId`, scoped heads, events, claims, work references, and selective projection | Two scopes advance and rebuild independently |
 | 2. Scoped authority | Implement per-scope leases, lazy takeover, and settlement-pressure scheduling | Parent and child controllers fail independently |
 | 3. Recursive admission | Implement plan revisions with typed proposal bases, shared admission, grants, escrow, sealing, certificates, and settlement | A bounded observation-derived revision completes and conserves budget |
@@ -638,7 +637,7 @@ This sequence becomes active only after the plan amendment.
 | 5. Scale proof | Exercise many scopes and nodes, selective replay, failover, and unknown outcomes | Root and projections avoid global hot paths |
 
 Phase 1 reuses compare-and-swap, immutable publication, exact-chain replay, disposable
-projection, and work-claim fencing. It adds scope parameters and a v1-to-v2 boundary.
+projection, and work-claim fencing. It adds scope parameters to those algorithms.
 
 ## 17. Deferred work
 
@@ -655,6 +654,6 @@ projection, and work-claim fencing. It adds scope parameters and a v1-to-v2 boun
 1. Record the failed assumption or measured limit.
 2. Classify it as structural or tunable.
 3. Prefer the smallest amendment that preserves existing proofs.
-4. Version durable identity and bytes. Never reinterpret old records.
+4. Change durable identity, bytes, and fixtures together in one canonical contract. Never reinterpret abandoned records.
 5. After adoption, update the architecture, epics, task graph, and fixtures together.
 6. Record unresolved questions until evidence resolves them.

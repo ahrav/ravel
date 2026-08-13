@@ -1,6 +1,6 @@
 //! Validated work identity and revision references.
 
-use crate::domain::campaign::{ValidationError, validate_key_segment};
+use crate::domain::validation::{ValidationError, validate_key_segment};
 
 /// Validated identity of one work item.
 #[derive(Clone, Debug, Eq, PartialEq)]

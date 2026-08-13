@@ -197,6 +197,7 @@ async fn prepare_suffix_with_limits(
         cursor,
         observed.head().tail().clone(),
         observed.head().scope_epoch().get(),
+        observed.head().operation_id(),
         limits,
     )
     .await?;
@@ -285,6 +286,7 @@ async fn prepare_chain(
     cursor: (u64, Option<Digest>),
     tail: ScopeEventRef,
     scope_epoch: u64,
+    head_operation: &str,
     limits: Limits,
 ) -> Result<Vec<Prepared>, ScopeReplayError> {
     if tail.sequence() < cursor.0 {
@@ -319,6 +321,7 @@ async fn prepare_chain(
         if decoded.event_ref() != &current
             || decoded.envelope().writer_epoch().get() != scope_epoch
             || !operations.insert(decoded.envelope().operation_id().to_owned())
+            || (hop == 0 && decoded.envelope().operation_id() != head_operation)
         {
             return Err(ScopeReplayError::HistoryConflict);
         }
@@ -564,6 +567,29 @@ mod tests {
         assert!(matches!(
             refresh_blocking(&store, &mut connection, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(WireError::InvalidValue))
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(
+            projections::scope_cursor(&connection, genesis.identity()).unwrap(),
+            (0, None)
+        );
+
+        let mismatched_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            None,
+            "mismatched-operation".into(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&mismatched_head).unwrap()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh_blocking(&store, &mut connection, genesis.identity()).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(

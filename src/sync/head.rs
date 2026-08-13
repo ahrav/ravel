@@ -17,7 +17,7 @@ use super::{
     WireError,
     event::{
         ResolvedScopeEventPublication, ScopeEventPublicationError, payload_registered,
-        publish_root, read_opaque, root_domain_valid,
+        publish_root, read_opaque, root_domain_valid, root_payload_valid,
     },
 };
 
@@ -371,7 +371,7 @@ async fn reconcile(
     let mut seen = HashSet::new();
     let mut total_bytes = 0usize;
     let mut found = false;
-    for _ in 0..hops {
+    for hop in 0..hops {
         if !seen.insert(current_ref.digest().as_str().to_owned()) {
             return ScopeHeadCommitOutcome::Unresolved(transition);
         }
@@ -384,7 +384,13 @@ async fn reconcile(
             Some(total) if total <= MAX_RECONCILE_BYTES => total,
             _ => return ScopeHeadCommitOutcome::Unresolved(transition),
         };
-        if !payload_registered(decoded.envelope()) || !root_domain_valid(decoded.envelope()) {
+        if !payload_registered(decoded.envelope())
+            || !root_domain_valid(decoded.envelope())
+            || !root_payload_valid(&decoded, transition.candidate.scope())
+        {
+            return ScopeHeadCommitOutcome::Unresolved(transition);
+        }
+        if hop == 0 && decoded.envelope().operation_id() != current.head.operation_id() {
             return ScopeHeadCommitOutcome::Unresolved(transition);
         }
         if decoded.envelope().operation_id() == transition.candidate.operation_id() {
@@ -1244,5 +1250,117 @@ mod tests {
         ));
         // The retained walk never starts, so no event read follows the head read.
         assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_refuses_a_current_head_that_mismatches_its_tail() {
+        let genesis = genesis();
+        let parent = genesis.head().clone();
+        let (_, other_encoded) = successor(genesis.identity(), genesis.event_ref(), 2, "other-op");
+        let mismatched = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            other_encoded.event_ref().clone(),
+            None,
+            "mismatched-op".into(),
+        )
+        .unwrap();
+        let (candidate_envelope, candidate_encoded) =
+            successor(genesis.identity(), genesis.event_ref(), 2, "absent-op");
+        let publication =
+            published(genesis.identity(), &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            publication.event_ref().clone(),
+            None,
+            "absent-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::Existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&mismatched).unwrap(),
+            ),
+            response(
+                200,
+                &[("etag", "\"e2\"")],
+                other_encoded.stored_bytes().to_vec(),
+            ),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_refuses_an_invalid_retained_root_payload() {
+        let genesis = genesis();
+        let root = crate::scope::decode_root_event(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
+        )
+        .unwrap();
+        let fake_envelope = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            1,
+            None,
+            1,
+            "fake-root-op".into(),
+            crate::scope::ROOT_GENESIS_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let fake = encode_scope_event(&fake_envelope, &Value::Null).unwrap();
+        let fake_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            fake.event_ref().clone(),
+            None,
+            "fake-root-op".into(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&fake_head).unwrap(),
+            ),
+            response(200, &[("etag", "\"e1\"")], fake.stored_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            append_root(
+                &store,
+                ScopeHeadParent::Genesis,
+                genesis.identity(),
+                &root,
+                &mut AttemptHistory::default(),
+                &mut AttemptHistory::default(),
+            )
+            .await
+            .unwrap(),
+            ScopeHeadCommitOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 4);
     }
 }

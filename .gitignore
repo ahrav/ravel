@@ -8,3 +8,5 @@
 
 # Cargo build artifacts
 /target
+.pi/
+piolium/

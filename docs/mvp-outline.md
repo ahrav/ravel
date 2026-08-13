@@ -2800,6 +2800,7 @@ Required correctness proof:
 * Root depth is 1, direct-child depth is 2, and grandchildren are rejected.
 * Children seal bottom-up; settlement is idempotent; unknown reserve stays unavailable;
   escrow remains conserved.
+
 ---
 
 # 32. MVP experiments
@@ -3153,10 +3154,12 @@ movement remain more likely initial bottlenecks.
 ```text
 ravel/
   src/
+    scope.rs
+
     domain/
-      campaign.rs
+      validation.rs
+      artifact.rs
       objective.rs
-      scope.rs
       plan.rs
       claim.rs
       work.rs
@@ -3165,22 +3168,16 @@ ravel/
       decision.rs
       certificate.rs
       settlement.rs
-      attempt.rs
 
     distributed/
       identity.rs
-      presence.rs
-      controller.rs
-      claims.rs
       scope_controller.rs
       scope_claims.rs
       fencing.rs
 
     sync/
-      head.rs
       event.rs
-      scope_head.rs
-      scope_event.rs
+      head.rs
       replay.rs
       cursor.rs
 
@@ -3190,9 +3187,8 @@ ravel/
       plans.rs
 
     db/
-      schema.rs
       projections.rs
-      scope_projections.rs
+      worker.rs
 
     controller/
       admission.rs
@@ -3237,11 +3233,12 @@ ravel/
       status.rs
 ```
 
-The canonical durable paths are `scope.rs`, `sync/event.rs`, `sync/head.rs`,
-`sync/replay.rs`, and `db/projections.rs`.
+The durable protocol lives in `scope.rs`, `sync/event.rs`, `sync/head.rs`, and
+`sync/replay.rs`, with the disposable projection in `db/projections.rs` and its owning
+worker in `db/worker.rs`. Only these ship today; the remaining entries are the planned
+layout for later epics.
 
-`distributed/controller.rs` is not described as a completed E01–E04 proof. Scoped
-controller authority is implemented in `distributed/scope_controller.rs`.
+Scoped controller authority is implemented in `distributed/scope_controller.rs`.
 
 `models/config.rs` records exact fixed model configuration identity and digest. There
 is no `models/profiles.rs`, profile registry, workflow trait, DSL, or generic discovery

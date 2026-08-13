@@ -162,6 +162,14 @@ pub(crate) fn root_domain_valid(envelope: &EventEnvelope) -> bool {
         || (envelope.sequence() == 1 && envelope.parent_event().is_none())
 }
 
+pub(crate) fn root_payload_valid(
+    decoded: &DecodedScopeEvent<Value>,
+    scope: &ScopeIdentity,
+) -> bool {
+    decoded.envelope().payload_type() != ROOT_GENESIS_PAYLOAD_TYPE
+        || crate::scope::root_event_from_decoded(decoded.clone(), scope).is_ok()
+}
+
 fn validate_registered(
     scope: &ScopeIdentity,
     envelope: &EventEnvelope,

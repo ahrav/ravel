@@ -64,7 +64,7 @@ pub enum ReplayError {
     TailMismatch,
     /// The unseen chain exceeds the preparation count or byte cap.
     Overflow,
-    /// The SQLite apply transaction rejected a prepared mutation.
+    /// SQLite worker admission or event application failed.
     Apply(ApplyError),
     /// The local database could not be inspected, removed, started, or read.
     DatabaseUnavailable,
@@ -84,7 +84,7 @@ impl fmt::Display for ReplayError {
             Self::CursorAhead => "local cursor is ahead of the campaign head",
             Self::TailMismatch => "local cursor digest differs from the campaign head",
             Self::Overflow => "unseen event preparation exceeds its bound",
-            Self::Apply(_) => "event application failed",
+            Self::Apply(_) => "event admission or application failed",
             Self::DatabaseUnavailable => "local database is unavailable",
         })
     }
@@ -199,8 +199,8 @@ fn compare_cursor(
 /// # Errors
 ///
 /// Returns [`ReplayError::DatabaseUnavailable`] when the path cannot be inspected, the worker
-/// cannot start, an existing file fails outside validation, or `db_path` is a SQLite URI or
-/// reserved filename. Every other variant reports the replay stage that failed.
+/// cannot start or serve a cursor read, an existing file fails outside validation, or `db_path`
+/// is a SQLite URI or reserved filename. Every other variant reports the replay stage that failed.
 pub async fn startup(store: &S3Store, db_path: &Path) -> Result<ReplayedProjection, ReplayError> {
     // Existence drives the create-or-validate decision, and `try_exists` compares a
     // literal path. SQLite would resolve `file:` URIs and `:memory:` to something
@@ -1591,5 +1591,111 @@ mod tests {
 
         drop(handle);
         clean(&path);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replay_benchmark_chain() -> (Vec<Vec<u8>>, Vec<EventRef>) {
+        let mut bytes = Vec::with_capacity(LIMITS.events as usize);
+        let mut references = Vec::with_capacity(LIMITS.events as usize);
+        let mut parent = None;
+        for sequence in 1..=LIMITS.events {
+            let event = Event::new(
+                format!("benchmark-operation-{sequence}"),
+                sequence,
+                parent,
+                1,
+                if sequence == 1 {
+                    EventContent::CampaignCreated
+                } else {
+                    EventContent::WorkflowStarted
+                },
+            )
+            .unwrap();
+            let (encoded, reference) = encoded_reference(&event);
+            bytes.push(encoded.stored_bytes().to_vec());
+            parent = Some(reference.clone());
+            references.push(reference);
+        }
+        (bytes, references)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn replay_benchmark_sample(
+        size: usize,
+        sample: &str,
+        bytes: &[Vec<u8>],
+        references: &[EventRef],
+    ) -> Duration {
+        let path = PathBuf::from(format!(
+            "/dev/shm/ravel-replay-growth-{}-{size}-{sample}.sqlite3",
+            process::id()
+        ));
+        clean(&path);
+        let mut responses = Vec::with_capacity(size + 1);
+        responses.push(head_response(references[size - 1].clone()));
+        responses.extend(
+            (0..size)
+                .rev()
+                .map(|index| event_response(bytes[index].clone())),
+        );
+        let (store, _) = replay_store(responses);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+
+        let started = Instant::now();
+        let success = replay_with_limits(&store, &handle, LIMITS).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(success.local_cursor.0, size as u64);
+        assert_eq!(
+            success.local_cursor.1.as_deref(),
+            Some(references[size - 1].digest())
+        );
+
+        drop(handle);
+        clean(&path);
+        elapsed
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn replay_growth_stays_subquadratic() {
+        const SIZES: [usize; 5] = [256, 512, 1_024, 2_048, 4_096];
+        assert_eq!(SIZES.last().copied(), Some(LIMITS.events as usize));
+        // Tmpfs keeps fixed filesystem latency from hiding history-dependent growth. Minimums
+        // reduce one-sided scheduler noise. Quadratic work approaches 4x per doubling and 256x
+        // end-to-end; the gates leave margin around the expected 2x and 16x linear growth.
+        let probe = PathBuf::from(format!(
+            "/dev/shm/ravel-replay-growth-probe-{}",
+            process::id()
+        ));
+        if fs::write(&probe, b"probe").is_err() {
+            eprintln!("skipping replay growth gate: /dev/shm is unavailable or unwritable");
+            return;
+        }
+        let _ = fs::remove_file(probe);
+
+        let (bytes, references) = replay_benchmark_chain();
+        let _ = replay_benchmark_sample(256, "warmup", &bytes, &references).await;
+        let mut minimums = Vec::with_capacity(SIZES.len());
+        for size in SIZES {
+            let mut samples = Vec::with_capacity(3);
+            for sample in 0..3 {
+                samples.push(
+                    replay_benchmark_sample(size, &format!("sample-{sample}"), &bytes, &references)
+                        .await,
+                );
+            }
+            minimums.push(samples.into_iter().min().unwrap());
+        }
+        let minimum_millis: Vec<u128> = minimums.iter().map(Duration::as_millis).collect();
+        assert!(
+            minimums
+                .windows(2)
+                .all(|pair| pair[1].as_nanos() < pair[0].as_nanos() * 3),
+            "replay growth exceeded 3x: sizes={SIZES:?} minimum-ms={minimum_millis:?}"
+        );
+        assert!(
+            minimums.last().unwrap().as_nanos() < minimums.first().unwrap().as_nanos() * 32,
+            "replay endpoint growth exceeded 32x: sizes={SIZES:?} minimum-ms={minimum_millis:?}"
+        );
     }
 }

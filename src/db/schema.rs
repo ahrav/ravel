@@ -305,8 +305,7 @@ pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connecti
         _ => return Err(ValidateError::InvalidHistory),
     }
 
-    // A replay whose cursor already equals the observed head applies no mutation, so
-    // `projections::apply` never reaches its row check on this database.
+    // The single-process worker validates projection consistency when it opens the database.
     if !projections::rows_match_cursor(&connection, stored_sequence).map_err(local_format_error)? {
         return Err(ValidateError::InvalidProjection);
     }

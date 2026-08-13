@@ -1,7 +1,8 @@
 //! A SQLite transaction applies scheduling mutations to projection tables.
 //!
-//! The transaction validates local history and parent continuity, applies one projection row,
-//! records the event identity, and advances the singleton synchronization cursor.
+//! The transaction validates the current cursor, parent, sequence, and digest, applies one
+//! projection row, records the event identity, and advances the cursor. The single-process
+//! sole-owner worker validates full history and projection consistency when it opens the database.
 
 use std::{collections::BTreeSet, error::Error, fmt};
 
@@ -10,6 +11,11 @@ use rusqlite::{OptionalExtension, params};
 use crate::sync::event::{GENESIS_CAMPAIGN_ID, SchedulingEffect, SchedulingMutation};
 
 const MAX_READY_WORK: usize = 1_024;
+const CURSOR_SELECT_SQL: &str = "SELECT sequence, tail_digest FROM sync_cursor WHERE id = 1";
+const SEQUENCE_LOOKUP_SQL: &str = "SELECT digest FROM applied_events WHERE sequence = ?1";
+const DIGEST_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_events WHERE digest = ?1)";
+const CURSOR_UPDATE_SQL: &str =
+    "UPDATE sync_cursor SET sequence = ?1, tail_digest = ?2 WHERE id = 1";
 
 #[cfg(test)]
 /// Installs the `fail_cursor_update` trigger; removal drops that exact name.
@@ -25,11 +31,16 @@ pub enum ApplyOutcome {
     AlreadyApplied,
 }
 
-/// Distinguishes projection conflicts from database failures.
+/// `ApplyError` distinguishes projection conflicts, worker admission refusals, and database
+/// failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyError {
     /// The mutation disagrees with recorded history, the cursor, or projection state.
     Conflict,
+    /// Emitted by [`crate::db::worker::DbHandle`] when its queue has no admission slot.
+    Full,
+    /// Emitted by [`crate::db::worker::DbHandle`] when its receiver is disconnected.
+    Stopping,
     /// SQLite failed, or a sequence overflowed its stored or domain representation.
     DatabaseOperationFailed,
 }
@@ -38,6 +49,8 @@ impl fmt::Display for ApplyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Conflict => "mutation conflicts with local projection state",
+            Self::Full => "database command queue is full",
+            Self::Stopping => "database worker is stopping",
             Self::DatabaseOperationFailed => "database operation failed",
         })
     }
@@ -58,23 +71,21 @@ impl From<rusqlite::Error> for ApplyError {
 ///
 /// # Errors
 ///
-/// Returns [`ApplyError::Conflict`] when the mutation disagrees with local history, the cursor,
-/// or projection state: a sequence gap, a parent that does not name the cursor tail, a parent
-/// carried at the genesis cursor, a digest recorded at another sequence, recorded history that
-/// does not cover every sequence through the cursor, or projected rows that do not match the
-/// identities the sequences through the cursor imply.
-/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite cannot complete an operation
-/// or a sequence cannot be converted between its domain and stored representations.
+/// Returns [`ApplyError::Conflict`] for a sequence gap, a parent that does not name the cursor
+/// tail, a parent at the genesis cursor, a digest recorded at another sequence, or a conflicting
+/// historical sequence. Full projection validation occurs at database open; the sole owner and
+/// atomic transactions preserve that validated state during normal operation.
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite cannot complete an operation or a
+/// sequence cannot be converted between its domain and stored representations. This function
+/// never returns [`ApplyError::Full`] or [`ApplyError::Stopping`]; those come from
+/// [`crate::db::worker::DbHandle`] admission.
 pub fn apply(
     connection: &mut rusqlite::Connection,
     mutation: &SchedulingMutation,
 ) -> Result<ApplyOutcome, ApplyError> {
     let transaction = connection.transaction()?;
-    let (stored_cursor_sequence, cursor_digest): (i64, Option<String>) = transaction.query_row(
-        "SELECT sequence, tail_digest FROM sync_cursor WHERE id = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let (stored_cursor_sequence, cursor_digest): (i64, Option<String>) =
+        transaction.query_row(CURSOR_SELECT_SQL, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let cursor_sequence =
         u64::try_from(stored_cursor_sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?;
     let sequence = mutation.reference().sequence();
@@ -82,11 +93,7 @@ pub fn apply(
         i64::try_from(sequence).map_err(|_| ApplyError::DatabaseOperationFailed)?;
 
     let historical_digest: Option<String> = transaction
-        .query_row(
-            "SELECT digest FROM applied_events WHERE sequence = ?1",
-            [stored_sequence],
-            |row| row.get(0),
-        )
+        .query_row(SEQUENCE_LOOKUP_SQL, [stored_sequence], |row| row.get(0))
         .optional()?;
     if sequence <= cursor_sequence {
         return if historical_digest.as_deref() == Some(mutation.reference().digest()) {
@@ -96,43 +103,6 @@ pub fn apply(
         };
     }
     if historical_digest.is_some() || cursor_sequence.checked_add(1) != Some(sequence) {
-        return Err(ApplyError::Conflict);
-    }
-
-    // History that does not cover `1..=cursor` would permanently skip absent event identities.
-    // Every recorded digest carries 64 lowercase hexadecimal characters.
-    let (recorded_rows, lowest_sequence, highest_sequence, malformed_digests, cursor_row_digest): (
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<String>,
-    ) = transaction.query_row(
-        "SELECT COUNT(*), COALESCE(MIN(sequence), 1), COALESCE(MAX(sequence), 0), \
-             COALESCE(SUM(length(digest) != 64 OR length(CAST(digest AS BLOB)) != 64 \
-             OR digest GLOB '*[^0-9a-f]*'), 0), \
-             (SELECT digest FROM applied_events WHERE sequence = ?1) FROM applied_events",
-        [stored_cursor_sequence],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
-    )?;
-    if recorded_rows != stored_cursor_sequence
-        || lowest_sequence < 1
-        || highest_sequence != stored_cursor_sequence
-        || malformed_digests != 0
-        || cursor_row_digest.as_deref() != cursor_digest.as_deref()
-    {
-        return Err(ApplyError::Conflict);
-    }
-
-    if !rows_match_cursor(&transaction, stored_cursor_sequence)? {
         return Err(ApplyError::Conflict);
     }
 
@@ -147,11 +117,10 @@ pub fn apply(
         return Err(ApplyError::Conflict);
     }
 
-    let digest_exists: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM applied_events WHERE digest = ?1)",
-        [mutation.reference().digest()],
-        |row| row.get(0),
-    )?;
+    let digest_exists: bool =
+        transaction.query_row(DIGEST_EXISTS_SQL, [mutation.reference().digest()], |row| {
+            row.get(0)
+        })?;
     if digest_exists {
         return Err(ApplyError::Conflict);
     }
@@ -176,7 +145,7 @@ pub fn apply(
         params![stored_sequence, mutation.reference().digest()],
     )?;
     let updated = transaction.execute(
-        "UPDATE sync_cursor SET sequence = ?1, tail_digest = ?2 WHERE id = 1",
+        CURSOR_UPDATE_SQL,
         params![stored_sequence, mutation.reference().digest()],
     )?;
     if updated != 1 {
@@ -326,7 +295,6 @@ pub(crate) mod tests {
     const DIGEST_2: &str = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0";
     const DIGEST_3: &str = "23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01";
     const DIGEST_4: &str = "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012";
-    const DIGEST_5: &str = "456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123";
 
     #[derive(Debug, Eq, PartialEq)]
     pub(crate) struct Snapshot {
@@ -446,6 +414,51 @@ pub(crate) mod tests {
                 .unwrap(),
             dependencies,
         }
+    }
+
+    fn query_plan(
+        connection: &rusqlite::Connection,
+        sql: &str,
+        parameters: &[&dyn rusqlite::ToSql],
+    ) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        statement
+            .query_map(
+                rusqlite::params_from_iter(parameters.iter().copied()),
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_lookup_statements_avoid_table_scans() {
+        let path = test_path("query-plans");
+        let connection = schema::create(&path).unwrap();
+        let sequence = 1_i64;
+        let digest = DIGEST_1;
+        let plans = [
+            query_plan(&connection, CURSOR_SELECT_SQL, &[]),
+            query_plan(&connection, SEQUENCE_LOOKUP_SQL, &[&sequence]),
+            query_plan(&connection, DIGEST_EXISTS_SQL, &[&digest]),
+            query_plan(&connection, CURSOR_UPDATE_SQL, &[&sequence, &digest]),
+        ];
+        assert!(plans.iter().all(|details| !details.is_empty()));
+        for detail in plans
+            .iter()
+            .flatten()
+            .filter(|detail| detail.starts_with("SCAN"))
+        {
+            // A constant-row scan touches no projection table; it is the only accepted
+            // SCAN plan from the bundled SQLite engine used by this test.
+            assert_eq!(detail, "SCAN CONSTANT ROW");
+        }
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -607,9 +620,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rejects_workflow_when_no_campaign_row_exists() {
+    fn open_rejects_missing_campaign_projection() {
         let path = test_path("missing-campaign");
-        let mut connection = schema::create(&path).unwrap();
+        let connection = schema::create(&path).unwrap();
         connection
             .execute(
                 "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1)",
@@ -622,67 +635,19 @@ pub(crate) mod tests {
                 [DIGEST_1],
             )
             .unwrap();
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
         drop(connection);
+
+        assert_eq!(
+            schema::open_existing(&path).err(),
+            Some(schema::ValidateError::InvalidProjection)
+        );
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn rejects_next_event_when_the_cursor_row_is_missing() {
-        let path = test_path("missing-cursor-row");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        connection
-            .execute("DELETE FROM applied_events WHERE sequence = 1", [])
-            .unwrap();
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_next_event_over_a_hole_below_the_cursor() {
-        let path = test_path("history-hole");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        connection
-            .execute(
-                "INSERT INTO applied_events (sequence, digest) VALUES (3, ?1)",
-                [DIGEST_3],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE sync_cursor SET sequence = 3, tail_digest = ?1 WHERE id = 1",
-                [DIGEST_3],
-            )
-            .unwrap();
-        let workflow = mutation(4, DIGEST_4, Some(DIGEST_3), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_workflow_when_only_a_stray_campaign_row_exists() {
+    fn open_rejects_stray_campaign_projection() {
         let path = test_path("stray-campaign");
-        let mut connection = schema::create(&path).unwrap();
+        let connection = schema::create(&path).unwrap();
         connection
             .execute(
                 "INSERT INTO applied_events (sequence, digest) VALUES (1, ?1)",
@@ -701,18 +666,17 @@ pub(crate) mod tests {
                 [],
             )
             .unwrap();
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
         drop(connection);
+
+        assert_eq!(
+            schema::open_existing(&path).err(),
+            Some(schema::ValidateError::InvalidProjection)
+        );
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn rejects_next_event_when_a_projected_workflow_row_is_missing() {
+    fn open_rejects_missing_workflow_projection() {
         let path = test_path("missing-workflow-row");
         let mut connection = schema::create(&path).unwrap();
         let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
@@ -725,29 +689,17 @@ pub(crate) mod tests {
                 [],
             )
             .unwrap();
-        let next = mutation(3, DIGEST_3, Some(DIGEST_2), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        connection
-            .execute(
-                "INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000009', 'active')",
-                [],
-            )
-            .unwrap();
-        let with_stray_row = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), with_stray_row);
-
         drop(connection);
+
+        assert_eq!(
+            schema::open_existing(&path).err(),
+            Some(schema::ValidateError::InvalidProjection)
+        );
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn rejects_next_event_when_an_interior_workflow_row_is_substituted() {
+    fn open_rejects_substituted_workflow_projection() {
         let path = test_path("substituted-workflow-row");
         let mut connection = schema::create(&path).unwrap();
         for mutation in [
@@ -764,18 +716,17 @@ pub(crate) mod tests {
                  INSERT INTO workflows (workflow_id, state) VALUES ('0000000000000002a', 'active');",
             )
             .unwrap();
-        let next = mutation(5, DIGEST_5, Some(DIGEST_4), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
         drop(connection);
+
+        assert_eq!(
+            schema::open_existing(&path).err(),
+            Some(schema::ValidateError::InvalidProjection)
+        );
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn rejects_next_event_when_an_unimplied_row_exists() {
+    fn open_rejects_unimplied_projection_row() {
         let path = test_path("unimplied-row");
         let mut connection = schema::create(&path).unwrap();
         let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
@@ -786,37 +737,12 @@ pub(crate) mod tests {
                 [],
             )
             .unwrap();
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &workflow), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
         drop(connection);
-        fs::remove_file(path).unwrap();
-    }
 
-    #[test]
-    fn rejects_next_event_when_a_recorded_digest_is_malformed() {
-        let path = test_path("malformed-digest");
-        let mut connection = schema::create(&path).unwrap();
-        let genesis = mutation(1, DIGEST_1, None, EventContent::CampaignCreated);
-        let workflow = mutation(2, DIGEST_2, Some(DIGEST_1), EventContent::WorkflowStarted);
-        assert_eq!(apply(&mut connection, &genesis), Ok(ApplyOutcome::Applied));
-        assert_eq!(apply(&mut connection, &workflow), Ok(ApplyOutcome::Applied));
-        connection
-            .execute(
-                "UPDATE applied_events SET digest = 'not-a-digest' WHERE sequence = 1",
-                [],
-            )
-            .unwrap();
-        let next = mutation(3, DIGEST_3, Some(DIGEST_2), EventContent::WorkflowStarted);
-        let before = snapshot(&connection);
-
-        assert_eq!(apply(&mut connection, &next), Err(ApplyError::Conflict));
-        assert_eq!(snapshot(&connection), before);
-
-        drop(connection);
+        assert_eq!(
+            schema::open_existing(&path).err(),
+            Some(schema::ValidateError::InvalidProjection)
+        );
         fs::remove_file(path).unwrap();
     }
 

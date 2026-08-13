@@ -1,16 +1,17 @@
 //! A dedicated blocking thread owns one SQLite connection and serializes mutations.
 //!
-//! Async callers transfer owned mutations and await owned results. SQLite values and guards
-//! remain on the worker thread. The connection runs in rollback-journal `delete` mode, which
-//! keeps the projection a single file with no write-ahead-log sidecars. The worker either
-//! creates a fresh projection or opens an existing file after validating it, and it answers
-//! cursor reads.
+//! Reads and writes share one queue bounded at 64. Admission fails with full or stopping
+//! instead of blocking. Accepted commands remain owned by the detached worker if callers drop
+//! response futures. SQLite values and guards remain on the worker thread. The connection runs in
+//! rollback-journal `delete` mode, which keeps the projection a single file with no
+//! write-ahead-log sidecars. The worker creates a fresh projection or opens an existing file
+//! after validating it.
 
 use std::{
     error::Error,
     fmt,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, SyncSender},
     thread,
 };
 
@@ -23,6 +24,12 @@ use crate::{
     },
     sync::event::SchedulingMutation,
 };
+
+const COMMAND_QUEUE_CAPACITY: usize = 64;
+
+fn command_channel() -> (SyncSender<Command>, Receiver<Command>) {
+    mpsc::sync_channel(COMMAND_QUEUE_CAPACITY)
+}
 
 enum Command {
     Apply {
@@ -89,7 +96,7 @@ impl Error for OpenExistingError {}
 /// Clones share one worker thread and one connection.
 #[derive(Clone)]
 pub struct DbHandle {
-    commands: Sender<Command>,
+    commands: SyncSender<Command>,
 }
 
 impl DbHandle {
@@ -134,7 +141,7 @@ impl DbHandle {
     }
 
     async fn start(path: PathBuf, mode: OpenMode) -> Result<Self, StartError> {
-        let (commands, receiver) = mpsc::channel();
+        let (commands, receiver) = command_channel();
         let (startup_send, startup_receive) = oneshot::channel();
         thread::Builder::new()
             .name("ravel-sqlite".into())
@@ -148,21 +155,39 @@ impl DbHandle {
         }
     }
 
+    fn enqueue<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, ApplyError>>) -> Command,
+    ) -> Result<oneshot::Receiver<Result<T, ApplyError>>, ApplyError> {
+        let (respond, receive) = oneshot::channel();
+        match self.commands.try_send(command(respond)) {
+            Ok(()) => Ok(receive),
+            Err(mpsc::TrySendError::Full(_)) => Err(ApplyError::Full),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(ApplyError::Stopping),
+        }
+    }
+
+    // The live, unpolled receiver keeps admission full; dropping it yields Stopping.
+    #[cfg(test)]
+    fn stalled() -> (Self, Receiver<Command>) {
+        let (commands, receiver) = command_channel();
+        (Self { commands }, receiver)
+    }
+
     /// Applies one owned scheduling mutation on the SQLite owner thread.
     ///
-    /// Dropping the returned future does not revoke a command that was already sent;
-    /// the mutation still applies, and only the response is discarded.
+    /// Dropping the returned future does not revoke a command that was already accepted;
+    /// the mutation still applies, and only the response is discarded. A lost response does
+    /// not indicate whether the accepted mutation committed.
     ///
     /// # Errors
     ///
-    /// Returns errors from [`projections::apply`], or [`ApplyError::DatabaseOperationFailed`]
-    /// when the command or response channel disconnects.
+    /// Returns [`ApplyError::Full`] when admission is saturated,
+    /// [`ApplyError::Stopping`] when the worker is disconnected, errors from
+    /// [`projections::apply`], or [`ApplyError::DatabaseOperationFailed`] when an accepted
+    /// command loses its response.
     pub async fn apply(&self, mutation: SchedulingMutation) -> Result<ApplyOutcome, ApplyError> {
-        let (respond, receive) = oneshot::channel();
-        self.commands
-            .send(Command::Apply { mutation, respond })
-            .map_err(|_| ApplyError::DatabaseOperationFailed)?;
-        receive
+        self.enqueue(|respond| Command::Apply { mutation, respond })?
             .await
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
@@ -171,14 +196,11 @@ impl DbHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::DatabaseOperationFailed`] when the query fails or the command or
-    /// response channel disconnects.
+    /// Returns [`ApplyError::Full`] when admission is saturated,
+    /// [`ApplyError::Stopping`] when the worker is disconnected, or
+    /// [`ApplyError::DatabaseOperationFailed`] when the query or accepted response fails.
     pub(crate) async fn cursor(&self) -> Result<(u64, Option<String>), ApplyError> {
-        let (respond, receive) = oneshot::channel();
-        self.commands
-            .send(Command::Cursor { respond })
-            .map_err(|_| ApplyError::DatabaseOperationFailed)?;
-        receive
+        self.enqueue(|respond| Command::Cursor { respond })?
             .await
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
@@ -187,8 +209,9 @@ impl DbHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::DatabaseOperationFailed`] when command delivery, response receipt, or
-    /// the SQLite query fails.
+    /// Returns [`ApplyError::Full`] when admission is saturated,
+    /// [`ApplyError::Stopping`] when the worker is disconnected, or
+    /// [`ApplyError::DatabaseOperationFailed`] when the query or accepted response fails.
     pub async fn list_ready_work(
         &self,
         campaign_id: String,
@@ -196,28 +219,20 @@ impl DbHandle {
         limit: usize,
         after: Option<(String, String)>,
     ) -> Result<Vec<(String, String)>, ApplyError> {
-        let (respond, receive) = oneshot::channel();
-        self.commands
-            .send(Command::ListReadyWork {
-                campaign_id,
-                capabilities,
-                limit,
-                after,
-                respond,
-            })
-            .map_err(|_| ApplyError::DatabaseOperationFailed)?;
-        receive
-            .await
-            .map_err(|_| ApplyError::DatabaseOperationFailed)?
+        self.enqueue(|respond| Command::ListReadyWork {
+            campaign_id,
+            capabilities,
+            limit,
+            after,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
     #[cfg(test)]
     pub(crate) async fn diagnostics(&self) -> Result<Diagnostics, ApplyError> {
-        let (respond, receive) = oneshot::channel();
-        self.commands
-            .send(Command::Diagnostics { respond })
-            .map_err(|_| ApplyError::DatabaseOperationFailed)?;
-        receive
+        self.enqueue(|respond| Command::Diagnostics { respond })?
             .await
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
@@ -326,7 +341,11 @@ fn read_cursor(connection: &rusqlite::Connection) -> Result<(u64, Option<String>
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process};
+    use std::{
+        fs,
+        process::{self, Command as ProcessCommand, Stdio},
+        time::{Duration, Instant},
+    };
 
     use crate::{
         domain::campaign::{Event, EventContent, EventRef},
@@ -337,6 +356,166 @@ mod tests {
 
     fn path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ravel-worker-{}-{label}.sqlite3", process::id()))
+    }
+
+    fn test_mutation() -> SchedulingMutation {
+        let event = Event::new(
+            "operation-1".into(),
+            1,
+            None,
+            1,
+            EventContent::CampaignCreated,
+        )
+        .unwrap();
+        let encoded = encode(&event).unwrap();
+        let reference = EventRef::new(
+            event.sequence(),
+            encoded.digest().to_owned(),
+            encoded.key().to_owned(),
+        )
+        .unwrap();
+        scheduling_mutation(reference, &event).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_reports_full_then_stopping_for_every_command() {
+        let (handle, receiver) = DbHandle::stalled();
+        let mut pending = Vec::with_capacity(COMMAND_QUEUE_CAPACITY);
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            pending.push(
+                handle
+                    .enqueue(|respond| Command::Cursor { respond })
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(handle.apply(test_mutation()).await, Err(ApplyError::Full));
+        assert_eq!(handle.cursor().await, Err(ApplyError::Full));
+        assert_eq!(
+            handle
+                .list_ready_work("campaign".into(), Vec::new(), 1, None)
+                .await,
+            Err(ApplyError::Full)
+        );
+        assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Full));
+
+        drop(receiver.recv().unwrap());
+        drop(
+            handle
+                .enqueue(|respond| Command::Cursor { respond })
+                .expect("admission recovers after one slot drains"),
+        );
+
+        drop(receiver);
+        assert_eq!(
+            handle.apply(test_mutation()).await,
+            Err(ApplyError::Stopping)
+        );
+        assert_eq!(handle.cursor().await, Err(ApplyError::Stopping));
+        assert_eq!(
+            handle
+                .list_ready_work("campaign".into(), Vec::new(), 1, None)
+                .await,
+            Err(ApplyError::Stopping)
+        );
+        assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Stopping));
+        drop(pending);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn vm_hwm_kib() -> u64 {
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .expect("VmHWM is present in /proc/self/status")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "launched in isolation by stalled_writer_memory_is_bounded"]
+    async fn stalled_writer_memory_child() {
+        let (handle, receiver) = DbHandle::stalled();
+        let mut pending = Vec::with_capacity(COMMAND_QUEUE_CAPACITY);
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            pending.push(
+                handle
+                    .enqueue(|respond| Command::Cursor { respond })
+                    .unwrap(),
+            );
+        }
+        assert_eq!(handle.apply(test_mutation()).await, Err(ApplyError::Full));
+
+        let mutation = test_mutation();
+        let mut rejected = 0_u64;
+        let mut samples = Vec::with_capacity(10);
+        // VmHWM is process-wide, so the parent isolates this child. The first sample follows
+        // 10,000 attempts to exclude allocator and runtime warm-up.
+        for attempt in 1..=100_000_u64 {
+            assert_eq!(handle.apply(mutation.clone()).await, Err(ApplyError::Full));
+            rejected += 1;
+            if attempt % 10_000 == 0 {
+                samples.push(vm_hwm_kib());
+            }
+        }
+        assert_eq!(rejected, 100_000);
+        let delta = samples.last().unwrap().saturating_sub(samples[0]);
+        println!("VmHWM-kib={samples:?}; delta-kib={delta}; rejected={rejected}");
+        assert!(delta <= 8 * 1024, "VmHWM grew by {delta} KiB: {samples:?}");
+
+        drop(receiver);
+        drop(pending);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_writer_memory_is_bounded() {
+        let stdout_path = path("rss-stdout");
+        let stderr_path = path("rss-stderr");
+        let _ = fs::remove_file(&stdout_path);
+        let _ = fs::remove_file(&stderr_path);
+        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::worker::tests::stalled_writer_memory_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("failed to poll stalled-writer RSS child: {error}");
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stalled-writer RSS child exceeded 60 seconds");
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = fs::read_to_string(&stdout_path).unwrap();
+        let stderr = fs::read_to_string(&stderr_path).unwrap();
+        let _ = fs::remove_file(stdout_path);
+        let _ = fs::remove_file(stderr_path);
+        assert!(status.success(), "child failed: {stdout}\n{stderr}");
+        let samples = stdout
+            .lines()
+            .find(|line| line.contains("VmHWM-kib="))
+            .expect("child reports RSS samples");
+        println!("{samples}");
     }
 
     #[tokio::test]

@@ -55,6 +55,22 @@ enum Command {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
         dependencies: Vec<WorkId>,
+        scope_epoch: NonZeroU64,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
+    RecordGrant {
+        scope: Box<ScopeIdentity>,
+        work: WorkRef,
+        claim_fence: NonZeroU64,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
+    ResumableWork {
+        scope: Box<ScopeIdentity>,
+        scope_epoch: NonZeroU64,
+        now_ms: u64,
+        respond: oneshot::Sender<Result<Vec<WorkRef>, ApplyError>>,
+    },
+    Drain {
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     RecordClaim {
@@ -300,16 +316,80 @@ impl DbHandle {
         scope: &ScopeIdentity,
         work: WorkRef,
         dependencies: Vec<WorkId>,
+        scope_epoch: NonZeroU64,
     ) -> Result<(), ApplyError> {
         let scope = Box::new(scope.clone());
         self.enqueue(|respond| Command::AdmitWork {
             scope,
             work,
             dependencies,
+            scope_epoch,
             respond,
         })?
         .await
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// A grant is recorded against the exact claim fence it was issued for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Conflict`] when the revision is unknown, terminal, or claimed at
+    /// another fence, [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub async fn record_grant(
+        &self,
+        scope: &ScopeIdentity,
+        work: WorkRef,
+        claim_fence: NonZeroU64,
+    ) -> Result<(), ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::RecordGrant {
+            scope,
+            work,
+            claim_fence,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Lists the revisions a restart may resume under `scope_epoch` at `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub async fn resumable_work(
+        &self,
+        scope: &ScopeIdentity,
+        scope_epoch: NonZeroU64,
+        now_ms: u64,
+    ) -> Result<Vec<WorkRef>, ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::ResumableWork {
+            scope,
+            scope_epoch,
+            now_ms,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Resolves once every command accepted before this call has been applied.
+    ///
+    /// Commands are served in admission order on one thread, so this reply proves the queue
+    /// ahead of it drained; it does not stop later admissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub async fn drain(&self) -> Result<(), ApplyError> {
+        self.enqueue(|respond| Command::Drain { respond })?
+            .await
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
     /// # Errors
@@ -435,6 +515,7 @@ fn run(
                 scope,
                 work,
                 dependencies,
+                scope_epoch,
                 respond,
             } => {
                 let _ = respond.send(projections::admit_work(
@@ -442,7 +523,37 @@ fn run(
                     &scope,
                     &work,
                     &dependencies,
+                    scope_epoch,
                 ));
+            }
+            Command::RecordGrant {
+                scope,
+                work,
+                claim_fence,
+                respond,
+            } => {
+                let _ = respond.send(projections::record_grant(
+                    &connection,
+                    &scope,
+                    &work,
+                    claim_fence,
+                ));
+            }
+            Command::ResumableWork {
+                scope,
+                scope_epoch,
+                now_ms,
+                respond,
+            } => {
+                let _ = respond.send(projections::resumable_work(
+                    &connection,
+                    &scope,
+                    scope_epoch,
+                    now_ms,
+                ));
+            }
+            Command::Drain { respond } => {
+                let _ = respond.send(Ok(()));
             }
             Command::RecordClaim {
                 scope,
@@ -598,7 +709,7 @@ mod tests {
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Full));
         assert_eq!(
             work_commands(&handle, &genesis).await,
-            [Err(ApplyError::Full); 4]
+            [Err(ApplyError::Full); 7]
         );
 
         drop(receiver.recv().unwrap());
@@ -633,26 +744,31 @@ mod tests {
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Stopping));
         assert_eq!(
             work_commands(&handle, &genesis).await,
-            [Err(ApplyError::Stopping); 4]
+            [Err(ApplyError::Stopping); 7]
         );
         drop(pending);
     }
 
-    /// Admission for the four work commands, which return `()` so one array compares them all.
+    /// Admission for every work command, mapped to `()` so one array compares them all.
     async fn work_commands(
         handle: &DbHandle,
         genesis: &crate::scope::RootGenesis,
-    ) -> [Result<(), ApplyError>; 4] {
+    ) -> [Result<(), ApplyError>; 7] {
         let scope = genesis.identity();
         let work = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
         let fence = NonZeroU64::new(1).unwrap();
         [
-            handle.admit_work(scope, work.clone(), Vec::new()).await,
+            handle
+                .admit_work(scope, work.clone(), Vec::new(), fence)
+                .await,
             handle.record_claim(scope, work.clone(), fence, fence).await,
             handle
                 .record_terminal(scope, work.clone(), genesis.config_digest().clone())
                 .await,
+            handle.record_grant(scope, work.clone(), fence).await,
             handle.ready_work(scope, 1).await.map(|_| ()),
+            handle.resumable_work(scope, fence, 1).await.map(|_| ()),
+            handle.drain().await,
         ]
     }
 

@@ -1053,6 +1053,15 @@ conditional replacement on that same key. Successful acquisition yields an opaqu
 identifiers as authority. Completion CASes `ACTIVE(claim_fence)` to a sealed submission,
 so reclamation and completion race on the same ETag.
 
+The seal names one immutable submission record on the content-addressed artifact axis, and
+that record carries the same campaign, scope, plan, work revision, owner, fence, and
+operation identity plus the result it binds. Each record declares its kind, so a claim object
+republished as content-addressed bytes cannot be read as a submission record. Controller intake reads the deterministic claim
+key for work its projection already knows, never a prefix listing, and accepts a seal only
+when the record's bytes hash to the sealed digest and every binding agrees. An active lease,
+a superseded fence, a foreign plan lineage, missing evidence, or any disagreement yields no
+fact, and repeated intake of one sealed claim yields the same fact.
+
 A worker that loses ownership may still publish an immutable late observation, but the
 observation cannot complete the `WorkSpec` or authorize a new effect. The current
 scoped controller accepts a sealed submission only when campaign, scope, plan, work
@@ -1203,9 +1212,12 @@ transitions advance the epoch without publishing an event. The first plan transi
 deliberately relax it further. Any async owner for the projection file must use a bounded
 intake queue from its first release.
 
-The projection also persists each admitted work revision with its claim fence, claim lease, and
-terminal evidence, plus that revision's dependency edges. Work readiness is derived from those
-rows by query as of a caller-supplied clock reading and is never stored.
+The projection also persists each admitted work revision with the scope epoch that admitted
+it, its claim fence and lease, the grant bound to that fence, terminal evidence, and its
+dependency edges. Work readiness is derived from those rows by query as of a caller-supplied
+clock reading and is never stored. A restart resumes a revision only while every binding is
+still current: the admitting epoch is not ahead of the controller's, the revision is the
+highest admitted, the claim lease is live, and a grant is bound to that exact claim fence.
 
 Each projected scope records:
 
@@ -3253,8 +3265,9 @@ The durable root wire contract lives in `scope.rs` with shared wire errors in
 `db/projections.rs` owned by `db/worker.rs`. They are supported by `domain/validation.rs`,
 `domain/artifact.rs`, `domain/work.rs`, `distributed/identity.rs`,
 `storage/s3.rs`, and `storage/artifacts.rs`. Root controller authority lives in
-`distributed/scope_controller.rs`. Only these ship today; the remaining
-entries are the planned layout for later epics.
+`distributed/scope_controller.rs`, scoped claims and sealed-submission intake in
+`distributed/claims.rs`, and bounded node intake and shutdown in `distributed/lifecycle.rs`.
+Only these ship today; the remaining entries are the planned layout for later epics.
 
 `models/config.rs` will record exact fixed model configuration identity and digest.
 There is no `models/profiles.rs`, profile registry, workflow trait, DSL, or generic

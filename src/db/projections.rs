@@ -48,7 +48,7 @@ CREATE TABLE scopes (
     CHECK (length(scope_id) = 64 AND length(CAST(scope_id AS BLOB)) = 64
         AND scope_id NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(CAST(campaign_id AS BLOB)) BETWEEN 1 AND 128
-        AND campaign_id NOT LIKE '%/%'),
+        AND instr(CAST(campaign_id AS BLOB), CAST('/' AS BLOB)) = 0),
     CHECK (parent_scope_id IS NULL),
     CHECK (delegation_digest IS NULL),
     CHECK (sequence BETWEEN 1 AND 9999999999999999),
@@ -80,10 +80,10 @@ CREATE TABLE applied_scope_events (
         AND length(CAST(parent_digest AS BLOB)) = 64
         AND parent_digest NOT GLOB '*[^0-9a-f]*')),
     CHECK (length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 128
-        AND operation_id NOT LIKE '%/%'),
+        AND instr(CAST(operation_id AS BLOB), CAST('/' AS BLOB)) = 0),
     CHECK (writer_epoch > 0),
     CHECK (length(CAST(payload_type AS BLOB)) BETWEEN 1 AND 128
-        AND payload_type NOT LIKE '%/%'),
+        AND instr(CAST(payload_type AS BLOB), CAST('/' AS BLOB)) = 0),
     CHECK ((sequence = 1 AND payload_type = 'root_genesis'
             AND operation_id = 'root-genesis:' || scope_id)
         OR (sequence > 1 AND payload_type <> 'root_genesis'))
@@ -850,6 +850,26 @@ mod tests {
 
         drop(connection);
         fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn a_projected_identity_rejects_a_slash_hidden_after_a_nul() {
+        let path = path("nul-smuggled");
+        let connection = create(&path).unwrap();
+        // SQLite text matching stops at an embedded NUL, so the bound is byte-wise.
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO scopes (scope_id, campaign_id, parent_scope_id, \
+                     delegation_digest, sequence, tail_event_digest, active_plan_digest, \
+                     scope_epoch) \
+                     VALUES (?1, 'campaign-a' || char(0) || '/other', NULL, NULL, 1, ?2, NULL, 1)",
+                    params![DIGEST_1, DIGEST_2],
+                )
+                .is_err()
+        );
+        drop(connection);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

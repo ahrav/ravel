@@ -895,6 +895,20 @@ pub fn decode_root_event(
     Ok(event)
 }
 
+pub(crate) fn payload_type_registered(payload_type: &str) -> bool {
+    if payload_type == ROOT_GENESIS_PAYLOAD_TYPE {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        payload_type == TEST_SUCCESSOR_PAYLOAD_TYPE
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 pub(crate) fn root_event_from_decoded(
     decoded: DecodedScopeEvent<ciborium::Value>,
     expected_scope: &ScopeIdentity,

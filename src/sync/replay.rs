@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     WireError,
-    event::{ScopeEventReadError, payload_registered, read_opaque},
+    event::{ScopeEventReadError, payload_registered, read_opaque, root_domain_valid},
     head::{self, ObservedScopeHead, ScopeHeadReadError},
 };
 
@@ -112,7 +112,8 @@ pub async fn refresh_blocking(
 }
 
 /// Replaces the file after deterministic local format or history validation failures.
-/// Database-operation failures leave the existing file intact.
+/// A foreign application id is a refusal, not a rebuild: it can belong to unrelated
+/// local data. Database-operation failures leave the existing file intact.
 ///
 /// # Blocking
 ///
@@ -134,10 +135,15 @@ pub fn open_projection(path: &Path) -> Result<rusqlite::Connection, ScopeReplayE
     }
     match projections::open_existing(path) {
         Ok(connection) => Ok(connection),
-        Err(projections::ValidateError::DatabaseOperationFailed) => {
-            Err(ScopeReplayError::DatabaseUnavailable)
-        }
-        Err(_) => rebuild_projection(path),
+        Err(
+            projections::ValidateError::DatabaseOperationFailed
+            | projections::ValidateError::WrongApplicationId,
+        ) => Err(ScopeReplayError::DatabaseUnavailable),
+        Err(
+            projections::ValidateError::IntegrityCheckFailed
+            | projections::ValidateError::InvalidSchema
+            | projections::ValidateError::InvalidHistory,
+        ) => rebuild_projection(path),
     }
 }
 
@@ -321,6 +327,9 @@ async fn prepare_chain(
         }
         if !payload_registered(decoded.envelope()) {
             return Err(ScopeReplayError::UnsupportedPayload);
+        }
+        if !root_domain_valid(decoded.envelope()) {
+            return Err(ScopeReplayError::EventInvalid(WireError::InvalidValue));
         }
         let final_hop = hop + 1 == unseen;
         if final_hop {
@@ -555,13 +564,12 @@ mod tests {
         let (store, client) = replay_store(vec![
             head_response(encode_head(&invalid_root_head).unwrap()),
             event_response(invalid_root.stored_bytes().to_vec()),
-            event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh_blocking(&store, &mut connection, genesis.identity()).await,
-            ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(_))
+            ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(WireError::InvalidValue))
         ));
-        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(
             projections::scope_cursor(&connection, genesis.identity()).unwrap(),
             (0, None)
@@ -664,9 +672,25 @@ mod tests {
         ));
         drop(connection);
 
-        let corrupt = rusqlite::Connection::open(&path).unwrap();
-        corrupt.pragma_update(None, "application_id", 0).unwrap();
-        drop(corrupt);
+        // A foreign application id is unrelated local data, so the file survives.
+        let foreign = rusqlite::Connection::open(&path).unwrap();
+        foreign
+            .pragma_update(None, "application_id", 0x1234)
+            .unwrap();
+        drop(foreign);
+        assert!(matches!(
+            open_projection(&path),
+            Err(ScopeReplayError::DatabaseUnavailable)
+        ));
+        assert_eq!(
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))
+                .unwrap(),
+            0x1234
+        );
+
+        fs::write(&path, b"not-a-database".repeat(512)).unwrap();
         let sidecars = [
             PathBuf::from(format!("{}-journal", path.display())),
             PathBuf::from(format!("{}-wal", path.display())),

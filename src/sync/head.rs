@@ -15,7 +15,10 @@ use crate::{
 
 use super::{
     WireError,
-    event::{ResolvedScopeEventPublication, ScopeEventPublicationError, publish_root, read_opaque},
+    event::{
+        ResolvedScopeEventPublication, ScopeEventPublicationError, payload_registered,
+        publish_root, read_opaque, root_domain_valid,
+    },
 };
 
 const MAX_RECONCILE_HOPS: u64 = 4_096;
@@ -372,6 +375,9 @@ async fn reconcile(
             Some(total) if total <= MAX_RECONCILE_BYTES => total,
             _ => return ScopeHeadCommitOutcome::Unresolved(transition),
         };
+        if !payload_registered(decoded.envelope()) || !root_domain_valid(decoded.envelope()) {
+            return ScopeHeadCommitOutcome::Unresolved(transition);
+        }
         if decoded.envelope().operation_id() == transition.candidate.operation_id() {
             if current_ref != *transition.candidate.tail()
                 || bytes != transition.event.canonical_bytes()

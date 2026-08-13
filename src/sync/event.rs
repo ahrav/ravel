@@ -153,17 +153,13 @@ pub(crate) async fn read_opaque(
 }
 
 pub(crate) fn payload_registered(envelope: &EventEnvelope) -> bool {
-    if envelope.payload_type() == ROOT_GENESIS_PAYLOAD_TYPE {
-        return true;
-    }
-    #[cfg(test)]
-    {
-        envelope.payload_type() == crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
+    crate::scope::payload_type_registered(envelope.payload_type())
+}
+
+/// Root genesis requires sequence 1 and no parent event.
+pub(crate) fn root_domain_valid(envelope: &EventEnvelope) -> bool {
+    envelope.payload_type() != ROOT_GENESIS_PAYLOAD_TYPE
+        || (envelope.sequence() == 1 && envelope.parent_event().is_none())
 }
 
 fn validate_registered(

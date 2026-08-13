@@ -360,13 +360,13 @@ async fn append_reports_publication_errors_with_exact_dispatch_evidence() {
         return;
     }
     let config = aws_config::load_from_env().await;
-    // A bucket this identity cannot write exercises the error path.
+    let campaign = run_campaign();
     let unwritable = S3Store::new(
-        "ravel-live-suite-absent-bucket",
+        format!("ravel-live-absent-{}", campaign.as_str()),
         Region::new(EXPECTED_REGION),
         Builder::from(&config),
     );
-    let genesis = genesis_for(run_campaign());
+    let genesis = genesis_for(campaign);
     let scope = genesis.identity();
     let root = decode_root_event(genesis.event_bytes(), genesis.event_key(), scope)
         .expect("canonical fixture decodes");

@@ -191,9 +191,7 @@ pub(crate) fn create(path: impl AsRef<Path>) -> Result<rusqlite::Connection, Sch
 pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<rusqlite::Connection, ValidateError> {
     let connection = rusqlite::Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_URI,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| ValidateError::DatabaseOperationFailed)?;
     connection

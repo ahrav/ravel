@@ -361,16 +361,15 @@ fn checked_total(total: usize, next: usize, limit: usize) -> Result<usize, Scope
     }
 }
 
+/// `is_sqlite_uri` compares encoded bytes so non-UTF-8 paths can match `b"file:"`.
 fn is_sqlite_uri(path: &Path) -> bool {
-    let Some(text) = path.to_str() else {
-        return false;
-    };
-    text == ":memory:" || text.starts_with("file:")
+    let bytes = path.as_os_str().as_encoded_bytes();
+    bytes == b":memory:" || bytes.starts_with(b"file:")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, process};
+    use std::{fs, os::unix::ffi::OsStringExt, path::PathBuf, process};
 
     use aws_sdk_s3::primitives::SdkBody;
     use ciborium::Value;
@@ -776,5 +775,8 @@ mod tests {
         );
         assert!(open_projection(Path::new(":memory:")).is_err());
         assert!(open_projection(Path::new("file:scope.sqlite3")).is_err());
+        let non_utf8 = std::ffi::OsString::from_vec(b"file:scope.sqlite3?mode=memory\xff".to_vec());
+        assert!(is_sqlite_uri(Path::new(&non_utf8)));
+        assert!(open_projection(Path::new(&non_utf8)).is_err());
     }
 }

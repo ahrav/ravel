@@ -754,8 +754,8 @@ pub(crate) fn encode_scope_event<P: Serialize>(
 ///
 /// # Errors
 ///
-/// Returns [`WireError`] for invalid framing, an unregistered payload type, noncanonical
-/// bytes, identities, scope binding, digest, or key.
+/// Returns [`WireError`] for invalid framing, a payload type other than `expected_payload`,
+/// noncanonical bytes, identities, scope binding, digest, or key.
 pub(crate) fn decode_scope_event<P>(
     stored_bytes: &[u8],
     expected_key: &str,
@@ -872,8 +872,8 @@ pub fn encode_root_event(event: &RootEvent) -> Result<EncodedScopeEvent, WireErr
 /// # Errors
 ///
 /// Returns [`WireError`] for framing and size failures, malformed or noncanonical bytes,
-/// an unregistered payload type, non-root or invalid identities, wrong-scope bytes, or a
-/// key mismatch. The payload type is rejected before canonicality checks.
+/// a payload type other than root-genesis, non-root or invalid identities, wrong-scope bytes,
+/// or a key mismatch. The decoder rejects the payload type before canonicality checks.
 pub fn decode_root_event(
     stored_bytes: &[u8],
     expected_key: &str,

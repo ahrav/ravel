@@ -196,6 +196,7 @@ async fn prepare_suffix_with_limits(
         cursor,
         observed.head().tail().clone(),
         observed.head().scope_epoch().get(),
+        observed.head().operation_id(),
         limits,
     )
     .await?;
@@ -279,6 +280,7 @@ async fn prepare_chain(
     cursor: (u64, Option<Digest>),
     tail: ScopeEventRef,
     scope_epoch: u64,
+    head_operation: &str,
     limits: Limits,
 ) -> Result<Vec<Prepared>, ScopeReplayError> {
     if tail.sequence() < cursor.0 {
@@ -313,6 +315,7 @@ async fn prepare_chain(
         if decoded.event_ref() != &current
             || decoded.envelope().writer_epoch().get() != scope_epoch
             || !operations.insert(decoded.envelope().operation_id().to_owned())
+            || (hop == 0 && decoded.envelope().operation_id() != head_operation)
         {
             return Err(ScopeReplayError::HistoryConflict);
         }
@@ -355,17 +358,17 @@ fn checked_total(total: usize, next: usize, limit: usize) -> Result<usize, Scope
     }
 }
 
+/// `is_sqlite_uri` compares encoded bytes so non-UTF-8 paths can match `b"file:"`.
 fn is_sqlite_uri(path: &Path) -> bool {
-    let Some(text) = path.to_str() else {
-        return false;
-    };
-    text == ":memory:" || text.starts_with("file:")
+    let bytes = path.as_os_str().as_encoded_bytes();
+    bytes == b":memory:" || bytes.starts_with(b"file:")
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
+        os::unix::ffi::OsStringExt,
         path::PathBuf,
         process,
         time::{Duration, Instant},
@@ -568,6 +571,29 @@ mod tests {
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(WireError::InvalidValue))
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (0, None)
+        );
+
+        let mismatched_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            None,
+            "mismatched-operation".into(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&mismatched_head).unwrap()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, genesis.identity()).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
         assert_eq!(client.actual_requests().count(), 2);
         assert_eq!(
@@ -790,6 +816,9 @@ mod tests {
                 .await
                 .is_err()
         );
+        let non_utf8 = std::ffi::OsString::from_vec(b"file:scope.sqlite3?mode=memory\xff".to_vec());
+        assert!(is_sqlite_uri(Path::new(&non_utf8)));
+        assert!(open_projection(Path::new(&non_utf8)).await.is_err());
     }
 
     /// Builds one canonical chain of `LIMITS.events` events: root genesis at sequence 1 and

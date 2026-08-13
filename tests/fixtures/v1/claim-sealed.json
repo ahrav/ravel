@@ -1,1 +1,0 @@
-{"version":1,"work_id":"work-17","work_revision":4,"owner_actor":"rust-worker","owner_instance":"instance-a","fence":9,"operation_id":"op-claim-001","state":{"state":"sealed","result_ref":{"digest":"0000000000000000000000000000000000000000000000000000000000000000","size":42,"media_type":"application/json","producer_attempt":"attempt-17","creation_time_unix_ms":1749999999000}}}

@@ -1,18 +1,14 @@
 # Distributed Autonomous Engineering Campaign Runtime
 
-## Working Plan and MVP Specification v0.2 — Scoped v2
+## Working Plan and MVP Specification — Root Scope Protocol
 
-> **Durable-version convention.** E01, E03, and E04 are complete frozen-v1 proof
-> records; E02's frozen v1 code is complete while its selected-bucket live preflight
-> (`ravel-aq8.7`) remains open and must close or be deferred on its own recorded
-> evidence. Existing v1 event, head, claim, projection, artifact, key, encoding, and
-> fixture bytes remain unchanged. Scoped v2 is a new durable boundary with new scope keys,
-> identities, claims, projections, and `EventEnvelope`. A v2 campaign starts with a
-> v2 root `Scope`; one authoritative chain never mixes v1 and v2 events.
->
-> In every section that documents both versions, present the frozen-v1 record first
-> and scoped v2 second. Reuse v1 algorithms through explicit v2 types and bindings;
-> never reinterpret, rewrite, migrate, or silently route a v1 object through v2 code.
+> **Durable-format convention.** The root-scoped protocol is the only durable protocol.
+> There is no second era, no compatibility decoder, and no migration path. A durable
+> format change updates this one contract, its canonical bytes, and its fixtures
+> together. Objects written by an earlier abandoned layout are unsupported and read as
+> malformed input. E01, E03, and E04 are complete proof records; E02's code is complete
+> while its selected-bucket live preflight (`ravel-aq8.7`) remains open and must close or
+> be deferred on its own recorded evidence.
 
 ## 0. Executive summary
 
@@ -55,7 +51,7 @@ referenced by typed `PlanRevision.proposal_basis` and pass deterministic admissi
 The system must not depend on human review for routine planning, evaluation, research
 synthesis, or candidate selection.
 
-Scoped v2 keeps three independent structures:
+The protocol keeps three independent structures:
 
 * A rooted authority tree of `Scope` controllers, delegation grants, attenuated
   authority, escrow, completion certificates, and settlement.
@@ -83,7 +79,7 @@ Machine
   └── Git support
 ```
 
-The scoped-v2 topology is distributed without a global sequencer:
+The topology is distributed without a global sequencer:
 
 ```text
                          Shared object storage
@@ -111,18 +107,6 @@ Each scope nevertheless has one fenced decision authority, one `ScopeHead`, one 
 decision stream, one `scope_epoch`, one active plan lineage, and one replay cursor. The
 root handles child certificates and settlement; it does not sequence every leaf
 transition.
-
-The frozen-v1 record used one flat campaign controller and one campaign head:
-
-```text
-many concurrent workers
-one lightweight campaign-level authoritative sequencer
-```
-
-That v1 event, head, claim, projection, artifact, key, encoding, and fixture behavior
-remains unchanged for E01–E04. Scoped v2 starts at a new root `Scope` with new keys and
-a new `EventEnvelope`. A v1 head never references a v2 event, a v2 `ScopeHead` never
-references a v1 event, and no object is silently converted between them.
 
 There is no permanent coordinator machine, PostgreSQL, DynamoDB, or distributed
 consensus system in the MVP, and no requirement that every machine remain online.
@@ -371,9 +355,8 @@ exact bindings and verifier remain applicable.
 
 ## 2.6 No replay of external side effects
 
-A frozen-v1 event log reconstructs frozen-v1 campaign state. A scoped-v2 decision log
-reconstructs one scope's authority state. Neither replays model calls, shell commands,
-Git pushes, external API calls, evaluator jobs, or build processes.
+A decision log reconstructs one scope's authority state. It never replays model calls,
+shell commands, Git pushes, external API calls, evaluator jobs, or build processes.
 
 Every external side effect requires all three:
 
@@ -393,7 +376,7 @@ stays unavailable.
 
 ## 2.7 Protocol semantics stay outside the kernel
 
-The scoped-v2 kernel authority vocabulary is limited to:
+The kernel authority vocabulary is limited to:
 
 ```text
 Campaign
@@ -448,11 +431,10 @@ Document:
   CoverageResult
 ```
 
-Scoped v2 has no universal `WorkflowInstance` or `WorkItem` authority object.
-Concrete protocol state remains outside the kernel, and claimable v2 work is
-represented by `WorkSpec`.
+The kernel has no universal `WorkflowInstance` or `WorkItem` authority object.
+Concrete protocol state remains outside the kernel, and claimable work is represented by
+`WorkSpec`.
 
-The frozen-v1 `WorkItem` remains documented separately as a shipped v1 record.
 Promote no additional concept into the kernel without demonstrated reuse. In particular,
 do not introduce workflow traits or DSLs, campaign profiles, a generic discovery
 interface, a curriculum engine, online model training, learned reward policies, a
@@ -470,10 +452,9 @@ The MVP includes:
 
 * Multiple actual machines, including late join and disappearance during active work.
 * Amazon S3 shared authority and disposable local SQLite on every machine.
-* The frozen-v1 E01–E04 event, head, claim, projection, artifact, key,
-  encoding, and fixture record, unchanged.
-* A separate scoped-v2 durable boundary with no mixed-version authoritative chain.
-* The exact scoped-v2 identity axis:
+* One canonical durable boundary: a single event, head, claim, projection, artifact,
+  key, encoding, and fixture contract with no second era and no compatibility decoder.
+* The exact durable identity axis:
 
   ```text
   campaign_id
@@ -487,18 +468,17 @@ The MVP includes:
   scope_epoch
   ```
 
-* The exact scoped-v2 envelope:
+* The exact envelope, whose `payload_type` discriminates the payload and which carries
+  no version field:
 
   ```text
   EventEnvelope {
-      envelope_version
       scope_id
       sequence
       parent_event
       writer_epoch
       operation_id
       payload_type
-      payload_version
   }
   ```
 
@@ -621,10 +601,6 @@ fenced decision authority at a time.
 
 ## 5.1 MVP backend
 
-> **Frozen-v1 substrate retained.** E02's S3 conditional-write boundary and all current
-> S3 requirements below remain unchanged. Scoped v2 reuses those algorithms through
-> separate version-specific keys, bytes, and types.
-
 Use Amazon S3 for the first implementation.
 
 Do not prematurely promise equivalent coordination semantics across:
@@ -643,49 +619,7 @@ Backend generalization comes later through explicit capability testing.
 
 ## 5.2 Object layout
 
-### Frozen-v1 layout
-
-The shipped v1 conceptual layout remains:
-
-```text
-workspace/{workspace_id}/
-
-  membership/
-    actors/{actor_id}.json
-
-  presence/
-    {actor_id}/{instance_id}.json
-
-  campaigns/{campaign_id}/
-
-    controller.json
-
-    head.json
-
-    events/
-      0000000000000001-{digest}.cbor.zst
-      0000000000000002-{digest}.cbor.zst
-      ...
-
-    work/
-      {work_id}/claim.json
-
-    submissions/
-      {attempt_id}.json
-
-    artifacts/
-      sha256/{digest}
-
-    checkpoints/
-      {checkpoint_digest}
-```
-
-The existing v1 keys, suffixes, canonical bytes, compression, digest encoding, and
-fixtures are frozen. They are not changed by the scoped-v2 layout.
-
-### Scoped-v2 layout
-
-Scoped v2 uses this separate key axis:
+The durable key axis is:
 
 ```text
 workspace/{workspace_id}/campaigns/{campaign_id}/
@@ -696,7 +630,7 @@ workspace/{workspace_id}/campaigns/{campaign_id}/
   artifacts/{digest}
 ```
 
-The scoped-v2 durable identity axis is:
+The durable identity axis is:
 
 ```text
 campaign_id
@@ -713,106 +647,49 @@ scope_epoch
 Fields are required only where the represented object has that relationship; omission
 never aliases a different identity.
 
-Scoped-v2 root events use declaration-order CBOR compressed as one zstd level-3
-frame with declared content size. The lowercase hexadecimal SHA-256 of those stored
-compressed bytes is both the event digest and the digest in the event basename above.
-Decoders require exact CBOR re-encoding and exact zstd recompression. `ScopeHead` uses
-compact declaration-order JSON with every nullable field present as explicit `null`;
-its fixed field order is `version`, `campaign_id`, `scope_id`,
-`controller_instance_id`, `scope_epoch`, `lease_until`, `sequence`,
-`tail_event_digest`, `active_plan_digest`, and `operation_id`. Head `version` is `2`;
-decoders reject every other value. Plan bytes and artifact media-type rules remain open
-contract questions and are not inferred from v1.
+Root events use declaration-order CBOR compressed as one zstd level-3 frame with
+declared content size. The lowercase hexadecimal SHA-256 of those stored compressed bytes
+is both the event digest and the digest in the event basename above. Decoders require
+exact CBOR re-encoding and exact zstd recompression. `ScopeHead` uses compact
+declaration-order JSON with every nullable field present as explicit `null`; its fixed
+field order is `campaign_id`, `scope_id`, `controller_instance_id`, `scope_epoch`,
+`lease_until`, `sequence`, `tail_event_digest`, `active_plan_digest`, and
+`operation_id`. The head carries no version field. Plan bytes and artifact media-type
+rules remain open contract questions.
 
-A v2 key never reinterprets a v1 object. A v2 `ScopeHead` cannot reference a v1 event,
-and a v1 campaign head cannot reference a v2 event. Future durable changes require a
-new explicit version rather than reinterpretation or silent migration.
+A durable format change updates this contract, its canonical bytes, and its fixtures
+together. No compatibility decoder, alias, or silent migration is provided, and bytes
+from an abandoned layout are rejected as malformed input.
 
 ---
 
-# 6. Campaign event log
+# 6. Scope decision logs
 
-## 6.1 Frozen-v1 campaign event log
+A campaign starts at a root scope. Each scope owns one `ScopeHead`, one ordered decision
+stream, one `scope_epoch`, one active plan lineage, and one replay cursor. Independent
+scopes do not share a mutable head or sequence.
 
-> **Frozen v1 record — E02.** The campaign-level event/head format, canonical bytes,
-> publication algorithm, operation reconciliation, and fixtures below remain unchanged.
-> This is not the scoped-v2 decision chain.
-
-The authoritative campaign history is append-oriented.
-
-An event might represent:
-
-```text
-CampaignCreated
-WorkflowStarted
-WorkCreated
-WorkCancelled
-AttemptAccepted
-EvaluationRecorded
-JudgmentRecorded
-DecisionRecorded
-WorkflowCompleted
-CampaignCompleted
-```
-
-The global head contains:
-
-```text
-sequence
-tail event digest
-controller fence
-operation ID
-```
-
-Commit protocol:
-
-1. Controller constructs event `N+1`.
-2. Upload immutable event object using create-if-absent.
-3. CAS `head.json` using the previously observed ETag.
-4. If the response is ambiguous, reread `head.json`.
-5. Determine whether the operation ID committed.
-6. Retry only if known safe.
-
-Workers do not directly contend on the global campaign head.
-
-That is important.
-
-Workers publish immutable submissions.
-
-The active controller validates those submissions and sequences them into authoritative campaign events.
-
-This gives us:
-
-```text
-many concurrent workers
-one lightweight authoritative sequencer
-```
-
-without requiring consensus for every campaign transition.
-
-## 6.2 Scoped-v2 scope decision logs
-
-A v2 campaign starts with a v2 root scope. Each scope owns one `ScopeHead`, one
-ordered decision stream, one `scope_epoch`, one active plan lineage, and one replay
-cursor. Independent scopes do not share a mutable head or sequence.
-
-Every v2 event uses:
+Every event uses:
 
 ```text
 EventEnvelope {
-    envelope_version
     scope_id
     sequence
     parent_event
     writer_epoch
     operation_id
     payload_type
-    payload_version
 }
 ```
 
-`writer_epoch` is the committing scope's current `scope_epoch`. Envelope version and
-payload version are independent.
+`writer_epoch` is the committing scope's current `scope_epoch`. `payload_type`
+discriminates the payload; the envelope carries no version field.
+
+Workers do not directly contend on a scope head. They publish immutable observations and
+same-key sealed submissions, and the active scoped controller validates those
+submissions and sequences them into authoritative decisions. That gives many concurrent
+workers one lightweight authoritative sequencer per scope, without requiring consensus
+for every campaign transition.
 
 The durable authority state for a scope binds:
 
@@ -845,23 +722,20 @@ Workers publish immutable observations and same-key sealed work submissions. The
 not commit scoped decisions or write `ScopeHead`s. A parent cannot append to a live
 child's decision stream.
 
-A v2 `ScopeHead` never references a v1 event, and a v1 campaign head never references
-a v2 event.
-
-The root-genesis event is declaration-order CBOR containing `{ envelope, payload }`.
-Its envelope version is `2`; the `root_genesis` payload version is `1`. The payload
-contains `campaign_id`, explicit-null `parent_scope_id` and `delegation_digest`, and
-`config_digest`, which is lowercase hexadecimal SHA-256 over nonempty caller-canonical
-admitted-configuration bytes capped at 1 MiB. The root `scope_id` is lowercase
-hexadecimal SHA-256 over `ravel.scope.root.v2\0` followed by declaration-order CBOR of
-`workspace_id` and validated caller-supplied `campaign_id`; configuration bytes do not
-change that identity.
+The root-genesis event is declaration-order CBOR containing `{ envelope, payload }` with
+payload type `root_genesis`. The payload contains `campaign_id`, explicit-null
+`parent_scope_id` and `delegation_digest`, and `config_digest`, which is lowercase
+hexadecimal SHA-256 over nonempty caller-canonical admitted-configuration bytes capped
+at 1 MiB. The root `scope_id` is lowercase hexadecimal SHA-256 over
+`ravel.scope.root\0` followed by declaration-order CBOR of `workspace_id` and validated
+caller-supplied `campaign_id`; configuration bytes do not change that identity.
 
 Genesis starts at sequence, writer epoch, and scope epoch `1`, with no event parent,
 controller, lease, or active plan. Its operation ID is `root-genesis:{scope_id}`.
-Positive fixtures live under `tests/fixtures/v2/`, and cross-version negatives prove
-that neither v1 nor v2 events and heads cross-decode. Root-head publication/CAS remains
-owned by the following root-log task. Non-null parent/delegation forms, child genesis,
+Canonical fixtures live under `tests/fixtures/wire/` and must decode and re-encode
+byte-identically; negatives prove that wrong-scope, wrong-key, unknown-field,
+noncanonical, and obsolete-shaped bytes all fail closed. Root-head publication/CAS
+remains owned by the following root-log task. Non-null parent/delegation forms, child genesis,
 and two-scope recovery are post-signal; the root-only MVP rejects them before domain
 conversion.
 
@@ -1038,34 +912,7 @@ expired/unsettled proof.
 
 # 8. Work model
 
-## 8.1 Frozen-v1 WorkItem record
-
-> **Frozen v1 record — E04.** The `WorkItem` shape below is retained for the shipped
-> v1 claim and projection proof. Do not add scope, plan, grant, or v2 fields to this
-> structure or its fixtures.
-
-A universal `WorkItem` remains intentionally small.
-
-```rust
-struct WorkItem {
-    id: WorkId,
-    workflow_id: WorkflowId,
-    revision: u64,
-
-    instructions: ArtifactRef,
-    inputs: Vec<RecordRef>,
-
-    dependencies: Vec<WorkId>,
-    required_capabilities: Vec<Capability>,
-
-    execution_profile: ExecutionProfile,
-    budget: Budget,
-
-    write_policy: Option<WritePolicy>,
-}
-```
-
-Protocol-specific behavior determines what the work means.
+Protocol-specific behavior determines what work means.
 
 Examples:
 
@@ -1083,9 +930,7 @@ Verify:
   Attempt to falsify cancellation safety.
 ```
 
-## 8.2 Scoped-v2 planning and work model
-
-Scoped v2 separates semantic goals, claimable execution, and delegation proposals.
+The model separates semantic goals, claimable execution, and delegation proposals.
 
 ```text
 PlanRevision {
@@ -1120,7 +965,7 @@ required capabilities, source or subject identity, write scope, deadline, effect
 resource bounds, and verifier requirements. A `ChildScopeProposal` proposes a bounded
 delegation; it is not a child scope or grant until parent admission succeeds.
 
-Every authoritative v2 work identity binds:
+Every authoritative work identity binds:
 
 ```text
 campaign_id
@@ -1148,9 +993,6 @@ revoked or extended by an unspecified rule.
 
 # 9. Distributed work claiming
 
-> **Frozen v1 record — E04.** The following claim and disappearance record remains
-> unchanged for the shipped v1 same-key claim proof. Scoped-v2 claims are separate.
-
 Workers compute eligible work from their local SQLite projection.
 
 ```text
@@ -1162,20 +1004,6 @@ AND budget allows execution
 
 Then attempt an authoritative remote claim.
 
-Claim object:
-
-```json
-{
-  "work_id": "W17",
-  "work_revision": 4,
-  "owner_actor": "agent-rust",
-  "owner_instance": "machine-b/boot-019b",
-  "fence": 9,
-  "lease_until": "...",
-  "operation_id": "..."
-}
-```
-
 Claim protocol:
 
 1. Read existing claim.
@@ -1186,38 +1014,10 @@ Claim protocol:
 
 Renewal uses another CAS.
 
----
-
-> **Frozen v1 record — E04.** The claim below uses the shipped v1 claim key,
-> identity, fence, lease, and same-key CAS behavior. It is not a scoped-v2 claim.
-
-## 9.1 Worker disappearance
-
-> **Frozen v1 example.** This disappearance and reclamation behavior remains unchanged.
-
-Example:
-
-```text
-Machine B claims W17, fence 9.
-Machine B starts work.
-Machine B loses power.
-
-Lease expires.
-
-Machine D acquires W17, fence 10.
-Machine D completes.
-
-Machine B eventually returns and submits fence 9 result.
-
-Controller rejects it as authoritative.
-```
-
-The stale result can remain as an artifact if useful, but it cannot complete W17.
-
-## 9.2 Scoped-v2 work claims and worker disappearance
+## 9.1 Scoped work claims
 
 Workers compute eligible `WorkSpec` revisions from a verified scope-indexed projection,
-then claim the exact scoped-v2 key:
+then claim the exact key:
 
 ```text
 workspace/{workspace_id}/campaigns/{campaign_id}/
@@ -1261,12 +1061,33 @@ makes a grant unusable after claim reclamation, remain open contract questions. 
 grant schema must resolve them before external effects can ship; an old worker must
 never start a new external effect after losing ownership.
 
+## 9.2 Worker disappearance
+
+Example:
+
+```text
+Machine B claims W17, fence 9.
+Machine B starts work.
+Machine B loses power.
+
+Lease expires.
+
+Machine D acquires W17, fence 10.
+Machine D completes.
+
+Machine B eventually returns and submits fence 9 result.
+
+Controller rejects it as authoritative.
+```
+
+The stale result can remain as an artifact if useful, but it cannot complete W17.
+
 ---
 
 # 10. Machine identity and presence
 
-> **Shared frozen-v1 identity record.** E04's stable actor identity, ephemeral instance
-> identity, and advisory-presence behavior remain unchanged. Scoped v2 adds exact scope,
+> **Shared identity record.** E04's stable actor identity, ephemeral instance
+> identity, and advisory-presence behavior are unchanged by scoping, which adds exact scope,
 > plan, work revision, and fence bindings where authority requires them.
 
 Each node has:
@@ -1294,9 +1115,6 @@ Claims bind to both.
 ---
 
 ## 10.1 Presence is advisory
-
-> **Shared frozen-v1 behavior.** Stable actor identity, per-start instance identity,
-> and advisory presence remain valid in scoped v2. They gain no scope authority.
 
 Presence records include:
 
@@ -1329,11 +1147,6 @@ presence may reduce efficiency but cannot block correctness or recovery.
 ---
 
 # 11. Local SQLite projection
-
-## 11.1 Frozen-v1 projection
-
-> **Frozen v1 record — E03.** The single-chain schema, cursor, transactional apply,
-> rebuild, and equivalence fixtures below remain unchanged.
 
 Every node maintains its own database.
 
@@ -1369,22 +1182,12 @@ change_candidates
 change_checks
 ```
 
-The sync engine:
+Application queries are local. S3 is not queried for ordinary task-graph reads.
 
-1. Reads current campaign head.
-2. Downloads unseen immutable events.
-3. Verifies digest chain/order.
-4. Applies events transactionally to SQLite.
-5. Advances local cursor.
-
-Application queries are local.
-
-S3 is not queried for ordinary task-graph reads.
-
-## 11.2 Scoped-v2 projections
-
-Scoped v2 adds scope-indexed tables and cursors beside the frozen-v1 projection.
-SQLite remains disposable and contains no uniquely durable authority.
+The projection is scope-indexed. SQLite remains disposable, carries one neutral
+application id so unrelated files are rejected, and contains no uniquely durable
+authority. Because the file is disposable it has no schema-version field and no
+migration path: a projection that fails validation is rebuilt from durable history.
 
 Each projected scope records:
 
@@ -1405,15 +1208,15 @@ The sync engine:
 1. Reads the exact selected `ScopeHead`.
 2. Traverses that scope's immutable parent chain without treating `LIST` as a
    publication snapshot.
-3. Validates envelope version, payload version, scope binding, sequence, parent digest,
-   `writer_epoch`, operation identity, and canonical bytes before apply.
+3. Validates payload type, scope binding, sequence, parent digest, `writer_epoch`,
+   operation identity, and canonical bytes before apply.
 4. Applies one event and advances that scope's cursor atomically.
 5. Reports readiness only when the verified cursor matches the freshly read
    `ScopeHead`.
 
-A gap, mixed-version parent, wrong-scope event, unknown version, digest conflict, or
-conversion failure leaves the affected scope projection and cursor unchanged and fails
-that scope's readiness closed. It does not invalidate an independent scope.
+A gap, wrong-scope event, unregistered payload type, digest conflict, or conversion
+failure leaves the affected scope projection and cursor unchanged and fails that scope's
+readiness closed. It does not invalidate an independent scope.
 
 Scoped projections support:
 
@@ -1472,12 +1275,12 @@ Remote object storage is durable authority.
 
 ---
 
-The frozen-v1 artifact path remains `artifacts/sha256/{digest}`. Scoped v2 uses the
-campaign-relative `artifacts/{digest}` key from section 5.2. Both remain immutable,
-content-addressed, and fully verified before use. A path or artifact reference is not
-authority by itself.
+Raw artifact blobs use the `artifacts/sha256/{digest}` path, and campaign-relative
+artifact references use the `artifacts/{digest}` key from section 5.2. Both are
+immutable, content-addressed, and fully verified before use. A path or artifact
+reference is not authority by itself.
 
-Scoped-v2 plan and artifact keys use lowercase hexadecimal SHA-256 digest text with no
+Plan and artifact keys use lowercase hexadecimal SHA-256 digest text with no
 algorithm tag. Their canonical bytes, compression, and media-type rules remain open
 contract questions and must be fixed before corresponding records ship.
 
@@ -1882,8 +1685,8 @@ The serialized synthesis payload remains an open contract question. Existing
 obligations must be preserved: conclusions, evidence supporting each conclusion,
 rejected explanations, material uncertainty, and unresolved questions. The contract
 must still choose between exactly those five semantic sections and the outline-survey
-variant that also retains `Suggested next workflow`. No v2 payload ships and no
-serialized shape is finalized or tested until a human records that ruling.
+variant that also retains `Suggested next workflow`. No payload ships and no serialized
+shape is finalized or tested until a human records that ruling.
 
 ---
 
@@ -2329,7 +2132,7 @@ work or start a new effect.
 
 ## 25.2 Scoped-controller crash cases
 
-Test all frozen controller-boundary cases through the scoped-v2 authority object:
+Test all controller-boundary cases through the scope authority object:
 
 ```text
 controller writes an immutable event but fails before ScopeHead CAS
@@ -2555,31 +2358,29 @@ incompatible or rejected changes is not success.
 
 # 30. MVP milestone plan
 
-M0–M3 are complete frozen-v1 proof milestones. Their deliverables, tests,
-prohibitions, exit conditions, bytes, and fixtures remain unchanged. M4–M12 are the
-active scoped-v2 milestones and reuse v1 algorithms only through explicit v2 types and
-bindings. No milestone migrates or reinterprets a v1 object.
+M0–M3 are complete proof milestones; their deliverables, tests, prohibitions, and exit
+conditions stand. M4–M12 are the active milestones.
 
-The scoped-v2 amendment sequence is:
+The amendment sequence is:
 
 | Phase | Work | Required proof |
 | --- | --- | --- |
 | 0. Contract amendment | Revise outline, epics, task graph, identity axis, keys, envelope, and fixtures together | Recursive protocol is coherent before new scoped payloads |
-| 1. Scoped substrate | Add scoped heads, events, claims, work references, and selective projection beside v1 | Two scopes advance and rebuild independently; mixed versions fail closed |
+| 1. Scoped substrate | Add scoped heads, events, claims, work references, and selective projection | Two scopes advance and rebuild independently; noncanonical records fail closed |
 | 2. Scoped authority | Add per-scope leases, lazy takeover, lifecycle supervision, and settlement-pressure scheduling | Parent and child controllers fail independently |
 | 3. Recursive admission | Add plans, typed proposal bases, shared admission, grants, escrow, sealing, certificates, and settlement | One bounded observation-derived revision completes and conserves budget |
 | 4. Campaign proof | Build Research and Change campaigns on that substrate | No flat workflow authority path requires replacement |
 | 5. Scale and feasibility proof | Exercise multiple scopes and nodes, selective replay, failover, unknown outcomes, and fixed experiments | Root and projections avoid global hot paths and the go/no-go evidence is complete |
 
-Open durable choices recorded in sections 5–12 must be resolved before their v2 bytes
+Open durable choices recorded in sections 5–12 must be resolved before their bytes
 ship. Milestone labels do not authorize implementations to invent event suffixes,
 encodings, payload schemas, root genesis, supersession, grant reclamation,
 cross-scope visibility, settlement ordering, or root completion representation.
 
 ## M0. Freeze invariants and pilot definitions
 
-> **Status: Complete — frozen v1 proof record.** The following historical deliverables
-> and prohibition remain unchanged and are not reopened by scoped v2.
+> **Status: Complete — proof record.** The following historical deliverables and
+> prohibition stand.
 
 Deliverables:
 
@@ -2599,10 +2400,10 @@ Do not code generic workflow infrastructure before these exist.
 
 ## M1. Object-store protocol
 
-> **Status: Complete — frozen v1 proof record.** The following v1 S3 event, head,
-> artifact, reconciliation, and CAS proof remains unchanged. Its historical "fenced
-> controller mechanism" exit phrase refers to the v1 head/envelope/CAS boundary, not a
-> completed dynamic controller-acquisition proof; scoped acquisition belongs to M4.
+> **Status: Complete — proof record.** The following S3 event, head, artifact,
+> reconciliation, and CAS proof stands. Its historical "fenced controller mechanism" exit
+> phrase refers to the head/envelope/CAS boundary, not a completed dynamic
+> controller-acquisition proof; scoped acquisition belongs to M4.
 
 Implement:
 
@@ -2635,8 +2436,8 @@ Two processes can safely append through the fenced controller mechanism without 
 
 ## M2. Local SQLite projector and sync
 
-> **Status: Complete — frozen v1 proof record.** The following v1 single-chain replay,
-> cursor, transaction, and rebuild proof remains unchanged.
+> **Status: Complete — proof record.** The following replay, cursor, transaction, and
+> rebuild proof stands.
 
 Implement:
 
@@ -2656,8 +2457,8 @@ A completely fresh machine can join and reconstruct the current campaign only fr
 
 ## M3. Identity, presence, and work claims
 
-> **Status: Complete — frozen v1 proof record.** The following v1 actor, instance,
-> presence, same-key claim, and stale-submission proof remains unchanged.
+> **Status: Complete — proof record.** The following actor, instance, presence,
+> same-key claim, and stale-submission proof stands.
 
 Implement:
 
@@ -2678,16 +2479,16 @@ A stale worker cannot complete after reclamation.
 
 ---
 
-## M4. Scoped-v2 substrate and controller failover
+## M4. Scope substrate and controller failover
 
-Implement beside the frozen-v1 paths:
+Implement:
 
-* The exact scoped-v2 identity axis and `EventEnvelope`.
-* The scoped-v2 keys from section 5.2.
+* The exact durable identity axis and `EventEnvelope`.
+* The keys from section 5.2.
 * Separate `ScopeHead`s, immutable scope-local chains, claim keys, projections, and
   cursors.
 * Scope-selective replay and readiness.
-* Mixed-version rejection.
+* Fail-closed rejection of noncanonical, wrong-scope, and obsolete-shaped records.
 * Per-scope controller lease, `scope_epoch`, active plan lineage, submission processing,
   reconciliation, and takeover.
 * One bounded per-scope takeover-demand queue, including injected
@@ -2712,7 +2513,7 @@ M4 precedes shared admission, grants, and admitted `WorkSpec`s (M6), so the work
 claims, and sealed submissions in this scenario are fixture-seeded substrate state,
 not admitted work; the live admitted-work failover proof belongs to M6. The live
 expired/unsettled-child settlement proof belongs to M6. The exact serialized
-head, genesis, event suffix, and encoding must be resolved before M4 ships v2 bytes.
+head, genesis, event suffix, and encoding must be resolved before M4 ships durable bytes.
 
 ---
 
@@ -2783,7 +2584,7 @@ Implement:
 * At most one observation-derived discriminating follow-up, in the one allowed
   depth-two child scope.
 * Admitted synthesis work and verifier-bounded root completion recorded in the
-  root-completion representation V2-P3 selects (§7.4 keeps certificate,
+  root-completion representation P3 selects (§7.4 keeps certificate,
   optional-delegation certificate, and `Decision`-plus-accounting open).
 * Child certificate and settlement for that follow-up child.
 
@@ -2798,8 +2599,8 @@ round, second adjudication loop, workflow trait, DSL, or campaign profile is int
 Exit condition:
 
 The campaign produces a traceable evidence-backed result without human control-loop
-decisions. The section 17.6 synthesis payload conflict must be resolved before its v2
-schema ships.
+decisions. The section 17.6 synthesis payload conflict must be resolved before its
+durable schema ships.
 
 ---
 
@@ -2915,12 +2716,12 @@ PR creation
 evaluator run
 ```
 
-Add scoped-v2 points:
+Add scoped points:
 
 ```text
-v2 immutable event write
+immutable event write
 ScopeHead CAS and lost success
-mixed-version or wrong-scope replay
+wrong-scope or noncanonical replay
 plan admission before and after commit
 claim reclamation racing sealed submission
 grant validation and effect start
@@ -2935,7 +2736,7 @@ root completion with open accounting
 
 Exit condition:
 
-No stale actor can perform an authoritative transition; no v1/v2 chain mixes; no
+No stale actor can perform an authoritative transition; no
 external effect exceeds documented at-least-once and idempotent semantics; no returned
 budget releases twice; unknown reserve remains unavailable; and escrow is conserved.
 
@@ -2948,7 +2749,7 @@ The MVP is **not complete** if it only works as multiple subprocesses on one wor
 Required distributed proof:
 
 * At least three independent machines or VM hosts.
-* A v2 root and direct child advance and rebuild independently.
+* A root scope and direct child advance and rebuild independently.
 * Scoped-controller failover between hosts, including independent parent/child recovery.
 * Worker joins after campaign start and reconstructs selected scopes from object storage.
 * Worker disappears with an active claim; a stale result is rejected by `claim_fence`.
@@ -2990,16 +2791,14 @@ Required correctness proof:
 * Root depth is 1, direct-child depth is 2, and grandchildren are rejected.
 * Children seal bottom-up; settlement is idempotent; unknown reserve stays unavailable;
   escrow remains conserved.
-* Frozen-v1 chains and fixtures remain unchanged and never mix with v2.
-
 ---
 
 # 32. MVP experiments
 
 Research and Change retain the frozen E01 precommitted three-treatment contracts,
-inputs, run counts, schedules, and success definitions. Scoped-v2 instrumentation adds
-scope, plan, claim, grant, certificate, settlement, and quarantine attribution without
-changing those frozen outcomes after results are observed. Analysis remains offline and
+inputs, run counts, schedules, and success definitions. Instrumentation adds scope, plan,
+claim, grant, certificate, settlement, and quarantine attribution without changing those
+frozen outcomes after results are observed. Analysis remains offline and
 descriptive.
 
 ## Experiment A: Distributed Research
@@ -3320,8 +3119,8 @@ Do not use CRDTs for:
 
 # 41. Later: controller scaling
 
-Scoped v2 already replaces the single global campaign sequencer with one fenced
-controller and ordered decision stream per `Scope`. Independent scopes can advance
+The protocol replaces a single global campaign sequencer with one fenced controller and
+ordered decision stream per `Scope`. Independent scopes can advance
 concurrently in the MVP; the root does not sequence every leaf transition.
 
 If measurements show a hot individual scope, root rollup, placement policy, or
@@ -3429,9 +3228,8 @@ ravel/
       status.rs
 ```
 
-The frozen-v1 paths are `sync/head.rs`, `sync/event.rs`,
-`distributed/claims.rs`, and `db/projections.rs`. Their shipped behavior and fixtures
-remain unchanged. Scoped-v2 modules sit beside them.
+The canonical durable paths are `scope.rs`, `sync/event.rs`, `sync/head.rs`,
+`sync/replay.rs`, and `db/projections.rs`.
 
 `distributed/controller.rs` is not described as a completed E01–E04 proof. Scoped
 controller authority is implemented in `distributed/scope_controller.rs`.
@@ -3446,12 +3244,11 @@ Do not split into many crates until dependency boundaries make that useful.
 
 # 43. Hard invariants
 
-The implementation must enforce all original obligations and the additive scoped-v2
-obligations from day one:
+The implementation must enforce all of these obligations from day one:
 
-1. No worker can authoritatively complete work without the current v1 work fence or v2
-   `claim_fence` for the exact work revision.
-2. No stale controller can commit after its v1 fence or v2 `scope_epoch` is superseded.
+1. No worker can authoritatively complete work without the current `claim_fence` for the
+   exact work revision.
+2. No stale controller can commit after its `scope_epoch` is superseded.
 3. No model-generated assertion becomes truth by self-report.
 4. No deterministic evaluator failure can be overridden by model consensus.
 5. No candidate accesses or changes its trusted evaluator.
@@ -3471,10 +3268,11 @@ obligations from day one:
     as graphs.
 19. No P2P or CRDT dependency is required for initial correctness.
 20. No MVP is declared successful without actual multi-machine execution and failover.
-21. No frozen-v1 event, head, claim, projection, artifact, key, encoding, or fixture is
-    reinterpreted, rewritten, or silently routed through v2 code.
-22. No authoritative chain mixes versions: a v1 head references only v1 events and a
-    v2 `ScopeHead` references only v2 events for its exact scope.
+21. No durable format change ships without updating the one canonical contract, its
+    canonical bytes, and its fixtures together; no compatibility decoder, alias, or
+    silent migration is added.
+22. No `ScopeHead` references an event outside its exact scope, and bytes that fail the
+    canonical contract are rejected as malformed rather than reinterpreted.
 23. No authoritative work, delegation, budget spend, or external effect bypasses
     deterministic admission of a `PlanRevision`.
 24. No `Observation` becomes authority by producer identity, confidence, agreement, or
@@ -3515,14 +3313,13 @@ escrowed = confirmed_spend + returned + quarantined_unknown
 
 # 44. MVP definition of done
 
-The project has an MVP when all applicable frozen-v1 and scoped-v2 proofs below pass.
+The project has an MVP when all applicable proofs below pass.
 
 ### Distributed substrate
 
 * Three or more independent machines participate.
-* The frozen-v1 substrate and fixtures remain unchanged and pass their historical
-  proofs.
-* A fresh machine reconstructs selected scoped-v2 state from object storage.
+* The canonical fixtures decode and re-encode byte-identically.
+* A fresh machine reconstructs selected scope state from object storage.
 * A root and direct child advance and rebuild independently; one failed replay does not
   invalidate the other.
 * Workers dynamically join and leave.
@@ -3559,7 +3356,7 @@ The project has an MVP when all applicable frozen-v1 and scoped-v2 proofs below 
 * Final synthesis is produced autonomously and claims only what its verifier checks.
 * Full scope, plan, work, attempt, producer, evaluator, policy, certificate, and
   settlement provenance is available.
-* The unresolved section 17.6 synthesis payload conflict is settled before durable v2
+* The unresolved section 17.6 synthesis payload conflict is settled before durable
   bytes ship.
 
 ### Change
@@ -3675,5 +3472,5 @@ Local SQLite makes each participant fast and independently useful. Shared object
 storage provides durable rendezvous, immutable plans and artifacts, per-scope ordered
 decision chains, and the minimum serialization needed for correctness.
 
-Frozen-v1 records remain valid beside scoped v2; no authoritative chain mixes them.
-That is the architecture the MVP should now be built to prove.
+One canonical durable contract governs every record. That is the architecture the MVP
+should now be built to prove.

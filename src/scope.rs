@@ -1,11 +1,10 @@
-//! Root-only scoped-v2 identities, keys, and canonical wire records.
+//! Root-only scope identities, keys, and canonical wire records.
 //!
-//! Scoped-v2 bytes and object keys use a separate format from frozen v1. Root-genesis
-//! payloads encode null parent-scope and delegation fields and reject non-null values.
-//! Events use a standard zstd level-3 frame with declared content size and require exact
-//! CBOR and zstd re-encoding. Decoder limits are 256 KiB stored, 1 MiB decompressed,
-//! CBOR recursion 16, and 4 KiB for heads. The `zstd-sys 2.0.16+zstd.1.5.7` lockfile pin
-//! is byte-affecting.
+//! Root-genesis payloads encode null parent-scope and delegation fields and reject
+//! non-null values. Events use a standard zstd level-3 frame with declared content size
+//! and require exact CBOR and zstd re-encoding. Decoder limits are 256 KiB stored, 1 MiB
+//! decompressed, CBOR recursion 16, and 4 KiB for heads. The
+//! `zstd-sys 2.0.16+zstd.1.5.7` lockfile pin is byte-affecting.
 
 use std::{io::Cursor, num::NonZeroU64};
 
@@ -14,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    distributed::{identity::InstanceId, presence::WorkspaceId},
+    distributed::identity::{InstanceId, WorkspaceId},
     domain::{
-        campaign::{
+        validation::{
             ValidationError, is_digest, validate_identity, validate_key_segment, validate_sequence,
         },
         work::WorkRef,
@@ -24,11 +23,8 @@ use crate::{
     sync::WireError,
 };
 
-const ENVELOPE_VERSION: u64 = 2;
-const ROOT_GENESIS_PAYLOAD_VERSION: u64 = 1;
-const HEAD_VERSION: u64 = 2;
 const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
-const ROOT_SCOPE_DOMAIN: &[u8] = b"ravel.scope.root.v2\0";
+const ROOT_SCOPE_DOMAIN: &[u8] = b"ravel.scope.root\0";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_COMPRESSED_BYTES: usize = 256 * 1024;
 const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
@@ -152,14 +148,14 @@ impl ScopeIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScopedClaimIdentity {
+pub struct ScopeClaimIdentity {
     scope: ScopeIdentity,
     plan_digest: Digest,
     work: WorkRef,
     claim_fence: NonZeroU64,
 }
 
-impl ScopedClaimIdentity {
+impl ScopeClaimIdentity {
     /// Creates a scoped claim identity with a nonzero claim fence.
     ///
     /// # Errors
@@ -197,7 +193,7 @@ impl ScopedClaimIdentity {
     }
 }
 
-/// Sequence and stored-byte digest of one scoped-v2 event.
+/// Sequence and stored-byte digest of one event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeEventRef {
     sequence: u64,
@@ -225,21 +221,19 @@ impl ScopeEventRef {
     }
 }
 
-/// Exact eight-field scoped-v2 event envelope.
+/// Exact six-field event envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventEnvelope {
-    envelope_version: u64,
     scope_id: ScopeId,
     sequence: u64,
     parent_event: Option<ScopeEventRef>,
     writer_epoch: NonZeroU64,
     operation_id: String,
     payload_type: String,
-    payload_version: u64,
 }
 
 impl EventEnvelope {
-    /// Creates a version-2 envelope after validating its local chain relationship.
+    /// Creates an envelope after validating its local chain relationship.
     ///
     /// # Errors
     ///
@@ -252,7 +246,6 @@ impl EventEnvelope {
         writer_epoch: u64,
         operation_id: String,
         payload_type: String,
-        payload_version: u64,
     ) -> Result<Self, ValidationError> {
         validate_sequence(sequence)?;
         match (sequence, &parent_event) {
@@ -265,19 +258,13 @@ impl EventEnvelope {
         validate_identity(&operation_id)?;
         validate_identity(&payload_type)?;
         Ok(Self {
-            envelope_version: ENVELOPE_VERSION,
             scope_id,
             sequence,
             parent_event,
             writer_epoch,
             operation_id,
             payload_type,
-            payload_version,
         })
-    }
-
-    pub fn envelope_version(&self) -> u64 {
-        self.envelope_version
     }
 
     pub fn scope_id(&self) -> &ScopeId {
@@ -303,10 +290,6 @@ impl EventEnvelope {
     pub fn payload_type(&self) -> &str {
         &self.payload_type
     }
-
-    pub fn payload_version(&self) -> u64 {
-        self.payload_version
-    }
 }
 
 /// Root genesis payload; root-only identity nulls remain explicit in the wire form.
@@ -326,7 +309,7 @@ impl RootGenesisPayload {
     }
 }
 
-/// Validated scoped-v2 root-genesis event.
+/// Validated root-genesis event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RootEvent {
     envelope: EventEnvelope,
@@ -372,7 +355,7 @@ impl ScopeAuthority {
     }
 }
 
-/// Version-2 root scope head.
+/// Authoritative root scope head.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeHead {
     scope: ScopeIdentity,
@@ -554,7 +537,7 @@ pub fn scope_head_key(scope: &ScopeIdentity) -> String {
     )
 }
 
-/// Builds the full key for a compressed scoped-v2 event.
+/// Builds the full key for one compressed event object.
 pub fn scope_event_key(scope: &ScopeIdentity, event: &ScopeEventRef) -> String {
     format!(
         "workspace/{}/campaigns/{}/scopes/{}/events/{:016}-{}.cbor.zst",
@@ -567,7 +550,7 @@ pub fn scope_event_key(scope: &ScopeIdentity, event: &ScopeEventRef) -> String {
 }
 
 /// Builds the full root-scoped work-claim key.
-pub fn scope_claim_key(claim: &ScopedClaimIdentity) -> String {
+pub fn scope_claim_key(claim: &ScopeClaimIdentity) -> String {
     format!(
         "workspace/{}/campaigns/{}/scopes/{}/claims/{}/{}",
         claim.scope().workspace_id().as_str(),
@@ -606,7 +589,7 @@ struct RootScopeSeed<'a> {
 
 /// Derives a root scope ID from workspace and campaign identity only.
 ///
-/// The hash input is `ravel.scope.root.v2\0` followed by declaration-order CBOR
+/// The hash input is `ravel.scope.root\0` followed by declaration-order CBOR
 /// containing `workspace_id` then `campaign_id`.
 ///
 /// # Errors
@@ -645,7 +628,6 @@ pub fn root_genesis(config: &AdmittedCampaignConfig) -> Result<RootGenesis, Wire
             1,
             operation_id.clone(),
             ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
-            ROOT_GENESIS_PAYLOAD_VERSION,
         )
         .map_err(|_| WireError::InvalidValue)?,
         payload: RootGenesisPayload {
@@ -687,14 +669,12 @@ struct WireRootEvent {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireEventEnvelope {
-    envelope_version: u64,
     scope_id: String,
     sequence: u64,
     parent_event: Option<WireEventRef>,
     writer_epoch: u64,
     operation_id: String,
     payload_type: String,
-    payload_version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -743,8 +723,8 @@ pub fn encode_root_event(event: &RootEvent) -> Result<EncodedScopeEvent, WireErr
 /// # Errors
 ///
 /// Returns [`WireError`] for framing and size failures, malformed or noncanonical bytes,
-/// unknown versions, non-root or invalid identities, wrong-scope bytes, or a key mismatch.
-/// Unknown versions are rejected before canonicality checks.
+/// an unregistered payload type, non-root or invalid identities, wrong-scope bytes, or a
+/// key mismatch. The payload type is rejected before canonicality checks.
 pub fn decode_root_event(
     stored_bytes: &[u8],
     expected_key: &str,
@@ -768,10 +748,7 @@ pub fn decode_root_event(
     let mut reader = Cursor::new(cbor.as_slice());
     let wire: WireRootEvent = from_reader_with_recursion_limit(&mut reader, CBOR_RECURSION_LIMIT)
         .map_err(|_| WireError::InvalidEncoding)?;
-    if wire.envelope.envelope_version != ENVELOPE_VERSION
-        || wire.envelope.payload_type != ROOT_GENESIS_PAYLOAD_TYPE
-        || wire.envelope.payload_version != ROOT_GENESIS_PAYLOAD_VERSION
-    {
+    if wire.envelope.payload_type != ROOT_GENESIS_PAYLOAD_TYPE {
         return Err(WireError::InvalidValue);
     }
     if reader.position() != cbor.len() as u64 {
@@ -798,7 +775,6 @@ impl From<&RootEvent> for WireRootEvent {
     fn from(event: &RootEvent) -> Self {
         Self {
             envelope: WireEventEnvelope {
-                envelope_version: event.envelope().envelope_version(),
                 scope_id: event.envelope().scope_id().as_str().to_owned(),
                 sequence: event.envelope().sequence(),
                 parent_event: event.envelope().parent_event().map(|parent| WireEventRef {
@@ -808,7 +784,6 @@ impl From<&RootEvent> for WireRootEvent {
                 writer_epoch: event.envelope().writer_epoch().get(),
                 operation_id: event.envelope().operation_id().to_owned(),
                 payload_type: event.envelope().payload_type().to_owned(),
-                payload_version: event.envelope().payload_version(),
             },
             payload: WireRootGenesisPayload {
                 campaign_id: event.payload().campaign_id().as_str().to_owned(),
@@ -851,7 +826,6 @@ fn root_event_from_wire(
         wire.envelope.writer_epoch,
         wire.envelope.operation_id,
         wire.envelope.payload_type,
-        wire.envelope.payload_version,
     )
     .map_err(|_| WireError::InvalidValue)?;
     Ok(RootEvent {
@@ -866,7 +840,6 @@ fn root_event_from_wire(
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireScopeHead {
-    version: u64,
     campaign_id: String,
     scope_id: String,
     controller_instance_id: Option<String>,
@@ -892,7 +865,6 @@ pub fn encode_head(head: &ScopeHead) -> Result<Vec<u8>, WireError> {
         } => (Some(instance.as_str().to_owned()), Some(lease_until.get())),
     };
     let bytes = serde_json::to_vec(&WireScopeHead {
-        version: HEAD_VERSION,
         campaign_id: head.scope().campaign_id().as_str().to_owned(),
         scope_id: head.scope().scope_id().as_str().to_owned(),
         controller_instance_id,
@@ -918,8 +890,8 @@ pub fn encode_head(head: &ScopeHead) -> Result<Vec<u8>, WireError> {
 ///
 /// # Errors
 ///
-/// Returns [`WireError`] for malformed, noncanonical, oversized, unknown-version,
-/// invalid authority, invalid tail, or a mismatched key.
+/// Returns [`WireError`] for malformed, noncanonical, oversized, invalid-authority,
+/// invalid-tail, or mismatched-key input.
 pub fn decode_head(
     bytes: &[u8],
     expected_key: &str,
@@ -930,9 +902,6 @@ pub fn decode_head(
     }
     let wire: WireScopeHead =
         serde_json::from_slice(bytes).map_err(|_| WireError::InvalidEncoding)?;
-    if wire.version != HEAD_VERSION {
-        return Err(WireError::InvalidValue);
-    }
     let canonical = serde_json::to_vec(&wire).map_err(|_| WireError::InvalidEncoding)?;
     if canonical != bytes {
         return Err(WireError::NonCanonical);

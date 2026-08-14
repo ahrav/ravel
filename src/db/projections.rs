@@ -1209,7 +1209,7 @@ mod tests {
             query_plan(
                 &connection,
                 SCOPE_UPDATE_SQL,
-                &[&sequence, &digest, &scope_id, &sequence],
+                &[&sequence, &digest, &sequence, &scope_id],
             ),
             query_plan(
                 &connection,

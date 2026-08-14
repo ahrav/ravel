@@ -371,7 +371,10 @@ async fn resolve(store: &S3Store, mut transition: ScopeHeadTransition) -> ScopeH
     };
 
     if current.head.operation_id() == transition.candidate.operation_id() {
-        if current.bytes != transition.head_bytes {
+        if current.head.tail() != transition.candidate.tail()
+            || current.head.active_plan_digest() != transition.candidate.active_plan_digest()
+            || current.head.scope_epoch() < transition.candidate.scope_epoch()
+        {
             return ScopeHeadCommitOutcome::Unresolved(transition);
         }
         return match read_opaque(
@@ -884,6 +887,105 @@ mod tests {
             .await,
             ScopeHeadCommitOutcome::Unresolved(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_authority_only_head_change_still_proves_an_ambiguous_append() {
+        let genesis = genesis();
+        let parent = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            3,
+            genesis.event_ref().clone(),
+            None,
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap();
+        for (current_epoch, matching_tail, matching_plan, exact_event, committed) in [
+            (4, true, true, true, true),
+            (2, true, true, true, false),
+            (4, false, true, true, false),
+            (4, true, false, true, false),
+            (4, true, true, false, false),
+        ] {
+            let (envelope, encoded) =
+                successor_at(genesis.identity(), genesis.event_ref(), 2, "renewed-op", 3);
+            let event_ref = encoded.event_ref().clone();
+            let event_bytes = encoded.stored_bytes().to_vec();
+            let publication = published(genesis.identity(), &envelope, encoded).await;
+            let candidate = ScopeHead::new(
+                genesis.identity().clone(),
+                ScopeAuthority::Unowned,
+                3,
+                event_ref.clone(),
+                None,
+                "renewed-op".into(),
+            )
+            .unwrap();
+            let transition = ScopeHeadTransition::new(
+                ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+                candidate,
+                publication,
+            )
+            .unwrap();
+            let current_tail = if matching_tail {
+                event_ref
+            } else {
+                genesis.event_ref().clone()
+            };
+            let current_plan = if matching_plan {
+                None
+            } else {
+                Some(genesis.config_digest().clone())
+            };
+            let current = ScopeHead::new(
+                genesis.identity().clone(),
+                ScopeAuthority::owned(
+                    InstanceId::new("controller-a".into()).unwrap(),
+                    1_700_000_030_000,
+                )
+                .unwrap(),
+                current_epoch,
+                current_tail,
+                current_plan,
+                "renewed-op".into(),
+            )
+            .unwrap();
+            let mut responses = vec![
+                response(500, &[], SdkBody::empty()),
+                response(
+                    200,
+                    &[("etag", "\"renewed\"")],
+                    encode_head(&current).unwrap(),
+                ),
+            ];
+            if current_epoch >= 3 && matching_tail && matching_plan {
+                responses.push(response(
+                    200,
+                    &[("etag", "\"event\"")],
+                    if exact_event {
+                        event_bytes
+                    } else {
+                        b"not-a-canonical-event".to_vec()
+                    },
+                ));
+            }
+            let (store, _) = replay_store(responses);
+            let outcome = commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default(),
+            )
+            .await;
+            assert_eq!(
+                matches!(outcome, ScopeHeadCommitOutcome::Committed),
+                committed
+            );
+            assert_eq!(
+                matches!(outcome, ScopeHeadCommitOutcome::Unresolved(_)),
+                !committed
+            );
+        }
     }
 
     #[tokio::test]

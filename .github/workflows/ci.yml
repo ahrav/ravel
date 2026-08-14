@@ -46,4 +46,6 @@ jobs:
         run: cargo test --locked
 
       - name: Test ignored gates
-        run: cargo test --locked -- --ignored
+        # VmHWM is process-wide, so the RSS gate cannot share a process with the
+        # replay growth gate that libtest would otherwise run concurrently.
+        run: cargo test --locked -- --ignored --test-threads=1

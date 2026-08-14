@@ -776,9 +776,9 @@ The scope does not depend on A returning. Parent and child controllers may run o
 separate machines and fail or recover independently. Presence and placement signals do
 not grant authority.
 
-Sections 5.2 and 6.2 fix the serialized `ScopeHead` and root-genesis forms.
-Publication, lease acquisition, renewal, and takeover transitions remain separate
-follow-on contracts.
+Sections 5.2 and 6.2 fix the serialized `ScopeHead` and root-genesis forms. Root lease
+acquisition, renewal, takeover, and relinquishment are one conditional replacement of that
+same head, each advancing `scope_epoch`; child-scope transitions remain follow-on contracts.
 
 ---
 
@@ -791,12 +791,20 @@ domain.
 
 A stale controller at epoch 42 cannot commit after epoch 43 wins, even if it retains an
 older ETag or local projection. Before its first decision, a replacement rebuilds and
-verifies the selected scope to the exact freshly read head and active plan lineage.
+verifies the selected scope against the freshly read head's exact tail, active plan lineage,
+and operation identity, at a projected scope epoch no higher than that head's.
 
 `scope_epoch` fences decisions. `claim_fence` separately fences ownership and submission
 for one exact `WorkSpec` revision. Neither substitutes for the other. Lease time is a
 liveness mechanism; conservative durations and synchronized clocks do not make clock
 precision a correctness assumption.
+
+Epoch ordering rule: a head's `scope_epoch` is at least the projected scope epoch, which is at
+least any applied event's `writer_epoch`, and a `writer_epoch` never decreases from an event to
+its child. Acquisition, renewal, and relinquishment raise the epoch without publishing an event,
+so applied events legitimately lag the head; an event commit leaves controller, lease, and epoch
+unchanged and carries that epoch as its `writer_epoch`. A head below the projected epoch, an
+event above the head epoch, and a parent above its child are all rejected.
 
 ---
 
@@ -1189,9 +1197,15 @@ application id so unrelated files are rejected, and contains no uniquely durable
 authority. Because the file is disposable it has no schema-version field and no
 migration path: a projection that fails validation is rebuilt from durable history.
 
-The schema persists the root-only epoch-1, unowned, plan-stable phase; the first epoch or
-plan transition must deliberately relax it. Any async owner for the projection file must
-use a bounded intake queue from its first release.
+The schema persists the root-only plan-stable phase at any controller epoch: a projected
+`scope_epoch` advances monotonically and may lead its applied events, because authority
+transitions advance the epoch without publishing an event. The first plan transition must
+deliberately relax it further. Any async owner for the projection file must use a bounded
+intake queue from its first release.
+
+The projection also persists each admitted work revision with its claim fence, claim lease, and
+terminal evidence, plus that revision's dependency edges. Work readiness is derived from those
+rows by query as of a caller-supplied clock reading and is never stored.
 
 Each projected scope records:
 
@@ -3236,13 +3250,11 @@ ravel/
 The durable root wire contract lives in `scope.rs` with shared wire errors in
 `sync.rs`; the root log, head transitions, and replay live in `sync/event.rs`,
 `sync/head.rs`, and `sync/replay.rs`, with the disposable projection in
-`db/projections.rs`. They are supported by `domain/validation.rs`,
+`db/projections.rs` owned by `db/worker.rs`. They are supported by `domain/validation.rs`,
 `domain/artifact.rs`, `domain/work.rs`, `distributed/identity.rs`,
-`storage/s3.rs`, and `storage/artifacts.rs`. Only these ship today; the remaining
-entries, including `db/worker.rs` and the controller modules, are the planned
-layout for later epics.
-
-Scoped controller authority is planned for `distributed/scope_controller.rs`.
+`storage/s3.rs`, and `storage/artifacts.rs`. Root controller authority lives in
+`distributed/scope_controller.rs`. Only these ship today; the remaining
+entries are the planned layout for later epics.
 
 `models/config.rs` will record exact fixed model configuration identity and digest.
 There is no `models/profiles.rs`, profile registry, workflow trait, DSL, or generic

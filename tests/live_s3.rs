@@ -19,9 +19,14 @@ use aws_sdk_s3::{
     primitives::ByteStream,
 };
 use ravel::{
-    distributed::identity::{InstanceId, WorkspaceId},
+    distributed::{
+        identity::{InstanceId, WorkspaceId},
+        scope_controller::{
+            AcquireOutcome, ReleaseOutcome, RenewOutcome, STOP_MARGIN_MS, acquire, release, renew,
+        },
+    },
     scope::{
-        AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeHead, ScopeIdentity,
+        AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeIdentity,
         decode_head, decode_root_event, encode_head, root_genesis, scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
@@ -29,7 +34,7 @@ use ravel::{
         event::publish_root,
         head::{
             ObservedScopeHead, ScopeAppendError, ScopeHeadCommitOutcome, ScopeHeadParent,
-            ScopeHeadTransition, append_root, read,
+            append_root, read,
         },
     },
 };
@@ -259,56 +264,88 @@ async fn head_create_cas_and_transition_validation_hold_against_the_live_bucket(
         genesis.event_key()
     );
 
-    // A successor cannot reuse the observed tail as its own tail.
-    assert!(
-        ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&store, scope).await)),
-            ScopeHead::new(
-                scope.clone(),
-                ScopeAuthority::Unowned,
-                1,
-                genesis.event_ref().clone(),
-                None,
-                "reused-tail".into(),
-            )
-            .expect("candidate head is valid"),
-            publish_root(&store, scope, &root, &mut AttemptHistory::default())
-                .await
-                .expect("republish succeeds"),
-        )
-        .is_err(),
-        "a successor must not reuse the observed tail"
-    );
-
-    // Root transitions remain unowned at epoch 1.
-    assert!(
-        ScopeHeadTransition::new(
-            ScopeHeadParent::Existing(Box::new(observed(&store, scope).await)),
-            ScopeHead::new(
-                scope.clone(),
-                ScopeAuthority::owned(
-                    InstanceId::new("live-controller".into()).expect("instance id is valid"),
-                    1,
-                )
-                .expect("owned authority is valid"),
-                1,
-                genesis.event_ref().clone(),
-                None,
-                "owned-successor".into(),
-            )
-            .expect("candidate head is valid"),
-            publish_root(&store, scope, &root, &mut AttemptHistory::default())
-                .await
-                .expect("republish succeeds"),
-        )
-        .is_err(),
-        "an owned root head must be rejected"
-    );
+    // Transition binding negatives are proven by unit tests; a read alone cannot mint the
+    // fenced boundary those cases would need.
 
     // The head still holds exactly the canonical genesis bytes after every rejection.
     let final_head = observed(&store, scope).await;
     assert_eq!(final_head.canonical_bytes(), genesis.head_bytes());
     assert_eq!(final_head.head().tail(), genesis.event_ref());
+}
+
+#[tokio::test]
+async fn root_controller_lifecycle_fences_a_stale_owner() {
+    if !ready() {
+        return;
+    }
+    let config = aws_config::load_from_env().await;
+    let store = store(&config);
+    let genesis = genesis_for(run_campaign());
+    let scope = genesis.identity();
+    let root = decode_root_event(genesis.event_bytes(), genesis.event_key(), scope)
+        .expect("canonical fixture decodes");
+    assert!(matches!(
+        append_root(
+            &store,
+            ScopeHeadParent::Genesis,
+            scope,
+            &root,
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .expect("root append succeeds"),
+        ScopeHeadCommitOutcome::Committed
+    ));
+
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("current Unix time fits u64 milliseconds");
+    let old = InstanceId::new("live-old-controller".into()).expect("instance id is valid");
+    let new = InstanceId::new("live-new-controller".into()).expect("instance id is valid");
+    let AcquireOutcome::Acquired(old_authority) = acquire(&store, scope, &old, now_ms)
+        .await
+        .expect("initial acquisition succeeds")
+    else {
+        panic!("expected initial acquisition");
+    };
+    let RenewOutcome::Renewed(old_authority) = renew(&store, old_authority, now_ms + 10_000)
+        .await
+        .expect("renewal succeeds")
+    else {
+        panic!("expected renewal");
+    };
+    let takeover_at = old_authority.lease_until().get();
+    let AcquireOutcome::Acquired(new_authority) = acquire(&store, scope, &new, takeover_at)
+        .await
+        .expect("takeover succeeds")
+    else {
+        panic!("expected takeover");
+    };
+
+    // Old holder's lagging clock still considers its term usable, but its retained ETag is fenced.
+    let stale_now = takeover_at - STOP_MARGIN_MS - 1;
+    assert!(matches!(
+        renew(&store, old_authority, stale_now)
+            .await
+            .expect("stale renewal resolves"),
+        RenewOutcome::Lost
+    ));
+    assert!(matches!(
+        release(&store, new_authority.stop())
+            .await
+            .expect("release succeeds"),
+        ReleaseOutcome::Released
+    ));
+    let final_head = observed(&store, scope).await;
+    assert!(matches!(
+        final_head.head().authority(),
+        ScopeAuthority::Unowned
+    ));
 }
 
 #[tokio::test]

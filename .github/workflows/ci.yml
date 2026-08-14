@@ -9,6 +9,67 @@ permissions:
   contents: read
 
 jobs:
+  # TLA+ model check for specs/tla/ControllerHead.tla. Landed disabled, and kept
+  # in its OWN job because it cannot fit the `check` job's 30-minute timeout: on
+  # the 32-core reference machine the safety run takes 12min 40s and the liveness
+  # run 1h 10min (specs/tla/README.md §5), and a 2-core hosted runner is much
+  # slower still. To enable, uncomment this job (drop the leading "# "); 360 is
+  # the hosted-runner ceiling, so re-time the full run on the runner you use
+  # before trusting it as a gate.
+  #
+  # Cheap enable path: uncomment the job and drop the "Full model check" step.
+  # The controls and witnesses have traces under 25 states and finish in seconds,
+  # and SANY still parses the spec.
+  # tla:
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 360
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+  #       with:
+  #         fetch-depth: 1
+  #         persist-credentials: false
+  #
+  #     - name: Fetch TLC
+  #       run: |
+  #         set -euo pipefail
+  #         curl -sSLo "$RUNNER_TEMP/tla2tools.jar" \
+  #           https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+  #         echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $RUNNER_TEMP/tla2tools.jar" \
+  #           | sha256sum --check --strict
+  #
+  #     - name: Negative controls and witnesses
+  #       run: |
+  #         set -euo pipefail
+  #         cd specs/tla
+  #         JAR="$RUNNER_TEMP/tla2tools.jar"
+  #         TLC="java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto"
+  #         java -cp "$JAR" tla2sany.SANY ControllerHead.tla
+  #         # These MUST fail, and must fail for the NAMED reason: any other
+  #         # nonzero exit (parse error, OOM, full tmpdir) would otherwise pass
+  #         # this gate silently.
+  #         check_violation() {
+  #           expected="$2"
+  #           $TLC -config "ControllerHead_$1.cfg" ControllerHead.tla > "out_$1.txt" 2>&1 || true
+  #           grep -qF "Invariant $expected is violated" "out_$1.txt" \
+  #             || { echo "ControllerHead_$1.cfg did not violate $expected" >&2
+  #                  tail -40 "out_$1.txt" >&2; exit 1; }
+  #         }
+  #         check_violation NC1 ResolutionSound
+  #         check_violation NC2 EpochMonotonic
+  #         check_violation NC3 FencingOrder
+  #         check_violation NC4 ResolutionSound
+  #         check_violation Witnesses WitnessesIncomplete
+  #
+  #     - name: Full model check (safety + liveness)
+  #       run: |
+  #         set -euo pipefail
+  #         cd specs/tla
+  #         JAR="$RUNNER_TEMP/tla2tools.jar"
+  #         TLC="java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto"
+  #         $TLC -coverage 5 -config ControllerHead_Safety.cfg ControllerHead.tla
+  #         $TLC -lncheck final -config ControllerHead_Liveness.cfg ControllerHead.tla
+
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -44,40 +105,6 @@ jobs:
 
       - name: Test
         run: cargo test --locked
-
-      # TLA+ model check for specs/tla/ControllerHead.tla. Landed disabled: the
-      # safety run is ~10^8 distinct states (minutes on 32 cores, far longer on a
-      # 2-core runner). To enable, uncomment this step (drop the leading "# ").
-      # A cheaper enable path is the second half alone (SANY + the negative
-      # controls and witnesses), whose traces are all under 25 states.
-      # - name: TLA model check
-      #   run: |
-      #     set -euo pipefail
-      #     JAR="$RUNNER_TEMP/tla2tools.jar"
-      #     curl -sSLo "$JAR" \
-      #       https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
-      #     echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $JAR" \
-      #       | sha256sum --check --strict
-      #     cd specs/tla
-      #     TLC="java -XX:+UseParallelGC -cp $JAR tlc2.TLC -workers auto"
-      #     java -cp "$JAR" tla2sany.SANY ControllerHead.tla
-      #     $TLC -coverage 5 -config ControllerHead_Safety.cfg ControllerHead.tla
-      #     $TLC -lncheck final -config ControllerHead_Liveness.cfg ControllerHead.tla
-      #     # Negative controls and witnesses MUST fail, and must fail for the
-      #     # NAMED reason: any other nonzero exit (parse error, OOM, full tmpdir)
-      #     # would otherwise pass this gate silently.
-      #     check_violation() {
-      #       expected="$2"
-      #       $TLC -config "ControllerHead_$1.cfg" ControllerHead.tla > "out_$1.txt" 2>&1 || true
-      #       grep -qF "Invariant $expected is violated" "out_$1.txt" \
-      #         || { echo "ControllerHead_$1.cfg did not violate $expected" >&2
-      #              tail -40 "out_$1.txt" >&2; exit 1; }
-      #     }
-      #     check_violation NC1 ResolutionSound
-      #     check_violation NC2 EpochMonotonic
-      #     check_violation NC3 FencingOrder
-      #     check_violation NC4 ResolutionSound
-      #     check_violation Witnesses WitnessesIncomplete
 
       - name: Test ignored gates
         # VmHWM is process-wide, so the RSS gate cannot share a process with the

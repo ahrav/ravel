@@ -194,7 +194,7 @@ Bounds: 2 controllers, `MaxInc 2`, `MaxReq 2` everywhere; `MaxEpoch 4`,
 | Liveness | clean | **clean**: 179,255,865 generated, 47,051,217 distinct, depth 40; the `-lncheck final` pass ran over a 141,153,651-state behaviour graph (1h 10min) |
 | Witnesses | `WitnessesIncomplete` violated | **violated at depth 22**, one trace reaching all five witnesses (§6) |
 | NC1 `ResolveIgnoresEpoch` | fail | **`ResolutionSound` violated**, 8-state trace |
-| NC2 `BlindRetry` | fail | **`EpochMonotonic` violated**, 7-state trace |
+| NC2 `BlindRetry` | fail | **`EpochMonotonic` violated**, 10-state trace (`-workers 1`; with `-workers auto` the reported trace is the same shape at 10–12 states) |
 | NC3 `FencingOff` | fail | **`FencingOrder` violated**, 11-state trace |
 | NC4 `IgnoreIncarnation` | fail | **`ResolutionSound` violated**, 9-state trace |
 
@@ -258,11 +258,25 @@ conflation — row 4 of the adversarial matrix.
 
 ### NC2 — blind CAS retry instead of resolving
 
-`Start(c1) → Acquire(c1) → GoUncertain → ApplyCas(commit ⟨epoch 2, c1, T1⟩) → BlindRetryCas(c1) → ApplyCas`
+`Start(c1) → Acquire(c1) (candidate ⟨epoch 2, c1, T1⟩) → GoUncertain(c1) → Start(c2) → Acquire(c2) (candidate ⟨epoch 2, c2, T2⟩) → ApplyCas(c2 commits ⟨epoch 2, c2, T2⟩) → DeliverProven(c2) → BlindRetryCas(c1) → ApplyCas(c1's stale candidate commits over it)`
 
-The retry re-CASes the *same* candidate against a refreshed ETag, so the log ends
-`…, ⟨epoch 2, c1⟩, ⟨epoch 2, c1⟩` — two authority writes at one epoch.
-`EpochMonotonic` catches it.
+`BlindRetryCas` is guarded on `RegB # ctl[c].cand`, so the head must have moved
+under the retry. c2's acquisition commits and c2 *concludes* `Proven` for epoch
+2; c1's blind retry then re-CASes its own epoch-2 candidate against the refreshed
+ETag and overwrites c2's committed authority, so the log ends
+`…, ⟨epoch 2, c2, T2⟩, ⟨epoch 2, c1, T1⟩` — two **distinct** authority writes at
+one epoch, one of them already proven to its owner. `EpochMonotonic` catches it,
+and the `takeoverDuringRetry` witness fires on the same trace.
+
+The guard is what makes this control evidence (§9, finding B-1). Unguarded, the
+shortest counterexample was a 7-state trace whose second write was
+*byte-identical* to the head it overwrote (`…, ⟨epoch 2, c1⟩, ⟨epoch 2, c1⟩`,
+same term, same tail): that is the **safe** `RetryIdentically` path real code
+takes behind `parent_is_current` (`head.rs:391-397`), and it repeats canonical
+head bytes — the one premise A13 / §7 forbid, since real content-digest ETags
+make such a rewrite a register no-op while the model appends an entry and hands
+out a fresh index. The property detected both shapes; TLC reports the shortest,
+so the recorded evidence was the benign one.
 
 ### NC3 — a rejected fenced write retried against a refreshed ETag
 
@@ -397,6 +411,12 @@ the authority, so the same controller reacquires and fences out its own in-fligh
 effect), NC3 violates *both* `FencingOrder` clauses so that run alone does not
 separate them (§1), and the NC1-versus-`FencingOrder` discrimination figure was
 re-measured against the current two-clause invariant (§5).
+
+PR review (automated reviewers on the change itself) added one finding:
+
+| Finding | Change |
+| --- | --- |
+| B-1: NC2's shortest counterexample was a **byte-identical** rewrite of the head — the safe `RetryIdentically` shape, and a canonical-byte repeat that A13/§7 forbid — so the run did not exercise a blind retry overwriting a genuinely newer head | `BlindRetryCas` guarded on `RegB # ctl[c].cand`; NC2 now reports the 10-state stale-overwrite trace (§6). Only NC2 sets `BlindRetry = TRUE`, so no other run's state space changes |
 
 Declined, with reasons:
 

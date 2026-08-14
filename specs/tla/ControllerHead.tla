@@ -412,10 +412,22 @@ ResolveStep(c) ==
 
 \* NC2 only: on an unknown outcome, re-CAS the same candidate against a
 \* refreshed ETag instead of resolving -- no proof, no epoch advance.
+\*
+\* The `RegB # ctl[c].cand` guard confines the control to the UNSAFE subset.
+\* Without it the shortest counterexample is a rewrite of the candidate over a
+\* head that already holds those exact bytes, which (a) is the *safe*
+\* `RetryIdentically` path real code takes behind `parent_is_current`
+\* (`head.rs:391-397`), and (b) repeats canonical head bytes -- the one premise
+\* A13 / section 7 of README.md say the ETag-as-index abstraction may not
+\* violate.  Real S3 ETags are content digests, so such a rewrite is a no-op at
+\* the register, while the model appends a second entry and hands out a fresh
+\* index.  Requiring an intervening distinct head version makes the reported
+\* trace the blind retry that overwrites a genuinely newer head.
 BlindRetryCas(c) ==
     /\ BlindRetry
     /\ ctl[c].st = "uncertain"
     /\ ctl[c].kind \in {"acquire", "renew", "release"}
+    /\ RegB # ctl[c].cand
     /\ IssueCas(c, ctl[c].cand, ctl[c].kind, RegEtag,
                 [b |-> RegB, etag |-> RegEtag])
     /\ UNCHANGED <<log, concl, nextTerm, witness>>

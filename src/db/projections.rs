@@ -168,10 +168,17 @@ CREATE TABLE admitted_work (
     CHECK (length(CAST(work_id AS BLOB)) BETWEEN 1 AND 128
         AND instr(CAST(work_id AS BLOB), CAST('/' AS BLOB)) = 0),
     CHECK (work_revision BETWEEN 0 AND 9999999999999999),
+    -- A CHECK passes when its expression evaluates to NULL, so each branch names the columns
+    -- it requires: without the explicit IS NOT NULL tests, a half-populated claim evaluates to
+    -- NULL and is accepted.
     CHECK ((claim_fence IS NULL AND claim_lease_until IS NULL)
-        OR (claim_fence BETWEEN 1 AND 9999999999999999
+        OR (claim_fence IS NOT NULL AND claim_lease_until IS NOT NULL
+            AND claim_fence BETWEEN 1 AND 9999999999999999
             AND claim_lease_until BETWEEN 1 AND 9999999999999999)),
-    CHECK (terminal_result_digest IS NULL OR (length(terminal_result_digest) = 64
+    -- `record_terminal` only writes a digest under a matching claim fence, so terminal evidence
+    -- without a recorded claim is not a row this code can produce.
+    CHECK (terminal_result_digest IS NULL OR (claim_fence IS NOT NULL
+        AND length(terminal_result_digest) = 64
         AND length(CAST(terminal_result_digest AS BLOB)) = 64
         AND terminal_result_digest NOT GLOB '*[^0-9a-f]*'))
 ) STRICT, WITHOUT ROWID;
@@ -1747,6 +1754,36 @@ mod tests {
         record_claim(&connection, &scope, &work("work-a", 2), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-a", 2), fence, &result).unwrap();
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn the_schema_rejects_a_half_recorded_claim_and_unclaimed_terminal_evidence() {
+        let (db_path, mut connection, scope) = admitted_scope("claim-column-checks");
+        let target = work("work-a", 1);
+        admit_work(&mut connection, &scope, &target, &[]).unwrap();
+        let tamper = |fence: Option<i64>, lease: Option<i64>, digest: Option<&str>| {
+            connection.execute(
+                "UPDATE admitted_work SET claim_fence = ?4, claim_lease_until = ?5, \
+                 terminal_result_digest = ?6 \
+                 WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3",
+                params![
+                    scope.scope_id().as_str(),
+                    target.id().as_str(),
+                    target.revision() as i64,
+                    fence,
+                    lease,
+                    digest
+                ],
+            )
+        };
+
+        assert!(tamper(Some(1), None, None).is_err());
+        assert!(tamper(None, Some(31_000), None).is_err());
+        assert!(tamper(None, None, Some(DIGEST_2)).is_err());
+        tamper(Some(1), Some(31_000), Some(DIGEST_2)).unwrap();
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

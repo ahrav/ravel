@@ -419,11 +419,13 @@ async fn reconcile(
     }
     let boundary = match &transition.parent {
         ScopeHeadParent::Genesis => None,
-        ScopeHeadParent::Existing(parent) => Some(parent.head.tail().clone()),
+        ScopeHeadParent::Existing(parent) => {
+            Some((parent.head.tail().clone(), parent.head.scope_epoch()))
+        }
     };
     let mut current_ref = current.head.tail().clone();
     let hops = match &boundary {
-        Some(boundary) if current_ref.sequence() > boundary.sequence() => {
+        Some((boundary, _)) if current_ref.sequence() > boundary.sequence() => {
             current_ref.sequence() - boundary.sequence()
         }
         Some(_) => return ScopeHeadCommitOutcome::Unresolved(transition),
@@ -477,12 +479,17 @@ async fn reconcile(
             return ScopeHeadCommitOutcome::Unresolved(transition);
         }
         let reached = match &boundary {
-            Some(boundary) => decoded.envelope().parent_event() == Some(boundary),
+            Some((boundary, _)) => decoded.envelope().parent_event() == Some(boundary),
             None => {
                 decoded.envelope().sequence() == 1 && decoded.envelope().parent_event().is_none()
             }
         };
         if reached {
+            if let Some((_, boundary_epoch)) = &boundary
+                && writer_epoch < *boundary_epoch
+            {
+                return ScopeHeadCommitOutcome::Unresolved(transition);
+            }
             return if found {
                 ScopeHeadCommitOutcome::CommittedSuperseded
             } else {
@@ -1511,6 +1518,64 @@ mod tests {
                 regressed_encoded.stored_bytes().to_vec(),
             ),
             response(200, &[("etag", "\"e2\"")], candidate_bytes),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Unresolved(_)
+        ));
+
+        let (candidate_envelope, candidate_encoded) = successor_at(
+            genesis.identity(),
+            genesis.event_ref(),
+            2,
+            "candidate-op",
+            2,
+        );
+        let publication =
+            published(genesis.identity(), &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            2,
+            publication.event_ref().clone(),
+            None,
+            "candidate-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (_, stale_encoded) =
+            successor_at(genesis.identity(), genesis.event_ref(), 2, "other-op", 1);
+        let stale_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            2,
+            stale_encoded.event_ref().clone(),
+            None,
+            "other-op".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&stale_head).unwrap(),
+            ),
+            response(
+                200,
+                &[("etag", "\"e2\"")],
+                stale_encoded.stored_bytes().to_vec(),
+            ),
         ]);
         assert!(matches!(
             commit(

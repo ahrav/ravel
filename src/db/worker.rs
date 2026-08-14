@@ -78,11 +78,13 @@ enum Command {
         work: WorkRef,
         claim_fence: NonZeroU64,
         lease_until: NonZeroU64,
+        now_ms: u64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     RecordTerminal {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
+        claim_fence: NonZeroU64,
         result: Digest,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
@@ -305,11 +307,13 @@ impl DbHandle {
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Dependency edges may name work ids that are not admitted yet.
+    /// Dependency edges may name work ids that are not admitted yet. Re-admission requires the
+    /// same canonical dependency set.
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// Returns [`ApplyError::Conflict`] for a changed dependency set or self-dependency,
+    /// [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
     pub async fn admit_work(
         &self,
@@ -403,6 +407,7 @@ impl DbHandle {
         work: WorkRef,
         claim_fence: NonZeroU64,
         lease_until: NonZeroU64,
+        now_ms: u64,
     ) -> Result<(), ApplyError> {
         let scope = Box::new(scope.clone());
         self.enqueue(|respond| Command::RecordClaim {
@@ -410,27 +415,32 @@ impl DbHandle {
             work,
             claim_fence,
             lease_until,
+            now_ms,
             respond,
         })?
         .await
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
+    /// Records terminal evidence produced under the revision's current claim fence.
+    ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::Conflict`] for an unknown revision or conflicting evidence,
-    /// [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// Returns [`ApplyError::Conflict`] for an unknown or unclaimed revision, a stale claim
+    /// fence, or conflicting evidence, [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
     pub async fn record_terminal(
         &self,
         scope: &ScopeIdentity,
         work: WorkRef,
+        claim_fence: NonZeroU64,
         result: Digest,
     ) -> Result<(), ApplyError> {
         let scope = Box::new(scope.clone());
         self.enqueue(|respond| Command::RecordTerminal {
             scope,
             work,
+            claim_fence,
             result,
             respond,
         })?
@@ -560,6 +570,7 @@ fn run(
                 work,
                 claim_fence,
                 lease_until,
+                now_ms,
                 respond,
             } => {
                 let _ = respond.send(projections::record_claim(
@@ -568,11 +579,13 @@ fn run(
                     &work,
                     claim_fence,
                     lease_until,
+                    now_ms,
                 ));
             }
             Command::RecordTerminal {
                 scope,
                 work,
+                claim_fence,
                 result,
                 respond,
             } => {
@@ -580,6 +593,7 @@ fn run(
                     &connection,
                     &scope,
                     &work,
+                    claim_fence,
                     &result,
                 ));
             }
@@ -761,9 +775,11 @@ mod tests {
             handle
                 .admit_work(scope, work.clone(), Vec::new(), fence)
                 .await,
-            handle.record_claim(scope, work.clone(), fence, fence).await,
             handle
-                .record_terminal(scope, work.clone(), genesis.config_digest().clone())
+                .record_claim(scope, work.clone(), fence, fence, 1)
+                .await,
+            handle
+                .record_terminal(scope, work.clone(), fence, genesis.config_digest().clone())
                 .await,
             handle.record_grant(scope, work.clone(), fence).await,
             handle.ready_work(scope, 1).await.map(|_| ()),

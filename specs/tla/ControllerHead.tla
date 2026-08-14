@@ -454,9 +454,20 @@ Progress ==
           ApplyCas(i) \/ DropDecided(i) \/ RefreshedEffectRetry(i)
 
 \* Terminal states exist only because the model bounds epochs, terms and
-\* incarnations.  The `Exhausted` conjunct keeps the deadlock gate live: a
-\* successor-less state that is NOT bound exhaustion is still reported by TLC
-\* as a deadlock rather than absorbed here (Phase 3.2 deadlock gate).
+\* incarnations.
+\*
+\* The `Exhausted` conjunct is INERT here, and the earlier claim that it keeps
+\* TLC's deadlock gate live is retracted (README section 5 / section 9 finding
+\* B-3).  `ENABLED Crash(c) <=> ctl[c].st # "down"` and
+\* `ENABLED Start(c) <=> ctl[c].st = "down" /\ ctl[c].inc < MaxInc`; neither needs
+\* a request slot and both are unconditional `Progress` disjuncts, so
+\* `~ENABLED Progress` already forces `NoLiveController`, which is itself a
+\* disjunct of `Exhausted`.  `Done` therefore absorbs every successor-less state
+\* and the deadlock check cannot fire.  A wedged controller is caught by L1
+\* (`TransitionResolves`) instead, never as a deadlock.  The conjunct is kept as
+\* a tripwire: guard `Crash` or `Start` (a crash budget, say) and terminal
+\* non-exhausted states become possible, at which point `Done` stops absorbing
+\* them and TLC reports them.
 Done == /\ Exhausted
         /\ ~ ENABLED Progress
         /\ UNCHANGED vars

@@ -113,7 +113,7 @@ Spec is `specs/tla/ControllerHead.tla`; code paths are relative to the repo root
 | `ResolveStep(c)` | `scope_controller::resolve` (`:302`) — all three rules verbatim: byte equality → Proven; owner **and** candidate epoch → Proven; `current.scope_epoch >= candidate.scope_epoch` → Superseded; else Unresolved | plus `proven_authority` (`:364`), which the owner rule's `OwnedProof` conjunct encodes |
 | `Crash(c)` | process death | request stays in flight |
 | `DropDecided(i)` | request/response lifetime end | model bookkeeping (frees a slot); no code counterpart |
-| `Done` | none | terminal self-loop, guarded by `Exhausted`, so a successor-less state that is *not* model-bound exhaustion is still reported by TLC as a deadlock (skill Phase 3.2) |
+| `Done` | none | terminal self-loop. Its `Exhausted` conjunct is currently **inert** — `~ENABLED Progress` already implies `NoLiveController` (§5, finding B-3) — so TLC's deadlock check cannot fire in this model. Kept as a tripwire for a future model where `Crash`/`Start` are guarded |
 | `BlindRetryCas(c)` | none — **injected bug** | NC2 only (`BlindRetry`) |
 | `RefreshedEffectRetry(i)` | none — **injected bug** | NC3 only (`FencingOff`): retries a rejected effect against a refreshed ETag while it still carries stale-epoch bytes |
 | `OwnedProof` incarnation conjunct | `proven_authority`'s owner check plus fresh `InstanceId` | NC4 (`IgnoreIncarnation`) makes it incarnation-blind, which is what a reused persisted id would do |
@@ -209,9 +209,24 @@ Anti-vacuity gate (skill Phase 3.0 + `references/model-validation.md`):
   136,792 `Done` self-loops. `BlindRetryCas` and `RefreshedEffectRetry` are
   **0**, intentionally: they are the NC2 and NC3 bugs, gated off by
   `BlindRetry = FALSE` / `FencingOff = FALSE`. Both fire in their own NC run.
-- **Deadlock gate**: satisfied, and it is a real check — `Done` fires only when
-  `Exhausted` holds, so a successor-less state that is not bound exhaustion
-  would still be reported by TLC as a deadlock.
+- **Deadlock gate**: satisfied, but it is **not** a check that could ever fail in
+  this model, and the earlier claim that it was (finding B-3) is retracted.
+  `ENABLED Crash(c) <=> ctl[c].st # "down"` (state-predicate guard, total primed
+  part, no slot needed) and `ENABLED Start(c) <=> ctl[c].st = "down" /\ ctl[c].inc
+  < MaxInc` (also slot-free), and both are unconditional `Progress` disjuncts, so
+  `~ENABLED Progress` forces every controller down at `MaxInc` — which *is*
+  `NoLiveController`, a disjunct of `Exhausted`. `Done`'s `Exhausted` conjunct
+  therefore never restricts anything and `Done` absorbs every successor-less
+  state, exactly as before the T-1 fix. Model-checked, not just argued: at
+  `MaxEpoch 3` / `MaxTerm 3` / `MaxTail 1` (1,621,871 distinct states, full
+  graph, no violation) both `NoLiveController \/ ENABLED Progress` and
+  `~(~ENABLED Progress /\ ~Exhausted)` hold at every reachable state. What this
+  model *does* detect instead of a wedge is L1: a controller stuck in ambiguity
+  fails `TransitionResolves`, because `Crash` keeps `Progress` enabled and so a
+  wedge never shows up as a deadlock. The `Exhausted` conjunct is kept as a
+  tripwire: if `Crash` or `Start` ever acquire a bound (a crash budget, say),
+  terminal non-exhausted states become possible and `Done` will stop absorbing
+  them.
 - **Liveness non-vacuity**: re-running the liveness cfg against `Spec` instead
   of `LiveSpec` (dropping all fairness) reports *Temporal properties were
   violated* with a stuttering counterexample at state 13 (measured at
@@ -409,7 +424,7 @@ Findings applied:
 | Finding | Change |
 | --- | --- |
 | A-1 **blocking**: L2 was vacuous at `MaxEpoch 3` — a release lands at epoch 3, which made `Exhausted` true and let the property escape instead of checking the handoff | L2 restated with narrow escapes (`NoLiveController`, term budget) that cannot fire at the handoff moment; liveness bounds raised to `MaxEpoch 4` / `MaxTerm 4` |
-| T-1: `Done` absorbed *every* successor-less state, so TLC's deadlock check could never fire | `Done` now requires `Exhausted` |
+| T-1: `Done` absorbed *every* successor-less state, so TLC's deadlock check could never fire | `Done` now requires `Exhausted` — **but this did not fix it**; see B-3 below |
 | T-2: `FencingOrder` clause 1 is implied by `EpochMonotonic`, so NC3 was not an independent control for S1 | clause 2 added (an effect's predecessor is exactly the version it fenced on); redundancy documented in §1 |
 | T-3: `NoDualAuthority` is a corollary, not independent evidence | documented in §1; NC cfgs narrowed to their named invariant |
 | T-6: ETag-as-index is sound only because canonical bytes never repeat | A13 and §7 |
@@ -437,6 +452,8 @@ PR review (automated reviewers on the change itself) added one finding:
 | Finding | Change |
 | --- | --- |
 | B-1: NC2's shortest counterexample was a **byte-identical** rewrite of the head — the safe `RetryIdentically` shape, and a canonical-byte repeat that A13/§7 forbid — so the run did not exercise a blind retry overwriting a genuinely newer head | `BlindRetryCas` guarded on `RegB # ctl[c].cand`; NC2 now reports the 10-state stale-overwrite trace (§6). Only NC2 sets `BlindRetry = TRUE`, so no other run's state space changes |
+| B-2: does L2 still cover the release handoff, given a release from `MaxEpoch - 1` lands an unowned head ON the bound and falsifies the antecedent? | it does, and §5 now records the measurement instead of asserting it: cross-node release handoff reachable (11 states), antecedent live with term budget remaining (8 states), and L2 **violated** (18 states) if the bound conjunct is dropped — so the conjunct is a bound, not a hole. No model change |
+| B-3 **blocking overclaim**: `Done`'s `Exhausted` conjunct is inert — `~ENABLED Progress` already implies `NoLiveController`, since `Crash` is enabled for every non-down controller and `Start` for every down one below `MaxInc`, neither needing a request slot. So the T-1 fix never restored TLC's deadlock gate | claim retracted in all four places (§3 `Done` row, §5 deadlock bullet, the T-1 row above, and the `Done` comment in the spec), with the model-checked evidence: `NoLiveController \/ ENABLED Progress` and `~(~ENABLED Progress /\ ~Exhausted)` both hold over the full 1,621,871-state graph at `MaxEpoch 3`. `Done` kept as-is — the conjunct is a tripwire for a future guarded `Crash`/`Start`, and dropping `~ENABLED Progress` would only relocate the inertness while adding a self-loop to every `Exhausted` state. Wedge detection here is L1's job |
 
 Declined, with reasons:
 

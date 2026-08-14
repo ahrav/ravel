@@ -303,10 +303,12 @@ ApplyCas(i) ==
     /\ UNCHANGED <<ctl, concl, nextTerm>>
 
 \* NC3 only: retry a rejected fenced write against a REFRESHED ETag while it
-\* still carries its stale-epoch bytes.  This is the shape a careless
-\* `RetryIdentically`-style refresh would take (`sync::head::resolve` refreshes
-\* the parent ETag before retrying); it is the realistic way to lose fencing,
-\* rather than omitting the `if-match` header that `put_if_match` always sends.
+\* still carries its stale-epoch bytes.  `sync::head::resolve` does refresh the
+\* parent ETag before a `RetryIdentically`, but only behind the
+\* `parent_is_current` guard (`head.rs:391-397`, `parent.bytes ==
+\* current.bytes`); this action is that guard deleted.  It is the realistic way
+\* to lose fencing, rather than omitting the `if-match` header that
+\* `put_if_match` always sends.
 RefreshedEffectRetry(i) ==
     /\ FencingOff
     /\ reqs[i].status = "rejected"

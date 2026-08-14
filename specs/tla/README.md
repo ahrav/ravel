@@ -30,7 +30,10 @@ Two of these are **not independent**, and the review pinned it down (§9):
 - `FencingOrder` clause 1 — S1 exactly as the lease-fencing reference states it —
   is *implied* by `EpochMonotonic`, because `log` is append-only and conjunct 1
   of `EpochMonotonic` holds at every reachable state. Clause 2 is what gives S1
-  independent detection power, and it is the clause NC3 fails on.
+  independent detection power: it can be falsified by a bug that keeps epochs
+  ordered, e.g. an effect committed against a *different* same-epoch version of
+  the head. NC3's trace happens to violate both clauses, so that run alone does
+  not separate them.
 - `NoDualAuthority` is a corollary of `ResolutionSound` plus the
   authority-epoch-uniqueness conjunct of `EpochMonotonic`. It is kept because it
   is the human-readable statement of the property people actually care about, but
@@ -48,8 +51,9 @@ Deliberately **absent**, per the lease-fencing reference §4:
   margin property ("no re-grant while an in-bound holder still believes it is
   active"). Dropping S2 is tolerable for the *head* because every modeled effect
   is register-fenced, but `append_root` publishes immutable event bytes **before**
-  the head CAS (`src/sync/head.rs:245-278`, whose own doc says a later failure
-  "can leave an unreferenced immutable event"). So the residual risk S2 would
+  the head CAS (`src/sync/head.rs:236-239`: "Every remaining binding check runs
+  after publication, so a failure there can leave an unreferenced immutable
+  event"). So the residual risk S2 would
   have bounded is: a zombie past its margin publishes durable but unreferenced
   event objects. That is garbage, not a correctness violation of the head, and
   it is not covered here.
@@ -219,12 +223,11 @@ Anti-vacuity gate (skill Phase 3.0 + `references/model-validation.md`):
   satisfied by the epoch budget running out at that exact moment (§9, finding
   A-1).
 - **Property discrimination**: NC1 (`ResolveIgnoresEpoch`) violates
-  `ResolutionSound` but leaves `FencingOrder` **clean** (82,383,557 distinct
-  states, no error, measured on the pre-review spec) — S1 alone would not have
-  caught the resolve bug. Conversely NC3 fails `FencingOrder` clause 2 while
-  `EpochMonotonic` is what catches its clause-1 shape, so the two invariants are
-  not interchangeable. The redundancies that *do* exist are stated in §1 rather
-  than being presented as independent evidence.
+  `ResolutionSound` but leaves the current two-clause `FencingOrder` **clean** (395,029,419 states generated, 98,063,677 distinct, no error, 12min 37s) —
+  S1 would not have caught the resolve bug. Conversely NC3's stale effect is
+  invisible to `ResolutionSound` (it makes no false conclusion) and is caught by
+  `FencingOrder`. The redundancies that *do* exist are stated in §1 rather than
+  being presented as independent evidence.
 
 ## 6. Traces
 
@@ -263,13 +266,19 @@ The retry re-CASes the *same* candidate against a refreshed ETag, so the log end
 
 ### NC3 — a rejected fenced write retried against a refreshed ETag
 
-`Start(c1) → Acquire(c1) → ApplyCas(⟨epoch 2, c1⟩) → DeliverProven → PublishEffect(c1) → Acquire(c2) → ApplyCas(⟨epoch 3, c2⟩) → ApplyCas(effect rejected) → RefreshedEffectRetry → ApplyCas(effect commits)`
+`Start(c2) → Acquire(c2) → ApplyCas(⟨epoch 2, c2⟩) → DeliverProven → PublishEffect(c2) → Acquire(c2) → ApplyCas(⟨epoch 3, c2⟩) → ApplyCas(effect rejected) → RefreshedEffectRetry → ApplyCas(effect commits)`
 
-c1's effect was fenced at epoch 2 and correctly rejected once c2 took over at
-epoch 3; the injected retry refreshes its parent ETag and lands the stale-epoch
-bytes anyway. `FencingOrder` catches it. This is the Kleppmann zombie (row 2 of
-the matrix) in the shape a real careless retry would take, rather than "the
-`if-match` header was omitted" — `put_if_match` always sends the header.
+Note this needs only **one** controller: `PublishEffect` consumes the authority,
+so the same controller reacquires at epoch 3 and thereby fences out its own
+in-flight effect — the ETag no longer matches and the effect is correctly
+rejected. The injected retry then refreshes the parent ETag and lands the
+stale-epoch bytes anyway, so `⟨epoch 2, tail 1⟩` is applied after the epoch-3
+write. `FencingOrder` catches it. This is the Kleppmann zombie (row 2 of the
+matrix) in the shape a real careless retry would take: `sync::head::resolve`
+refreshes the parent ETag before a `RetryIdentically`, but only behind the
+`parent_is_current` byte-equality guard (`head.rs:391-397`) that this control
+deletes. "The `if-match` header was omitted" would not have been a code-shaped
+bug — `put_if_match` always sends it.
 
 ### NC4 — incarnation-blind owner rule
 
@@ -327,7 +336,10 @@ row 10; duplicates come from the append path in A10), **11** (clock drift — §
     pair. 2 admits the effect → takeover → second-effect schedules.
   - `MaxReq 2` is a *guard*, not just a tracking bound: `IssueCas` needs a free
     slot, so a three-way race (two stale writes in flight plus a fresh takeover)
-    is pruned. See §9 finding T-5 for the confirmation run at `MaxReq 3`.
+    is pruned. A `MaxReq 3` confirmation run (`MaxEpoch 4`, `MaxTail 1`) ran to
+    completion **clean**: 3,499,514,983 states generated, 747,105,825 distinct,
+    depth 44, no deadlock (1h 02min). The committed cfg keeps `MaxReq 2` so the
+    routine run stays minutes rather than an hour.
   - `MaxTerm 4`: term nonces are drawn from a finite pool, so a behaviour that
     retries forever ends in `Exhausted`. L2's consequent names this escape
     explicitly instead of hiding it.
@@ -366,7 +378,6 @@ Findings applied:
 | T-1: `Done` absorbed *every* successor-less state, so TLC's deadlock check could never fire | `Done` now requires `Exhausted` |
 | T-2: `FencingOrder` clause 1 is implied by `EpochMonotonic`, so NC3 was not an independent control for S1 | clause 2 added (an effect's predecessor is exactly the version it fenced on); redundancy documented in §1 |
 | T-3: `NoDualAuthority` is a corollary, not independent evidence | documented in §1; NC cfgs narrowed to their named invariant |
-| T-4/A-6: `MaxTail 1` capped committed effects at one per behaviour | safety run raised to `MaxTail 2`; both bounds justified in §7 |
 | T-6: ETag-as-index is sound only because canonical bytes never repeat | A13 and §7 |
 | T-7: the CI control loop treated any nonzero exit as "control failed" | it now greps for the expected named violation; `-coverage` restored |
 | F-1: `GoUncertain` is a conservative union of outcomes with different real lifecycles; `AmbiguousConflict` is unreachable on this path | A12 |
@@ -378,6 +389,14 @@ Findings applied:
 | A-8: `DropDecided` can free a slot an `uncertain` controller still names | comment pinning the invariant that makes it safe |
 | A-9/matrix row 10 was overclaimed | reclassified out of scope in §6 |
 | T-8/A-2 nits on wording (A2 justification, `Start` fairness placement) | applied |
+
+A second confirmation pass by the lane that raised A-1 re-checked every fix and
+found no new defect in the spec. Three of its reporting corrections are applied
+above: the NC3 trace in §6 needs only one controller (`PublishEffect` consumes
+the authority, so the same controller reacquires and fences out its own in-flight
+effect), NC3 violates *both* `FencingOrder` clauses so that run alone does not
+separate them (§1), and the NC1-versus-`FencingOrder` discrimination figure was
+re-measured against the current two-clause invariant (§5).
 
 Declined, with reasons:
 

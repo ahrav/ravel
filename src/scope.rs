@@ -550,14 +550,18 @@ pub fn scope_event_key(scope: &ScopeIdentity, event: &ScopeEventRef) -> String {
 }
 
 /// Builds the full root-scoped work-claim key.
-pub fn scope_claim_key(claim: &ScopeClaimIdentity) -> String {
+/// Builds the full claim key, which locates a claim by scope and work revision only.
+///
+/// Plan lineage and claim fence are bindings inside the record, not part of its location, so a
+/// reader that has not yet seen the record can still address it.
+pub fn scope_claim_key(scope: &ScopeIdentity, work: &WorkRef) -> String {
     format!(
         "workspace/{}/campaigns/{}/scopes/{}/claims/{}/{}",
-        claim.scope().workspace_id().as_str(),
-        claim.scope().campaign_id().as_str(),
-        claim.scope().scope_id().as_str(),
-        claim.work().id().as_str(),
-        claim.work().revision()
+        scope.workspace_id().as_str(),
+        scope.campaign_id().as_str(),
+        scope.scope_id().as_str(),
+        work.id().as_str(),
+        work.revision()
     )
 }
 

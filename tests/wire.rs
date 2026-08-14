@@ -215,7 +215,7 @@ fn scope_keys_cover_the_exact_identity_axis() {
         )
     );
     assert_eq!(
-        scope_claim_key(&claim),
+        scope_claim_key(claim.scope(), claim.work()),
         format!("workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/claims/work-17/4")
     );
     assert_eq!(claim.plan_digest(), &digest);

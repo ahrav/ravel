@@ -44,6 +44,3 @@ jobs:
 
       - name: Test
         run: cargo test --locked
-
-      - name: Test ignored gates
-        run: cargo test --locked -- --ignored

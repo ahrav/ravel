@@ -928,7 +928,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[ignore = "55s growth gate: cargo test -- --ignored"]
     async fn replay_growth_stays_subquadratic() {
         const SIZES: [usize; 5] = [256, 512, 1_024, 2_048, 4_096];
         assert_eq!(SIZES.last().copied(), Some(LIMITS.events as usize));

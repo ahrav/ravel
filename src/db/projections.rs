@@ -445,20 +445,14 @@ pub(crate) fn admit_work(
         params![scope.scope_id().as_str(), work.id().as_str(), revision],
     )?;
     if inserted == 0 {
-        let matches = {
-            let mut statement = transaction.prepare(WORK_DEPENDENCIES_SQL)?;
-            let stored = statement
-                .query_map(
-                    params![scope.scope_id().as_str(), work.id().as_str(), revision],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<Result<Vec<_>, _>>()?;
-            stored
-                .iter()
-                .map(String::as_str)
-                .eq(dependencies.iter().copied())
-        };
-        if !matches {
+        let mut statement = transaction.prepare(WORK_DEPENDENCIES_SQL)?;
+        let stored = statement
+            .query_map(
+                params![scope.scope_id().as_str(), work.id().as_str(), revision],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if stored != dependencies {
             return Err(ApplyError::Conflict);
         }
     } else {

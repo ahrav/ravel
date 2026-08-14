@@ -21,14 +21,16 @@ use crate::{
 pub const RECONCILE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 /// Outcome of offering one item to a bounded queue.
+///
+/// A refusal hands the item back, so no offered work is dropped by the offer itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
-pub enum Admission {
+pub enum Admission<T> {
     Accepted,
     /// The queue is at capacity; the caller keeps the item and sheds or retries.
-    Overloaded,
+    Overloaded(T),
     /// Admission stopped, so the item will never be served.
-    Stopped,
+    Stopped(T),
 }
 
 /// Fixed-capacity intake queue that refuses instead of growing or blocking.
@@ -47,12 +49,12 @@ impl<T> IntakeQueue<T> {
         }
     }
 
-    pub fn admit(&mut self, item: T) -> Admission {
+    pub fn admit(&mut self, item: T) -> Admission<T> {
         if !self.admitting {
-            return Admission::Stopped;
+            return Admission::Stopped(item);
         }
         if self.queued.len() >= self.capacity.get() {
-            return Admission::Overloaded;
+            return Admission::Overloaded(item);
         }
         self.queued.push_back(item);
         Admission::Accepted
@@ -417,7 +419,7 @@ mod tests {
         assert_eq!(queue.admit("first"), Admission::Accepted);
         assert_eq!(queue.admit("second"), Admission::Accepted);
         // Capacity is fixed: overload is an outcome, not a wait or a resize.
-        assert_eq!(queue.admit("third"), Admission::Overloaded);
+        assert_eq!(queue.admit("third"), Admission::Overloaded("third"));
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.capacity(), capacity(2));
 
@@ -425,7 +427,7 @@ mod tests {
         assert_eq!(queue.admit("third"), Admission::Accepted);
 
         queue.stop_admission();
-        assert_eq!(queue.admit("fourth"), Admission::Stopped);
+        assert_eq!(queue.admit("fourth"), Admission::Stopped("fourth"));
         assert!(!queue.is_admitting());
         assert_eq!(queue.len(), 2);
     }
@@ -483,7 +485,7 @@ mod tests {
 
         // The returned queue is the evidence that admission stopped and shed its items.
         let mut stopped = stopped;
-        assert_eq!(stopped.admit("late"), Admission::Stopped);
+        assert_eq!(stopped.admit("late"), Admission::Stopped("late"));
         assert!(stopped.is_empty());
 
         // The descendant is gone before shutdown returned, so nothing outlives the node.

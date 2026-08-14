@@ -62,6 +62,7 @@ const ADMIT_WORK_SQL: &str = "INSERT INTO admitted_work \
      WHERE admitted_scope_epoch <= ?4";
 const ADMITTED_REVISION_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM admitted_work \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3)";
+const PROJECTED_SCOPE_EPOCH_SQL: &str = "SELECT scope_epoch FROM scopes WHERE scope_id = ?1";
 /// A grant is bound to the exact claim fence it was issued for, so a reclaimed work revision
 /// cannot resume under a grant minted for the fence it superseded.
 const RECORD_GRANT_SQL: &str = "UPDATE admitted_work SET grant_fence = ?4 \
@@ -482,6 +483,16 @@ pub(crate) fn admit_work(
         params![scope.scope_id().as_str(), work.id().as_str(), revision],
         |row| row.get::<_, bool>(0),
     )?;
+    // The projected epoch only advances, so an admission below it was produced under superseded
+    // authority.
+    let projected_epoch: i64 = transaction.query_row(
+        PROJECTED_SCOPE_EPOCH_SQL,
+        [scope.scope_id().as_str()],
+        |row| row.get(0),
+    )?;
+    if !u64::try_from(projected_epoch).is_ok_and(|epoch| epoch <= scope_epoch.get()) {
+        return Err(ApplyError::Conflict);
+    }
     // A superseded epoch cannot update the row, so it must not rewrite the edges readiness is
     // derived from either.
     if transaction.execute(
@@ -2252,6 +2263,31 @@ mod tests {
             admit_work(&mut connection, &scope, &target, &[], epoch(2)),
             Err(ApplyError::Conflict)
         );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn work_offered_below_the_projected_scope_epoch_never_becomes_ready() {
+        let (db_path, mut connection, scope) = admitted_scope("admission-epoch-floor");
+        apply_scope_event(
+            &mut connection,
+            &mutation_at_epoch(&scope, 2, DIGEST_2, Some(DIGEST_1), 5, 5),
+        )
+        .unwrap();
+        assert_eq!(projected_epoch(&connection, &scope), 5);
+
+        // A first revision has no prior row to compare against, so the projected epoch is the
+        // only floor that refuses it.
+        assert_eq!(
+            admit_work(&mut connection, &scope, &work("work-a", 1), &[], epoch(3)),
+            Err(ApplyError::Conflict)
+        );
+        assert!(ready(&connection, &scope, 1_000).is_empty());
+
+        admit_work(&mut connection, &scope, &work("work-a", 1), &[], epoch(5)).unwrap();
+        assert_eq!(ready(&connection, &scope, 1_000), vec!["work-a@1"]);
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

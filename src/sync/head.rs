@@ -12,7 +12,7 @@
 //! Root heads reject active plan digests.
 //! Retained walks stop at 4,096 events or 64 MiB of stored event bytes.
 
-use std::{collections::HashSet, error::Error, fmt};
+use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 
 use crate::{
     scope::{
@@ -435,6 +435,7 @@ async fn reconcile(
     let mut seen = HashSet::new();
     let mut total_bytes = 0usize;
     let mut found = false;
+    let mut child_writer_epoch: Option<NonZeroU64> = None;
     for hop in 0..hops {
         if !seen.insert(current_ref.digest().as_str().to_owned()) {
             return ScopeHeadCommitOutcome::Unresolved(transition);
@@ -457,6 +458,13 @@ async fn reconcile(
         if hop == 0 && decoded.envelope().operation_id() != current.head.operation_id() {
             return ScopeHeadCommitOutcome::Unresolved(transition);
         }
+        let writer_epoch = decoded.envelope().writer_epoch();
+        if writer_epoch > current.head.scope_epoch()
+            || child_writer_epoch.is_some_and(|child| writer_epoch > child)
+        {
+            return ScopeHeadCommitOutcome::Unresolved(transition);
+        }
+        child_writer_epoch = Some(writer_epoch);
         if decoded.envelope().operation_id() == transition.candidate.operation_id() {
             if current_ref != *transition.candidate.tail()
                 || bytes != transition.event.canonical_bytes()
@@ -1381,6 +1389,137 @@ mod tests {
             )
             .await,
             ScopeHeadCommitOutcome::ProvenNotCommitted
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_refuses_a_chain_that_breaks_the_epoch_ordering_rule() {
+        let genesis = genesis();
+        // An event whose writer epoch exceeds the current head's scope epoch.
+        let (candidate_envelope, candidate_encoded) =
+            successor(genesis.identity(), genesis.event_ref(), 2, "candidate-op");
+        let candidate_ref = candidate_encoded.event_ref().clone();
+        let candidate_bytes = candidate_encoded.stored_bytes().to_vec();
+        let publication =
+            published(genesis.identity(), &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            candidate_ref.clone(),
+            None,
+            "candidate-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (_, above_encoded) = successor_at(genesis.identity(), &candidate_ref, 3, "later-op", 3);
+        let above_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            above_encoded.event_ref().clone(),
+            None,
+            "later-op".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&above_head).unwrap(),
+            ),
+            response(
+                200,
+                &[("etag", "\"e3\"")],
+                above_encoded.stored_bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"e2\"")], candidate_bytes),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Unresolved(_)
+        ));
+
+        // A writer epoch that decreases from an event to its child.
+        let parent = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            2,
+            genesis.event_ref().clone(),
+            None,
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap();
+        let (candidate_envelope, candidate_encoded) = successor_at(
+            genesis.identity(),
+            genesis.event_ref(),
+            2,
+            "candidate-op",
+            2,
+        );
+        let candidate_ref = candidate_encoded.event_ref().clone();
+        let candidate_bytes = candidate_encoded.stored_bytes().to_vec();
+        let publication =
+            published(genesis.identity(), &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            2,
+            candidate_ref.clone(),
+            None,
+            "candidate-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (_, regressed_encoded) =
+            successor_at(genesis.identity(), &candidate_ref, 3, "later-op", 1);
+        let regressed_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            2,
+            regressed_encoded.event_ref().clone(),
+            None,
+            "later-op".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&regressed_head).unwrap(),
+            ),
+            response(
+                200,
+                &[("etag", "\"e3\"")],
+                regressed_encoded.stored_bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"e2\"")], candidate_bytes),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Unresolved(_)
         ));
     }
 

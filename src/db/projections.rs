@@ -62,13 +62,14 @@ const WORK_DEPENDENCIES_SQL: &str = "SELECT depends_on_work_id FROM work_depende
      ORDER BY depends_on_work_id";
 const ADMIT_DEPENDENCY_SQL: &str = "INSERT INTO work_dependencies \
      (scope_id, work_id, work_revision, depends_on_work_id) VALUES (?1, ?2, ?3, ?4)";
-/// A recorded fence never regresses; an equal fence only extends its lease, preventing
-/// duplicate or reordered claim records from shortening a live lease and releasing work twice.
+/// A recorded fence never regresses. A higher `?4` replaces `claim_fence` only when
+/// `claim_lease_until <= ?6`; an equal `?4` only extends its own lease.
 const RECORD_CLAIM_SQL: &str = "UPDATE admitted_work \
      SET claim_fence = ?4, claim_lease_until = ?5 \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
        AND terminal_result_digest IS NULL \
-       AND (claim_fence IS NULL OR claim_fence < ?4 \
+       AND (claim_fence IS NULL \
+            OR (claim_fence < ?4 AND claim_lease_until <= ?6) \
             OR (claim_fence = ?4 AND claim_lease_until <= ?5))";
 /// Terminal evidence names the exact claim it came from, so a submission from a superseded
 /// claim cannot mark work terminal.
@@ -472,17 +473,22 @@ pub(crate) fn admit_work(
     Ok(())
 }
 
+/// `now_ms` is the clock a higher fence takes over an expired lease against, on the same base as
+/// [`ready_work`].
+///
 /// # Errors
 ///
 /// Returns [`ApplyError::Conflict`] when the revision is unknown, already carries terminal
-/// evidence, or would regress its fence, and [`ApplyError::DatabaseOperationFailed`] when SQLite
-/// fails or a value exceeds the stored-integer bound.
+/// evidence, would regress its fence, or holds a claim whose lease is still live at `now_ms`, and
+/// [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a value exceeds the
+/// stored-integer bound.
 pub(crate) fn record_claim(
     connection: &rusqlite::Connection,
     scope: &ScopeIdentity,
     work: &WorkRef,
     claim_fence: NonZeroU64,
     lease_until: NonZeroU64,
+    now_ms: u64,
 ) -> Result<(), ApplyError> {
     let updated = connection.execute(
         RECORD_CLAIM_SQL,
@@ -492,6 +498,7 @@ pub(crate) fn record_claim(
             stored_u64(work.revision())?,
             stored_u64(claim_fence.get())?,
             stored_u64(lease_until.get())?,
+            stored_u64(now_ms)?,
         ],
     )?;
     if updated == 1 {
@@ -1212,7 +1219,9 @@ mod tests {
             query_plan(
                 &connection,
                 RECORD_CLAIM_SQL,
-                &[&scope_id, &work_id, &revision, &sequence, &sequence],
+                &[
+                    &scope_id, &work_id, &revision, &sequence, &sequence, &sequence,
+                ],
             ),
             query_plan(
                 &connection,
@@ -1636,11 +1645,11 @@ mod tests {
         let result = Digest::new(DIGEST_2.into()).unwrap();
         let fence = NonZeroU64::new(1).unwrap();
         let lease = NonZeroU64::new(31_000).unwrap();
-        record_claim(&connection, &scope, &work("work-a", 1), fence, lease).unwrap();
+        record_claim(&connection, &scope, &work("work-a", 1), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-a", 1), fence, &result).unwrap();
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
 
-        record_claim(&connection, &scope, &work("work-b", 1), fence, lease).unwrap();
+        record_claim(&connection, &scope, &work("work-b", 1), fence, lease, 1_000).unwrap();
         // A live claim withholds the revision; an expired one makes it reclaimable.
         assert!(ready(&connection, &scope, 1_000).is_empty());
         assert_eq!(ready(&connection, &scope, 31_000), vec!["work-b@1"]);
@@ -1650,13 +1659,13 @@ mod tests {
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@2"]);
 
         // Terminal evidence from the current claim removes the revision from the ready set.
-        record_claim(&connection, &scope, &work("work-b", 2), fence, lease).unwrap();
+        record_claim(&connection, &scope, &work("work-b", 2), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-b", 2), fence, &result).unwrap();
         assert!(ready(&connection, &scope, 1_000).is_empty());
 
         // Work that was never admitted is never ready.
         assert_eq!(
-            record_claim(&connection, &scope, &work("work-c", 1), fence, lease),
+            record_claim(&connection, &scope, &work("work-c", 1), fence, lease, 1_000),
             Err(ApplyError::Conflict)
         );
 
@@ -1677,6 +1686,7 @@ mod tests {
             &work("work-c", 1),
             NonZeroU64::new(4).unwrap(),
             NonZeroU64::new(31_000).unwrap(),
+            1_000,
         )
         .unwrap();
         let before = ready(&connection, &scope, 1_000);
@@ -1697,7 +1707,8 @@ mod tests {
                 &scope,
                 &work("work-c", 1),
                 NonZeroU64::new(3).unwrap(),
-                NonZeroU64::new(61_000).unwrap()
+                NonZeroU64::new(61_000).unwrap(),
+                31_000
             ),
             Err(ApplyError::Conflict)
         );
@@ -1725,7 +1736,7 @@ mod tests {
         .unwrap();
         let fence = NonZeroU64::new(1).unwrap();
         let lease = NonZeroU64::new(31_000).unwrap();
-        record_claim(&connection, &scope, &work("work-a", 1), fence, lease).unwrap();
+        record_claim(&connection, &scope, &work("work-a", 1), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-a", 1), fence, &result).unwrap();
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
 
@@ -1733,7 +1744,7 @@ mod tests {
         admit_work(&mut connection, &scope, &work("work-a", 2), &[]).unwrap();
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-a@2"]);
 
-        record_claim(&connection, &scope, &work("work-a", 2), fence, lease).unwrap();
+        record_claim(&connection, &scope, &work("work-a", 2), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-a", 2), fence, &result).unwrap();
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
 
@@ -1758,20 +1769,29 @@ mod tests {
             record_terminal(&connection, &scope, &target, low, &first),
             Err(ApplyError::Conflict)
         );
-        record_claim(&connection, &scope, &target, low, short_lease).unwrap();
+        record_claim(&connection, &scope, &target, low, short_lease, 1_000).unwrap();
         assert_eq!(
             ready(&connection, &scope, short_lease.get()),
             vec!["work-a@1"]
         );
-        record_claim(&connection, &scope, &target, high, lease).unwrap();
-
-        // A lower fence, and an equal fence that would shorten the live lease, are refused.
+        // A higher fence waits for the recorded lease instead of displacing a live claimant.
         assert_eq!(
-            record_claim(&connection, &scope, &target, low, lease),
+            record_claim(&connection, &scope, &target, high, lease, 1_999),
             Err(ApplyError::Conflict)
         );
         assert_eq!(
-            record_claim(&connection, &scope, &target, high, short_lease),
+            stored_claim(&connection, &scope, &target),
+            (Some(3), Some(2_000))
+        );
+        record_claim(&connection, &scope, &target, high, lease, 2_000).unwrap();
+
+        // A lower fence, and an equal fence that would shorten the live lease, are refused.
+        assert_eq!(
+            record_claim(&connection, &scope, &target, low, lease, 31_000),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(
+            record_claim(&connection, &scope, &target, high, short_lease, 31_000),
             Err(ApplyError::Conflict)
         );
         assert_eq!(
@@ -1785,6 +1805,7 @@ mod tests {
             &target,
             high,
             NonZeroU64::new(41_000).unwrap(),
+            31_000,
         )
         .unwrap();
         assert_eq!(
@@ -1816,7 +1837,8 @@ mod tests {
                 &scope,
                 &target,
                 NonZeroU64::new(9).unwrap(),
-                lease
+                lease,
+                41_000
             ),
             Err(ApplyError::Conflict)
         );
@@ -1862,11 +1884,11 @@ mod tests {
         let lease = NonZeroU64::new(31_000).unwrap();
         let result = Digest::new(DIGEST_2.into()).unwrap();
         admit_work(&mut connection, &scope, &work("work-a", 1), &[]).unwrap();
-        record_claim(&connection, &scope, &work("work-a", 1), fence, lease).unwrap();
+        record_claim(&connection, &scope, &work("work-a", 1), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-a", 1), fence, &result).unwrap();
         assert!(ready(&connection, &scope, 1_000).is_empty());
         admit_work(&mut connection, &scope, &work("work-c", 1), &[]).unwrap();
-        record_claim(&connection, &scope, &work("work-c", 1), fence, lease).unwrap();
+        record_claim(&connection, &scope, &work("work-c", 1), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-c", 1), fence, &result).unwrap();
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-b@1"]);
 

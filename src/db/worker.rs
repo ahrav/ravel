@@ -62,6 +62,7 @@ enum Command {
         work: WorkRef,
         claim_fence: NonZeroU64,
         lease_until: NonZeroU64,
+        now_ms: u64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     RecordTerminal {
@@ -326,6 +327,7 @@ impl DbHandle {
         work: WorkRef,
         claim_fence: NonZeroU64,
         lease_until: NonZeroU64,
+        now_ms: u64,
     ) -> Result<(), ApplyError> {
         let scope = Box::new(scope.clone());
         self.enqueue(|respond| Command::RecordClaim {
@@ -333,6 +335,7 @@ impl DbHandle {
             work,
             claim_fence,
             lease_until,
+            now_ms,
             respond,
         })?
         .await
@@ -456,6 +459,7 @@ fn run(
                 work,
                 claim_fence,
                 lease_until,
+                now_ms,
                 respond,
             } => {
                 let _ = respond.send(projections::record_claim(
@@ -464,6 +468,7 @@ fn run(
                     &work,
                     claim_fence,
                     lease_until,
+                    now_ms,
                 ));
             }
             Command::RecordTerminal {
@@ -657,7 +662,9 @@ mod tests {
         let fence = NonZeroU64::new(1).unwrap();
         [
             handle.admit_work(scope, work.clone(), Vec::new()).await,
-            handle.record_claim(scope, work.clone(), fence, fence).await,
+            handle
+                .record_claim(scope, work.clone(), fence, fence, 1)
+                .await,
             handle
                 .record_terminal(scope, work.clone(), fence, genesis.config_digest().clone())
                 .await,

@@ -115,12 +115,6 @@ impl std::ops::Deref for FencedParent {
     }
 }
 
-impl std::ops::DerefMut for FencedParent {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 /// Validated event/head unit consumed by [`commit`].
 pub struct ScopeHeadTransition {
     parent: ScopeHeadParent,
@@ -198,7 +192,7 @@ impl ScopeHeadTransition {
     pub(crate) fn attributed_to(mut self, namespace: &str) -> Self {
         self.event = self.event.attributed_to(namespace);
         if let ScopeHeadParent::Existing(observed) = &mut self.parent {
-            observed.namespace = namespace.to_owned();
+            observed.0.namespace = namespace.to_owned();
         }
         self
     }

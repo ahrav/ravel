@@ -47,7 +47,8 @@ CONSTANTS
     MaxReq,               \* concurrently tracked in-flight CAS requests
     ResolveIgnoresEpoch,  \* NC1: drop the epoch conjunct from resolve()'s owner rule
     BlindRetry,           \* NC2: re-CAS on a refreshed ETag instead of resolving
-    FencingOff            \* NC3: fenced downstream write skips its ETag condition
+    FencingOff,           \* NC3: retry a rejected effect against a refreshed ETag
+    IgnoreIncarnation     \* NC4: incarnation-blind owner rule in resolve()
 
 Unowned == "unowned"      \* ScopeAuthority::Unowned
 NoInst  == "noInst"       \* absent author / absent issuer
@@ -78,7 +79,8 @@ Kinds     == {"acquire", "renew", "release", "effect"}
 ReqStatus == {"none", "inflight", "committed", "rejected"}
 CtlStates == {"down", "idle", "waiting", "uncertain", "holding", "stopped"}
 RequestId == 1..MaxReq
-Witnesses == {"ownerEpochProof", "takeoverDuringRetry", "delayedApply"}
+Witnesses == {"ownerEpochProof", "takeoverDuringRetry", "delayedApply",
+               "effectCommitted", "staleEffectRejected"}
 
 VARIABLES
     log,        \* ghost: sequence of committed register versions; the register
@@ -102,6 +104,10 @@ RegEtag == Len(log)              \* current ETag = write sequence number
 
 \* "b names c's CURRENT instance as owner"
 OwnedByNow(b, c) == b.owner = c /\ b.oinc = ctl[c].inc
+
+\* The same test as used by resolve()'s owner rule.  NC4 makes it
+\* incarnation-blind, which is the bug a reused instance id would create.
+OwnedProof(b, c) == b.owner = c /\ (IgnoreIncarnation \/ b.oinc = ctl[c].inc)
 
 TypeOK ==
     /\ Len(log) >= 1
@@ -261,6 +267,8 @@ Crash(c) ==
 
 WitnessAtCommit(i) ==
     LET r == reqs[i] IN
+    (IF r.kind = "effect" THEN {"effectCommitted"} ELSE {})
+      \cup
     (IF /\ r.kind = "acquire"
         /\ \E d \in Controller : /\ d # r.inode
                                  /\ ctl[d].st \in {"waiting", "uncertain"}
@@ -278,8 +286,7 @@ WitnessAtCommit(i) ==
 ApplyCas(i) ==
     /\ reqs[i].status = "inflight"
     /\ LET r      == reqs[i]
-           fenced == \/ r.parent = RegEtag
-                     \/ (FencingOff /\ r.kind = "effect")
+           fenced == r.parent = RegEtag
        IN IF fenced
           THEN /\ log' = Append(log,
                             [b |-> r.b, anode |-> r.inode, ainc |-> r.iinc,
@@ -289,11 +296,31 @@ ApplyCas(i) ==
                                        ![i].cetag = Len(log) + 1]
                /\ witness' = witness \cup WitnessAtCommit(i)
           ELSE /\ reqs' = [reqs EXCEPT ![i].status = "rejected"]
-               /\ UNCHANGED <<log, witness>>
+               /\ witness' = witness \cup (IF r.kind = "effect"
+                                           THEN {"staleEffectRejected"}
+                                           ELSE {})
+               /\ UNCHANGED log
     /\ UNCHANGED <<ctl, concl, nextTerm>>
+
+\* NC3 only: retry a rejected fenced write against a REFRESHED ETag while it
+\* still carries its stale-epoch bytes.  This is the shape a careless
+\* `RetryIdentically`-style refresh would take (`sync::head::resolve` refreshes
+\* the parent ETag before retrying); it is the realistic way to lose fencing,
+\* rather than omitting the `if-match` header that `put_if_match` always sends.
+RefreshedEffectRetry(i) ==
+    /\ FencingOff
+    /\ reqs[i].status = "rejected"
+    /\ reqs[i].kind = "effect"
+    /\ reqs[i].parent # RegEtag
+    /\ reqs' = [reqs EXCEPT ![i].status = "inflight", ![i].parent = RegEtag]
+    /\ UNCHANGED <<log, ctl, concl, nextTerm, witness>>
 
 \* Free a decided slot nobody is waiting on (garbage collection; also how a
 \* crashed issuer's or a fire-and-forget effect's slot is reclaimed).
+\* An `uncertain` controller's slot may be freed while ctl[c].req still names
+\* it: safe only because nothing outside `"waiting"` ever dereferences
+\* reqs[ctl[c].req] (ResolveStep works from ctl[c].cand / ctl[c].kind).  Keep it
+\* that way, or this becomes cross-request aliasing.
 DropDecided(i) ==
     /\ reqs[i].status \in {"committed", "rejected"}
     /\ ~ \E c \in Controller : ctl[c].st = "waiting" /\ ctl[c].req = i
@@ -352,7 +379,7 @@ ResolveStep(c) ==
            hasOwner   == cand.owner # Unowned          \* Option<&InstanceId>
            bytesEqual == cur.b = cand
            ownerProof == /\ hasOwner
-                         /\ OwnedByNow(cur.b, c)
+                         /\ OwnedProof(cur.b, c)
                          /\ \/ ResolveIgnoresEpoch
                             \/ cur.b.epoch = cand.epoch
            proven     == bytesEqual \/ ownerProof
@@ -394,35 +421,49 @@ BlindRetryCas(c) ==
 (***************************************************************************)
 (* Next-state relation                                                      *)
 (***************************************************************************)
+\* Exhaustion of the model's artificial bounds (epochs, term nonces,
+\* incarnations); stable once true.  Liveness is claimed only while budget
+\* remains -- a bound is not a protocol property.
+NoLiveController == \A c \in Controller : ctl[c].st = "down" /\ ctl[c].inc = MaxInc
+
+Exhausted == \/ RegB.epoch = MaxEpoch
+             \/ nextTerm > MaxTerm
+             \/ NoLiveController
+
 Progress ==
     \/ \E c \in Controller :
           \/ Start(c) \/ Acquire(c) \/ Renew(c) \/ Stop(c) \/ DropStopped(c)
           \/ Release(c) \/ PublishEffect(c) \/ Crash(c)
           \/ DeliverProven(c) \/ GoUncertain(c) \/ NotSent(c)
           \/ ResolveStep(c) \/ BlindRetryCas(c)
-    \/ \E i \in RequestId : ApplyCas(i) \/ DropDecided(i)
+    \/ \E i \in RequestId :
+          ApplyCas(i) \/ DropDecided(i) \/ RefreshedEffectRetry(i)
 
-\* Terminal states exist only because the model bounds epochs, terms,
-\* incarnations and request slots.  This self-loop distinguishes bound
-\* exhaustion from protocol deadlock (Phase 3.2 deadlock gate).
-Done == /\ ~ ENABLED Progress
+\* Terminal states exist only because the model bounds epochs, terms and
+\* incarnations.  The `Exhausted` conjunct keeps the deadlock gate live: a
+\* successor-less state that is NOT bound exhaustion is still reported by TLC
+\* as a deadlock rather than absorbed here (Phase 3.2 deadlock gate).
+Done == /\ Exhausted
+        /\ ~ ENABLED Progress
         /\ UNCHANGED vars
 
 Next == Progress \/ Done
 
 \* Environment progress assumptions (storage decides, responses arrive,
 \* slots are reclaimed) -- stated apart from the system's own fairness.
+\* (`Start` is here, not in SysFairness: restarting a dead process is a
+\* supervisor obligation, not something the protocol can do for itself.)
 EnvFairness ==
     /\ \A i \in RequestId : WF_vars(ApplyCas(i))
     /\ \A i \in RequestId : WF_vars(DropDecided(i))
     /\ \A c \in Controller : WF_vars(DeliverProven(c) \/ GoUncertain(c))
+    /\ \A c \in Controller : WF_vars(Start(c))
 
 \* System fairness: a live controller keeps resolving and keeps trying to
 \* acquire.  No fairness on Crash, Stop, Release or PublishEffect: those are
 \* adversarial or optional.
 SysFairness ==
     /\ \A c \in Controller : WF_vars(ResolveStep(c))
-    /\ \A c \in Controller : WF_vars(Start(c))
     /\ \A c \in Controller : WF_vars(Acquire(c))
 
 Fairness == EnvFairness /\ SysFairness
@@ -463,24 +504,28 @@ NoDualAuthority ==
     \A x, y \in concl :
        (x.own /\ y.own /\ x.epoch = y.epoch) => (x.node = y.node /\ x.inc = y.inc)
 
-\* S1 (fencing), per lease-fencing-and-ownership-transfer-design: no effect
-\* fenced at epoch e is applied after a register write with a higher epoch.
+\* S1 (fencing), per lease-fencing-and-ownership-transfer-design.
+\* Clause 1 is S1 as that reference states it: no effect fenced at epoch e is
+\* applied after a register write with a higher epoch.  On its own clause 1 is
+\* implied by EpochMonotonic, so clause 2 carries the independent content: an
+\* applied effect's predecessor is exactly the head version it was fenced on
+\* (same epoch, owner, incarnation and term; one tail step), which is what CAS
+\* on the held ETag is supposed to guarantee.
 FencingOrder ==
-    \A i, j \in 1..Len(log) :
-       (i < j /\ log[j].kind = "effect") => log[j].b.epoch >= log[i].b.epoch
+    /\ \A i, j \in 1..Len(log) :
+          (i < j /\ log[j].kind = "effect") => log[j].b.epoch >= log[i].b.epoch
+    /\ \A j \in 1..Len(log) :
+          log[j].kind = "effect" =>
+             /\ j > 1
+             /\ log[j - 1].b.epoch = log[j].b.epoch
+             /\ log[j - 1].b.owner = log[j].b.owner
+             /\ log[j - 1].b.oinc = log[j].b.oinc
+             /\ log[j - 1].b.term = log[j].b.term
+             /\ log[j - 1].b.tail + 1 = log[j].b.tail
 
 (***************************************************************************)
 (* Liveness                                                                 *)
 (***************************************************************************)
-
-\* Exhaustion of the model's artificial bounds (epochs, term nonces,
-\* incarnations); stable once true.  Liveness is claimed only while budget
-\* remains -- a bound is not a protocol property.
-NoLiveController == \A c \in Controller : ctl[c].st = "down" /\ ctl[c].inc = MaxInc
-
-Exhausted == \/ RegB.epoch = MaxEpoch
-             \/ nextTerm > MaxTerm
-             \/ NoLiveController
 
 Ambiguous(c) == ctl[c].st \in {"waiting", "uncertain"}
 
@@ -489,12 +534,17 @@ Ambiguous(c) == ctl[c].st \in {"waiting", "uncertain"}
 TransitionResolves ==
     \A c \in Controller : Ambiguous(c) ~> ~Ambiguous(c)
 
-\* Once the head is unowned, some controller acquires proven authority -- or
-\* the model's epoch/term budget ran out.
+\* Once the head is unowned it does not stay unowned: some controller commits an
+\* acquisition.  The two escape disjuncts are model bounds, not protocol
+\* behaviour, and neither fires at the moment a handoff completes -- so a release
+\* followed by a successor's acquisition is checked, not escaped.  (An
+\* `Exhausted`-shaped escape would instead be satisfied by the epoch budget
+\* running out exactly when the handoff lands, which is vacuous.)
 AcquisitionProgress ==
-    (RegB.owner = Unowned)
-      ~> (\/ \E c \in Controller : ctl[c].st \in {"holding", "stopped"}
-          \/ Exhausted)
+    (RegB.owner = Unowned /\ RegB.epoch < MaxEpoch)
+      ~> (\/ RegB.owner # Unowned          \* an acquisition committed
+          \/ NoLiveController              \* nobody left alive to acquire
+          \/ nextTerm > MaxTerm)           \* term-nonce budget spent
 
 (***************************************************************************)
 (* Anti-vacuity: reachability witnesses.  Each is an INVERTED invariant --   *)
@@ -506,6 +556,10 @@ AcquisitionProgress ==
 (*                          controller is mid-transition.                     *)
 (*   delayedApply         : a request commits after its issuer already reread  *)
 (*                          and concluded.                                    *)
+(*   effectCommitted      : a fenced downstream write actually commits (so S1  *)
+(*                          is not vacuous under fencing ON).                  *)
+(*   staleEffectRejected  : a fenced downstream write is rejected because the  *)
+(*                          register moved under it (the fence firing).        *)
 (***************************************************************************)
 WitnessesIncomplete == witness # Witnesses
 =============================================================================

@@ -318,7 +318,8 @@ where
     F: Fn(usize) -> Fut,
     Fut: Future<Output = R>,
 {
-    let capacity = concurrency.get();
+    // Concurrency above the work count reserves slots no item can ever occupy.
+    let capacity = concurrency.get().min(count);
     let mut finished: Vec<Option<R>> = Vec::with_capacity(count);
     finished.resize_with(count, || None);
     let mut started = 0;
@@ -1046,5 +1047,30 @@ mod tests {
         // Four rounds of 8 at 20 ms each: concurrent, and not one 640 ms sequential run.
         assert!(elapsed >= Duration::from_millis(80), "elapsed {elapsed:?}");
         assert!(elapsed < Duration::from_millis(500), "elapsed {elapsed:?}");
+    }
+
+    /// A cap above `count` invokes `run` once for each index below `count`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cap_above_the_work_count_still_runs_every_item_once() {
+        let cap = NonZeroUsize::new(4_096).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        assert!(
+            bounded_map(0, cap, |index| async move { index })
+                .await
+                .is_empty()
+        );
+
+        let counted = Arc::clone(&calls);
+        let outcomes = bounded_map(2, cap, |index| {
+            let calls = Arc::clone(&counted);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                index
+            }
+        })
+        .await;
+        assert_eq!(outcomes, vec![0, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

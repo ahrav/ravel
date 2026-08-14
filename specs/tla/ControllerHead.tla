@@ -554,6 +554,17 @@ TransitionResolves ==
 \* followed by a successor's acquisition is checked, not escaped.  (An
 \* `Exhausted`-shaped escape would instead be satisfied by the epoch budget
 \* running out exactly when the handoff lands, which is vacuous.)
+\*
+\* The antecedent's `RegB.epoch < MaxEpoch` conjunct excludes exactly the states
+\* where an acquisition is not *possible*: `Acquire` requires
+\* `o.b.epoch < MaxEpoch`, so an unowned head sitting ON the bound (a release
+\* from `MaxEpoch - 1`) can never be reacquired.  Dropping the conjunct makes L2
+\* FALSE for that budget reason alone (measured: 18-state stuttering
+\* counterexample, README section 5), which is why the bound lives in the
+\* antecedent rather than as a third escape disjunct.  It costs no coverage:
+\* behaviours that release BELOW the bound do carry the obligation, and README
+\* section 5 records the reachability measurement for the release-then-successor
+\* handoff, including the cross-node case.
 AcquisitionProgress ==
     (RegB.owner = Unowned /\ RegB.epoch < MaxEpoch)
       ~> (\/ RegB.owner # Unowned          \* an acquisition committed

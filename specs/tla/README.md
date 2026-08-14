@@ -222,6 +222,26 @@ Anti-vacuity gate (skill Phase 3.0 + `references/model-validation.md`):
   release followed by a successor's acquisition is *checked* rather than
   satisfied by the epoch budget running out at that exact moment (§9, finding
   A-1).
+- **L2's release handoff is in the checked state space** (§9, finding B-2 —
+  measured with one-off inverted invariants at the liveness bounds, not committed
+  because the `witness` ghost would cost state space in every run):
+  - a release commits an unowned head **below** the bound and a *different*
+    node's acquisition commits after it: **reachable, 11-state trace**. So L2's
+    antecedent does fire in post-release states, and the successor handoff is
+    inside the graph the clean liveness run covered — this is the
+    `genesis 1 → acquire 2 → release 3 → successor acquires 4` schedule the
+    liveness cfg header names.
+  - an unowned head at `1 < epoch < MaxEpoch` with `nextTerm <= MaxTerm`:
+    **reachable, 8-state trace** — the antecedent holds in states where the
+    term-budget escape is not already satisfied.
+  - the antecedent's `RegB.epoch < MaxEpoch` conjunct is a *bound*, not a hole:
+    with it dropped, L2 is **violated** (18-state stuttering counterexample,
+    `MaxEpoch 3` for run time, 1min 05s), and the final state is a release that
+    landed on the bound — `⟨epoch 3, unowned⟩` with `nextTerm 3 <= MaxTerm` —
+    which `Acquire`'s own `o.b.epoch < MaxEpoch` guard makes unreacquirable. Any
+    finite epoch budget has a last epoch a release can land on, so this escape is
+    structural to bounding epochs rather than a coverage gap; "reserve an epoch"
+    only moves it.
 - **Property discrimination**: NC1 (`ResolveIgnoresEpoch`) violates
   `ResolutionSound` but leaves the current two-clause `FencingOrder` **clean** (395,029,419 states generated, 98,063,677 distinct, no error, 12min 37s) —
   S1 would not have caught the resolve bug. Conversely NC3's stale effect is

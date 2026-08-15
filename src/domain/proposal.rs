@@ -304,8 +304,13 @@ impl PlanProposal {
     ///
     /// Returns [`ProposalError::PlanTooLarge`] above [`MAX_PLAN_CANONICAL_BYTES`] of CBOR.
     ///
-    /// Returns [`ProposalError::InvalidEncoding`] on a serialization failure, which no field type
-    /// here can produce.
+    /// Returns [`ProposalError::InvalidEncoding`] on a serialization or digest failure, neither of
+    /// which is reachable: the writer is a `&mut Vec<u8>`, which takes `ciborium_io`'s blanket
+    /// `std::io::Write` impl and so reports `std::io::Error`, but a `Vec<u8>` write only grows the
+    /// buffer and never returns one — allocation failure aborts the process instead. No `Serialize`
+    /// impl reached from [`WirePlanProposal`] raises a custom error, and a SHA-256 rendered with
+    /// `{:x}` is always 64 lowercase hexadecimal bytes. The variant keeps the boundary total rather
+    /// than forcing a panic here.
     fn encode(&self) -> Result<(Vec<u8>, Digest), ProposalError> {
         let mut cbor = Vec::new();
         into_writer(&WirePlanProposal::from(self), &mut cbor)

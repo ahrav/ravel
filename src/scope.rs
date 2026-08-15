@@ -612,6 +612,22 @@ pub fn scope_claim_key(scope: &ScopeIdentity, work: &WorkRef) -> String {
     )
 }
 
+/// Builds the full key of one claim generation's effect grant.
+///
+/// The fence is part of the location so create-only publication yields one immutable object per
+/// claim generation, and reconciliation can read the exact attempt back.
+pub fn scope_grant_key(scope: &ScopeIdentity, work: &WorkRef, claim_fence: NonZeroU64) -> String {
+    format!(
+        "workspace/{}/campaigns/{}/scopes/{}/grants/{}/{}/{}",
+        scope.workspace_id().as_str(),
+        scope.campaign_id().as_str(),
+        scope.scope_id().as_str(),
+        work.id().as_str(),
+        work.revision(),
+        claim_fence
+    )
+}
+
 /// Builds the full campaign plan key.
 pub fn plan_key(workspace: &WorkspaceId, campaign: &CampaignId, digest: &Digest) -> String {
     format!(

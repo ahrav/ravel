@@ -68,6 +68,10 @@ enum Command {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
         claim_fence: NonZeroU64,
+        plan_digest: Digest,
+        scope_epoch: NonZeroU64,
+        grant_deadline_unix_ms: NonZeroU64,
+        now_ms: u64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     ResumableWork {
@@ -342,24 +346,36 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// A grant is recorded against the exact claim fence it was issued for.
+    /// A grant is recorded against the exact claim fence, plan, epoch, and live lease it was
+    /// issued for.
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::Conflict`] when the revision is unknown, terminal, or claimed at
-    /// another fence, [`ApplyError::Full`], [`ApplyError::Stopping`], or
-    /// [`ApplyError::DatabaseOperationFailed`].
-    pub async fn record_grant(
+    /// Returns [`ApplyError::Conflict`] when any of those bindings fails, [`ApplyError::Full`],
+    /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one durable rule, every binding named"
+    )]
+    pub(crate) async fn record_grant(
         &self,
         scope: &ScopeIdentity,
         work: WorkRef,
         claim_fence: NonZeroU64,
+        plan_digest: Digest,
+        scope_epoch: NonZeroU64,
+        grant_deadline_unix_ms: NonZeroU64,
+        now_ms: u64,
     ) -> Result<(), ApplyError> {
         let scope = Box::new(scope.clone());
         self.enqueue(|respond| Command::RecordGrant {
             scope,
             work,
             claim_fence,
+            plan_digest,
+            scope_epoch,
+            grant_deadline_unix_ms,
+            now_ms,
             respond,
         })?
         .await
@@ -551,6 +567,10 @@ fn run(
                 scope,
                 work,
                 claim_fence,
+                plan_digest,
+                scope_epoch,
+                grant_deadline_unix_ms,
+                now_ms,
                 respond,
             } => {
                 let _ = respond.send(projections::record_grant(
@@ -558,6 +578,10 @@ fn run(
                     &scope,
                     &work,
                     claim_fence,
+                    &plan_digest,
+                    scope_epoch,
+                    grant_deadline_unix_ms,
+                    now_ms,
                 ));
             }
             Command::ResumableWork {
@@ -795,7 +819,17 @@ mod tests {
             handle
                 .record_terminal(scope, work.clone(), fence, genesis.config_digest().clone())
                 .await,
-            handle.record_grant(scope, work.clone(), fence).await,
+            handle
+                .record_grant(
+                    scope,
+                    work.clone(),
+                    fence,
+                    genesis.config_digest().clone(),
+                    fence,
+                    fence,
+                    1,
+                )
+                .await,
             handle.ready_work(scope, 1).await.map(|_| ()),
             handle.resumable_work(scope, fence, 1).await.map(|_| ()),
             handle.drain().await,

@@ -332,9 +332,6 @@ async fn read_supported(
         Err(ScopeHeadReadError::Storage(_)) => return Err(AuthorityError::ScopeStorage),
         Err(ScopeHeadReadError::Invalid(_)) => return Err(AuthorityError::HeadInvalid),
     };
-    if !head::root_head_supported(observed.head()) {
-        return Err(AuthorityError::HeadInvalid);
-    }
     Ok(observed)
 }
 

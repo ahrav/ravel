@@ -9,15 +9,15 @@
 //! `db::projections`.
 //! commentlint: allow(JUDGE)
 //!
-//! Root heads reject active plan digests.
+//! Only a plan-admission event changes a head's active plan digest.
 //! Retained walks stop at 4,096 events or 64 MiB of stored event bytes.
 
 use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 
 use crate::{
     scope::{
-        MAX_HEAD_BYTES, ScopeAuthority, ScopeHead, ScopeIdentity, decode_head, encode_head,
-        scope_head_key,
+        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, ScopeAuthority, ScopeHead, ScopeIdentity,
+        decode_head, decode_plan_admitted_event, encode_head, scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
 };
@@ -26,7 +26,7 @@ use super::{
     WireError,
     event::{
         ResolvedScopeEventPublication, ScopeEventPublicationError, payload_registered,
-        publish_root, read_opaque, root_domain_valid, root_payload_valid,
+        publish_encoded, publish_root, read_opaque, root_domain_valid, root_payload_valid,
     },
 };
 
@@ -173,10 +173,10 @@ impl ScopeHeadTransition {
                     || envelope.sequence() != expected
                     || envelope.parent_event() != Some(observed.head.tail())
                     || candidate.operation_id() == observed.head.operation_id()
-                    || candidate.active_plan_digest() != observed.head.active_plan_digest()
                 {
                     return Err(WireError::InvalidValue);
                 }
+                validate_active_plan_transition(observed.head(), &candidate, &event)?;
             }
         }
         let head_bytes = encode_head(&candidate)?;
@@ -230,6 +230,115 @@ impl fmt::Display for ScopeAppendError {
 }
 
 impl Error for ScopeAppendError {}
+
+/// One attempt-history slot per object an admission writes.
+#[derive(Default)]
+pub struct AdmissionHistories {
+    pub plan: AttemptHistory,
+    pub event: AttemptHistory,
+    pub head: AttemptHistory,
+}
+
+/// The one rule for how an event may move a head's active plan.
+///
+/// A `plan_admitted` event moves it from none to exactly the digest its own payload names; every
+/// other event preserves it. The payload is re-decoded from the published bytes, so the head
+/// cannot disagree with the event that authorized it.
+///
+/// # Errors
+///
+/// Returns [`WireError::InvalidValue`] for any other movement, and decode errors verbatim.
+fn validate_active_plan_transition(
+    observed: &ScopeHead,
+    candidate: &ScopeHead,
+    event: &ResolvedScopeEventPublication,
+) -> Result<(), WireError> {
+    if event.envelope().payload_type() != PLAN_ADMITTED_PAYLOAD_TYPE {
+        return if candidate.active_plan_digest() == observed.active_plan_digest() {
+            Ok(())
+        } else {
+            Err(WireError::InvalidValue)
+        };
+    }
+    let key = scope_event_key(candidate.scope(), event.event_ref());
+    let admitted = decode_plan_admitted_event(event.canonical_bytes(), &key, candidate.scope())?;
+    if observed.active_plan_digest().is_some()
+        || candidate.active_plan_digest() != Some(admitted.payload().plan_digest())
+    {
+        return Err(WireError::InvalidValue);
+    }
+    Ok(())
+}
+
+/// Publishes the plan object and its admission event, then commits the head that activates it.
+///
+/// The plan object is published first: an event that names an address must never win the head
+/// race while that address is unreadable. Objects a failed attempt leaves behind are immutable
+/// and reusable.
+///
+/// # Errors
+///
+/// Returns [`ScopeAppendError::InvalidInput`] for a parent that already has an active plan, a
+/// mismatched writer epoch, or an invalid transition, and publication errors verbatim.
+pub async fn append_plan_admitted(
+    store: &S3Store,
+    parent: ScopeHeadParent,
+    scope: &ScopeIdentity,
+    admissible: &crate::domain::proposal::AdmissibleProposal,
+    event: &crate::scope::PlanAdmittedEvent,
+    histories: &mut AdmissionHistories,
+) -> Result<ScopeHeadCommitOutcome, ScopeAppendError> {
+    let AdmissionHistories {
+        plan: plan_history,
+        event: event_history,
+        head: head_history,
+    } = histories;
+    let ScopeHeadParent::Existing(observed) = &parent else {
+        // Admission always succeeds a genesis head, so there is a parent to fence against.
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    if event.payload().plan_digest() != admissible.plan_digest()
+        || observed.head().active_plan_digest().is_some()
+        || event.envelope().writer_epoch() != observed.head().scope_epoch()
+    {
+        return Err(ScopeAppendError::InvalidInput);
+    }
+    let (authority, scope_epoch) = (
+        observed.head().authority().clone(),
+        observed.head().scope_epoch().get(),
+    );
+    let plan_digest = admissible.plan_digest().clone();
+    let plan_key = crate::scope::plan_key(scope.workspace_id(), scope.campaign_id(), &plan_digest);
+    store
+        .publish_with_history(
+            &plan_key,
+            admissible.stored_bytes().to_vec(),
+            plan_digest.as_str(),
+            plan_history,
+        )
+        .await
+        .map_err(|error| {
+            ScopeAppendError::Publication(ScopeEventPublicationError::Storage(error))
+        })?;
+    let encoded = crate::scope::encode_plan_admitted_event(event)
+        .map_err(ScopeEventPublicationError::Invalid)
+        .map_err(ScopeAppendError::Publication)?;
+    let publication = publish_encoded(store, scope, event.envelope(), encoded, event_history)
+        .await
+        .map_err(ScopeAppendError::Publication)?;
+    let candidate = ScopeHead::new(
+        scope.clone(),
+        authority,
+        scope_epoch,
+        publication.event_ref().clone(),
+        Some(plan_digest),
+        event.envelope().operation_id().to_owned(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let transition = ScopeHeadTransition::new(parent, candidate, publication)
+        .map_err(|_| ScopeAppendError::InvalidInput)?;
+    Ok(commit(store, transition, head_history).await)
+}
 
 /// Publishes immutable event bytes before validating or mutating the head.
 ///
@@ -405,18 +514,11 @@ async fn resolve(store: &S3Store, mut transition: ScopeHeadTransition) -> ScopeH
     reconcile(store, transition, current).await
 }
 
-pub(crate) fn root_head_supported(head: &ScopeHead) -> bool {
-    head.active_plan_digest().is_none()
-}
-
 async fn reconcile(
     store: &S3Store,
     transition: ScopeHeadTransition,
     current: ObservedScopeHead,
 ) -> ScopeHeadCommitOutcome {
-    if !root_head_supported(&current.head) {
-        return ScopeHeadCommitOutcome::Unresolved(transition);
-    }
     let boundary = match &transition.parent {
         ScopeHeadParent::Genesis => None,
         ScopeHeadParent::Existing(parent) => {

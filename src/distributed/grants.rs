@@ -362,13 +362,19 @@ pub async fn intake(
         .await
     {
         Ok(resumable) => {
-            if grant.deadline_unix_ms.get() <= now_ms.saturating_add(elapsed_ms(started)) {
+            let accepted_at_ms = now_ms.saturating_add(elapsed_ms(started));
+            if grant.deadline_unix_ms.get() <= accepted_at_ms {
                 return GrantIntake::Rejected(GrantRejection::Expired);
             }
             match resumable
                 .iter()
                 .find(|row| row.work() == expected.identity.work())
             {
+                // The query filtered leases against the time it was given, so the row's own lease
+                // is retested against the clock after it returned.
+                Some(row) if row.claim_lease_until().get() <= accepted_at_ms => {
+                    GrantIntake::Rejected(GrantRejection::Revoked)
+                }
                 Some(row) if row.claim_fence() == expected.identity.claim_fence() => {
                     if row.grant_digest().as_str() == format!("{:x}", Sha256::digest(&bytes)) {
                         GrantIntake::Accepted(Box::new(grant))

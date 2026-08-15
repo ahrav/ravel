@@ -118,7 +118,8 @@ const RECORD_GRANT_SQL: &str = "UPDATE admitted_work \
 /// not ahead of the controller's, the revision is the highest admitted, carries no terminal
 /// evidence, its deadline is still ahead of `?3`, the claim lease is live, and a grant is bound
 /// to that exact claim fence.
-const RESUMABLE_WORK_SQL: &str = "SELECT work_id, work_revision, claim_fence, grant_digest \
+const RESUMABLE_WORK_SQL: &str = "SELECT work_id, work_revision, claim_fence, grant_digest, \
+     claim_lease_until \
      FROM admitted_work AS resumable \
      WHERE resumable.scope_id = ?1 \
        AND resumable.deadline_unix_ms > ?3 \
@@ -852,6 +853,7 @@ pub struct ResumableWork {
     work: WorkRef,
     claim_fence: NonZeroU64,
     grant_digest: Digest,
+    claim_lease_until: NonZeroU64,
 }
 
 impl ResumableWork {
@@ -867,6 +869,12 @@ impl ResumableWork {
     /// [`Self::claim_fence`].
     pub fn grant_digest(&self) -> &Digest {
         &self.grant_digest
+    }
+
+    /// The row's recorded lease, so a caller can retest it against a clock read after this query
+    /// returned.
+    pub fn claim_lease_until(&self) -> NonZeroU64 {
+        self.claim_lease_until
     }
 }
 
@@ -896,26 +904,32 @@ pub(crate) fn resumable_work(
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )?
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
-        .map(|(work_id, revision, claim_fence, grant_digest)| {
-            let claim_fence = u64::try_from(claim_fence)
-                .ok()
-                .and_then(NonZeroU64::new)
-                .ok_or(ApplyError::DatabaseOperationFailed)?;
-            Ok(ResumableWork {
-                work: WorkRef::new(
-                    WorkId::new(work_id).map_err(|_| ApplyError::DatabaseOperationFailed)?,
-                    u64::try_from(revision).map_err(|_| ApplyError::DatabaseOperationFailed)?,
-                ),
-                claim_fence,
-                grant_digest: Digest::new(grant_digest)
-                    .map_err(|_| ApplyError::DatabaseOperationFailed)?,
-            })
-        })
+        .map(
+            |(work_id, revision, claim_fence, grant_digest, claim_lease_until)| {
+                let bounded = |value: i64| {
+                    u64::try_from(value)
+                        .ok()
+                        .and_then(NonZeroU64::new)
+                        .ok_or(ApplyError::DatabaseOperationFailed)
+                };
+                Ok(ResumableWork {
+                    work: WorkRef::new(
+                        WorkId::new(work_id).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                        u64::try_from(revision).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                    ),
+                    claim_fence: bounded(claim_fence)?,
+                    grant_digest: Digest::new(grant_digest)
+                        .map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                    claim_lease_until: bounded(claim_lease_until)?,
+                })
+            },
+        )
         .collect()
 }
 
@@ -3021,9 +3035,13 @@ mod tests {
         assert_eq!(
             resumed
                 .iter()
-                .map(|row| (row.work().clone(), row.claim_fence().get()))
+                .map(|row| (
+                    row.work().clone(),
+                    row.claim_fence().get(),
+                    row.claim_lease_until().get()
+                ))
                 .collect::<Vec<_>>(),
-            [(work("work-a", 1), 1)]
+            [(work("work-a", 1), 1, 20_000)]
         );
         assert_eq!(
             resumable_work(&connection, &scope, epoch(1), 10_000).unwrap(),

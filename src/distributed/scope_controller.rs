@@ -113,8 +113,8 @@ pub enum AuthorityError {
     ScopeMissing,
     /// The head read failed in transport; a later attempt may succeed.
     ScopeStorage,
-    /// The head is undecodable, carries an active plan digest, or names another owner after a
-    /// proven write. Retrying cannot change any of those.
+    /// The head is undecodable or names another owner after a proven write. Retrying cannot
+    /// change either.
     HeadInvalid,
     /// A caller supplied a witness from another store, or a term, epoch, or encoded head that
     /// cannot be represented.

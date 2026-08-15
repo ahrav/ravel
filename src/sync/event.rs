@@ -1,6 +1,6 @@
 //! Immutable event reads and publication witnesses.
 //!
-//! Production publication registers root genesis only; test-only successors exercise CAS and retained-chain behavior.
+//! Production publication registers root genesis and plan admission; test-only successors exercise CAS and retained-chain behavior.
 
 use std::{error::Error, fmt};
 

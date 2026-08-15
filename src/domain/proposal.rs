@@ -8,9 +8,9 @@
 //! object-store integrity check recomputes the same digest it would for any blob. The `ciborium`
 //! lockfile pin is byte-affecting for this address, as the `zstd-sys` pin is for event bytes.
 //!
-//! This module decides proposal shape, not admission policy: it accepts any parent equal to the
-//! scope's active plan, including a successor. Only durable state knows whether a superseded plan
-//! can be drained, so refusing a successor is the durable layer's rule.
+//! The shape gate here accepts any parent equal to the scope's active plan, including a
+//! successor. Only durable state knows whether a superseded plan can be drained, so refusing a
+//! successor is the durable layer's rule, not this module's.
 //!
 //! Two shapes are admissible by design rather than by omission. An empty basis list is allowed,
 //! because fixed initial work is proposed from the objective alone. Citing the prior revision is
@@ -20,11 +20,11 @@
 //! The root-only MVP has exactly two basis kinds; child certificates and delegation bases are
 //! post-signal work and are not representable. `root_genesis` is the only supported planning-input
 //! payload, because it is the durable objective and configuration record and no observation payload
-//! type exists yet. Every other payload type fails closed, the way `payload_type_registered`
-//! refuses an unregistered event payload — but against that one constant, not that predicate, whose
-//! allow-list also admits the test-only successor payload.
+//! type exists yet. Every other payload type fails closed against that one constant, not against
+//! `payload_type_registered`, whose allow-list also admits the admission event itself and the
+//! test-only successor payload.
 
-use std::{collections::BTreeSet, error::Error, fmt, io::Cursor, num::NonZeroU64};
+use std::{collections::BTreeMap, error::Error, fmt, io::Cursor, num::NonZeroU64};
 
 use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ use crate::{
 const PLAN_PROPOSAL_DOMAIN: &[u8] = b"ravel.plan.proposal\0";
 const CBOR_RECURSION_LIMIT: usize = 16;
 
-/// Highest value the projection's `INTEGER` columns round-trip.
+/// Highest value the durable integer columns and 16-digit key encodings accept.
 pub const MAX_STORED_INTEGER: u64 = 9_999_999_999_999_999;
 /// Cap on the CBOR body of one plan object.
 pub const MAX_PLAN_CANONICAL_BYTES: usize = 1024 * 1024;
@@ -469,28 +469,29 @@ pub fn decode_plan(
 ///
 /// Closure is over this proposal alone, so an edge naming work outside it fails closed.
 fn validate_work_graph(work_specs: &[WorkSpec]) -> Result<(), ProposalError> {
-    let declared: BTreeSet<&str> = work_specs
+    let index: BTreeMap<&str, usize> = work_specs
         .iter()
-        .map(|spec| spec.work_id.as_str())
+        .enumerate()
+        .map(|(position, spec)| (spec.work_id.as_str(), position))
         .collect();
-    if declared.len() != work_specs.len() {
+    if index.len() != work_specs.len() {
         return Err(ProposalError::DuplicateWork);
     }
     for spec in work_specs {
         for dependency in &spec.dependencies {
-            if !declared.contains(dependency.as_str()) {
+            if !index.contains_key(dependency.as_str()) {
                 return Err(ProposalError::UnknownDependency);
             }
         }
     }
-    if has_cycle(work_specs) {
+    if has_cycle(work_specs, &index) {
         return Err(ProposalError::CyclicDependency);
     }
     Ok(())
 }
 
 /// Iterative depth-first search over a set already proven closed; a self-edge is a cycle here.
-fn has_cycle(work_specs: &[WorkSpec]) -> bool {
+fn has_cycle(work_specs: &[WorkSpec], index: &BTreeMap<&str, usize>) -> bool {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum Mark {
         Unseen,
@@ -498,12 +499,6 @@ fn has_cycle(work_specs: &[WorkSpec]) -> bool {
         Done,
     }
 
-    let index: std::collections::BTreeMap<&str, usize> = work_specs
-        .iter()
-        .enumerate()
-        .map(|(position, spec)| (spec.work_id.as_str(), position))
-        .collect();
-    let index = |work_id: &str| index.get(work_id).copied();
     let mut marks = vec![Mark::Unseen; work_specs.len()];
     // Each frame holds one node and how many of its edges are walked, so a deep chain cannot
     // overflow the stack.
@@ -519,7 +514,7 @@ fn has_cycle(work_specs: &[WorkSpec]) -> bool {
                 None => marks[node] = Mark::Done,
                 Some(dependency) => {
                     stack.push((node, edge + 1));
-                    let Some(next) = index(dependency.as_str()) else {
+                    let Some(next) = index.get(dependency.as_str()).copied() else {
                         continue;
                     };
                     match marks[next] {

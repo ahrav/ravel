@@ -6,8 +6,9 @@
 //!
 //! Work readiness is derived by query from admitted work, dependencies, revision, claim
 //! state, and terminal evidence; it is never stored as a flag. A reopened file keeps its work
-//! rows; a rebuilt file recovers them by re-applying the admission event, whose payload carries
-//! the plan. Claim leases and readiness clocks are Unix-epoch milliseconds on one shared base.
+//! rows; a rebuilt file recovers them by re-applying the admission event, whose payload names
+//! the plan object replay re-fetches. Claim leases and readiness clocks are Unix-epoch
+//! milliseconds on one shared base.
 //! commentlint: allow(JUDGE)
 //!
 //! The epoch ordering rule lives in `sync::head`.
@@ -69,7 +70,7 @@ const PROJECTED_SCOPE_EPOCH_SQL: &str = "SELECT scope_epoch FROM scopes WHERE sc
 const OBJECTIVE_SQL: &str = "SELECT objective_digest FROM scopes WHERE scope_id = ?1";
 const OBSERVATION_FACT_SQL: &str =
     "SELECT digest, payload_type FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
-/// Admission is the only writer of the pair, and only from no plan: rowcount 0 is a second plan.
+/// Only admission sets the pair, and only from no plan: rowcount 0 is a second plan.
 const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
      SET active_plan_digest = ?2, reserved_budget_units = ?3 \
      WHERE scope_id = ?1 AND active_plan_digest IS NULL";
@@ -79,8 +80,9 @@ const RECORD_GRANT_SQL: &str = "UPDATE admitted_work SET grant_fence = ?4 \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
        AND terminal_result_digest IS NULL AND claim_fence = ?4";
 /// Restart resumes a revision only while every binding is still current: the admitting epoch is
-/// not ahead of the controller's, the revision is the highest admitted and not past its deadline
-/// at `?3`, the claim lease is live, and a grant is bound to that exact claim fence.
+/// not ahead of the controller's, the revision is the highest admitted, carries no terminal
+/// evidence, its deadline is still ahead of `?3`, the claim lease is live, and a grant is bound
+/// to that exact claim fence.
 const RESUMABLE_WORK_SQL: &str = "SELECT work_id, work_revision FROM admitted_work AS resumable \
      WHERE resumable.scope_id = ?1 \
        AND resumable.deadline_unix_ms > ?3 \
@@ -116,7 +118,7 @@ const RECORD_TERMINAL_SQL: &str = "UPDATE admitted_work SET terminal_result_dige
        AND (terminal_result_digest IS NULL OR terminal_result_digest = ?5)";
 
 /// Readiness is a query, not a stored flag: an admitted revision is ready when it is the
-/// highest admitted revision of its work id, is not past its deadline at `?2`, carries no
+/// highest admitted revision of its work id, has a deadline still ahead of `?2`, carries no
 /// terminal evidence, holds no claim whose lease is still live at `?2`, and every dependency's
 /// own highest admitted revision carries terminal evidence. Expiry gates scheduling only; claim
 /// and grant mutations stay deadline-free.
@@ -882,16 +884,8 @@ pub(crate) fn apply_scope_event(
         if digest != event.reference.digest().as_str() {
             return Err(ApplyError::Conflict);
         }
-        // The event and its admission writes commit in one transaction, so an applied admission
-        // whose plan row is absent is corruption, not a retry.
-        if let ScopeProjectionPayload::PlanAdmitted { plan_digest, .. } = &event.payload {
-            let admitted = current.as_ref().is_some_and(|(_, _, _, active_plan, _)| {
-                active_plan.as_deref() == Some(plan_digest.as_str())
-            });
-            if !admitted {
-                return Err(ApplyError::Conflict);
-            }
-        }
+        // A same-digest event with different admission content is unrepresentable: the event
+        // digest covers the payload, and the event and its rows commit in one transaction.
         return Ok(ApplyOutcome::AlreadyApplied);
     }
 
@@ -904,7 +898,9 @@ pub(crate) fn apply_scope_event(
             let ScopeProjectionPayload::RootGenesis { objective_digest } = &event.payload else {
                 return Err(ApplyError::Conflict);
             };
-            if sequence != 1 || parent_digest.is_some() {
+            // The payload/sequence biconditional in `ScopeProjectionEvent::new` proves this is
+            // sequence 1, and the envelope proved genesis carries no parent.
+            if parent_digest.is_some() {
                 return Err(ApplyError::Conflict);
             }
             transaction.execute(
@@ -2713,12 +2709,27 @@ mod tests {
         assert_eq!(events, 2);
         assert!(active.is_some());
 
-        // Same operation identity with different bytes is a conflict, not a replay.
-        let (conflicting, _) = admission_event(
-            &scope,
-            &plan_proposal(&scope, &objective, 30_000),
-            "admit-plan-1",
-        );
+        // Same operation identity with different event bytes is a conflict, not a replay: the
+        // historical row at sequence 2 holds another digest.
+        let conflicting = ScopeProjectionEvent::new(
+            scope.clone(),
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(ScopeEventRef::new(1, Digest::new(DIGEST_1.into()).unwrap()).unwrap()),
+                1,
+                "admit-plan-1".into(),
+                crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            ScopeEventRef::new(2, Digest::new(DIGEST_3.into()).unwrap()).unwrap(),
+            ScopeProjectionPayload::PlanAdmitted {
+                plan_digest: Digest::new("8".repeat(64)).unwrap(),
+                proposal: Box::new(plan_proposal(&scope, &objective, 30_000)),
+            },
+            1,
+        )
+        .unwrap();
         assert_eq!(
             apply_scope_event(&mut connection, &conflicting),
             Err(ApplyError::Conflict)

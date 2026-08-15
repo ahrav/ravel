@@ -13,6 +13,7 @@ pub mod db {
 
 pub mod domain {
     pub mod artifact;
+    pub mod proposal;
     pub mod validation;
     pub mod work;
 }

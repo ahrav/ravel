@@ -2497,6 +2497,16 @@ mod tests {
         proposal: &PlanProposal,
         operation: &str,
     ) -> (ScopeProjectionEvent, Digest) {
+        admission_event_at_head_epoch(scope, proposal, operation, 1)
+    }
+
+    /// The event's writer epoch is 1; `head_epoch` may be higher.
+    fn admission_event_at_head_epoch(
+        scope: &ScopeIdentity,
+        proposal: &PlanProposal,
+        operation: &str,
+        head_epoch: u64,
+    ) -> (ScopeProjectionEvent, Digest) {
         let objective = proposal.objective_digest().clone();
         let facts = [ObservationFact::new(
             scope.scope_id().clone(),
@@ -2526,7 +2536,7 @@ mod tests {
                 plan_digest: plan_digest.clone(),
                 proposal: Box::new(proposal.clone()),
             },
-            1,
+            head_epoch,
         )
         .unwrap();
         (event, plan_digest)
@@ -2599,6 +2609,48 @@ mod tests {
             apply_scope_event(&mut connection, &event),
             Ok(ApplyOutcome::AlreadyApplied)
         );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// `admitted_scope_epoch` records the projected head epoch, not the event's writer epoch.
+    #[test]
+    fn admission_at_a_head_above_its_writer_epoch_records_the_projected_epoch() {
+        let (db_path, mut connection, scope) = admitted_scope("plan-admission-epoch-lag");
+        let proposal = plan_proposal(&scope, &zero_objective(), 10_000);
+        let (event, _) = admission_event_at_head_epoch(&scope, &proposal, "admit-plan-lag", 3);
+
+        assert_eq!(
+            apply_scope_event(&mut connection, &event),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(projected_epoch(&connection, &scope), 3);
+        let admitted: Vec<(String, i64)> = connection
+            .prepare("SELECT work_id, admitted_scope_epoch FROM admitted_work ORDER BY work_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            admitted,
+            [("work-a".to_owned(), 3), ("work-b".to_owned(), 3)]
+        );
+
+        // At the head that admitted it, the work is still schedulable and resumable.
+        assert_eq!(ready(&connection, &scope, 1), ["work-a@1"]);
+        record_claim(
+            &connection,
+            &scope,
+            &work("work-a", 1),
+            epoch(1),
+            epoch(20_000),
+            1,
+        )
+        .unwrap();
+        record_grant(&connection, &scope, &work("work-a", 1), epoch(1)).unwrap();
+        assert_eq!(resumable(&connection, &scope, 3, 1), ["work-a@1"]);
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

@@ -10,10 +10,6 @@
 //! carry the plain digest separately. The `ciborium` lockfile pin is byte-affecting for this
 //! address, as the `zstd-sys` pin is for event bytes.
 //!
-//! [`validate_proposal`] performs no I/O, which is what "fails before mutation" means here: the
-//! gate cannot reach durable state to mutate it, and every basis rejection is reachable from a
-//! unit test.
-//!
 //! Two shapes are admissible by design rather than by omission. An empty basis list is allowed,
 //! because fixed initial work is proposed from the objective alone. Citing the prior revision is
 //! optional, and because bases are part of the address, a proposal that cites it and one that does
@@ -245,14 +241,8 @@ impl AdmissibleProposal {
 ///
 /// # Errors
 ///
-/// Returns the [`ProposalError`] category of the first binding that fails: `ScopeMismatch` or
-/// `ObjectiveMismatch` for a header naming another scope or objective; `StaleBasis` for a parent
-/// plan or prior revision that is not the scope's active plan, or a cited observation whose digest
-/// differs at that sequence; `MissingBasis` for a citation above the projected tail or with no
-/// resolved fact; `CrossScopeBasis` for a resolved fact from another scope;
-/// `UnsupportedPlanningInput` for one whose payload type is not a planning input; `CyclicBasis`
-/// when the proposal is its own ancestor; and `InvalidEncoding` when canonical bytes cannot be
-/// derived.
+/// Returns the [`ProposalError`] category of the first binding that fails: header bindings before
+/// bases, and bases in canonical order.
 pub fn validate_proposal(
     proposal: &PlanProposal,
     facts: &ProposalFacts<'_>,
@@ -335,8 +325,11 @@ fn sort_key(basis: &ProposalBasis) -> (u8, u64, &str) {
     }
 }
 
-/// Serialize-only canonical form. There is no decode path: a proposal is validated from typed
-/// values and addressed by these bytes, never reconstructed from them.
+/// Serialize-only canonical form: the hash input is [`PLAN_PROPOSAL_DOMAIN`] followed by
+/// declaration-order CBOR of `scope_id`, `objective_digest`, `parent_plan_digest`, then `bases`,
+/// which is what a second producer has to reproduce to derive the same address. There is no decode
+/// path: a proposal is validated from typed values and addressed by these bytes, never
+/// reconstructed from them.
 #[derive(Serialize)]
 struct WirePlanProposal<'a> {
     scope_id: &'a str,
@@ -461,6 +454,8 @@ mod tests {
         let objective = digest(0x11);
         let facts = [
             genesis_fact(),
+            // Sequence 2 is forward-looking: durable state holds no `root_genesis` row above
+            // sequence 1, and normalization does not read the payload type.
             fact(scope.scope_id().clone(), 2, 0xbb, ROOT_GENESIS_PAYLOAD_TYPE),
         ];
         let active = digest(0x22);
@@ -481,11 +476,6 @@ mod tests {
                 prior_basis(0x22),
                 observation_basis(1, 0xaa),
                 observation_basis(2, 0xbb),
-            ],
-            vec![
-                observation_basis(2, 0xbb),
-                prior_basis(0x22),
-                observation_basis(1, 0xaa),
             ],
         ] {
             let proposal = PlanProposal::new(

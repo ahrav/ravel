@@ -81,22 +81,30 @@ const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
 /// one, a live claim lease at `?7`, and a grant deadline no later than the admitted work
 /// deadline. The projected epoch may lag an eventless authority transition, hence `<=`.
 ///
-/// `?9 <= max_attempts` refuses an attempt above the admitted bound. `granted_units` accumulates
-/// every grant this revision has drawn, so successive fences add up instead of replacing one
-/// another, and the running total plus every sibling revision's must stay within
-/// `reserved_budget_units`. Re-recording the identical object at the same fence adds nothing; a
-/// different object at an already-granted fence is refused.
+/// `?6 > ?7` refuses a grant whose own deadline has already passed, so an expired object cannot be
+/// activated and cannot charge units for authority nobody can use.
+///
+/// Attempts are consumed, not merely labelled: `granted_attempt` records the last attempt this
+/// revision drew, a new fence must name a strictly higher one, and `?9 <= max_attempts` caps the
+/// series. Re-recording the identical object at the same fence repeats its attempt and draws
+/// nothing; a different object at an already-granted fence is refused.
+///
+/// `granted_units` accumulates every grant this revision has drawn, so successive fences add up
+/// instead of replacing one another, and the running total plus every sibling revision's must stay
+/// within `reserved_budget_units`.
 const RECORD_GRANT_SQL: &str = "UPDATE admitted_work \
-     SET grant_fence = ?4, grant_digest = ?11, \
+     SET grant_fence = ?4, grant_digest = ?11, granted_attempt = ?9, \
          granted_units = CASE WHEN grant_fence = ?4 AND grant_digest = ?11 \
              THEN granted_units ELSE COALESCE(granted_units, 0) + ?10 END \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
        AND terminal_result_digest IS NULL AND claim_fence = ?4 \
        AND claim_lease_until > ?7 \
        AND deadline_unix_ms >= ?6 \
+       AND ?6 > ?7 \
        AND ?9 <= max_attempts \
-       AND (grant_fence IS NULL OR grant_fence < ?4 \
-            OR (grant_fence = ?4 AND grant_digest = ?11)) \
+       AND (grant_fence IS NULL \
+            OR (grant_fence < ?4 AND ?9 > granted_attempt) \
+            OR (grant_fence = ?4 AND grant_digest = ?11 AND ?9 = granted_attempt)) \
        AND (CASE WHEN grant_fence = ?4 AND grant_digest = ?11 \
               THEN COALESCE(granted_units, 0) \
               ELSE COALESCE(granted_units, 0) + ?10 END) \
@@ -247,6 +255,7 @@ CREATE TABLE admitted_work (
     claim_lease_until INTEGER,
     grant_fence INTEGER,
     grant_digest TEXT,
+    granted_attempt INTEGER,
     granted_units INTEGER,
     terminal_result_digest TEXT,
     PRIMARY KEY (scope_id, work_id, work_revision),
@@ -264,12 +273,15 @@ CREATE TABLE admitted_work (
         OR (claim_fence IS NOT NULL AND claim_lease_until IS NOT NULL
             AND claim_fence BETWEEN 1 AND 9999999999999999
             AND claim_lease_until BETWEEN 1 AND 9999999999999999)),
-    -- `granted_units` is the running total this revision has drawn from the plan reservation and
-    -- `grant_digest` names the object the latest fence activated, so the three grant columns are
-    -- present or absent together.
-    CHECK ((grant_fence IS NULL AND grant_digest IS NULL AND granted_units IS NULL)
+    -- `granted_units` is the running total this revision has drawn from the plan reservation,
+    -- `granted_attempt` is the last attempt it drew, and `grant_digest` names the object the
+    -- latest fence activated, so the four grant columns are present or absent together.
+    CHECK ((grant_fence IS NULL AND grant_digest IS NULL AND granted_units IS NULL
+            AND granted_attempt IS NULL)
         OR (grant_fence IS NOT NULL AND grant_digest IS NOT NULL AND granted_units IS NOT NULL
+            AND granted_attempt IS NOT NULL
             AND grant_fence BETWEEN 1 AND 9999999999999999
+            AND granted_attempt BETWEEN 1 AND 9999999999999999
             AND granted_units BETWEEN 1 AND 9999999999999999
             AND length(grant_digest) = 64
             AND length(CAST(grant_digest AS BLOB)) = 64
@@ -557,7 +569,7 @@ pub(crate) fn admit_work(
     dependencies: &[WorkId],
     scope_epoch: NonZeroU64,
 ) -> Result<(), ApplyError> {
-    let bounds = TargetBounds::new(1, MAX_STORED_INTEGER)
+    let bounds = TargetBounds::new(3, MAX_STORED_INTEGER)
         .map_err(|_| ApplyError::DatabaseOperationFailed)?;
     let transaction = connection.transaction()?;
     insert_work_row(&transaction, scope, work, dependencies, scope_epoch, bounds)?;
@@ -799,10 +811,11 @@ pub(crate) struct GrantActivation {
 /// # Errors
 ///
 /// Returns [`ApplyError::Conflict`] when the revision is unknown, terminal, claimed at another
-/// fence or with an expired lease, when the grant deadline exceeds the admitted deadline, when
-/// the attempt is above the admitted `max_attempts`, when the units would take the scope past
-/// its reserved budget, when another object already holds this fence, or when the scope's active
-/// plan is not the identity's or the projected epoch is ahead of `scope_epoch`; and
+/// fence or with an expired lease, when the grant deadline has passed or exceeds the admitted
+/// deadline, when the attempt is above the admitted `max_attempts` or does not exceed the last
+/// attempt this revision drew, when the units would take the scope past its reserved budget, when
+/// another object already holds this fence, or when the scope's active plan is not the identity's
+/// or the projected epoch is ahead of `scope_epoch`; and
 /// [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
 pub(crate) fn record_grant(
     connection: &rusqlite::Connection,
@@ -2501,11 +2514,25 @@ mod tests {
         work: &WorkRef,
         fence: NonZeroU64,
         scope_epoch: u64,
+        attempt: u64,
     ) -> Result<(), ApplyError> {
         let deadline = NonZeroU64::new(MAX_STORED_INTEGER).unwrap();
-        grant_bounded(connection, scope, work, fence, scope_epoch, deadline, 1)
+        grant_bounded(
+            connection,
+            scope,
+            work,
+            fence,
+            scope_epoch,
+            deadline,
+            attempt,
+            1,
+        )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call shape for every SQL binding"
+    )]
     fn grant_bounded(
         connection: &rusqlite::Connection,
         scope: &ScopeIdentity,
@@ -2513,6 +2540,7 @@ mod tests {
         fence: NonZeroU64,
         scope_epoch: u64,
         deadline: NonZeroU64,
+        attempt: u64,
         units: u64,
     ) -> Result<(), ApplyError> {
         let identity = ScopeClaimIdentity::new(
@@ -2527,7 +2555,7 @@ mod tests {
             &identity,
             &GrantActivation {
                 scope_epoch: epoch(scope_epoch),
-                attempt: NonZeroU64::new(1).unwrap(),
+                attempt: NonZeroU64::new(attempt).unwrap(),
                 units: NonZeroU64::new(units).unwrap(),
                 deadline_unix_ms: deadline,
                 digest: grant_digest(fence.get(), units),
@@ -2549,25 +2577,29 @@ mod tests {
         record_claim(&connection, &scope, &target, fence, lease, 1_000).unwrap();
         assert!(resumable(&connection, &scope, 3, 1_000).is_empty());
 
-        grant_at(&connection, &scope, &target, fence, 3).unwrap();
+        grant_at(&connection, &scope, &target, fence, 3, 1).unwrap();
         assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1#2"]);
 
         // An expired claim lease is not current.
         assert!(resumable(&connection, &scope, 31_000, 31_000).is_empty());
 
         // A reclaim at a higher fence, once the recorded lease has expired, leaves the old grant
-        // behind.
+        // behind, and its grant draws the next attempt.
         let higher = NonZeroU64::new(3).unwrap();
         record_claim(&connection, &scope, &target, higher, lease, 31_000).unwrap();
         assert!(resumable(&connection, &scope, 3, 1_000).is_empty());
-        grant_at(&connection, &scope, &target, higher, 3).unwrap();
+        assert_eq!(
+            grant_at(&connection, &scope, &target, higher, 3, 1),
+            Err(ApplyError::Conflict)
+        );
+        grant_at(&connection, &scope, &target, higher, 3, 2).unwrap();
         assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1#3"]);
 
         // Work admitted under a newer epoch than this controller holds is not resumable.
         let ahead = work("work-b", 1);
         admit_work(&mut connection, &scope, &ahead, &[], epoch(5)).unwrap();
         record_claim(&connection, &scope, &ahead, fence, lease, 1_000).unwrap();
-        grant_at(&connection, &scope, &ahead, fence, 3).unwrap();
+        grant_at(&connection, &scope, &ahead, fence, 3, 1).unwrap();
         assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1#3"]);
         assert_eq!(
             resumable(&connection, &scope, 5, 1_000),
@@ -2604,16 +2636,23 @@ mod tests {
         // No claim yet, so there is no fence to bind to.
         admit_work(&mut connection, &scope, &target, &[], epoch(1)).unwrap();
         assert_eq!(
-            grant_at(&connection, &scope, &target, fence, 1),
+            grant_at(&connection, &scope, &target, fence, 1, 1),
             Err(ApplyError::Conflict)
         );
 
         record_claim(&connection, &scope, &target, fence, lease, 1_000).unwrap();
         assert_eq!(
-            grant_at(&connection, &scope, &target, NonZeroU64::new(9).unwrap(), 1),
+            grant_at(
+                &connection,
+                &scope,
+                &target,
+                NonZeroU64::new(9).unwrap(),
+                1,
+                1
+            ),
             Err(ApplyError::Conflict)
         );
-        grant_at(&connection, &scope, &target, fence, 1).unwrap();
+        grant_at(&connection, &scope, &target, fence, 1, 1).unwrap();
 
         // Terminal work takes no further grant.
         record_terminal(
@@ -2625,7 +2664,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            grant_at(&connection, &scope, &target, fence, 1),
+            grant_at(&connection, &scope, &target, fence, 1, 2),
             Err(ApplyError::Conflict)
         );
 
@@ -2708,12 +2747,22 @@ mod tests {
             ),
             Err(ApplyError::Conflict)
         );
-        // `admit_work` bounds this revision to one attempt; attempt 2 conflicts.
+        // The active plan permits three attempts; attempt 4 conflicts.
         assert_eq!(
             record_grant(
                 &connection,
                 &identity(DIGEST_2),
-                &activation(3, 2, 1, deadline),
+                &activation(3, 4, 1, deadline),
+                1_000
+            ),
+            Err(ApplyError::Conflict)
+        );
+        // A grant deadline at `now_ms` has already passed.
+        assert_eq!(
+            record_grant(
+                &connection,
+                &identity(DIGEST_2),
+                &activation(3, 1, 1, NonZeroU64::new(1_000).unwrap()),
                 1_000
             ),
             Err(ApplyError::Conflict)
@@ -2759,15 +2808,27 @@ mod tests {
         );
         assert_eq!(granted_units(&connection, &target), Some(60));
 
-        // A reclaim draws again from the same reservation; 40 units remain.
+        // A reclaim must draw the next attempt, and 40 units remain of the reservation.
         let higher = NonZeroU64::new(3).unwrap();
         record_claim(&connection, &scope, &target, higher, lease, 31_000).unwrap();
         assert_eq!(
-            grant_bounded(&connection, &scope, &target, higher, 4, deadline, 41),
+            grant_bounded(&connection, &scope, &target, higher, 4, deadline, 1, 40),
             Err(ApplyError::Conflict)
         );
-        grant_bounded(&connection, &scope, &target, higher, 4, deadline, 40).unwrap();
+        assert_eq!(
+            grant_bounded(&connection, &scope, &target, higher, 4, deadline, 2, 41),
+            Err(ApplyError::Conflict)
+        );
+        grant_bounded(&connection, &scope, &target, higher, 4, deadline, 2, 40).unwrap();
         assert_eq!(granted_units(&connection, &target), Some(100));
+
+        // Three attempts are admitted, so a third fence must name attempt 3.
+        let third = NonZeroU64::new(4).unwrap();
+        record_claim(&connection, &scope, &target, third, lease, 31_000).unwrap();
+        assert_eq!(
+            grant_bounded(&connection, &scope, &target, third, 4, deadline, 2, 1),
+            Err(ApplyError::Conflict)
+        );
 
         // record_grant created no work row and wrote no terminal result.
         let (rows, terminal): (i64, i64) = connection

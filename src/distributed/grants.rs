@@ -115,13 +115,12 @@ impl EffectGrant {
 
 /// What a caller requires of a grant before acting under it.
 ///
-/// `max_units` and `max_deadline_unix_ms` cap what the request asked for, so a wider grant fails
-/// closed instead of widening the operation. `operation_id` pins the stable idempotency identity
-/// the caller will act under, so a grant minted for another operation fails closed too.
+/// `max_units` and `max_deadline_unix_ms` reject a grant that exceeds the request's limits.
 pub struct ExpectedGrant {
     identity: ScopeClaimIdentity,
     action: String,
     resource_scope: String,
+    attempt: NonZeroU64,
     max_units: NonZeroU64,
     max_deadline_unix_ms: NonZeroU64,
     operation_id: String,
@@ -137,6 +136,7 @@ impl ExpectedGrant {
         identity: ScopeClaimIdentity,
         action: String,
         resource_scope: String,
+        attempt: u64,
         max_units: u64,
         max_deadline_unix_ms: u64,
         operation_id: String,
@@ -153,6 +153,7 @@ impl ExpectedGrant {
             identity,
             action,
             resource_scope,
+            attempt: bounded(attempt)?,
             max_units: bounded(max_units)?,
             max_deadline_unix_ms: bounded(max_deadline_unix_ms)?,
             operation_id,
@@ -167,8 +168,7 @@ pub enum GrantRejection {
     Absent,
     /// The projection resumes the work under a newer claim generation than the caller's.
     StaleFence,
-    /// Plan, action, resource, or operation binding disagrees with the caller's expectation, or
-    /// the stored object is not the one the projection activated.
+    /// `IdentityMismatch` covers a grant whose binding differs from the expected binding.
     IdentityMismatch,
     Expired,
     WiderThanRequested,
@@ -337,6 +337,7 @@ pub async fn intake(
     if grant.identity != expected.identity
         || grant.action != expected.action
         || grant.resource_scope != expected.resource_scope
+        || grant.attempt != expected.attempt
         || grant.operation_id != expected.operation_id
     {
         return GrantIntake::Rejected(GrantRejection::IdentityMismatch);
@@ -585,6 +586,7 @@ mod tests {
             identity(fence),
             "git-push".into(),
             "repo-a".into(),
+            1,
             max_units,
             max_deadline,
             "grant-op-1".into(),
@@ -855,6 +857,7 @@ mod tests {
             .unwrap(),
             "git-push".into(),
             "repo-a".into(),
+            1,
             5,
             NOW_MS + 60_000,
             "grant-op-1".into(),
@@ -870,6 +873,7 @@ mod tests {
             identity(2),
             "git-fetch".into(),
             "repo-a".into(),
+            1,
             5,
             NOW_MS + 60_000,
             "grant-op-1".into(),
@@ -879,12 +883,29 @@ mod tests {
             intake(&store, &handle, &other_action, epoch, NOW_MS).await,
             GrantIntake::Rejected(GrantRejection::IdentityMismatch)
         ));
+        // A grant minted for another attempt cannot stand in for this one.
+        let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);
+        let other_attempt = ExpectedGrant::new(
+            identity(2),
+            "git-push".into(),
+            "repo-a".into(),
+            2,
+            5,
+            NOW_MS + 60_000,
+            "grant-op-1".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            intake(&store, &handle, &other_attempt, epoch, NOW_MS).await,
+            GrantIntake::Rejected(GrantRejection::IdentityMismatch)
+        ));
         // A grant minted for another operation cannot stand in for this one.
         let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);
         let other_operation = ExpectedGrant::new(
             identity(2),
             "git-push".into(),
             "repo-a".into(),
+            1,
             5,
             NOW_MS + 60_000,
             "grant-op-2".into(),
@@ -1284,15 +1305,24 @@ mod tests {
             )
             .await
             .unwrap();
-        let fence_three = fixture(3, 5, NOW_MS + 50_000);
+        let fence_three = EffectGrant::new(
+            identity(3),
+            "git-push".into(),
+            "repo-a".into(),
+            2,
+            5,
+            NOW_MS + 50_000,
+            "grant-op-1".into(),
+        )
+        .unwrap();
         handle
             .record_grant(
                 &identity(3),
                 GrantActivation {
                     scope_epoch: epoch,
-                    attempt: NonZeroU64::new(1).unwrap(),
-                    units: NonZeroU64::new(5).unwrap(),
-                    deadline_unix_ms: NonZeroU64::new(NOW_MS + 50_000).unwrap(),
+                    attempt: fence_three.attempt(),
+                    units: fence_three.limit_units(),
+                    deadline_unix_ms: fence_three.deadline_unix_ms(),
                     digest: Digest::new(format!(
                         "{:x}",
                         Sha256::digest(encode_grant(&fence_three).unwrap())

@@ -1217,29 +1217,34 @@ fn is_blank(connection: &rusqlite::Connection) -> bool {
         .unwrap_or(false)
 }
 
+/// Covers every projected TEXT column a read decodes as a Rust `String`, minus the columns a
+/// CHECK pins `IS NULL` and the FK-derived `scope_id`s, which SQLite's `foreign_key_check`
+/// matches against an already validated `scopes.scope_id`.
+const VALIDATE_TEXT_SQL: &str = "SELECT CAST(scope_id AS BLOB) FROM scopes \
+     UNION ALL SELECT CAST(campaign_id AS BLOB) FROM scopes \
+     UNION ALL SELECT CAST(tail_event_digest AS BLOB) FROM scopes \
+     UNION ALL SELECT CAST(objective_digest AS BLOB) FROM scopes \
+     UNION ALL SELECT CAST(active_plan_digest AS BLOB) FROM scopes \
+       WHERE active_plan_digest IS NOT NULL \
+     UNION ALL SELECT CAST(scope_id AS BLOB) FROM applied_scope_events \
+     UNION ALL SELECT CAST(digest AS BLOB) FROM applied_scope_events \
+     UNION ALL SELECT CAST(parent_digest AS BLOB) FROM applied_scope_events \
+       WHERE parent_digest IS NOT NULL \
+     UNION ALL SELECT CAST(operation_id AS BLOB) FROM applied_scope_events \
+     UNION ALL SELECT CAST(payload_type AS BLOB) FROM applied_scope_events \
+     UNION ALL SELECT CAST(work_id AS BLOB) FROM admitted_work \
+     UNION ALL SELECT CAST(grant_digest AS BLOB) FROM admitted_work \
+       WHERE grant_digest IS NOT NULL \
+     UNION ALL SELECT CAST(terminal_result_digest AS BLOB) FROM admitted_work \
+       WHERE terminal_result_digest IS NOT NULL \
+     UNION ALL SELECT CAST(work_id AS BLOB) FROM work_dependencies \
+     UNION ALL SELECT CAST(depends_on_work_id AS BLOB) FROM work_dependencies";
+
 /// Invalid UTF-8 passes the byte-oriented CHECKs and then fails the read that converts the
 /// column to a Rust `String`, so it is rejected here as invalid history.
 fn validate_text(connection: &rusqlite::Connection) -> Result<(), ValidateError> {
     let mut statement = connection
-        .prepare(
-            "SELECT CAST(scope_id AS BLOB) FROM scopes \
-             UNION ALL SELECT CAST(campaign_id AS BLOB) FROM scopes \
-             UNION ALL SELECT CAST(tail_event_digest AS BLOB) FROM scopes \
-             UNION ALL SELECT CAST(objective_digest AS BLOB) FROM scopes \
-             UNION ALL SELECT CAST(active_plan_digest AS BLOB) FROM scopes \
-               WHERE active_plan_digest IS NOT NULL \
-             UNION ALL SELECT CAST(scope_id AS BLOB) FROM applied_scope_events \
-             UNION ALL SELECT CAST(digest AS BLOB) FROM applied_scope_events \
-             UNION ALL SELECT CAST(parent_digest AS BLOB) FROM applied_scope_events \
-               WHERE parent_digest IS NOT NULL \
-             UNION ALL SELECT CAST(operation_id AS BLOB) FROM applied_scope_events \
-             UNION ALL SELECT CAST(payload_type AS BLOB) FROM applied_scope_events \
-             UNION ALL SELECT CAST(work_id AS BLOB) FROM admitted_work \
-             UNION ALL SELECT CAST(terminal_result_digest AS BLOB) FROM admitted_work \
-               WHERE terminal_result_digest IS NOT NULL \
-             UNION ALL SELECT CAST(work_id AS BLOB) FROM work_dependencies \
-             UNION ALL SELECT CAST(depends_on_work_id AS BLOB) FROM work_dependencies",
-        )
+        .prepare(VALIDATE_TEXT_SQL)
         .map_err(|_| ValidateError::DatabaseOperationFailed)?;
     let mut rows = statement
         .query([])
@@ -1913,6 +1918,41 @@ mod tests {
             open_existing(&path).unwrap_err(),
             ValidateError::InvalidHistory
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A new TEXT column needs a matching UNION arm in `VALIDATE_TEXT_SQL`, or it escapes UTF-8
+    /// validation; this test fails otherwise.
+    #[test]
+    fn validate_text_covers_every_projected_text_column() {
+        const PINNED_NULL_OR_FK_DERIVED: [(&str, &str); 4] = [
+            ("scopes", "parent_scope_id"),
+            ("scopes", "delegation_digest"),
+            ("admitted_work", "scope_id"),
+            ("work_dependencies", "scope_id"),
+        ];
+        let path = path("validate-text-coverage");
+        let connection = create(&path).unwrap();
+        for table in TABLES {
+            let columns: Vec<String> = connection
+                .prepare("SELECT name FROM pragma_table_info(?1) WHERE type = 'TEXT'")
+                .unwrap()
+                .query_map([table], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!columns.is_empty(), "{table} reported no TEXT columns");
+            for column in columns {
+                if PINNED_NULL_OR_FK_DERIVED.contains(&(table, column.as_str())) {
+                    continue;
+                }
+                assert!(
+                    VALIDATE_TEXT_SQL.contains(&format!("CAST({column} AS BLOB) FROM {table}")),
+                    "{table}.{column} is not validated by VALIDATE_TEXT_SQL"
+                );
+            }
+        }
+        drop(connection);
         fs::remove_file(path).unwrap();
     }
 

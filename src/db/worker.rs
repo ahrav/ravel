@@ -20,8 +20,8 @@ use tokio::sync::oneshot;
 
 use crate::{
     db::projections::{
-        self, ApplyError, ApplyOutcome, ResumableWork, SchemaError, ScopeProjectionEvent,
-        ValidateError,
+        self, ApplyError, ApplyOutcome, GrantActivation, ResumableWork, SchemaError,
+        ScopeProjectionEvent, ValidateError,
     },
     domain::work::WorkRef,
     scope::{Digest, ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeIdentity},
@@ -67,8 +67,7 @@ enum Command {
     },
     RecordGrant {
         identity: Box<ScopeClaimIdentity>,
-        scope_epoch: NonZeroU64,
-        grant_deadline_unix_ms: NonZeroU64,
+        activation: Box<GrantActivation>,
         now_ms: u64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
@@ -345,7 +344,8 @@ impl DbHandle {
     }
 
     /// `record_grant` records a grant only when `identity`'s claim fence, plan, scope epoch,
-    /// live lease, and admitted deadline are current.
+    /// live lease, and admitted deadline are current, and `activation` stays inside the admitted
+    /// attempt bound and the plan's reserved budget.
     ///
     /// # Errors
     ///
@@ -354,15 +354,14 @@ impl DbHandle {
     pub(crate) async fn record_grant(
         &self,
         identity: &ScopeClaimIdentity,
-        scope_epoch: NonZeroU64,
-        grant_deadline_unix_ms: NonZeroU64,
+        activation: GrantActivation,
         now_ms: u64,
     ) -> Result<(), ApplyError> {
         let identity = Box::new(identity.clone());
+        let activation = Box::new(activation);
         self.enqueue(|respond| Command::RecordGrant {
             identity,
-            scope_epoch,
-            grant_deadline_unix_ms,
+            activation,
             now_ms,
             respond,
         })?
@@ -553,16 +552,14 @@ fn run(
             }
             Command::RecordGrant {
                 identity,
-                scope_epoch,
-                grant_deadline_unix_ms,
+                activation,
                 now_ms,
                 respond,
             } => {
                 let _ = respond.send(projections::record_grant(
                     &connection,
                     &identity,
-                    scope_epoch,
-                    grant_deadline_unix_ms,
+                    &activation,
                     now_ms,
                 ));
             }
@@ -810,8 +807,13 @@ mod tests {
                         fence.get(),
                     )
                     .unwrap(),
-                    fence,
-                    fence,
+                    GrantActivation {
+                        scope_epoch: fence,
+                        attempt: fence,
+                        units: fence,
+                        deadline_unix_ms: fence,
+                        digest: genesis.config_digest().clone(),
+                    },
                     1,
                 )
                 .await,

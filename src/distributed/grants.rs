@@ -10,14 +10,17 @@
 //! evidence.
 //! commentlint: allow(JUDGE)
 
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    db::{projections::ApplyError, worker::DbHandle},
-    distributed::scope_controller::ControllerAuthority,
+    db::{
+        projections::{ApplyError, GrantActivation},
+        worker::DbHandle,
+    },
+    distributed::scope_controller::{ControllerAuthority, STOP_MARGIN_MS},
     domain::{
         proposal::MAX_STORED_INTEGER,
         validation::{ValidationError, validate_key_segment},
@@ -39,6 +42,7 @@ pub struct EffectGrant {
     identity: ScopeClaimIdentity,
     action: String,
     resource_scope: String,
+    attempt: NonZeroU64,
     limit_units: NonZeroU64,
     deadline_unix_ms: NonZeroU64,
     operation_id: String,
@@ -54,6 +58,7 @@ impl EffectGrant {
         identity: ScopeClaimIdentity,
         action: String,
         resource_scope: String,
+        attempt: u64,
         limit_units: u64,
         deadline_unix_ms: u64,
         operation_id: String,
@@ -72,6 +77,7 @@ impl EffectGrant {
             identity,
             action,
             resource_scope,
+            attempt: bounded(attempt)?,
             limit_units: bounded(limit_units)?,
             deadline_unix_ms: bounded(deadline_unix_ms)?,
             operation_id,
@@ -90,6 +96,10 @@ impl EffectGrant {
         &self.resource_scope
     }
 
+    pub fn attempt(&self) -> NonZeroU64 {
+        self.attempt
+    }
+
     pub fn limit_units(&self) -> NonZeroU64 {
         self.limit_units
     }
@@ -106,13 +116,15 @@ impl EffectGrant {
 /// What a caller requires of a grant before acting under it.
 ///
 /// `max_units` and `max_deadline_unix_ms` cap what the request asked for, so a wider grant fails
-/// closed instead of widening the operation.
+/// closed instead of widening the operation. `operation_id` pins the stable idempotency identity
+/// the caller will act under, so a grant minted for another operation fails closed too.
 pub struct ExpectedGrant {
     identity: ScopeClaimIdentity,
     action: String,
     resource_scope: String,
     max_units: NonZeroU64,
     max_deadline_unix_ms: NonZeroU64,
+    operation_id: String,
 }
 
 impl ExpectedGrant {
@@ -127,9 +139,11 @@ impl ExpectedGrant {
         resource_scope: String,
         max_units: u64,
         max_deadline_unix_ms: u64,
+        operation_id: String,
     ) -> Result<Self, ValidationError> {
         validate_key_segment(&action)?;
         validate_key_segment(&resource_scope)?;
+        validate_key_segment(&operation_id)?;
         let bounded = |value: u64| {
             NonZeroU64::new(value)
                 .filter(|value| value.get() <= MAX_STORED_INTEGER)
@@ -141,6 +155,7 @@ impl ExpectedGrant {
             resource_scope,
             max_units: bounded(max_units)?,
             max_deadline_unix_ms: bounded(max_deadline_unix_ms)?,
+            operation_id,
         })
     }
 }
@@ -152,7 +167,8 @@ pub enum GrantRejection {
     Absent,
     /// The projection resumes the work under a newer claim generation than the caller's.
     StaleFence,
-    /// Plan, action, or resource binding disagrees with the caller's expectation.
+    /// Plan, action, resource, or operation binding disagrees with the caller's expectation, or
+    /// the stored object is not the one the projection activated.
     IdentityMismatch,
     Expired,
     WiderThanRequested,
@@ -193,11 +209,11 @@ pub enum IssueError {
 ///
 /// # Errors
 ///
-/// Returns [`IssueError::NotAuthorized`] when `authority` must stop or does not hold this
-/// grant's scope and plan, [`IssueError::Expired`] when the deadline is not ahead of `now_ms`,
-/// [`IssueError::Unresolved`] when publication or recording is unproven, and
-/// [`IssueError::Refused`] when a rival object holds the key or the projection rejects the
-/// binding.
+/// Returns [`IssueError::NotAuthorized`] when `authority` must stop, was observed in another
+/// store's namespace, or does not hold this grant's scope and plan, [`IssueError::Expired`] when
+/// the deadline is not ahead of `now_ms`, [`IssueError::Unresolved`] when publication or
+/// recording is unproven, and [`IssueError::Refused`] when a rival object holds the key or the
+/// projection rejects the binding.
 pub async fn issue(
     store: &S3Store,
     database: &DbHandle,
@@ -208,6 +224,7 @@ pub async fn issue(
 ) -> Result<(), IssueError> {
     let head = authority.head();
     if authority.must_stop(now_ms)
+        || authority.namespace() != store.namespace()
         || head.scope() != grant.identity.scope()
         || head.active_plan_digest() != Some(grant.identity.plan_digest())
     {
@@ -225,20 +242,35 @@ pub async fn issue(
     let digest = format!("{:x}", Sha256::digest(&bytes));
     // `operation_id` is inside the canonical bytes, so byte identity at the key is identity of
     // the operation: an ambiguous write reconciles by read-back before any retry.
-    store
-        .publish_with_history(&key, bytes, &digest, history)
-        .await
-        .map_err(|error| match error {
+    //
+    // When `remaining_term_ms(now_ms) > STOP_MARGIN_MS`, publication leaves `STOP_MARGIN_MS` before term expiry.
+    let publication_budget_ms = authority
+        .remaining_term_ms(now_ms)
+        .saturating_sub(STOP_MARGIN_MS);
+    match tokio::time::timeout(
+        Duration::from_millis(publication_budget_ms),
+        store.publish_with_history(&key, bytes, &digest, history),
+    )
+    .await
+    {
+        Err(_) => return Err(IssueError::Unresolved),
+        Ok(result) => result.map_err(|error| match error {
             PublicationError::NotSent
             | PublicationError::Unresolved
             | PublicationError::StorageNotFound => IssueError::Unresolved,
             _ => IssueError::Refused,
-        })?;
+        })?,
+    }
     database
         .record_grant(
             &grant.identity,
-            authority.scope_epoch(),
-            grant.deadline_unix_ms,
+            GrantActivation {
+                scope_epoch: authority.scope_epoch(),
+                attempt: grant.attempt,
+                units: grant.limit_units,
+                deadline_unix_ms: grant.deadline_unix_ms,
+                digest: Digest::new(digest).map_err(|_| IssueError::Refused)?,
+            },
             now_ms,
         )
         .await
@@ -288,6 +320,7 @@ pub async fn intake(
     if grant.identity != expected.identity
         || grant.action != expected.action
         || grant.resource_scope != expected.resource_scope
+        || grant.operation_id != expected.operation_id
     {
         return GrantIntake::Rejected(GrantRejection::IdentityMismatch);
     }
@@ -299,7 +332,8 @@ pub async fn intake(
     {
         return GrantIntake::Rejected(GrantRejection::WiderThanRequested);
     }
-    // A grant object alone is not authority.
+    // A grant object alone is not authority: the resumable-work record authorizes only the grant
+    // whose SHA-256 digest it stores.
     match database
         .resumable_work(expected.identity.scope(), scope_epoch, now_ms)
         .await
@@ -310,7 +344,11 @@ pub async fn intake(
                 .find(|row| row.work() == expected.identity.work())
             {
                 Some(row) if row.claim_fence() == expected.identity.claim_fence() => {
-                    GrantIntake::Accepted(Box::new(grant))
+                    if row.grant_digest().as_str() == format!("{:x}", Sha256::digest(&bytes)) {
+                        GrantIntake::Accepted(Box::new(grant))
+                    } else {
+                        GrantIntake::Rejected(GrantRejection::IdentityMismatch)
+                    }
                 }
                 Some(row) if row.claim_fence() > expected.identity.claim_fence() => {
                     GrantIntake::Rejected(GrantRejection::StaleFence)
@@ -334,6 +372,7 @@ struct WireEffectGrant {
     claim_fence: u64,
     action: String,
     resource_scope: String,
+    attempt: u64,
     limit_units: u64,
     deadline_unix_ms: u64,
     operation_id: String,
@@ -355,6 +394,7 @@ pub fn encode_grant(grant: &EffectGrant) -> Result<Vec<u8>, WireError> {
         claim_fence: grant.identity.claim_fence().get(),
         action: grant.action.clone(),
         resource_scope: grant.resource_scope.clone(),
+        attempt: grant.attempt.get(),
         limit_units: grant.limit_units.get(),
         deadline_unix_ms: grant.deadline_unix_ms.get(),
         operation_id: grant.operation_id.clone(),
@@ -407,6 +447,7 @@ pub fn decode_grant(
         identity,
         wire.action,
         wire.resource_scope,
+        wire.attempt,
         wire.limit_units,
         wire.deadline_unix_ms,
         wire.operation_id,
@@ -450,8 +491,45 @@ mod tests {
         .unwrap()
     }
 
+    fn seed_objective() -> Digest {
+        Digest::new("11".repeat(32)).unwrap()
+    }
+
+    fn seed_proposal() -> crate::domain::proposal::PlanProposal {
+        use crate::domain::proposal::{PlanProposal, ProposalBasis, TargetBounds, WorkSpec};
+        PlanProposal::new(
+            genesis().identity().scope_id().clone(),
+            seed_objective(),
+            None,
+            vec![ProposalBasis::Observation {
+                event: crate::scope::ScopeEventRef::new(1, seed_objective()).unwrap(),
+            }],
+            vec![WorkSpec::new(
+                WorkId::new("work-17".into()).unwrap(),
+                Vec::new(),
+                TargetBounds::new(3, NOW_MS + 600_000).unwrap(),
+            )],
+            100,
+        )
+    }
+
+    /// `plan` returns the digest [`seed_proposal`] admits under.
     fn plan() -> Digest {
-        Digest::new("ab".repeat(32)).unwrap()
+        use crate::domain::proposal::{ObservationFact, ProposalFacts, validate_proposal};
+        let scope = genesis().identity().clone();
+        let objective = seed_objective();
+        let facts = [ObservationFact::new(
+            scope.scope_id().clone(),
+            crate::scope::ScopeEventRef::new(1, objective.clone()).unwrap(),
+            crate::scope::ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        validate_proposal(
+            &seed_proposal(),
+            &ProposalFacts::new(&scope, &objective, None, 1, &facts),
+        )
+        .unwrap()
+        .plan_digest()
+        .clone()
     }
 
     fn identity(fence: u64) -> ScopeClaimIdentity {
@@ -469,6 +547,7 @@ mod tests {
             identity(fence),
             "git-push".into(),
             "repo-a".into(),
+            1,
             units,
             deadline,
             "grant-op-1".into(),
@@ -483,14 +562,21 @@ mod tests {
             "repo-a".into(),
             max_units,
             max_deadline,
+            "grant-op-1".into(),
         )
         .unwrap()
     }
 
-    /// A head whose plan is active, observed and acquired through one replay store.
+    /// The returned store retains replay responses after `acquire` consumes its head read and
+    /// conditional write.
     async fn authority_with_plan(
         plan: Option<Digest>,
-    ) -> crate::distributed::scope_controller::ControllerAuthority {
+        then: Vec<http::Response<SdkBody>>,
+    ) -> (
+        crate::distributed::scope_controller::ControllerAuthority,
+        S3Store,
+        aws_smithy_runtime::client::http::test_util::StaticReplayClient,
+    ) {
         let genesis = genesis();
         let head = ScopeHead::new(
             genesis.identity().clone(),
@@ -501,10 +587,12 @@ mod tests {
             "op-authority".into(),
         )
         .unwrap();
-        let (store, _) = replay_store(vec![
+        let mut responses = vec![
             response(200, &[("etag", "\"head\"")], encode_head(&head).unwrap()),
             response(200, &[("etag", "\"next\"")], SdkBody::empty()),
-        ]);
+        ];
+        responses.extend(then);
+        let (store, client) = replay_store(responses);
         let outcome = acquire(
             &store,
             genesis.identity(),
@@ -516,7 +604,7 @@ mod tests {
         let AcquireOutcome::Acquired(authority) = outcome else {
             panic!("expected acquisition");
         };
-        authority
+        (authority, store, client)
     }
 
     async fn database(label: &str) -> (std::path::PathBuf, DbHandle) {
@@ -528,7 +616,7 @@ mod tests {
         (path.clone(), DbHandle::spawn(path).await.unwrap())
     }
 
-    /// Seeds a projection directly so `issue` and `intake` can run end to end.
+    /// Applies a root genesis and a plan admission, then claims the admitted revision at fence 2.
     async fn seeded_database(label: &str) -> (std::path::PathBuf, DbHandle) {
         use crate::db::projections::{self, ScopeProjectionEvent, ScopeProjectionPayload};
         use crate::scope::{EventEnvelope, ScopeEventRef};
@@ -541,7 +629,7 @@ mod tests {
         let target = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
         {
             let mut connection = projections::create(&path).unwrap();
-            let digest = Digest::new("11".repeat(32)).unwrap();
+            let digest = seed_objective();
             let envelope = EventEnvelope::new(
                 scope.scope_id().clone(),
                 1,
@@ -562,21 +650,27 @@ mod tests {
             )
             .unwrap();
             projections::apply_scope_event(&mut connection, &event).unwrap();
-            connection
-                .execute(
-                    "UPDATE scopes SET active_plan_digest = ?1, reserved_budget_units = 0 \
-                     WHERE scope_id = ?2",
-                    rusqlite::params![plan().as_str(), scope.scope_id().as_str()],
+
+            let admission = ScopeProjectionEvent::new(
+                scope.clone(),
+                EventEnvelope::new(
+                    scope.scope_id().clone(),
+                    2,
+                    Some(ScopeEventRef::new(1, seed_objective()).unwrap()),
+                    1,
+                    "admit-plan".into(),
+                    crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE.into(),
                 )
-                .unwrap();
-            projections::admit_work(
-                &mut connection,
-                &scope,
-                &target,
-                &[],
-                NonZeroU64::new(1).unwrap(),
+                .unwrap(),
+                ScopeEventRef::new(2, Digest::new("22".repeat(32)).unwrap()).unwrap(),
+                ScopeProjectionPayload::PlanAdmitted {
+                    plan_digest: plan(),
+                    proposal: Box::new(seed_proposal()),
+                },
+                1,
             )
             .unwrap();
+            projections::apply_scope_event(&mut connection, &admission).unwrap();
             projections::record_claim(
                 &connection,
                 &scope,
@@ -643,6 +737,7 @@ mod tests {
                     identity(2),
                     "a".into(),
                     "r".into(),
+                    1,
                     units,
                     deadline,
                     "op".into()
@@ -737,6 +832,7 @@ mod tests {
             "repo-a".into(),
             5,
             NOW_MS + 60_000,
+            "grant-op-1".into(),
         )
         .unwrap();
         assert!(matches!(
@@ -751,10 +847,26 @@ mod tests {
             "repo-a".into(),
             5,
             NOW_MS + 60_000,
+            "grant-op-1".into(),
         )
         .unwrap();
         assert!(matches!(
             intake(&store, &handle, &other_action, epoch, NOW_MS).await,
+            GrantIntake::Rejected(GrantRejection::IdentityMismatch)
+        ));
+        // A grant minted for another operation cannot stand in for this one.
+        let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);
+        let other_operation = ExpectedGrant::new(
+            identity(2),
+            "git-push".into(),
+            "repo-a".into(),
+            5,
+            NOW_MS + 60_000,
+            "grant-op-2".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            intake(&store, &handle, &other_operation, epoch, NOW_MS).await,
             GrantIntake::Rejected(GrantRejection::IdentityMismatch)
         ));
         // Valid bytes, but the projection resumes nothing: the object alone is not authority.
@@ -793,10 +905,9 @@ mod tests {
     async fn issuance_requires_live_authority_over_the_admitted_plan() {
         let (db_path, handle) = database("issue").await;
         let grant = fixture(2, 5, NOW_MS + 60_000);
-        let (store, _) = replay_store(vec![]);
 
         // No active plan on the head.
-        let authority = authority_with_plan(None).await;
+        let (authority, store, client) = authority_with_plan(None, vec![]).await;
         assert_eq!(
             issue(
                 &store,
@@ -809,8 +920,10 @@ mod tests {
             .await,
             Err(IssueError::NotAuthorized)
         );
+        assert_eq!(client.actual_requests().count(), 2);
         // Another plan is active.
-        let authority = authority_with_plan(Some(Digest::new("cd".repeat(32)).unwrap())).await;
+        let (authority, store, _) =
+            authority_with_plan(Some(Digest::new("cd".repeat(32)).unwrap()), vec![]).await;
         assert_eq!(
             issue(
                 &store,
@@ -823,8 +936,24 @@ mod tests {
             .await,
             Err(IssueError::NotAuthorized)
         );
+        // Ownership proved in one store proves nothing in another.
+        let (authority, _, _) = authority_with_plan(Some(plan()), vec![]).await;
+        let (foreign_store, foreign_client) = replay_store(vec![]);
+        assert_eq!(
+            issue(
+                &foreign_store,
+                &handle,
+                &authority,
+                &grant,
+                &mut AttemptHistory::default(),
+                NOW_MS
+            )
+            .await,
+            Err(IssueError::NotAuthorized)
+        );
+        assert_eq!(foreign_client.actual_requests().count(), 0);
         // The right plan and a live lease, but the grant deadline has already passed.
-        let authority = authority_with_plan(Some(plan())).await;
+        let (authority, store, _) = authority_with_plan(Some(plan()), vec![]).await;
         let short = fixture(2, 5, NOW_MS + 10_000);
         assert_eq!(
             issue(
@@ -839,8 +968,8 @@ mod tests {
             Err(IssueError::Expired)
         );
         // Publication succeeds but the projection knows no such claim: the object stays inert.
-        let authority = authority_with_plan(Some(plan())).await;
-        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let (authority, store, client) =
+            authority_with_plan(Some(plan()), vec![response(200, &[], SdkBody::empty())]).await;
         assert_eq!(
             issue(
                 &store,
@@ -853,7 +982,7 @@ mod tests {
             .await,
             Err(IssueError::Refused)
         );
-        assert_eq!(client.actual_requests().count(), 1);
+        assert_eq!(client.actual_requests().count(), 3);
 
         handle.drain().await.unwrap();
         drop(handle);
@@ -878,6 +1007,7 @@ mod tests {
                 identity,
                 "git-push".into(),
                 "repo-a".into(),
+                1,
                 units,
                 deadline,
                 "grant-op-1".into(),
@@ -910,8 +1040,8 @@ mod tests {
         let bytes = encode_grant(&grant).unwrap();
 
         // A plain create publishes once and records.
-        let authority = authority_with_plan(Some(plan())).await;
-        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let (authority, store, client) =
+            authority_with_plan(Some(plan()), vec![response(200, &[], SdkBody::empty())]).await;
         assert_eq!(
             issue(
                 &store,
@@ -924,14 +1054,17 @@ mod tests {
             .await,
             Ok(())
         );
-        assert_eq!(client.actual_requests().count(), 1);
+        assert_eq!(client.actual_requests().count(), 3);
 
         // A conflicting create whose read-back returns the identical bytes reconciles.
-        let authority = authority_with_plan(Some(plan())).await;
-        let (store, client) = replay_store(vec![
-            response(412, &[], SdkBody::empty()),
-            response(200, &[("etag", "\"grant\"")], bytes.clone()),
-        ]);
+        let (authority, store, client) = authority_with_plan(
+            Some(plan()),
+            vec![
+                response(412, &[], SdkBody::empty()),
+                response(200, &[("etag", "\"grant\"")], bytes.clone()),
+            ],
+        )
+        .await;
         assert_eq!(
             issue(
                 &store,
@@ -944,23 +1077,27 @@ mod tests {
             .await,
             Ok(())
         );
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
 
         // A rival operation's bytes at the key cause refusal without a resend.
         let rival = EffectGrant::new(
             identity(2),
             "git-push".into(),
             "repo-a".into(),
+            1,
             5,
             NOW_MS + 60_000,
             "grant-op-2".into(),
         )
         .unwrap();
-        let authority = authority_with_plan(Some(plan())).await;
-        let (store, client) = replay_store(vec![
-            response(412, &[], SdkBody::empty()),
-            response(200, &[("etag", "\"grant\"")], encode_grant(&rival).unwrap()),
-        ]);
+        let (authority, store, client) = authority_with_plan(
+            Some(plan()),
+            vec![
+                response(412, &[], SdkBody::empty()),
+                response(200, &[("etag", "\"grant\"")], encode_grant(&rival).unwrap()),
+            ],
+        )
+        .await;
         assert_eq!(
             issue(
                 &store,
@@ -973,11 +1110,10 @@ mod tests {
             .await,
             Err(IssueError::Refused)
         );
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
 
         // An authority past its lease safety margin must stop issuing.
-        let authority = authority_with_plan(Some(plan())).await;
-        let (store, client) = replay_store(vec![]);
+        let (authority, store, client) = authority_with_plan(Some(plan()), vec![]).await;
         assert_eq!(
             issue(
                 &store,
@@ -990,7 +1126,7 @@ mod tests {
             .await,
             Err(IssueError::NotAuthorized)
         );
-        assert_eq!(client.actual_requests().count(), 0);
+        assert_eq!(client.actual_requests().count(), 2);
 
         // A grant naming another scope is not this authority's to issue.
         let other = root_genesis(
@@ -1012,12 +1148,13 @@ mod tests {
             .unwrap(),
             "git-push".into(),
             "repo-a".into(),
+            1,
             5,
             NOW_MS + 60_000,
             "grant-op-1".into(),
         )
         .unwrap();
-        let authority = authority_with_plan(Some(plan())).await;
+        let (authority, store, client) = authority_with_plan(Some(plan()), vec![]).await;
         assert_eq!(
             issue(
                 &store,
@@ -1030,7 +1167,7 @@ mod tests {
             .await,
             Err(IssueError::NotAuthorized)
         );
-        assert_eq!(client.actual_requests().count(), 0);
+        assert_eq!(client.actual_requests().count(), 2);
 
         handle.drain().await.unwrap();
         drop(handle);
@@ -1060,8 +1197,8 @@ mod tests {
         ));
 
         // Recording activates the grant, and intake accepts it.
-        let authority = authority_with_plan(Some(plan())).await;
-        let (publish, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let (authority, publish, _) =
+            authority_with_plan(Some(plan()), vec![response(200, &[], SdkBody::empty())]).await;
         issue(
             &publish,
             &handle,
@@ -1086,6 +1223,30 @@ mod tests {
         };
         assert_eq!(*accepted, grant);
 
+        // A grant with matching bindings must equal the projection's recorded grant.
+        let rival = EffectGrant::new(
+            identity(2),
+            "git-push".into(),
+            "repo-a".into(),
+            2,
+            5,
+            NOW_MS + 60_000,
+            "grant-op-1".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![found(encode_grant(&rival).unwrap())]);
+        assert!(matches!(
+            intake(
+                &store,
+                &handle,
+                &expected(2, 5, NOW_MS + 60_000),
+                epoch,
+                NOW_MS
+            )
+            .await,
+            GrantIntake::Rejected(GrantRejection::IdentityMismatch)
+        ));
+
         // A reclaim at fence 3 supersedes the fence-2 caller once its lease has lapsed.
         let target = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
         handle
@@ -1098,11 +1259,21 @@ mod tests {
             )
             .await
             .unwrap();
+        let fence_three = fixture(3, 5, NOW_MS + 50_000);
         handle
             .record_grant(
                 &identity(3),
-                epoch,
-                NonZeroU64::new(NOW_MS + 50_000).unwrap(),
+                GrantActivation {
+                    scope_epoch: epoch,
+                    attempt: NonZeroU64::new(1).unwrap(),
+                    units: NonZeroU64::new(5).unwrap(),
+                    deadline_unix_ms: NonZeroU64::new(NOW_MS + 50_000).unwrap(),
+                    digest: Digest::new(format!(
+                        "{:x}",
+                        Sha256::digest(encode_grant(&fence_three).unwrap())
+                    ))
+                    .unwrap(),
+                },
                 NOW_MS + 30_000,
             )
             .await

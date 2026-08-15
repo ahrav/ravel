@@ -273,8 +273,9 @@ fn validate_active_plan_transition(
 ///
 /// # Errors
 ///
-/// Returns [`ScopeAppendError::InvalidInput`] for a parent that already has an active plan, a
-/// mismatched writer epoch, or an invalid transition, and publication errors verbatim.
+/// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent, a parent that already has an
+/// active plan, a cross-scope proposal, an unrepresentable operation identity or sequence, or an
+/// invalid transition, and publication errors verbatim.
 pub async fn append_plan_admitted(
     store: &S3Store,
     parent: ScopeHeadParent,

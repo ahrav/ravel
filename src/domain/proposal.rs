@@ -185,10 +185,12 @@ impl PlanProposal {
     /// Derives the canonical bytes and the content address they hash to.
     ///
     /// Both failure paths map to [`ProposalError::InvalidEncoding`] and neither is reachable: the
-    /// writer is a `Vec<u8>`, whose `ciborium_io::Write::Error` is `Infallible`, no `Serialize` impl
-    /// reached from [`WirePlanProposal`] raises a custom error, and a SHA-256 rendered with `{:x}`
-    /// is always 64 lowercase hexadecimal bytes. The variant keeps the boundary total rather than
-    /// forcing a panic here.
+    /// writer is a `&mut Vec<u8>`, which takes `ciborium_io`'s blanket `std::io::Write` impl and so
+    /// reports `std::io::Error`, but a `Vec<u8>` write only grows the buffer and never returns one —
+    /// allocation failure aborts the process instead. No `Serialize` impl reached from
+    /// [`WirePlanProposal`] raises a custom error, and a SHA-256 rendered with `{:x}` is always 64
+    /// lowercase hexadecimal bytes. The variant keeps the boundary total rather than forcing a panic
+    /// here.
     fn encode(&self) -> Result<(Vec<u8>, Digest), ProposalError> {
         let wire = WirePlanProposal {
             scope_id: self.scope_id.as_str(),

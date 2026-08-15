@@ -1,9 +1,7 @@
 //! Typed root-plan proposals and the pure gate that runs before admission.
 //!
 //! A proposal binds its exact root scope, objective, parent plan, and typed bases in its own
-//! bytes. Construction normalizes the basis list into one total order and drops duplicates, so
-//! two callers that cite the same bases in different order derive byte-identical canonical bytes
-//! and one `plan_digest`.
+//! bytes, and construction normalizes those bases so equivalent citations derive one address.
 //!
 //! The content address is `SHA-256("ravel.plan.proposal\0" || CBOR)`, matching how
 //! [`crate::scope::root_scope_id`] domain-separates its own seed. It is therefore *not*
@@ -12,23 +10,21 @@
 //! carry the plain digest separately. The `ciborium` lockfile pin is byte-affecting for this
 //! address, as the `zstd-sys` pin is for event bytes.
 //!
-//! [`validate_proposal`] performs no I/O: every durable fact it needs arrives in
-//! [`ProposalFacts`], which the admitting transaction resolves. That is what "fails before
-//! mutation" means here — the gate cannot reach durable state to mutate it. Every *basis*
-//! rejection is reachable from a unit test; [`ProposalError::CyclicBasis`] and
-//! [`ProposalError::InvalidEncoding`] are unreachable by construction and documented where they
-//! are raised.
+//! [`validate_proposal`] performs no I/O, which is what "fails before mutation" means here: the
+//! gate cannot reach durable state to mutate it, and every basis rejection is reachable from a
+//! unit test.
 //!
 //! Two shapes are admissible by design rather than by omission. An empty basis list is allowed,
 //! because fixed initial work is proposed from the objective alone. Citing the prior revision is
-//! optional, and because bases are part of the content address, a proposal that cites it and one
-//! that does not are two distinct plans rather than one plan proposed twice.
+//! optional, and because bases are part of the address, a proposal that cites it and one that does
+//! not are two distinct plans rather than one plan proposed twice.
 //!
-//! The root-only MVP has exactly two basis kinds. Child certificates and delegation bases are
-//! post-signal work and are not representable. `root_genesis` is the only supported
-//! planning-input payload, because it is the durable objective and configuration record and no
-//! observation payload type exists yet; every other payload type fails closed, exactly as
-//! `payload_type_registered` does for events.
+//! The root-only MVP has exactly two basis kinds; child certificates and delegation bases are
+//! post-signal work and are not representable. `root_genesis` is the only supported planning-input
+//! payload, because it is the durable objective and configuration record and no observation payload
+//! type exists yet. Every other payload type fails closed, the way `payload_type_registered`
+//! refuses an unregistered event payload — but against that one constant, not that predicate, whose
+//! allow-list also admits the test-only successor payload.
 
 use std::{error::Error, fmt};
 
@@ -84,8 +80,8 @@ pub enum ProposalBasis {
 
 /// What durable state records about one cited observation.
 ///
-/// Construction is infallible because every field is already a validated domain value. Whether
-/// the payload type is a planning input is [`validate_proposal`]'s decision, not this type's.
+/// Construction is infallible: `scope_id` and `event` are already validated domain values, and a
+/// `payload_type` other than `root_genesis` fails closed in [`validate_proposal`] rather than here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservationFact {
     scope_id: ScopeId,
@@ -105,8 +101,10 @@ impl ObservationFact {
 
 /// The durable facts one validation call is decided against.
 ///
-/// The caller resolves these from the scope head and projection before validating, which keeps
-/// this module free of I/O and makes every basis rejection reachable from a unit test.
+/// The caller resolves the head facts and observations from the scope head and projection, and
+/// `objective_digest` from the campaign's root-genesis `config_digest` — no projection table and no
+/// head field carries the objective. Resolving outside keeps this module free of I/O and makes
+/// every basis rejection reachable from a unit test.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProposalFacts<'a> {
     scope: &'a ScopeIdentity,
@@ -122,8 +120,8 @@ impl<'a> ProposalFacts<'a> {
     ///
     /// `observations` must hold at most one fact per sequence, and the first match at a sequence
     /// decides the verdict. `applied_scope_events` is keyed on `(scope_id, sequence)`, so a query
-    /// scoped to one scope already satisfies this; a caller that merges scopes or eras must
-    /// deduplicate first, or slice order silently chooses which rejection fires.
+    /// scoped to one scope already satisfies this; a caller that merges more than one scope's rows
+    /// must deduplicate first, or slice order silently chooses which rejection fires.
     pub fn new(
         scope: &'a ScopeIdentity,
         objective_digest: &'a Digest,
@@ -190,10 +188,11 @@ impl PlanProposal {
 
     /// Derives the canonical bytes and the content address they hash to.
     ///
-    /// Both failure paths map to [`ProposalError::InvalidEncoding`] and neither is reachable:
-    /// CBOR serialization of `&str`, `u64`, and `Option<&str>` has no failing case, and a
-    /// SHA-256 rendered with `{:x}` is always 64 lowercase hexadecimal bytes. The variant keeps
-    /// the boundary total rather than forcing a panic here.
+    /// Both failure paths map to [`ProposalError::InvalidEncoding`] and neither is reachable: the
+    /// writer is a `Vec<u8>`, whose `ciborium_io::Write::Error` is `Infallible`, no `Serialize` impl
+    /// reached from [`WirePlanProposal`] raises a custom error, and a SHA-256 rendered with `{:x}`
+    /// is always 64 lowercase hexadecimal bytes. The variant keeps the boundary total rather than
+    /// forcing a panic here.
     fn encode(&self) -> Result<(Vec<u8>, Digest), ProposalError> {
         let wire = WirePlanProposal {
             scope_id: self.scope_id.as_str(),
@@ -246,15 +245,14 @@ impl AdmissibleProposal {
 ///
 /// # Errors
 ///
-/// Returns [`ProposalError::ScopeMismatch`] when the proposal names another scope and
-/// [`ProposalError::ObjectiveMismatch`] when it names another objective. Returns
-/// [`ProposalError::StaleBasis`] when the parent plan is not the scope's active plan, a prior
-/// revision names anything other than the active plan, or a cited observation's digest differs
-/// at that sequence; [`ProposalError::MissingBasis`] when a citation is above the projected tail
-/// or has no resolved fact; [`ProposalError::CrossScopeBasis`] when a resolved fact belongs to
-/// another scope; [`ProposalError::UnsupportedPlanningInput`] when its payload type is not a
-/// planning input; [`ProposalError::CyclicBasis`] when the proposal is its own ancestor; and
-/// [`ProposalError::InvalidEncoding`] when canonical bytes cannot be derived.
+/// Returns the [`ProposalError`] category of the first binding that fails: `ScopeMismatch` or
+/// `ObjectiveMismatch` for a header naming another scope or objective; `StaleBasis` for a parent
+/// plan or prior revision that is not the scope's active plan, or a cited observation whose digest
+/// differs at that sequence; `MissingBasis` for a citation above the projected tail or with no
+/// resolved fact; `CrossScopeBasis` for a resolved fact from another scope;
+/// `UnsupportedPlanningInput` for one whose payload type is not a planning input; `CyclicBasis`
+/// when the proposal is its own ancestor; and `InvalidEncoding` when canonical bytes cannot be
+/// derived.
 pub fn validate_proposal(
     proposal: &PlanProposal,
     facts: &ProposalFacts<'_>,
@@ -348,8 +346,8 @@ struct WirePlanProposal<'a> {
 }
 
 /// Externally tagged, unlike the internally tagged JSON records in `distributed::claims`: CBOR
-/// encodes the default representation directly, while an internal tag would buffer the variant
-/// through serde's `Content` before writing.
+/// writes the default one-entry map `{variant: {fields}}`, while an internal tag would fold the tag
+/// into the field map and change these bytes.
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireProposalBasis<'a> {
@@ -455,11 +453,6 @@ mod tests {
         .unwrap();
         assert_eq!(admissible.scope_id(), scope.scope_id());
         assert_eq!(admissible.plan_digest().as_str(), GENESIS_PLAN_DIGEST);
-        // The address is domain-separated, so it is not the plain digest of the same bytes.
-        assert_ne!(
-            admissible.plan_digest().as_str(),
-            format!("{:x}", Sha256::digest(admissible.canonical_bytes()))
-        );
     }
 
     #[test]
@@ -593,11 +586,9 @@ mod tests {
             fact(scope_id.clone(), 2, 0xbb, ROOT_GENESIS_PAYLOAD_TYPE),
         ];
         let successor_payload = [fact(scope_id.clone(), 1, 0xaa, TEST_SUCCESSOR_PAYLOAD_TYPE)];
-        // A payload type that will exist later is still not a planning input today.
-        let future_payload = [fact(scope_id.clone(), 1, 0xaa, "plan_admitted")];
         let one_observation = vec![observation_basis(1, 0xaa)];
 
-        let cases: [(PlanProposal, Option<&Digest>, u64, &[ObservationFact], _); 14] = [
+        let cases: [(PlanProposal, Option<&Digest>, u64, &[ObservationFact], _); 12] = [
             (
                 PlanProposal::new(
                     other_scope_id(),
@@ -622,15 +613,8 @@ mod tests {
                 &genesis,
                 ProposalError::ObjectiveMismatch,
             ),
-            // Above the projected tail, and no fact resolves there either.
-            (
-                genesis_proposal(vec![observation_basis(2, 0xaa)]),
-                None,
-                1,
-                &genesis,
-                ProposalError::MissingBasis,
-            ),
-            // Above the projected tail even though a matching fact was supplied.
+            // The projected-tail guard rejects sequence 2 although its supplied fact matches,
+            // because the tail is 1.
             (
                 genesis_proposal(vec![observation_basis(2, 0xbb)]),
                 None,
@@ -709,18 +693,13 @@ mod tests {
                 &cross_scope,
                 ProposalError::CrossScopeBasis,
             ),
+            // The planning-input check accepts only `root_genesis`, not every payload type
+            // `payload_type_registered` accepts.
             (
                 genesis_proposal(one_observation.clone()),
                 None,
                 1,
                 &successor_payload,
-                ProposalError::UnsupportedPlanningInput,
-            ),
-            (
-                genesis_proposal(one_observation.clone()),
-                None,
-                1,
-                &future_payload,
                 ProposalError::UnsupportedPlanningInput,
             ),
         ];

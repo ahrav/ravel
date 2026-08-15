@@ -2,17 +2,18 @@
 //!
 //! A grant is an immutable JSON object at its claim generation's grant key, published
 //! create-if-absent and activated by the existing `grant_fence` projection marker. The object
-//! alone grants nothing: intake accepts a grant only while the projection still reports its
-//! exact work revision resumable, so claim reclamation, terminal evidence, or expiry revokes it
-//! without a revocation record.
+//! alone grants nothing: intake accepts a grant only while the projection still resumes its
+//! exact work revision under its exact claim fence, so claim reclamation, terminal evidence,
+//! or expiry revokes it without a revocation record.
 //!
 //! A grant authorizes execution only. No path here inserts work rows or writes terminal
-//! evidence; those writers stay reachable only from plan admission and sealed-claim intake.
+//! evidence.
 //! commentlint: allow(JUDGE)
 
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     db::{projections::ApplyError, worker::DbHandle},
@@ -47,7 +48,8 @@ impl EffectGrant {
     /// # Errors
     ///
     /// Returns [`ValidationError`] when `action`, `resource_scope`, or `operation_id` is not one
-    /// key segment, or when `limit_units` or `deadline_unix_ms` is outside `1..=MAX_STORED_INTEGER`.
+    /// key segment, or when a numeric binding falls outside the stored-integer range.
+    /// commentlint: allow(JUDGE)
     pub fn new(
         identity: ScopeClaimIdentity,
         action: String,
@@ -62,8 +64,10 @@ impl EffectGrant {
         let bounded = |value: u64| {
             NonZeroU64::new(value)
                 .filter(|value| value.get() <= MAX_STORED_INTEGER)
-                .ok_or(ValidationError::InvalidExpiry)
+                .ok_or(ValidationError::OutOfRange)
         };
+        bounded(identity.work().revision())?;
+        bounded(identity.claim_fence().get())?;
         Ok(Self {
             identity,
             action,
@@ -104,11 +108,41 @@ impl EffectGrant {
 /// `max_units` and `max_deadline_unix_ms` cap what the request asked for, so a wider grant fails
 /// closed instead of widening the operation.
 pub struct ExpectedGrant {
-    pub identity: ScopeClaimIdentity,
-    pub action: String,
-    pub resource_scope: String,
-    pub max_units: NonZeroU64,
-    pub max_deadline_unix_ms: NonZeroU64,
+    identity: ScopeClaimIdentity,
+    action: String,
+    resource_scope: String,
+    max_units: NonZeroU64,
+    max_deadline_unix_ms: NonZeroU64,
+}
+
+impl ExpectedGrant {
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] for a value [`EffectGrant::new`] would also reject, so an
+    /// expectation cannot name a value no grant can carry.
+    /// commentlint: allow(JUDGE)
+    pub fn new(
+        identity: ScopeClaimIdentity,
+        action: String,
+        resource_scope: String,
+        max_units: u64,
+        max_deadline_unix_ms: u64,
+    ) -> Result<Self, ValidationError> {
+        validate_key_segment(&action)?;
+        validate_key_segment(&resource_scope)?;
+        let bounded = |value: u64| {
+            NonZeroU64::new(value)
+                .filter(|value| value.get() <= MAX_STORED_INTEGER)
+                .ok_or(ValidationError::OutOfRange)
+        };
+        Ok(Self {
+            identity,
+            action,
+            resource_scope,
+            max_units: bounded(max_units)?,
+            max_deadline_unix_ms: bounded(max_deadline_unix_ms)?,
+        })
+    }
 }
 
 /// Data-free category for one refused grant.
@@ -116,13 +150,13 @@ pub struct ExpectedGrant {
 pub enum GrantRejection {
     /// No object exists at the claim generation's grant key.
     Absent,
-    /// The grant names a lower claim fence than the caller's.
+    /// The projection resumes the work under a newer claim generation than the caller's.
     StaleFence,
-    /// Scope, plan, revision, action, or resource binding disagrees.
+    /// Plan, action, or resource binding disagrees with the caller's expectation.
     IdentityMismatch,
     Expired,
     WiderThanRequested,
-    /// The projection no longer reports the revision resumable under this generation.
+    /// The projection does not resume, or no longer resumes, the caller's claim generation.
     Revoked,
     Malformed,
 }
@@ -139,13 +173,14 @@ pub enum GrantIntake {
 /// Data-free category for one refused issuance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IssueError {
-    /// The authority is stopped, from another scope, or holds no or another active plan.
+    /// The authority must stop, is from another scope, or holds no or another active plan.
     NotAuthorized,
     /// The grant is already expired at issuance time.
     Expired,
-    /// Publication could not be proven; retry the identical grant.
+    /// The outcome is unproven; the identical retry is safe.
     Unresolved,
-    /// The projection refused the recording; the grant object stays inert.
+    /// No identical retry can succeed: a rival object occupies this claim generation's key, or
+    /// the projection refused the binding and any published object stays inert.
     Refused,
 }
 
@@ -157,10 +192,11 @@ pub enum IssueError {
 ///
 /// # Errors
 ///
-/// Returns [`IssueError::NotAuthorized`] when `authority` is stopped or does not hold this
+/// Returns [`IssueError::NotAuthorized`] when `authority` must stop or does not hold this
 /// grant's scope and plan, [`IssueError::Expired`] when the deadline is not ahead of `now_ms`,
-/// [`IssueError::Unresolved`] for unproven publication, and [`IssueError::Refused`] when the
-/// projection rejects the binding.
+/// [`IssueError::Unresolved`] when publication or recording is unproven, and
+/// [`IssueError::Refused`] when a rival object holds the key or the projection rejects the
+/// binding.
 pub async fn issue(
     store: &S3Store,
     database: &DbHandle,
@@ -185,22 +221,21 @@ pub async fn issue(
         grant.identity.work(),
         grant.identity.claim_fence(),
     );
-    let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    let digest = format!("{:x}", Sha256::digest(&bytes));
     // `operation_id` is inside the canonical bytes, so byte identity at the key is identity of
     // the operation: an ambiguous write reconciles by read-back before any retry.
     store
         .publish_with_history(&key, bytes, &digest, history)
         .await
         .map_err(|error| match error {
-            PublicationError::NotSent | PublicationError::Unresolved => IssueError::Unresolved,
+            PublicationError::NotSent
+            | PublicationError::Unresolved
+            | PublicationError::StorageNotFound => IssueError::Unresolved,
             _ => IssueError::Refused,
         })?;
     database
         .record_grant(
-            grant.identity.scope(),
-            grant.identity.work().clone(),
-            grant.identity.claim_fence(),
-            grant.identity.plan_digest().clone(),
+            &grant.identity,
             authority.scope_epoch(),
             grant.deadline_unix_ms,
             now_ms,
@@ -216,8 +251,12 @@ pub async fn issue(
 
 /// Reads one grant back and decides it against `expected` at `now_ms`.
 ///
-/// Absence, malformed bytes, and every binding disagreement are permanent rejections; only
-/// transport failure is retryable.
+/// Absence, malformed bytes, and every binding disagreement are permanent rejections.
+/// [`GrantRejection::Revoked`] also covers a grant not yet activated by [`issue`], so a caller
+/// may retry after activation; transport failure is retryable as [`GrantIntake::Unavailable`].
+///
+/// `scope_epoch` caps which admissions count as current and must come from the same observed
+/// head as `expected`; a newer epoch can only widen the resumable set, never narrow a refusal.
 pub async fn intake(
     store: &S3Store,
     database: &DbHandle,
@@ -245,9 +284,6 @@ pub async fn intake(
         Ok(grant) => grant,
         Err(_) => return GrantIntake::Rejected(GrantRejection::Malformed),
     };
-    if grant.identity.claim_fence() < expected.identity.claim_fence() {
-        return GrantIntake::Rejected(GrantRejection::StaleFence);
-    }
     if grant.identity != expected.identity
         || grant.action != expected.action
         || grant.resource_scope != expected.resource_scope
@@ -262,15 +298,25 @@ pub async fn intake(
     {
         return GrantIntake::Rejected(GrantRejection::WiderThanRequested);
     }
-    // The object alone is not authority: the projection must still resume this exact revision.
+    // A grant object alone is not authority.
     match database
         .resumable_work(expected.identity.scope(), scope_epoch, now_ms)
         .await
     {
-        Ok(resumable) if resumable.contains(expected.identity.work()) => {
-            GrantIntake::Accepted(Box::new(grant))
+        Ok(resumable) => {
+            match resumable
+                .iter()
+                .find(|row| row.work() == expected.identity.work())
+            {
+                Some(row) if row.claim_fence() == expected.identity.claim_fence() => {
+                    GrantIntake::Accepted(Box::new(grant))
+                }
+                Some(row) if row.claim_fence() > expected.identity.claim_fence() => {
+                    GrantIntake::Rejected(GrantRejection::StaleFence)
+                }
+                _ => GrantIntake::Rejected(GrantRejection::Revoked),
+            }
         }
-        Ok(_) => GrantIntake::Rejected(GrantRejection::Revoked),
         Err(_) => GrantIntake::Unavailable,
     }
 }
@@ -430,13 +476,14 @@ mod tests {
     }
 
     fn expected(fence: u64, max_units: u64, max_deadline: u64) -> ExpectedGrant {
-        ExpectedGrant {
-            identity: identity(fence),
-            action: "git-push".into(),
-            resource_scope: "repo-a".into(),
-            max_units: NonZeroU64::new(max_units).unwrap(),
-            max_deadline_unix_ms: NonZeroU64::new(max_deadline).unwrap(),
-        }
+        ExpectedGrant::new(
+            identity(fence),
+            "git-push".into(),
+            "repo-a".into(),
+            max_units,
+            max_deadline,
+        )
+        .unwrap()
     }
 
     /// A head whose plan is active, observed and acquired through one replay store.
@@ -478,6 +525,68 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         (path.clone(), DbHandle::spawn(path).await.unwrap())
+    }
+
+    /// Seeds a projection directly so `issue` and `intake` can run end to end.
+    async fn seeded_database(label: &str) -> (std::path::PathBuf, DbHandle) {
+        use crate::db::projections::{self, ScopeProjectionEvent, ScopeProjectionPayload};
+        use crate::scope::{EventEnvelope, ScopeEventRef};
+        let path = std::env::temp_dir().join(format!(
+            "ravel-grants-{}-{label}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let scope = genesis().identity().clone();
+        let target = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
+        {
+            let mut connection = projections::create(&path).unwrap();
+            let digest = Digest::new("11".repeat(32)).unwrap();
+            let envelope = EventEnvelope::new(
+                scope.scope_id().clone(),
+                1,
+                None,
+                1,
+                format!("root-genesis:{}", scope.scope_id().as_str()),
+                "root_genesis".into(),
+            )
+            .unwrap();
+            let event = ScopeProjectionEvent::new(
+                scope.clone(),
+                envelope,
+                ScopeEventRef::new(1, digest.clone()).unwrap(),
+                ScopeProjectionPayload::RootGenesis {
+                    objective_digest: digest,
+                },
+                1,
+            )
+            .unwrap();
+            projections::apply_scope_event(&mut connection, &event).unwrap();
+            connection
+                .execute(
+                    "UPDATE scopes SET active_plan_digest = ?1, reserved_budget_units = 0 \
+                     WHERE scope_id = ?2",
+                    rusqlite::params![plan().as_str(), scope.scope_id().as_str()],
+                )
+                .unwrap();
+            projections::admit_work(
+                &mut connection,
+                &scope,
+                &target,
+                &[],
+                NonZeroU64::new(1).unwrap(),
+            )
+            .unwrap();
+            projections::record_claim(
+                &connection,
+                &scope,
+                &target,
+                NonZeroU64::new(2).unwrap(),
+                NonZeroU64::new(NOW_MS + 30_000).unwrap(),
+                NOW_MS,
+            )
+            .unwrap();
+        }
+        (path.clone(), DbHandle::open_existing(path).await.unwrap())
     }
 
     #[test]
@@ -554,13 +663,17 @@ mod tests {
             .await,
             GrantIntake::Rejected(GrantRejection::Absent)
         ));
-        // Stale fence: the caller has moved to fence 3.
+        // A key naming a fence the object does not carry cannot decode.
         let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);
-        let mut stale = expected(3, 5, NOW_MS + 60_000);
-        stale.identity = identity(3);
-        // The read key embeds the caller's fence, so the object read back names a lower one.
         assert!(matches!(
-            intake(&store, &handle, &stale, epoch, NOW_MS).await,
+            intake(
+                &store,
+                &handle,
+                &expected(3, 5, NOW_MS + 60_000),
+                epoch,
+                NOW_MS
+            )
+            .await,
             GrantIntake::Rejected(GrantRejection::Malformed)
         ));
         // Expired.
@@ -603,8 +716,14 @@ mod tests {
         ));
         // Action mismatch is an identity disagreement.
         let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);
-        let mut other_action = expected(2, 5, NOW_MS + 60_000);
-        other_action.action = "git-fetch".into();
+        let other_action = ExpectedGrant::new(
+            identity(2),
+            "git-fetch".into(),
+            "repo-a".into(),
+            5,
+            NOW_MS + 60_000,
+        )
+        .unwrap();
         assert!(matches!(
             intake(&store, &handle, &other_action, epoch, NOW_MS).await,
             GrantIntake::Rejected(GrantRejection::IdentityMismatch)
@@ -636,8 +755,8 @@ mod tests {
             GrantIntake::Unavailable
         ));
 
+        handle.drain().await.unwrap();
         drop(handle);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -707,8 +826,273 @@ mod tests {
         );
         assert_eq!(client.actual_requests().count(), 1);
 
+        handle.drain().await.unwrap();
         drop(handle);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn grant_bounds_reject_values_beyond_stored_range() {
+        let max = MAX_STORED_INTEGER;
+        let work_ref = |revision| WorkRef::new(WorkId::new("work-17".into()).unwrap(), revision);
+        let claim = |revision, fence| {
+            ScopeClaimIdentity::new(
+                genesis().identity().clone(),
+                plan(),
+                work_ref(revision),
+                fence,
+            )
+            .unwrap()
+        };
+        let grant = |identity, units, deadline| {
+            EffectGrant::new(
+                identity,
+                "git-push".into(),
+                "repo-a".into(),
+                units,
+                deadline,
+                "grant-op-1".into(),
+            )
+        };
+
+        assert!(grant(claim(max, max), max, max).is_ok());
+        assert_eq!(
+            grant(claim(max + 1, 2), 5, max),
+            Err(ValidationError::OutOfRange)
+        );
+        assert_eq!(
+            grant(claim(1, max + 1), 5, max),
+            Err(ValidationError::OutOfRange)
+        );
+        assert_eq!(
+            grant(claim(1, 2), max + 1, max),
+            Err(ValidationError::OutOfRange)
+        );
+        assert_eq!(
+            grant(claim(1, 2), 5, max + 1),
+            Err(ValidationError::OutOfRange)
+        );
+    }
+
+    #[tokio::test]
+    async fn issuance_reconciles_ambiguity_by_operation_identity() {
+        let (db_path, handle) = seeded_database("issue-ok").await;
+        let grant = fixture(2, 5, NOW_MS + 60_000);
+        let bytes = encode_grant(&grant).unwrap();
+
+        // A plain create publishes once and records.
+        let authority = authority_with_plan(Some(plan())).await;
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        assert_eq!(
+            issue(
+                &store,
+                &handle,
+                &authority,
+                &grant,
+                &mut AttemptHistory::default(),
+                NOW_MS
+            )
+            .await,
+            Ok(())
+        );
+        assert_eq!(client.actual_requests().count(), 1);
+
+        // A conflicting create whose read-back returns the identical bytes reconciles.
+        let authority = authority_with_plan(Some(plan())).await;
+        let (store, client) = replay_store(vec![
+            response(412, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"grant\"")], bytes.clone()),
+        ]);
+        assert_eq!(
+            issue(
+                &store,
+                &handle,
+                &authority,
+                &grant,
+                &mut AttemptHistory::default(),
+                NOW_MS
+            )
+            .await,
+            Ok(())
+        );
+        assert_eq!(client.actual_requests().count(), 2);
+
+        // A rival operation's bytes at the key cause refusal without a resend.
+        let rival = EffectGrant::new(
+            identity(2),
+            "git-push".into(),
+            "repo-a".into(),
+            5,
+            NOW_MS + 60_000,
+            "grant-op-2".into(),
+        )
+        .unwrap();
+        let authority = authority_with_plan(Some(plan())).await;
+        let (store, client) = replay_store(vec![
+            response(412, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"grant\"")], encode_grant(&rival).unwrap()),
+        ]);
+        assert_eq!(
+            issue(
+                &store,
+                &handle,
+                &authority,
+                &grant,
+                &mut AttemptHistory::default(),
+                NOW_MS
+            )
+            .await,
+            Err(IssueError::Refused)
+        );
+        assert_eq!(client.actual_requests().count(), 2);
+
+        // An authority past its lease safety margin must stop issuing.
+        let authority = authority_with_plan(Some(plan())).await;
+        let (store, client) = replay_store(vec![]);
+        assert_eq!(
+            issue(
+                &store,
+                &handle,
+                &authority,
+                &fixture(2, 5, NOW_MS + 120_000),
+                &mut AttemptHistory::default(),
+                NOW_MS + 60_000
+            )
+            .await,
+            Err(IssueError::NotAuthorized)
+        );
+        assert_eq!(client.actual_requests().count(), 0);
+
+        // A grant naming another scope is not this authority's to issue.
+        let other = root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-b".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let foreign = EffectGrant::new(
+            ScopeClaimIdentity::new(
+                other.identity().clone(),
+                plan(),
+                WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1),
+                2,
+            )
+            .unwrap(),
+            "git-push".into(),
+            "repo-a".into(),
+            5,
+            NOW_MS + 60_000,
+            "grant-op-1".into(),
+        )
+        .unwrap();
+        let authority = authority_with_plan(Some(plan())).await;
+        assert_eq!(
+            issue(
+                &store,
+                &handle,
+                &authority,
+                &foreign,
+                &mut AttemptHistory::default(),
+                NOW_MS
+            )
+            .await,
+            Err(IssueError::NotAuthorized)
+        );
+        assert_eq!(client.actual_requests().count(), 0);
+
+        handle.drain().await.unwrap();
+        drop(handle);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn intake_tracks_the_projected_claim_generation() {
+        let (db_path, handle) = seeded_database("intake-gen").await;
+        let grant = fixture(2, 5, NOW_MS + 60_000);
+        let bytes = encode_grant(&grant).unwrap();
+        let epoch = NonZeroU64::new(1).unwrap();
+        let found = |bytes: Vec<u8>| response(200, &[("etag", "\"grant\"")], bytes);
+
+        // Published but not yet recorded: the projection resumes nothing.
+        let (store, _) = replay_store(vec![found(bytes.clone())]);
+        assert!(matches!(
+            intake(
+                &store,
+                &handle,
+                &expected(2, 5, NOW_MS + 60_000),
+                epoch,
+                NOW_MS
+            )
+            .await,
+            GrantIntake::Rejected(GrantRejection::Revoked)
+        ));
+
+        // Recording activates the grant, and intake accepts it.
+        let authority = authority_with_plan(Some(plan())).await;
+        let (publish, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        issue(
+            &publish,
+            &handle,
+            &authority,
+            &grant,
+            &mut AttemptHistory::default(),
+            NOW_MS,
+        )
+        .await
+        .unwrap();
+        let (store, _) = replay_store(vec![found(bytes.clone())]);
+        let accepted = intake(
+            &store,
+            &handle,
+            &expected(2, 5, NOW_MS + 60_000),
+            epoch,
+            NOW_MS,
+        )
+        .await;
+        let GrantIntake::Accepted(accepted) = accepted else {
+            panic!("expected acceptance");
+        };
+        assert_eq!(*accepted, grant);
+
+        // A reclaim at fence 3 supersedes the fence-2 caller once its lease has lapsed.
+        let target = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
+        handle
+            .record_claim(
+                genesis().identity(),
+                target.clone(),
+                NonZeroU64::new(3).unwrap(),
+                NonZeroU64::new(NOW_MS + 90_000).unwrap(),
+                NOW_MS + 30_000,
+            )
+            .await
+            .unwrap();
+        handle
+            .record_grant(
+                &identity(3),
+                epoch,
+                NonZeroU64::new(NOW_MS + 50_000).unwrap(),
+                NOW_MS + 30_000,
+            )
+            .await
+            .unwrap();
+        let (store, _) = replay_store(vec![found(bytes)]);
+        assert!(matches!(
+            intake(
+                &store,
+                &handle,
+                &expected(2, 5, NOW_MS + 60_000),
+                epoch,
+                NOW_MS + 30_001
+            )
+            .await,
+            GrantIntake::Rejected(GrantRejection::StaleFence)
+        ));
+
+        handle.drain().await.unwrap();
+        drop(handle);
         let _ = std::fs::remove_file(db_path);
     }
 }

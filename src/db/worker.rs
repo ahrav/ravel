@@ -20,10 +20,11 @@ use tokio::sync::oneshot;
 
 use crate::{
     db::projections::{
-        self, ApplyError, ApplyOutcome, SchemaError, ScopeProjectionEvent, ValidateError,
+        self, ApplyError, ApplyOutcome, ResumableWork, SchemaError, ScopeProjectionEvent,
+        ValidateError,
     },
     domain::work::WorkRef,
-    scope::{Digest, ScopeEventRef, ScopeHead, ScopeIdentity},
+    scope::{Digest, ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeIdentity},
 };
 
 #[cfg(test)]
@@ -65,10 +66,7 @@ enum Command {
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     RecordGrant {
-        scope: Box<ScopeIdentity>,
-        work: WorkRef,
-        claim_fence: NonZeroU64,
-        plan_digest: Digest,
+        identity: Box<ScopeClaimIdentity>,
         scope_epoch: NonZeroU64,
         grant_deadline_unix_ms: NonZeroU64,
         now_ms: u64,
@@ -78,7 +76,7 @@ enum Command {
         scope: Box<ScopeIdentity>,
         scope_epoch: NonZeroU64,
         now_ms: u64,
-        respond: oneshot::Sender<Result<Vec<WorkRef>, ApplyError>>,
+        respond: oneshot::Sender<Result<Vec<ResumableWork>, ApplyError>>,
     },
     Drain {
         respond: oneshot::Sender<Result<(), ApplyError>>,
@@ -346,33 +344,23 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// A grant is recorded against the exact claim fence, plan, epoch, and live lease it was
-    /// issued for.
+    /// `record_grant` records a grant only when `identity`'s claim fence, plan, scope epoch,
+    /// live lease, and admitted deadline are current.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Conflict`] when any of those bindings fails, [`ApplyError::Full`],
     /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one durable rule, every binding named"
-    )]
     pub(crate) async fn record_grant(
         &self,
-        scope: &ScopeIdentity,
-        work: WorkRef,
-        claim_fence: NonZeroU64,
-        plan_digest: Digest,
+        identity: &ScopeClaimIdentity,
         scope_epoch: NonZeroU64,
         grant_deadline_unix_ms: NonZeroU64,
         now_ms: u64,
     ) -> Result<(), ApplyError> {
-        let scope = Box::new(scope.clone());
+        let identity = Box::new(identity.clone());
         self.enqueue(|respond| Command::RecordGrant {
-            scope,
-            work,
-            claim_fence,
-            plan_digest,
+            identity,
             scope_epoch,
             grant_deadline_unix_ms,
             now_ms,
@@ -393,7 +381,7 @@ impl DbHandle {
         scope: &ScopeIdentity,
         scope_epoch: NonZeroU64,
         now_ms: u64,
-    ) -> Result<Vec<WorkRef>, ApplyError> {
+    ) -> Result<Vec<ResumableWork>, ApplyError> {
         let scope = Box::new(scope.clone());
         self.enqueue(|respond| Command::ResumableWork {
             scope,
@@ -564,10 +552,7 @@ fn run(
                 ));
             }
             Command::RecordGrant {
-                scope,
-                work,
-                claim_fence,
-                plan_digest,
+                identity,
                 scope_epoch,
                 grant_deadline_unix_ms,
                 now_ms,
@@ -575,10 +560,7 @@ fn run(
             } => {
                 let _ = respond.send(projections::record_grant(
                     &connection,
-                    &scope,
-                    &work,
-                    claim_fence,
-                    &plan_digest,
+                    &identity,
                     scope_epoch,
                     grant_deadline_unix_ms,
                     now_ms,
@@ -821,10 +803,13 @@ mod tests {
                 .await,
             handle
                 .record_grant(
-                    scope,
-                    work.clone(),
-                    fence,
-                    genesis.config_digest().clone(),
+                    &ScopeClaimIdentity::new(
+                        scope.clone(),
+                        genesis.config_digest().clone(),
+                        work.clone(),
+                        fence.get(),
+                    )
+                    .unwrap(),
                     fence,
                     fence,
                     1,

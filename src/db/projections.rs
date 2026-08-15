@@ -27,7 +27,8 @@ use crate::{
         work::{WorkId, WorkRef},
     },
     scope::{
-        Digest, EventEnvelope, ScopeEventRef, ScopeHead, ScopeIdentity, payload_type_registered,
+        Digest, EventEnvelope, ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeIdentity,
+        payload_type_registered,
     },
 };
 
@@ -76,20 +77,22 @@ const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
      WHERE scope_id = ?1 AND active_plan_digest IS NULL";
 /// A grant is bound to the exact claim fence it was issued for, so a reclaimed work revision
 /// cannot resume under a grant minted for the fence it superseded. Recording also requires the
-/// issuing authority's plan and epoch to match the scope row, a live claim lease at `?7`, and a
-/// grant deadline no later than the admitted work deadline.
+/// issuing authority's plan to match the scope row, its epoch to be no older than the projected
+/// one, a live claim lease at `?7`, and a grant deadline no later than the admitted work
+/// deadline. The projected epoch may lag an eventless authority transition, hence `<=`.
 const RECORD_GRANT_SQL: &str = "UPDATE admitted_work SET grant_fence = ?4 \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
        AND terminal_result_digest IS NULL AND claim_fence = ?4 \
        AND claim_lease_until > ?7 \
        AND deadline_unix_ms >= ?6 \
        AND EXISTS(SELECT 1 FROM scopes WHERE scope_id = ?1 \
-             AND active_plan_digest = ?5 AND scope_epoch = ?8)";
+             AND active_plan_digest = ?5 AND scope_epoch <= ?8)";
 /// Restart resumes a revision only while every binding is still current: the admitting epoch is
 /// not ahead of the controller's, the revision is the highest admitted, carries no terminal
 /// evidence, its deadline is still ahead of `?3`, the claim lease is live, and a grant is bound
 /// to that exact claim fence.
-const RESUMABLE_WORK_SQL: &str = "SELECT work_id, work_revision FROM admitted_work AS resumable \
+const RESUMABLE_WORK_SQL: &str = "SELECT work_id, work_revision, claim_fence \
+     FROM admitted_work AS resumable \
      WHERE resumable.scope_id = ?1 \
        AND resumable.deadline_unix_ms > ?3 \
        AND resumable.terminal_result_digest IS NULL \
@@ -757,18 +760,12 @@ pub(crate) fn record_terminal(
 /// # Errors
 ///
 /// Returns [`ApplyError::Conflict`] when the revision is unknown, terminal, claimed at another
-/// fence or with an expired lease, past its admitted deadline, or when the scope does not hold
-/// `plan_digest` at `scope_epoch`; and [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one durable rule, every binding named"
-)]
+/// fence or with an expired lease, when the grant deadline exceeds the admitted deadline, or
+/// when the scope's active plan is not the identity's or the projected epoch is ahead of
+/// `scope_epoch`; and [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
 pub(crate) fn record_grant(
     connection: &rusqlite::Connection,
-    scope: &ScopeIdentity,
-    work: &WorkRef,
-    claim_fence: NonZeroU64,
-    plan_digest: &Digest,
+    identity: &ScopeClaimIdentity,
     scope_epoch: NonZeroU64,
     grant_deadline_unix_ms: NonZeroU64,
     now_ms: u64,
@@ -776,11 +773,11 @@ pub(crate) fn record_grant(
     let updated = connection.execute(
         RECORD_GRANT_SQL,
         params![
-            scope.scope_id().as_str(),
-            work.id().as_str(),
-            stored_u64(work.revision())?,
-            stored_u64(claim_fence.get())?,
-            plan_digest.as_str(),
+            identity.scope().scope_id().as_str(),
+            identity.work().id().as_str(),
+            stored_u64(identity.work().revision())?,
+            stored_u64(identity.claim_fence().get())?,
+            identity.plan_digest().as_str(),
             stored_u64(grant_deadline_unix_ms.get())?,
             stored_u64(now_ms)?,
             stored_u64(scope_epoch.get())?,
@@ -790,6 +787,23 @@ pub(crate) fn record_grant(
         Ok(())
     } else {
         Err(ApplyError::Conflict)
+    }
+}
+
+/// A resumable revision and the claim fence its grant is bound to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumableWork {
+    work: WorkRef,
+    claim_fence: NonZeroU64,
+}
+
+impl ResumableWork {
+    pub fn work(&self) -> &WorkRef {
+        &self.work
+    }
+
+    pub fn claim_fence(&self) -> NonZeroU64 {
+        self.claim_fence
     }
 }
 
@@ -804,7 +818,7 @@ pub(crate) fn resumable_work(
     scope: &ScopeIdentity,
     scope_epoch: NonZeroU64,
     now_ms: u64,
-) -> Result<Vec<WorkRef>, ApplyError> {
+) -> Result<Vec<ResumableWork>, ApplyError> {
     let mut statement = connection.prepare(RESUMABLE_WORK_SQL)?;
     let rows = statement
         .query_map(
@@ -813,10 +827,30 @@ pub(crate) fn resumable_work(
                 stored_u64(scope_epoch.get())?,
                 stored_u64(now_ms)?
             ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
         )?
         .collect::<Result<Vec<_>, _>>()?;
-    work_refs(rows)
+    rows.into_iter()
+        .map(|(work_id, revision, claim_fence)| {
+            let claim_fence = u64::try_from(claim_fence)
+                .ok()
+                .and_then(NonZeroU64::new)
+                .ok_or(ApplyError::DatabaseOperationFailed)?;
+            Ok(ResumableWork {
+                work: WorkRef::new(
+                    WorkId::new(work_id).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                    u64::try_from(revision).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                ),
+                claim_fence,
+            })
+        })
+        .collect()
 }
 
 /// Derives one scope's ready set from admitted work, dependencies, revision, claim state,
@@ -2368,7 +2402,14 @@ mod tests {
         resumable_work(connection, scope, epoch(scope_epoch), now_ms)
             .unwrap()
             .into_iter()
-            .map(|work| format!("{}@{}", work.id().as_str(), work.revision()))
+            .map(|row| {
+                format!(
+                    "{}@{}#{}",
+                    row.work().id().as_str(),
+                    row.work().revision(),
+                    row.claim_fence()
+                )
+            })
             .collect()
     }
 
@@ -2391,16 +2432,26 @@ mod tests {
         fence: NonZeroU64,
         scope_epoch: u64,
     ) -> Result<(), ApplyError> {
-        record_grant(
-            connection,
-            scope,
-            work,
-            fence,
-            &Digest::new(DIGEST_2.into()).unwrap(),
-            epoch(scope_epoch),
-            NonZeroU64::new(MAX_STORED_INTEGER).unwrap(),
-            1_000,
+        let deadline = NonZeroU64::new(MAX_STORED_INTEGER).unwrap();
+        grant_bounded(connection, scope, work, fence, scope_epoch, deadline)
+    }
+
+    fn grant_bounded(
+        connection: &rusqlite::Connection,
+        scope: &ScopeIdentity,
+        work: &WorkRef,
+        fence: NonZeroU64,
+        scope_epoch: u64,
+        deadline: NonZeroU64,
+    ) -> Result<(), ApplyError> {
+        let identity = ScopeClaimIdentity::new(
+            scope.clone(),
+            Digest::new(DIGEST_2.into()).unwrap(),
+            work.clone(),
+            fence.get(),
         )
+        .unwrap();
+        record_grant(connection, &identity, epoch(scope_epoch), deadline, 1_000)
     }
 
     #[test]
@@ -2417,7 +2468,7 @@ mod tests {
         assert!(resumable(&connection, &scope, 3, 1_000).is_empty());
 
         grant_at(&connection, &scope, &target, fence, 3).unwrap();
-        assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1"]);
+        assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1#2"]);
 
         // An expired claim lease is not current.
         assert!(resumable(&connection, &scope, 31_000, 31_000).is_empty());
@@ -2428,22 +2479,22 @@ mod tests {
         record_claim(&connection, &scope, &target, higher, lease, 31_000).unwrap();
         assert!(resumable(&connection, &scope, 3, 1_000).is_empty());
         grant_at(&connection, &scope, &target, higher, 3).unwrap();
-        assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1"]);
+        assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1#3"]);
 
         // Work admitted under a newer epoch than this controller holds is not resumable.
         let ahead = work("work-b", 1);
         admit_work(&mut connection, &scope, &ahead, &[], epoch(5)).unwrap();
         record_claim(&connection, &scope, &ahead, fence, lease, 1_000).unwrap();
         grant_at(&connection, &scope, &ahead, fence, 3).unwrap();
-        assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1"]);
+        assert_eq!(resumable(&connection, &scope, 3, 1_000), vec!["work-a@1#3"]);
         assert_eq!(
             resumable(&connection, &scope, 5, 1_000),
-            vec!["work-a@1", "work-b@1"]
+            vec!["work-a@1#3", "work-b@1#2"]
         );
 
         // A superseding revision withdraws its predecessor, grant and all.
         admit_work(&mut connection, &scope, &work("work-a", 2), &[], epoch(3)).unwrap();
-        assert_eq!(resumable(&connection, &scope, 5, 1_000), vec!["work-b@1"]);
+        assert_eq!(resumable(&connection, &scope, 5, 1_000), vec!["work-b@1#2"]);
 
         // Terminal evidence ends resumption.
         record_terminal(
@@ -2502,6 +2553,74 @@ mod tests {
             admit_work(&mut connection, &scope, &target, &[], epoch(2)),
             Err(ApplyError::Conflict)
         );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn grant_recording_refuses_every_stale_binding() {
+        let (db_path, mut connection, scope) = admitted_scope("grant-refusals");
+        seed_active_plan(&connection, &scope, 3);
+        let target = work("work-a", 1);
+        let fence = NonZeroU64::new(2).unwrap();
+        let lease = NonZeroU64::new(31_000).unwrap();
+        admit_work(&mut connection, &scope, &target, &[], epoch(3)).unwrap();
+        record_claim(&connection, &scope, &target, fence, lease, 1_000).unwrap();
+        let identity = |digest: &str| {
+            ScopeClaimIdentity::new(
+                scope.clone(),
+                Digest::new(digest.into()).unwrap(),
+                target.clone(),
+                fence.get(),
+            )
+            .unwrap()
+        };
+        let deadline = NonZeroU64::new(MAX_STORED_INTEGER).unwrap();
+
+        // A lease that ends at `now_ms` is already expired.
+        assert_eq!(
+            record_grant(&connection, &identity(DIGEST_2), epoch(3), deadline, 31_000),
+            Err(ApplyError::Conflict)
+        );
+        // A plan the scope does not hold.
+        assert_eq!(
+            record_grant(&connection, &identity(DIGEST_1), epoch(3), deadline, 1_000),
+            Err(ApplyError::Conflict)
+        );
+        // An authority epoch behind the projection is superseded.
+        assert_eq!(
+            record_grant(&connection, &identity(DIGEST_2), epoch(2), deadline, 1_000),
+            Err(ApplyError::Conflict)
+        );
+        // A grant deadline beyond the admitted work deadline.
+        assert_eq!(
+            record_grant(
+                &connection,
+                &identity(DIGEST_2),
+                epoch(3),
+                NonZeroU64::new(MAX_STORED_INTEGER + 1).unwrap(),
+                1_000
+            ),
+            Err(ApplyError::Conflict)
+        );
+
+        // An authority epoch ahead of the projection records, and re-recording the same fence
+        // is idempotent.
+        record_grant(&connection, &identity(DIGEST_2), epoch(4), deadline, 1_000).unwrap();
+        record_grant(&connection, &identity(DIGEST_2), epoch(4), deadline, 1_000).unwrap();
+
+        // record_grant created no work row and wrote no terminal result.
+        let (rows, terminal): (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM admitted_work), \
+                 (SELECT COUNT(*) FROM admitted_work \
+                    WHERE terminal_result_digest IS NOT NULL)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, terminal), (1, 0));
 
         drop(connection);
         fs::remove_file(db_path).unwrap();
@@ -2666,18 +2785,20 @@ mod tests {
         .unwrap();
         record_grant(
             &connection,
-            &scope,
-            &work("work-a", 1),
-            epoch(1),
-            &plan_digest,
+            &ScopeClaimIdentity::new(scope.clone(), plan_digest.clone(), work("work-a", 1), 1)
+                .unwrap(),
             epoch(1),
             NonZeroU64::new(9_000).unwrap(),
             1,
         )
         .unwrap();
+        let resumed = resumable_work(&connection, &scope, epoch(1), 1).unwrap();
         assert_eq!(
-            resumable_work(&connection, &scope, epoch(1), 1).unwrap(),
-            [work("work-a", 1)]
+            resumed
+                .iter()
+                .map(|row| (row.work().clone(), row.claim_fence().get()))
+                .collect::<Vec<_>>(),
+            [(work("work-a", 1), 1)]
         );
         assert_eq!(
             resumable_work(&connection, &scope, epoch(1), 10_000).unwrap(),

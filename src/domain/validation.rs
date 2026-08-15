@@ -19,6 +19,7 @@ pub enum ValidationError {
     InvalidParent,
     InvalidFence,
     InvalidExpiry,
+    OutOfRange,
 }
 
 impl fmt::Display for ValidationError {
@@ -30,6 +31,7 @@ impl fmt::Display for ValidationError {
             Self::InvalidParent => "invalid event parent",
             Self::InvalidFence => "invalid fence",
             Self::InvalidExpiry => "invalid expiry",
+            Self::OutOfRange => "value out of stored range",
         })
     }
 }

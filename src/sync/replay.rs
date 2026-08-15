@@ -1342,6 +1342,36 @@ mod tests {
         ));
         drop(handle);
         assert_eq!(admitted_rows(&path), first);
+
+        // Reject a head whose plan digest differs from its admission event's plan digest.
+        let disagreeing = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            "admit-plan-1".into(),
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&disagreeing).unwrap()),
+            event_response(encoded.stored_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                admissible.stored_bytes().to_vec(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
+        ));
+        drop(handle);
+        // The projection holds the event's admission, not the head's claim.
+        assert_eq!(admitted_rows(&path), first);
         fs::remove_file(&path).unwrap();
     }
 }

@@ -3,18 +3,32 @@
 //! A proposal binds its exact root scope, objective, parent plan, and typed bases in its own
 //! bytes. Construction normalizes the basis list into one total order and drops duplicates, so
 //! two callers that cite the same bases in different order derive byte-identical canonical bytes
-//! and one `plan_digest`. The content address is `SHA-256("ravel.plan.proposal\0" || CBOR)`,
-//! matching how [`crate::scope::root_scope_id`] domain-separates its own seed.
+//! and one `plan_digest`.
+//!
+//! The content address is `SHA-256("ravel.plan.proposal\0" || CBOR)`, matching how
+//! [`crate::scope::root_scope_id`] domain-separates its own seed. It is therefore *not*
+//! `sha256(canonical_bytes)`, which is the digest every store-side integrity check recomputes: a
+//! publisher that puts these bytes under a content-addressed key must prepend the same domain or
+//! carry the plain digest separately. The `ciborium` lockfile pin is byte-affecting for this
+//! address, as the `zstd-sys` pin is for event bytes.
 //!
 //! [`validate_proposal`] performs no I/O: every durable fact it needs arrives in
 //! [`ProposalFacts`], which the admitting transaction resolves. That is what "fails before
-//! mutation" means here — the gate cannot reach durable state to mutate it.
+//! mutation" means here — the gate cannot reach durable state to mutate it. Every *basis*
+//! rejection is reachable from a unit test; [`ProposalError::CyclicBasis`] and
+//! [`ProposalError::InvalidEncoding`] are unreachable by construction and documented where they
+//! are raised.
+//!
+//! Two shapes are admissible by design rather than by omission. An empty basis list is allowed,
+//! because fixed initial work is proposed from the objective alone. Citing the prior revision is
+//! optional, and because bases are part of the content address, a proposal that cites it and one
+//! that does not are two distinct plans rather than one plan proposed twice.
 //!
 //! The root-only MVP has exactly two basis kinds. Child certificates and delegation bases are
 //! post-signal work and are not representable. `root_genesis` is the only supported
 //! planning-input payload, because it is the durable objective and configuration record and no
 //! observation payload type exists yet; every other payload type fails closed, exactly as
-//! [`crate::scope::payload_type_registered`] does for events.
+//! `payload_type_registered` does for events.
 
 use std::{error::Error, fmt};
 
@@ -92,7 +106,8 @@ impl ObservationFact {
 /// The durable facts one validation call is decided against.
 ///
 /// The caller resolves these from the scope head and projection before validating, which keeps
-/// this module free of I/O and makes every rejection reachable from a unit test.
+/// this module free of I/O and makes every basis rejection reachable from a unit test.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProposalFacts<'a> {
     scope: &'a ScopeIdentity,
     objective_digest: &'a Digest,
@@ -104,6 +119,11 @@ pub struct ProposalFacts<'a> {
 impl<'a> ProposalFacts<'a> {
     /// `tail_sequence` is the highest sequence the projection has applied; a citation above it
     /// names an event this scope has not seen.
+    ///
+    /// `observations` must hold at most one fact per sequence, and the first match at a sequence
+    /// decides the verdict. `applied_scope_events` is keyed on `(scope_id, sequence)`, so a query
+    /// scoped to one scope already satisfies this; a caller that merges scopes or eras must
+    /// deduplicate first, or slice order silently chooses which rejection fires.
     pub fn new(
         scope: &'a ScopeIdentity,
         objective_digest: &'a Digest,
@@ -134,9 +154,6 @@ impl PlanProposal {
     /// Normalizes `bases` into the one order this record is content-addressed over:
     /// observations before prior revisions, observations by `(sequence, digest)`, prior revisions
     /// by digest, duplicates removed.
-    ///
-    /// Construction cannot fail: every argument is already a validated domain value, and
-    /// ordering has no rejectable input.
     pub fn new(
         scope_id: ScopeId,
         objective_digest: Digest,
@@ -144,7 +161,8 @@ impl PlanProposal {
         mut bases: Vec<ProposalBasis>,
     ) -> Self {
         bases.sort_unstable_by(|left, right| sort_key(left).cmp(&sort_key(right)));
-        // The sort key determines the basis, so equal keys are equal values and land adjacent.
+        // `dedup` drops only adjacent equals. The sort key carries the variant tag and every
+        // field of that variant, so equal keys are equal values and sorting makes them adjacent.
         bases.dedup();
         Self {
             scope_id,
@@ -170,6 +188,12 @@ impl PlanProposal {
         &self.bases
     }
 
+    /// Derives the canonical bytes and the content address they hash to.
+    ///
+    /// Both failure paths map to [`ProposalError::InvalidEncoding`] and neither is reachable:
+    /// CBOR serialization of `&str`, `u64`, and `Option<&str>` has no failing case, and a
+    /// SHA-256 rendered with `{:x}` is always 64 lowercase hexadecimal bytes. The variant keeps
+    /// the boundary total rather than forcing a panic here.
     fn encode(&self) -> Result<(Vec<u8>, Digest), ProposalError> {
         let wire = WirePlanProposal {
             scope_id: self.scope_id.as_str(),
@@ -189,13 +213,22 @@ impl PlanProposal {
 }
 
 /// A proposal whose every binding held, paired with the bytes that address it.
+///
+/// The scope is inside the opaque bytes and there is no decode path, so it is carried out
+/// separately: a caller keying these bytes by scope reads it from here rather than from a
+/// `PlanProposal` it has to keep alongside and could confuse for another scope's.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissibleProposal {
+    scope_id: ScopeId,
     canonical_bytes: Vec<u8>,
     plan_digest: Digest,
 }
 
 impl AdmissibleProposal {
+    pub fn scope_id(&self) -> &ScopeId {
+        &self.scope_id
+    }
+
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
@@ -206,6 +239,10 @@ impl AdmissibleProposal {
 }
 
 /// Decides one proposal against the facts the caller resolved, without touching durable state.
+///
+/// Bases are decided in canonical order, observations before prior revisions, so a proposal
+/// carrying two faults reports the first one in that order and reports it identically for every
+/// equivalent input.
 ///
 /// # Errors
 ///
@@ -222,7 +259,8 @@ pub fn validate_proposal(
     proposal: &PlanProposal,
     facts: &ProposalFacts<'_>,
 ) -> Result<AdmissibleProposal, ProposalError> {
-    if &proposal.scope_id != facts.scope.scope_id() {
+    let scope_id = facts.scope.scope_id();
+    if &proposal.scope_id != scope_id {
         return Err(ProposalError::ScopeMismatch);
     }
     if &proposal.objective_digest != facts.objective_digest {
@@ -244,16 +282,16 @@ pub fn validate_proposal(
                 if event.sequence() > facts.tail_sequence {
                     return Err(ProposalError::MissingBasis);
                 }
-                // Facts are resolved by sequence, so a digest that disagrees at a sequence the
-                // scope has applied is stale evidence rather than a missing one.
                 let fact = facts
                     .observations
                     .iter()
                     .find(|fact| fact.event.sequence() == event.sequence())
                     .ok_or(ProposalError::MissingBasis)?;
-                if &fact.scope_id != facts.scope.scope_id() {
+                if &fact.scope_id != scope_id {
                     return Err(ProposalError::CrossScopeBasis);
                 }
+                // Facts resolve by sequence, so a digest that disagrees at a sequence this scope
+                // has applied is stale evidence rather than a missing one.
                 if fact.event.digest() != event.digest() {
                     return Err(ProposalError::StaleBasis);
                 }
@@ -264,10 +302,13 @@ pub fn validate_proposal(
         }
     }
     let (canonical_bytes, plan_digest) = proposal.encode()?;
+    // Unreachable by construction: reaching it requires a SHA-256 fixed point. Covered only
+    // through `is_cyclic` directly.
     if is_cyclic(&plan_digest, proposal) {
         return Err(ProposalError::CyclicBasis);
     }
     Ok(AdmissibleProposal {
+        scope_id: proposal.scope_id.clone(),
         canonical_bytes,
         plan_digest,
     })
@@ -287,8 +328,8 @@ fn is_cyclic(plan_digest: &Digest, proposal: &PlanProposal) -> bool {
         })
 }
 
-/// Total order over bases. The leading tag keeps observations ahead of prior revisions, and the
-/// remaining fields determine the basis, so equal keys mean equal values.
+/// Total order over bases: the leading tag keeps observations ahead of prior revisions, then
+/// observations order by sequence before digest.
 fn sort_key(basis: &ProposalBasis) -> (u8, u64, &str) {
     match basis {
         ProposalBasis::Observation { event } => (0, event.sequence(), event.digest().as_str()),
@@ -339,6 +380,12 @@ mod tests {
 
     use super::*;
 
+    /// Pins the content address of the fixture proposal, which no relation between two
+    /// implementation runs can pin: it is the only assertion that fails if the domain prefix is
+    /// dropped, a wire field is renamed, or two wire fields swap declaration order.
+    const GENESIS_PLAN_DIGEST: &str =
+        "606c97aae5c1d8cbdd129d6af94b9200d97de3b09e506dc89a188849e87fc4ca";
+
     fn digest(seed: u8) -> Digest {
         Digest::new(format!("{seed:02x}").repeat(32)).unwrap()
     }
@@ -359,15 +406,20 @@ mod tests {
         ScopeEventRef::new(sequence, digest(seed)).unwrap()
     }
 
+    fn fact(scope_id: ScopeId, sequence: u64, seed: u8, payload_type: &str) -> ObservationFact {
+        ObservationFact::new(scope_id, event(sequence, seed), payload_type.to_owned())
+    }
+
     fn genesis_fact() -> ObservationFact {
-        ObservationFact::new(
+        fact(
             scope().scope_id().clone(),
-            event(1, 0xaa),
-            ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+            1,
+            0xaa,
+            ROOT_GENESIS_PAYLOAD_TYPE,
         )
     }
 
-    /// A first root plan: no active plan, one observation basis naming the genesis event.
+    /// A first root plan: no active plan, bases cited against the genesis event.
     fn genesis_proposal(bases: Vec<ProposalBasis>) -> PlanProposal {
         PlanProposal::new(scope().scope_id().clone(), digest(0x11), None, bases)
     }
@@ -378,8 +430,14 @@ mod tests {
         }
     }
 
+    fn prior_basis(seed: u8) -> ProposalBasis {
+        ProposalBasis::PriorRevision {
+            plan_digest: digest(seed),
+        }
+    }
+
     #[test]
-    fn genesis_proposal_binds_its_identities_and_admits_the_root_genesis_basis() {
+    fn genesis_proposal_binds_its_identities_and_addresses_its_own_bytes() {
         let scope = scope();
         let objective = digest(0x11);
         let proposal = genesis_proposal(vec![observation_basis(1, 0xaa)]);
@@ -395,35 +453,12 @@ mod tests {
             &ProposalFacts::new(&scope, &objective, None, 1, &facts),
         )
         .unwrap();
-        assert!(!admissible.canonical_bytes().is_empty());
-        // The address is derived, so it must not collide with any input digest.
-        assert_ne!(admissible.plan_digest(), &objective);
-    }
-
-    #[test]
-    fn a_successor_admits_the_active_plan_as_its_parent_and_prior_revision() {
-        let scope = scope();
-        let objective = digest(0x11);
-        let active = digest(0x22);
-        let proposal = PlanProposal::new(
-            scope.scope_id().clone(),
-            objective.clone(),
-            Some(active.clone()),
-            vec![
-                ProposalBasis::PriorRevision {
-                    plan_digest: active.clone(),
-                },
-                observation_basis(1, 0xaa),
-            ],
-        );
-        let facts = [genesis_fact()];
-
-        assert!(
-            validate_proposal(
-                &proposal,
-                &ProposalFacts::new(&scope, &objective, Some(&active), 1, &facts),
-            )
-            .is_ok()
+        assert_eq!(admissible.scope_id(), scope.scope_id());
+        assert_eq!(admissible.plan_digest().as_str(), GENESIS_PLAN_DIGEST);
+        // The address is domain-separated, so it is not the plain digest of the same bytes.
+        assert_ne!(
+            admissible.plan_digest().as_str(),
+            format!("{:x}", Sha256::digest(admissible.canonical_bytes()))
         );
     }
 
@@ -433,20 +468,13 @@ mod tests {
         let objective = digest(0x11);
         let facts = [
             genesis_fact(),
-            ObservationFact::new(
-                scope.scope_id().clone(),
-                event(2, 0xbb),
-                ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
-            ),
+            fact(scope.scope_id().clone(), 2, 0xbb, ROOT_GENESIS_PAYLOAD_TYPE),
         ];
         let active = digest(0x22);
-        let prior = ProposalBasis::PriorRevision {
-            plan_digest: active.clone(),
-        };
         let ordered = [
             observation_basis(1, 0xaa),
             observation_basis(2, 0xbb),
-            prior.clone(),
+            prior_basis(0x22),
         ];
 
         let mut admitted = Vec::new();
@@ -454,16 +482,16 @@ mod tests {
             ordered.to_vec(),
             // Reversed, and with every basis duplicated.
             vec![
-                prior.clone(),
+                prior_basis(0x22),
                 observation_basis(2, 0xbb),
                 observation_basis(1, 0xaa),
-                prior.clone(),
+                prior_basis(0x22),
                 observation_basis(1, 0xaa),
                 observation_basis(2, 0xbb),
             ],
             vec![
                 observation_basis(2, 0xbb),
-                prior.clone(),
+                prior_basis(0x22),
                 observation_basis(1, 0xaa),
             ],
         ] {
@@ -485,6 +513,33 @@ mod tests {
         assert!(admitted.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
+    /// Each tiebreak below is invisible when the fixture's sequence order and digest order agree,
+    /// so every pair here makes them disagree.
+    #[test]
+    fn canonical_order_ranks_sequence_over_digest_and_orders_prior_revisions() {
+        let scope_id = scope().scope_id().clone();
+
+        for (input, expected) in [
+            (
+                vec![observation_basis(2, 0xaa), observation_basis(1, 0xbb)],
+                vec![observation_basis(1, 0xbb), observation_basis(2, 0xaa)],
+            ),
+            (
+                vec![observation_basis(1, 0xbb), observation_basis(1, 0xaa)],
+                vec![observation_basis(1, 0xaa), observation_basis(1, 0xbb)],
+            ),
+            (
+                vec![prior_basis(0x33), prior_basis(0x22)],
+                vec![prior_basis(0x22), prior_basis(0x33)],
+            ),
+        ] {
+            assert_eq!(
+                PlanProposal::new(scope_id.clone(), digest(0x11), None, input).bases(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn every_header_and_basis_field_changes_the_plan_digest() {
         let scope = scope();
@@ -503,9 +558,7 @@ mod tests {
             ),
             genesis_proposal(vec![observation_basis(2, 0xaa)]),
             genesis_proposal(vec![observation_basis(1, 0xbb)]),
-            genesis_proposal(vec![ProposalBasis::PriorRevision {
-                plan_digest: digest(0xaa),
-            }]),
+            genesis_proposal(vec![prior_basis(0xaa)]),
             genesis_proposal(vec![]),
             PlanProposal::new(
                 scope.scope_id().clone(),
@@ -525,34 +578,26 @@ mod tests {
     }
 
     #[test]
-    fn every_rejection_category_fails_closed_before_any_mutation() {
+    fn every_basis_rejection_fails_closed_before_any_mutation() {
         let scope = scope();
+        let scope_id = scope.scope_id().clone();
         let objective = digest(0x11);
         let active = digest(0x22);
         let genesis = [genesis_fact()];
-        let cross_scope = [ObservationFact::new(
-            other_scope_id(),
-            event(1, 0xaa),
-            ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
-        )];
-        let wrong_digest = [ObservationFact::new(
-            scope.scope_id().clone(),
-            event(1, 0xcc),
-            ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
-        )];
-        let successor_payload = [ObservationFact::new(
-            scope.scope_id().clone(),
-            event(1, 0xaa),
-            TEST_SUCCESSOR_PAYLOAD_TYPE.to_owned(),
-        )];
-        let unknown_payload = [ObservationFact::new(
-            scope.scope_id().clone(),
-            event(1, 0xaa),
-            "plan_admitted".to_owned(),
-        )];
+        let cross_scope = [fact(other_scope_id(), 1, 0xaa, ROOT_GENESIS_PAYLOAD_TYPE)];
+        let wrong_digest = [fact(scope_id.clone(), 1, 0xcc, ROOT_GENESIS_PAYLOAD_TYPE)];
+        // Valid in every respect except that the scope has not applied sequence 2 yet, so only
+        // the projected-tail guard can reject it.
+        let beyond_tail = [
+            genesis_fact(),
+            fact(scope_id.clone(), 2, 0xbb, ROOT_GENESIS_PAYLOAD_TYPE),
+        ];
+        let successor_payload = [fact(scope_id.clone(), 1, 0xaa, TEST_SUCCESSOR_PAYLOAD_TYPE)];
+        // A payload type that will exist later is still not a planning input today.
+        let future_payload = [fact(scope_id.clone(), 1, 0xaa, "plan_admitted")];
         let one_observation = vec![observation_basis(1, 0xaa)];
 
-        let cases: [(PlanProposal, Option<&Digest>, u64, &[ObservationFact], _); 10] = [
+        let cases: [(PlanProposal, Option<&Digest>, u64, &[ObservationFact], _); 14] = [
             (
                 PlanProposal::new(
                     other_scope_id(),
@@ -567,7 +612,7 @@ mod tests {
             ),
             (
                 PlanProposal::new(
-                    scope.scope_id().clone(),
+                    scope_id.clone(),
                     digest(0x99),
                     None,
                     one_observation.clone(),
@@ -577,7 +622,7 @@ mod tests {
                 &genesis,
                 ProposalError::ObjectiveMismatch,
             ),
-            // A citation the scope has not applied yet.
+            // Above the projected tail, and no fact resolves there either.
             (
                 genesis_proposal(vec![observation_basis(2, 0xaa)]),
                 None,
@@ -585,9 +630,17 @@ mod tests {
                 &genesis,
                 ProposalError::MissingBasis,
             ),
+            // Above the projected tail even though a matching fact was supplied.
+            (
+                genesis_proposal(vec![observation_basis(2, 0xbb)]),
+                None,
+                1,
+                &beyond_tail,
+                ProposalError::MissingBasis,
+            ),
             // Within the tail, but no fact was resolved at that sequence.
             (
-                genesis_proposal(vec![observation_basis(1, 0xaa)]),
+                genesis_proposal(one_observation.clone()),
                 None,
                 1,
                 &[],
@@ -600,10 +653,10 @@ mod tests {
                 &wrong_digest,
                 ProposalError::StaleBasis,
             ),
-            // Parent disagrees with the active plan in both directions.
+            // The three illegal parent/active combinations.
             (
                 PlanProposal::new(
-                    scope.scope_id().clone(),
+                    scope_id.clone(),
                     objective.clone(),
                     Some(digest(0x33)),
                     one_observation.clone(),
@@ -620,11 +673,30 @@ mod tests {
                 &genesis,
                 ProposalError::StaleBasis,
             ),
+            // A parent naming a plan this scope does not hold at all.
+            (
+                PlanProposal::new(
+                    scope_id.clone(),
+                    objective.clone(),
+                    Some(active.clone()),
+                    one_observation.clone(),
+                ),
+                None,
+                1,
+                &genesis,
+                ProposalError::StaleBasis,
+            ),
             // A prior revision with no active plan to supersede.
             (
-                genesis_proposal(vec![ProposalBasis::PriorRevision {
-                    plan_digest: active.clone(),
-                }]),
+                genesis_proposal(vec![prior_basis(0x22)]),
+                None,
+                1,
+                &genesis,
+                ProposalError::StaleBasis,
+            ),
+            // Two citations at one sequence: the lower digest passes, the other is stale.
+            (
+                genesis_proposal(vec![observation_basis(1, 0xaa), observation_basis(1, 0xbb)]),
                 None,
                 1,
                 &genesis,
@@ -644,33 +716,51 @@ mod tests {
                 &successor_payload,
                 ProposalError::UnsupportedPlanningInput,
             ),
+            (
+                genesis_proposal(one_observation.clone()),
+                None,
+                1,
+                &future_payload,
+                ProposalError::UnsupportedPlanningInput,
+            ),
         ];
 
         for (proposal, active_plan, tail, observations, expected) in cases {
+            let facts = ProposalFacts::new(&scope, &objective, active_plan, tail, observations);
             assert_eq!(
-                validate_proposal(
-                    &proposal,
-                    &ProposalFacts::new(&scope, &objective, active_plan, tail, observations),
-                ),
+                validate_proposal(&proposal, &facts),
                 Err(expected),
-                "{proposal:?}"
+                "{proposal:?} against {facts:?}"
             );
         }
 
-        // A payload type that will exist later is still not a planning input today.
+        // Canonical order decides which of two faults is reported: observations rank ahead of
+        // prior revisions, so the unseen citation wins over the stale prior revision.
         assert_eq!(
             validate_proposal(
-                &genesis_proposal(one_observation),
-                &ProposalFacts::new(&scope, &objective, None, 1, &unknown_payload),
+                &genesis_proposal(vec![observation_basis(2, 0xaa), prior_basis(0x22)]),
+                &ProposalFacts::new(&scope, &objective, None, 1, &genesis),
             ),
-            Err(ProposalError::UnsupportedPlanningInput)
+            Err(ProposalError::MissingBasis)
+        );
+        // An empty basis list carries no rejection rule of its own.
+        assert!(
+            validate_proposal(
+                &genesis_proposal(Vec::new()),
+                &ProposalFacts::new(&scope, &objective, None, 1, &genesis),
+            )
+            .is_ok()
         );
     }
 
+    /// Predicate-level only: `validate_proposal` cannot reach this without a SHA-256 fixed point.
     #[test]
     fn a_proposal_naming_its_own_address_is_cyclic() {
         let scope_id = scope().scope_id().clone();
         let own = digest(0x44);
+        let observation = ProposalBasis::Observation {
+            event: ScopeEventRef::new(1, own.clone()).unwrap(),
+        };
 
         assert!(is_cyclic(
             &own,
@@ -688,14 +778,11 @@ mod tests {
                 digest(0x11),
                 None,
                 vec![ProposalBasis::PriorRevision {
-                    plan_digest: own.clone(),
+                    plan_digest: own.clone()
                 }],
             ),
         ));
         // An observation whose event digest matches is not a lineage edge.
-        let observation = ProposalBasis::Observation {
-            event: ScopeEventRef::new(1, own.clone()).unwrap(),
-        };
         assert!(!is_cyclic(
             &own,
             &PlanProposal::new(scope_id, digest(0x11), None, vec![observation]),

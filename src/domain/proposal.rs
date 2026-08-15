@@ -42,6 +42,8 @@ const CBOR_RECURSION_LIMIT: usize = 16;
 pub const MAX_STORED_INTEGER: u64 = 9_999_999_999_999_999;
 /// Cap on the CBOR body of one plan object.
 pub const MAX_PLAN_CANONICAL_BYTES: usize = 1024 * 1024;
+/// Cap on one stored plan object: the domain prefix plus the CBOR body.
+pub const MAX_PLAN_STORED_BYTES: usize = PLAN_PROPOSAL_DOMAIN.len() + MAX_PLAN_CANONICAL_BYTES;
 /// Revision every work row of a first admitted plan carries.
 pub const INITIAL_WORK_REVISION: u64 = 1;
 
@@ -437,7 +439,7 @@ pub fn decode_plan(
     stored_bytes: &[u8],
     expected_digest: &Digest,
 ) -> Result<PlanProposal, ProposalError> {
-    if stored_bytes.len() > PLAN_PROPOSAL_DOMAIN.len() + MAX_PLAN_CANONICAL_BYTES {
+    if stored_bytes.len() > MAX_PLAN_STORED_BYTES {
         return Err(ProposalError::PlanTooLarge);
     }
     let cbor = stored_bytes
@@ -479,9 +481,6 @@ fn validate_work_graph(work_specs: &[WorkSpec]) -> Result<(), ProposalError> {
             if !declared.contains(dependency.as_str()) {
                 return Err(ProposalError::UnknownDependency);
             }
-            if dependency == &spec.work_id {
-                return Err(ProposalError::CyclicDependency);
-            }
         }
     }
     if has_cycle(work_specs) {
@@ -490,7 +489,7 @@ fn validate_work_graph(work_specs: &[WorkSpec]) -> Result<(), ProposalError> {
     Ok(())
 }
 
-/// Iterative depth-first search over a set already proven closed and free of self-edges.
+/// Iterative depth-first search over a set already proven closed; a self-edge is a cycle here.
 fn has_cycle(work_specs: &[WorkSpec]) -> bool {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum Mark {
@@ -499,11 +498,12 @@ fn has_cycle(work_specs: &[WorkSpec]) -> bool {
         Done,
     }
 
-    let index = |work_id: &str| {
-        work_specs
-            .binary_search_by(|spec| spec.work_id.as_str().cmp(work_id))
-            .ok()
-    };
+    let index: std::collections::BTreeMap<&str, usize> = work_specs
+        .iter()
+        .enumerate()
+        .map(|(position, spec)| (spec.work_id.as_str(), position))
+        .collect();
+    let index = |work_id: &str| index.get(work_id).copied();
     let mut marks = vec![Mark::Unseen; work_specs.len()];
     // Each frame holds one node and how many of its edges are walked, so a deep chain cannot
     // overflow the stack.

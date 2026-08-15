@@ -15,9 +15,11 @@
 use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 
 use crate::{
+    domain::proposal::AdmissibleProposal,
     scope::{
-        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, ScopeAuthority, ScopeHead, ScopeIdentity,
-        decode_head, decode_plan_admitted_event, encode_head, scope_event_key, scope_head_key,
+        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PlanAdmittedEvent, ScopeAuthority, ScopeHead,
+        ScopeIdentity, decode_head, decode_plan_admitted_event, encode_head,
+        encode_plan_admitted_event, plan_key, scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
 };
@@ -231,14 +233,6 @@ impl fmt::Display for ScopeAppendError {
 
 impl Error for ScopeAppendError {}
 
-/// One attempt-history slot per object an admission writes.
-#[derive(Default)]
-pub struct AdmissionHistories {
-    pub plan: AttemptHistory,
-    pub event: AttemptHistory,
-    pub head: AttemptHistory,
-}
-
 /// The one rule for how an event may move a head's active plan.
 ///
 /// A `plan_admitted` event moves it from none to exactly the digest its own payload names; every
@@ -284,20 +278,19 @@ pub async fn append_plan_admitted(
     store: &S3Store,
     parent: ScopeHeadParent,
     scope: &ScopeIdentity,
-    admissible: &crate::domain::proposal::AdmissibleProposal,
-    event: &crate::scope::PlanAdmittedEvent,
-    histories: &mut AdmissionHistories,
+    admissible: &AdmissibleProposal,
+    event: &PlanAdmittedEvent,
+    histories: [&mut AttemptHistory; 3],
 ) -> Result<ScopeHeadCommitOutcome, ScopeAppendError> {
-    let AdmissionHistories {
-        plan: plan_history,
-        event: event_history,
-        head: head_history,
-    } = histories;
+    let [plan_history, event_history, head_history] = histories;
     let ScopeHeadParent::Existing(observed) = &parent else {
         // Admission always succeeds a genesis head, so there is a parent to fence against.
         return Err(ScopeAppendError::InvalidInput);
     };
+    // Same pre-publication trick as `append_root`: refuse a doomed attempt before it writes
+    // immutable objects. `ScopeHeadTransition::new` re-proves the plan rule after publication.
     if event.payload().plan_digest() != admissible.plan_digest()
+        || admissible.scope_id() != scope.scope_id()
         || observed.head().active_plan_digest().is_some()
         || event.envelope().writer_epoch() != observed.head().scope_epoch()
     {
@@ -308,7 +301,7 @@ pub async fn append_plan_admitted(
         observed.head().scope_epoch().get(),
     );
     let plan_digest = admissible.plan_digest().clone();
-    let plan_key = crate::scope::plan_key(scope.workspace_id(), scope.campaign_id(), &plan_digest);
+    let plan_key = plan_key(scope.workspace_id(), scope.campaign_id(), &plan_digest);
     store
         .publish_with_history(
             &plan_key,
@@ -320,7 +313,7 @@ pub async fn append_plan_admitted(
         .map_err(|error| {
             ScopeAppendError::Publication(ScopeEventPublicationError::Storage(error))
         })?;
-    let encoded = crate::scope::encode_plan_admitted_event(event)
+    let encoded = encode_plan_admitted_event(event)
         .map_err(ScopeEventPublicationError::Invalid)
         .map_err(ScopeAppendError::Publication)?;
     let publication = publish_encoded(store, scope, event.envelope(), encoded, event_history)
@@ -2096,5 +2089,240 @@ mod tests {
         ));
         assert_eq!(client.actual_requests().count(), 3);
         assert_eq!(winning_envelope.writer_epoch().get(), 5);
+    }
+
+    fn admissible_plan(
+        genesis: &crate::scope::RootGenesis,
+    ) -> (AdmissibleProposal, PlanAdmittedEvent) {
+        use crate::domain::proposal::{
+            ObservationFact, PlanProposal, ProposalBasis, ProposalFacts, TargetBounds, WorkSpec,
+            validate_proposal,
+        };
+        use crate::domain::work::WorkId;
+
+        let scope = genesis.identity().clone();
+        let objective = genesis.config_digest().clone();
+        let proposal = PlanProposal::new(
+            scope.scope_id().clone(),
+            objective.clone(),
+            None,
+            vec![ProposalBasis::Observation {
+                event: genesis.event_ref().clone(),
+            }],
+            vec![WorkSpec::new(
+                WorkId::new("work-a".into()).unwrap(),
+                Vec::new(),
+                TargetBounds::new(1, 60_000).unwrap(),
+            )],
+            0,
+        );
+        let facts = [ObservationFact::new(
+            scope.scope_id().clone(),
+            genesis.event_ref().clone(),
+            crate::scope::ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        let admissible = validate_proposal(
+            &proposal,
+            &ProposalFacts::new(&scope, &objective, None, 1, &facts),
+        )
+        .unwrap();
+        let event = PlanAdmittedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "admit-plan-1".into(),
+                PLAN_ADMITTED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            crate::scope::PlanAdmittedPayload::new(admissible.plan_digest().clone()),
+        )
+        .unwrap();
+        (admissible, event)
+    }
+
+    #[tokio::test]
+    async fn append_plan_admitted_publishes_plan_then_event_then_head() {
+        let genesis = genesis();
+        let (admissible, event) = admissible_plan(&genesis);
+        // The parent witness must come from the same store the commit targets: a witness from
+        // another constructed store is refused by design.
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        let parent = ScopeHeadParent::existing(Box::new(
+            read(&store, genesis.identity()).await.unwrap().unwrap(),
+        ));
+
+        assert!(matches!(
+            append_plan_admitted(
+                &store,
+                parent,
+                genesis.identity(),
+                &admissible,
+                &event,
+                [
+                    &mut AttemptHistory::default(),
+                    &mut AttemptHistory::default(),
+                    &mut AttemptHistory::default(),
+                ],
+            )
+            .await
+            .unwrap(),
+            ScopeHeadCommitOutcome::Committed
+        ));
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        let plan_uri = requests[1].uri().parse::<http::Uri>().unwrap();
+        let event_uri = requests[2].uri().parse::<http::Uri>().unwrap();
+        let head_uri = requests[3].uri().parse::<http::Uri>().unwrap();
+        assert!(plan_uri.path().contains("/plans/"));
+        assert!(plan_uri.path().ends_with(admissible.plan_digest().as_str()));
+        assert!(event_uri.path().contains("/events/"));
+        assert!(head_uri.path().ends_with("/head"));
+        // The head replaces exactly the fenced parent; the objects are create-if-absent.
+        assert_eq!(requests[1].headers().get("if-none-match").unwrap(), "*");
+        assert_eq!(requests[2].headers().get("if-none-match").unwrap(), "*");
+        assert_eq!(requests[3].headers().get("if-match").unwrap(), "\"parent\"");
+    }
+
+    #[tokio::test]
+    async fn append_plan_admitted_refuses_doomed_attempts_before_any_write() {
+        let genesis = genesis();
+        let (admissible, event) = admissible_plan(&genesis);
+        let store = never_store("bucket-a");
+
+        // A payload that names another address than the validated proposal.
+        let mismatched = PlanAdmittedEvent::new(
+            event.envelope().clone(),
+            crate::scope::PlanAdmittedPayload::new(Digest::new("b".repeat(64)).unwrap()),
+        )
+        .unwrap();
+        let mut plan = AttemptHistory::default();
+        let mut evt = AttemptHistory::default();
+        let mut head = AttemptHistory::default();
+        assert!(matches!(
+            append_plan_admitted(
+                &store,
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+                genesis.identity(),
+                &admissible,
+                &mismatched,
+                [&mut plan, &mut evt, &mut head],
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+
+        // A parent that already holds an active plan cannot admit again.
+        let occupied = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            "already-admitted".into(),
+        )
+        .unwrap();
+        let mut plan = AttemptHistory::default();
+        let mut evt = AttemptHistory::default();
+        let mut head = AttemptHistory::default();
+        assert!(matches!(
+            append_plan_admitted(
+                &store,
+                ScopeHeadParent::existing(Box::new(observed(&occupied).await)),
+                genesis.identity(),
+                &admissible,
+                &event,
+                [&mut plan, &mut evt, &mut head],
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+
+        // Genesis is not a fenced parent for admission.
+        let mut plan = AttemptHistory::default();
+        let mut evt = AttemptHistory::default();
+        let mut head = AttemptHistory::default();
+        assert!(matches!(
+            append_plan_admitted(
+                &store,
+                ScopeHeadParent::Genesis,
+                genesis.identity(),
+                &admissible,
+                &event,
+                [&mut plan, &mut evt, &mut head],
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+    }
+
+    /// The transition rule itself binds the candidate head to the payload's address, so a head
+    /// that names any other plan is refused even when every pre-check upstream is bypassed.
+    #[tokio::test]
+    async fn a_transition_head_must_name_exactly_the_admitted_plan() {
+        let genesis = genesis();
+        let (admissible, event) = admissible_plan(&genesis);
+        let encoded = encode_plan_admitted_event(&event).unwrap();
+        let event_ref = encoded.event_ref().clone();
+        let publication = published(genesis.identity(), event.envelope(), encoded).await;
+        let head_with = |plan: Option<Digest>| {
+            ScopeHead::new(
+                genesis.identity().clone(),
+                ScopeAuthority::Unowned,
+                1,
+                event_ref.clone(),
+                plan,
+                "admit-plan-1".into(),
+            )
+            .unwrap()
+        };
+
+        // The exact payload address commits; a foreign address and no address are refused.
+        assert!(
+            ScopeHeadTransition::new(
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+                head_with(Some(admissible.plan_digest().clone())),
+                publication.clone(),
+            )
+            .is_ok()
+        );
+        for wrong in [Some(Digest::new("c".repeat(64)).unwrap()), None] {
+            assert!(matches!(
+                ScopeHeadTransition::new(
+                    ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+                    head_with(wrong),
+                    publication.clone(),
+                ),
+                Err(WireError::InvalidValue)
+            ));
+        }
+        // An occupied parent refuses the admission at the same rule.
+        let occupied = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            "already-admitted".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ScopeHeadTransition::new(
+                ScopeHeadParent::existing(Box::new(observed(&occupied).await)),
+                head_with(Some(admissible.plan_digest().clone())),
+                publication,
+            ),
+            Err(WireError::InvalidValue)
+        ));
     }
 }

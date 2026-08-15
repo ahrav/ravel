@@ -188,6 +188,15 @@ fn validate_registered(
             Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
         };
     }
+    if envelope.payload_type() == crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE {
+        let admitted = crate::scope::decode_plan_admitted_event(encoded.stored_bytes(), key, scope)
+            .map_err(ScopeEventPublicationError::Invalid)?;
+        return if admitted.envelope() == envelope {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
+    }
     #[cfg(test)]
     if envelope.payload_type() == crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE {
         let decoded = decode_scope_event::<Value>(encoded.stored_bytes(), key, scope, None)

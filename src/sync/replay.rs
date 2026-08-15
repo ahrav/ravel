@@ -3,7 +3,7 @@
 //! Ready output carries the observed head whose tail matches the committed local row.
 //! Remote validation completes before the first projection write.
 //! A writer epoch may lag the head epoch but never exceeds it or its own child's.
-//! Replay limits are 4,096 unseen events and 64 MiB of stored event bytes.
+//! Replay limits are 4,096 unseen events and 64 MiB of stored event and plan bytes.
 
 use std::{collections::HashSet, error::Error, fmt, path::Path};
 
@@ -16,7 +16,7 @@ use crate::{
         },
         worker::{DbHandle, OpenExistingError},
     },
-    domain::proposal::{MAX_PLAN_CANONICAL_BYTES, PlanProposal, decode_plan},
+    domain::proposal::{MAX_PLAN_STORED_BYTES, PlanProposal, decode_plan},
     scope::{
         Digest, PLAN_ADMITTED_PAYLOAD_TYPE, ScopeEventRef, ScopeIdentity,
         plan_admitted_from_decoded, plan_key, root_event_from_decoded,
@@ -29,9 +29,6 @@ use super::{
     event::{ScopeEventReadError, payload_registered, read_opaque, root_domain_valid},
     head::{self, ObservedScopeHead, ScopeHeadReadError},
 };
-
-/// One plan object: the domain prefix plus the canonical CBOR cap.
-const PLAN_STORED_BYTES_LIMIT: usize = MAX_PLAN_CANONICAL_BYTES + 20;
 
 const LIMITS: Limits = Limits {
     events: 4_096,
@@ -98,8 +95,9 @@ pub(crate) struct PreparedSuffix {
 
 struct Prepared {
     decoded: crate::scope::DecodedScopeEvent<Value>,
-    /// Present exactly for `plan_admitted` events: the verified plan object replay re-admits from.
-    plan: Option<PlanProposal>,
+    /// Present exactly for `plan_admitted` events: the decoded event and the verified plan object
+    /// replay re-admits from.
+    plan: Option<(crate::scope::PlanAdmittedEvent, PlanProposal)>,
 }
 
 /// Replays the unseen suffix through the projection-owning worker.
@@ -271,9 +269,7 @@ fn typed_payload(
 ) -> Result<(crate::scope::EventEnvelope, ScopeProjectionPayload), ScopeReplayError> {
     match prepared.decoded.envelope().payload_type() {
         PLAN_ADMITTED_PAYLOAD_TYPE => {
-            let event = plan_admitted_from_decoded(prepared.decoded)
-                .map_err(ScopeReplayError::EventInvalid)?;
-            let proposal = prepared.plan.ok_or(ScopeReplayError::HistoryConflict)?;
+            let (event, proposal) = prepared.plan.ok_or(ScopeReplayError::HistoryConflict)?;
             Ok((
                 event.envelope().clone(),
                 ScopeProjectionPayload::PlanAdmitted {
@@ -282,12 +278,7 @@ fn typed_payload(
                 },
             ))
         }
-        #[cfg(test)]
-        crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE => Ok((
-            prepared.decoded.envelope().clone(),
-            ScopeProjectionPayload::TestSuccessor,
-        )),
-        _ => {
+        crate::scope::ROOT_GENESIS_PAYLOAD_TYPE => {
             let event = root_event_from_decoded(prepared.decoded, scope)
                 .map_err(ScopeReplayError::EventInvalid)?;
             Ok((
@@ -297,6 +288,14 @@ fn typed_payload(
                 },
             ))
         }
+        #[cfg(test)]
+        crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE => Ok((
+            prepared.decoded.envelope().clone(),
+            ScopeProjectionPayload::TestSuccessor,
+        )),
+        // `prepare_chain` already refused unregistered payloads; a new registered type must be
+        // routed here explicitly rather than absorbed by a catch-all.
+        _ => Err(ScopeReplayError::UnsupportedPayload),
     }
 }
 
@@ -377,10 +376,14 @@ async fn prepare_chain(
         let plan = if decoded.envelope().payload_type() == PLAN_ADMITTED_PAYLOAD_TYPE {
             let event = plan_admitted_from_decoded(decoded.clone())
                 .map_err(ScopeReplayError::EventInvalid)?;
-            let digest = event.payload().plan_digest();
-            let key = plan_key(scope.workspace_id(), scope.campaign_id(), digest);
+            let key = plan_key(
+                scope.workspace_id(),
+                scope.campaign_id(),
+                event.payload().plan_digest(),
+            );
+            // Plan objects draw on the same byte budget as the events that cite them.
             let bytes = match store
-                .get_object(&key, PLAN_STORED_BYTES_LIMIT)
+                .get_object(&key, MAX_PLAN_STORED_BYTES)
                 .await
                 .map_err(|error| match error {
                     GetError::TooLarge => ScopeReplayError::EventInvalid(WireError::LimitExceeded),
@@ -390,10 +393,9 @@ async fn prepare_chain(
                 GetOutcome::NotFound => return Err(ScopeReplayError::EventMissing),
             };
             total_bytes = checked_total(total_bytes, bytes.len(), limits.bytes)?;
-            Some(
-                decode_plan(&bytes, digest)
-                    .map_err(|_| ScopeReplayError::EventInvalid(WireError::InvalidValue))?,
-            )
+            let proposal = decode_plan(&bytes, event.payload().plan_digest())
+                .map_err(|_| ScopeReplayError::EventInvalid(WireError::InvalidValue))?;
+            Some((event, proposal))
         } else {
             None
         };
@@ -1254,27 +1256,54 @@ mod tests {
                 event_response(genesis.event_bytes().to_vec()),
             ]
         };
+        // The oracle lists every work row field-by-field, so a wrong revision, bound, or edge
+        // in the rebuilt projection cannot hide behind matching counts.
         let admitted_rows = |path: &Path| {
-            rusqlite::Connection::open(path)
-                .unwrap()
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let scope_row = connection
                 .query_row(
-                    "SELECT (SELECT COUNT(*) FROM admitted_work), \
-                     (SELECT COUNT(*) FROM work_dependencies), \
-                     (SELECT active_plan_digest FROM scopes), \
+                    "SELECT (SELECT active_plan_digest FROM scopes), \
                      (SELECT reserved_budget_units FROM scopes), \
                      (SELECT objective_digest FROM scopes)",
                     [],
                     |row| {
                         Ok((
-                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, String>(4)?,
                         ))
                     },
                 )
+                .unwrap();
+            let work_rows = connection
+                .prepare(
+                    "SELECT work_id, work_revision, max_attempts, deadline_unix_ms \
+                     FROM admitted_work ORDER BY work_id",
+                )
                 .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let edges = connection
+                .prepare(
+                    "SELECT work_id, depends_on_work_id FROM work_dependencies ORDER BY work_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (scope_row, work_rows, edges)
         };
 
         let path = path("replay-admission");
@@ -1289,11 +1318,16 @@ mod tests {
         assert_eq!(
             first,
             (
-                2,
-                1,
-                admissible.plan_digest().as_str().to_owned(),
-                11,
-                objective.as_str().to_owned()
+                (
+                    admissible.plan_digest().as_str().to_owned(),
+                    11,
+                    objective.as_str().to_owned(),
+                ),
+                vec![
+                    ("work-a".to_owned(), 1, 2, 60_000),
+                    ("work-b".to_owned(), 1, 2, 60_000),
+                ],
+                vec![("work-b".to_owned(), "work-a".to_owned())],
             )
         );
 

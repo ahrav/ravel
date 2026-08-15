@@ -326,13 +326,12 @@ async fn read_supported(
     store: &S3Store,
     scope: &ScopeIdentity,
 ) -> Result<ObservedScopeHead, AuthorityError> {
-    let observed = match head::read(store, scope).await {
-        Ok(Some(observed)) => observed,
-        Ok(None) => return Err(AuthorityError::ScopeMissing),
-        Err(ScopeHeadReadError::Storage(_)) => return Err(AuthorityError::ScopeStorage),
-        Err(ScopeHeadReadError::Invalid(_)) => return Err(AuthorityError::HeadInvalid),
-    };
-    Ok(observed)
+    match head::read(store, scope).await {
+        Ok(Some(observed)) => Ok(observed),
+        Ok(None) => Err(AuthorityError::ScopeMissing),
+        Err(ScopeHeadReadError::Storage(_)) => Err(AuthorityError::ScopeStorage),
+        Err(ScopeHeadReadError::Invalid(_)) => Err(AuthorityError::HeadInvalid),
+    }
 }
 
 fn next_head(observed: &ScopeHead, authority: ScopeAuthority) -> Result<ScopeHead, AuthorityError> {

@@ -118,8 +118,8 @@ pub struct ExpectedGrant {
 impl ExpectedGrant {
     /// # Errors
     ///
-    /// Returns [`ValidationError`] for a value [`EffectGrant::new`] would also reject, so an
-    /// expectation cannot name a value no grant can carry.
+    /// Returns [`ValidationError`] when a field of the expectation itself fails
+    /// [`EffectGrant::new`]'s segment or range rules; `identity` is taken as given.
     /// commentlint: allow(JUDGE)
     pub fn new(
         identity: ScopeClaimIdentity,
@@ -179,8 +179,8 @@ pub enum IssueError {
     Expired,
     /// The outcome is unproven; the identical retry is safe.
     Unresolved,
-    /// No identical retry can succeed: a rival object occupies this claim generation's key, or
-    /// the projection refused the binding and any published object stays inert.
+    /// A rival object occupies this claim generation's key, or the projection refused the
+    /// binding; any published object stays inert until its binding is current again.
     Refused,
 }
 
@@ -188,7 +188,8 @@ pub enum IssueError {
 ///
 /// The immutable object is published before the `grant_fence` marker, so a crash between the two
 /// leaves an inert object and the identical retry is safe: publication verifies the same bytes
-/// and the recording is same-fence idempotent.
+/// and the recording is same-fence idempotent. Publication also pins this claim generation's
+/// bytes, so a different grant at the same fence stays refused until a reclaim.
 ///
 /// # Errors
 ///
@@ -610,6 +611,14 @@ mod tests {
             decode_grant(b"not-json", &key, &scope, &work),
             Err(WireError::InvalidEncoding)
         );
+        // An unknown field is not part of the record.
+        let mut extra = bytes.clone();
+        extra.truncate(extra.len() - 1);
+        extra.extend_from_slice(b",\"extra\":1}");
+        assert_eq!(
+            decode_grant(&extra, &key, &scope, &work),
+            Err(WireError::InvalidEncoding)
+        );
         // Padded bytes decode but are not canonical.
         let mut padded = bytes.clone();
         padded.push(b' ');
@@ -713,6 +722,26 @@ mod tests {
             )
             .await,
             GrantIntake::Rejected(GrantRejection::WiderThanRequested)
+        ));
+        // A plan the caller does not expect is an identity disagreement.
+        let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);
+        let other_plan = ExpectedGrant::new(
+            ScopeClaimIdentity::new(
+                genesis().identity().clone(),
+                Digest::new("cd".repeat(32)).unwrap(),
+                WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1),
+                2,
+            )
+            .unwrap(),
+            "git-push".into(),
+            "repo-a".into(),
+            5,
+            NOW_MS + 60_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            intake(&store, &handle, &other_plan, epoch, NOW_MS).await,
+            GrantIntake::Rejected(GrantRejection::IdentityMismatch)
         ));
         // Action mismatch is an identity disagreement.
         let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);

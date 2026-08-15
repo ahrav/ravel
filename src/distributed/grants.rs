@@ -243,12 +243,17 @@ pub async fn issue(
     // `operation_id` is inside the canonical bytes, so byte identity at the key is identity of
     // the operation: an ambiguous write reconciles by read-back before any retry.
     //
-    // When `remaining_term_ms(now_ms) > STOP_MARGIN_MS`, publication leaves `STOP_MARGIN_MS` before term expiry.
-    let publication_budget_ms = authority
-        .remaining_term_ms(now_ms)
-        .saturating_sub(STOP_MARGIN_MS);
-    match tokio::time::timeout(
-        Duration::from_millis(publication_budget_ms),
+    // Publication and recording share one deadline `STOP_MARGIN_MS` short of term expiry.
+    // `elapsed_ms` advances `now_ms` by time spent since `started`.
+    let started = tokio::time::Instant::now();
+    let deadline = started
+        + Duration::from_millis(
+            authority
+                .remaining_term_ms(now_ms)
+                .saturating_sub(STOP_MARGIN_MS),
+        );
+    match tokio::time::timeout_at(
+        deadline,
         store.publish_with_history(&key, bytes, &digest, history),
     )
     .await
@@ -261,25 +266,36 @@ pub async fn issue(
             _ => IssueError::Refused,
         })?,
     }
-    database
-        .record_grant(
+    let activation = GrantActivation {
+        scope_epoch: authority.scope_epoch(),
+        attempt: grant.attempt,
+        units: grant.limit_units,
+        deadline_unix_ms: grant.deadline_unix_ms,
+        digest: Digest::new(digest).map_err(|_| IssueError::Refused)?,
+    };
+    match tokio::time::timeout_at(
+        deadline,
+        database.record_grant(
             &grant.identity,
-            GrantActivation {
-                scope_epoch: authority.scope_epoch(),
-                attempt: grant.attempt,
-                units: grant.limit_units,
-                deadline_unix_ms: grant.deadline_unix_ms,
-                digest: Digest::new(digest).map_err(|_| IssueError::Refused)?,
-            },
-            now_ms,
-        )
-        .await
-        .map_err(|error| match error {
+            activation,
+            now_ms.saturating_add(elapsed_ms(started)),
+        ),
+    )
+    .await
+    {
+        Err(_) => Err(IssueError::Unresolved),
+        Ok(result) => result.map_err(|error| match error {
             ApplyError::Full | ApplyError::Stopping | ApplyError::DatabaseOperationFailed => {
                 IssueError::Unresolved
             }
             ApplyError::Conflict => IssueError::Refused,
-        })
+        }),
+    }
+}
+
+/// Returns `u64::MAX` when elapsed milliseconds exceed `u64::MAX`.
+fn elapsed_ms(started: tokio::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Reads one grant back and decides it against `expected` at `now_ms`.
@@ -297,6 +313,7 @@ pub async fn intake(
     scope_epoch: NonZeroU64,
     now_ms: u64,
 ) -> GrantIntake {
+    let started = tokio::time::Instant::now();
     let key = scope_grant_key(
         expected.identity.scope(),
         expected.identity.work(),
@@ -324,7 +341,8 @@ pub async fn intake(
     {
         return GrantIntake::Rejected(GrantRejection::IdentityMismatch);
     }
-    if grant.deadline_unix_ms.get() <= now_ms {
+    // `elapsed_ms(started)` advances each deadline check past preceding awaits.
+    if grant.deadline_unix_ms.get() <= now_ms.saturating_add(elapsed_ms(started)) {
         return GrantIntake::Rejected(GrantRejection::Expired);
     }
     if grant.limit_units > expected.max_units
@@ -335,10 +353,17 @@ pub async fn intake(
     // A grant object alone is not authority: the resumable-work record authorizes only the grant
     // whose SHA-256 digest it stores.
     match database
-        .resumable_work(expected.identity.scope(), scope_epoch, now_ms)
+        .resumable_work(
+            expected.identity.scope(),
+            scope_epoch,
+            now_ms.saturating_add(elapsed_ms(started)),
+        )
         .await
     {
         Ok(resumable) => {
+            if grant.deadline_unix_ms.get() <= now_ms.saturating_add(elapsed_ms(started)) {
+                return GrantIntake::Rejected(GrantRejection::Expired);
+            }
             match resumable
                 .iter()
                 .find(|row| row.work() == expected.identity.work())

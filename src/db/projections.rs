@@ -6,8 +6,9 @@
 //!
 //! Work readiness is derived by query from admitted work, dependencies, revision, claim
 //! state, and terminal evidence; it is never stored as a flag. A reopened file keeps its work
-//! rows; a rebuilt file has none until they are re-admitted, because no event payload writes
-//! them yet. Claim leases and readiness clocks are Unix-epoch milliseconds on one shared base.
+//! rows; a rebuilt file recovers them by re-applying the admission event, whose payload names
+//! the plan object replay re-fetches. Claim leases and readiness clocks are Unix-epoch
+//! milliseconds on one shared base.
 //! commentlint: allow(JUDGE)
 //!
 //! The epoch ordering rule lives in `sync::head`.
@@ -18,6 +19,10 @@ use rusqlite::{OpenFlags, OptionalExtension, params};
 
 use crate::{
     domain::{
+        proposal::{
+            INITIAL_WORK_REVISION, MAX_STORED_INTEGER, ObservationFact, PlanProposal,
+            ProposalFacts, TargetBounds, validate_proposal,
+        },
         validation::ValidationError,
         work::{WorkId, WorkRef},
     },
@@ -28,7 +33,6 @@ use crate::{
 
 // "RAVL": rejects an unrelated SQLite file without naming a protocol era.
 const APPLICATION_ID: i32 = 0x5241_564c;
-const MAX_STORED_INTEGER: u64 = 9_999_999_999_999_999;
 const TABLES: [&str; 4] = [
     "admitted_work",
     "applied_scope_events",
@@ -55,24 +59,33 @@ const SCOPE_UPDATE_SQL: &str = "UPDATE scopes SET sequence = ?1, tail_event_dige
 const TAIL_WRITER_EPOCH_SQL: &str = "SELECT writer_epoch FROM applied_scope_events \
      WHERE scope_id = ?1 AND sequence = ?2";
 const ADMIT_WORK_SQL: &str = "INSERT INTO admitted_work \
-     (scope_id, work_id, work_revision, admitted_scope_epoch, claim_fence, claim_lease_until, \
-      grant_fence, terminal_result_digest) \
-     VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL) \
+     (scope_id, work_id, work_revision, admitted_scope_epoch, max_attempts, deadline_unix_ms, \
+      claim_fence, claim_lease_until, grant_fence, terminal_result_digest) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL) \
      ON CONFLICT DO UPDATE SET admitted_scope_epoch = ?4 \
      WHERE admitted_scope_epoch <= ?4";
 const ADMITTED_REVISION_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM admitted_work \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3)";
 const PROJECTED_SCOPE_EPOCH_SQL: &str = "SELECT scope_epoch FROM scopes WHERE scope_id = ?1";
+const OBJECTIVE_SQL: &str = "SELECT objective_digest FROM scopes WHERE scope_id = ?1";
+const OBSERVATION_FACT_SQL: &str =
+    "SELECT digest, payload_type FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
+/// Only admission sets the pair, and only from no plan: rowcount 0 is a second plan.
+const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
+     SET active_plan_digest = ?2, reserved_budget_units = ?3 \
+     WHERE scope_id = ?1 AND active_plan_digest IS NULL";
 /// A grant is bound to the exact claim fence it was issued for, so a reclaimed work revision
 /// cannot resume under a grant minted for the fence it superseded.
 const RECORD_GRANT_SQL: &str = "UPDATE admitted_work SET grant_fence = ?4 \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
        AND terminal_result_digest IS NULL AND claim_fence = ?4";
 /// Restart resumes a revision only while every binding is still current: the admitting epoch is
-/// not ahead of the controller's, the revision is the highest admitted, the claim lease is live,
-/// and a grant is bound to that exact claim fence.
+/// not ahead of the controller's, the revision is the highest admitted, carries no terminal
+/// evidence, its deadline is still ahead of `?3`, the claim lease is live, and a grant is bound
+/// to that exact claim fence.
 const RESUMABLE_WORK_SQL: &str = "SELECT work_id, work_revision FROM admitted_work AS resumable \
      WHERE resumable.scope_id = ?1 \
+       AND resumable.deadline_unix_ms > ?3 \
        AND resumable.terminal_result_digest IS NULL \
        AND resumable.admitted_scope_epoch <= ?2 \
        AND resumable.claim_lease_until > ?3 \
@@ -98,17 +111,20 @@ const RECORD_CLAIM_SQL: &str = "UPDATE admitted_work \
             OR (claim_fence = ?4 AND claim_lease_until <= ?5))";
 /// Terminal evidence names the exact claim it came from, so a submission from a superseded
 /// claim cannot mark work terminal.
+#[cfg(test)]
 const RECORD_TERMINAL_SQL: &str = "UPDATE admitted_work SET terminal_result_digest = ?5 \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
        AND claim_fence = ?4 \
        AND (terminal_result_digest IS NULL OR terminal_result_digest = ?5)";
 
 /// Readiness is a query, not a stored flag: an admitted revision is ready when it is the
-/// highest admitted revision of its work id, carries no terminal evidence, holds no claim
-/// whose lease is still live at `?2`, and every dependency's own highest admitted revision
-/// carries terminal evidence.
+/// highest admitted revision of its work id, has a deadline still ahead of `?2`, carries no
+/// terminal evidence, holds no claim whose lease is still live at `?2`, and every dependency's
+/// own highest admitted revision carries terminal evidence. Expiry gates scheduling only; claim
+/// and grant mutations stay deadline-free.
 const READY_WORK_SQL: &str = "SELECT work_id, work_revision FROM admitted_work AS ready \
      WHERE ready.scope_id = ?1 \
+       AND ready.deadline_unix_ms > ?2 \
        AND ready.terminal_result_digest IS NULL \
        AND (ready.claim_lease_until IS NULL OR ready.claim_lease_until <= ?2) \
        AND ready.work_revision = (SELECT MAX(newer.work_revision) FROM admitted_work AS newer \
@@ -137,6 +153,8 @@ CREATE TABLE scopes (
     tail_event_digest TEXT NOT NULL,
     active_plan_digest TEXT,
     scope_epoch INTEGER NOT NULL,
+    objective_digest TEXT NOT NULL,
+    reserved_budget_units INTEGER,
     CHECK (length(scope_id) = 64 AND length(CAST(scope_id AS BLOB)) = 64
         AND scope_id NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(CAST(campaign_id AS BLOB)) BETWEEN 1 AND 128
@@ -147,8 +165,17 @@ CREATE TABLE scopes (
     CHECK (length(tail_event_digest) = 64
         AND length(CAST(tail_event_digest AS BLOB)) = 64
         AND tail_event_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (active_plan_digest IS NULL),
-    CHECK (scope_epoch BETWEEN 1 AND 9999999999999999)
+    CHECK (active_plan_digest IS NULL OR (length(active_plan_digest) = 64
+        AND length(CAST(active_plan_digest AS BLOB)) = 64
+        AND active_plan_digest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (scope_epoch BETWEEN 1 AND 9999999999999999),
+    CHECK (length(objective_digest) = 64
+        AND length(CAST(objective_digest AS BLOB)) = 64
+        AND objective_digest NOT GLOB '*[^0-9a-f]*'),
+    -- The plan and its reservation are one fact: a half-written pair is unrepresentable.
+    CHECK ((active_plan_digest IS NULL AND reserved_budget_units IS NULL)
+        OR (active_plan_digest IS NOT NULL AND reserved_budget_units IS NOT NULL
+            AND reserved_budget_units BETWEEN 0 AND 9999999999999999))
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE applied_scope_events (
@@ -186,6 +213,8 @@ CREATE TABLE admitted_work (
     work_id TEXT NOT NULL,
     work_revision INTEGER NOT NULL,
     admitted_scope_epoch INTEGER NOT NULL,
+    max_attempts INTEGER NOT NULL,
+    deadline_unix_ms INTEGER NOT NULL,
     claim_fence INTEGER,
     claim_lease_until INTEGER,
     grant_fence INTEGER,
@@ -196,6 +225,8 @@ CREATE TABLE admitted_work (
         AND instr(CAST(work_id AS BLOB), CAST('/' AS BLOB)) = 0),
     CHECK (work_revision BETWEEN 0 AND 9999999999999999),
     CHECK (admitted_scope_epoch BETWEEN 1 AND 9999999999999999),
+    CHECK (max_attempts BETWEEN 1 AND 9999999999999999),
+    CHECK (deadline_unix_ms BETWEEN 1 AND 9999999999999999),
     -- A CHECK passes when its expression evaluates to NULL, so each branch names the columns
     -- it requires: without the explicit IS NOT NULL tests, a half-populated claim evaluates to
     -- NULL and is accepted.
@@ -301,12 +332,28 @@ impl From<rusqlite::Error> for ApplyError {
     }
 }
 
+/// Typed content one applied event writes, resolved before any SQLite call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeProjectionPayload {
+    RootGenesis {
+        objective_digest: Digest,
+    },
+    /// Carries the decoded proposal so a rebuilt projection recovers its work rows from bytes the
+    /// event address already proves.
+    PlanAdmitted {
+        plan_digest: Digest,
+        proposal: Box<PlanProposal>,
+    },
+    #[cfg(test)]
+    TestSuccessor,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScopeProjectionEvent {
     scope: ScopeIdentity,
     envelope: EventEnvelope,
     reference: ScopeEventRef,
-    active_plan_digest: Option<Digest>,
+    payload: ScopeProjectionPayload,
     scope_epoch: u64,
 }
 
@@ -315,7 +362,7 @@ impl ScopeProjectionEvent {
         scope: ScopeIdentity,
         envelope: EventEnvelope,
         reference: ScopeEventRef,
-        active_plan_digest: Option<Digest>,
+        payload: ScopeProjectionPayload,
         scope_epoch: u64,
     ) -> Result<Self, ValidationError> {
         // Authority transitions advance the epoch without publishing an event, so an event's
@@ -324,15 +371,19 @@ impl ScopeProjectionEvent {
             || envelope.sequence() != reference.sequence()
             || envelope.writer_epoch().get() > scope_epoch
             || scope_epoch > MAX_STORED_INTEGER
-            || active_plan_digest.is_some()
         {
+            return Err(ValidationError::InvalidIdentity);
+        }
+        // Genesis carries the objective; nothing else may occupy sequence 1.
+        let genesis_payload = matches!(payload, ScopeProjectionPayload::RootGenesis { .. });
+        if genesis_payload != (envelope.sequence() == 1) {
             return Err(ValidationError::InvalidIdentity);
         }
         Ok(Self {
             scope,
             envelope,
             reference,
-            active_plan_digest,
+            payload,
             scope_epoch,
         })
     }
@@ -459,12 +510,30 @@ pub(crate) fn scope_matches_head(
 /// Returns [`ApplyError::Conflict`] when a dependency names the revision's own work id or an
 /// existing revision has a different dependency set. Returns
 /// [`ApplyError::DatabaseOperationFailed`] when the scope has no projected row or SQLite fails.
+#[cfg(test)]
 pub(crate) fn admit_work(
     connection: &mut rusqlite::Connection,
     scope: &ScopeIdentity,
     work: &WorkRef,
     dependencies: &[WorkId],
     scope_epoch: NonZeroU64,
+) -> Result<(), ApplyError> {
+    let bounds = TargetBounds::new(1, MAX_STORED_INTEGER)
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?;
+    let transaction = connection.transaction()?;
+    insert_work_row(&transaction, scope, work, dependencies, scope_epoch, bounds)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Writes one admitted revision and its edges inside the caller's transaction.
+fn insert_work_row(
+    transaction: &rusqlite::Transaction<'_>,
+    scope: &ScopeIdentity,
+    work: &WorkRef,
+    dependencies: &[WorkId],
+    scope_epoch: NonZeroU64,
+    bounds: TargetBounds,
 ) -> Result<(), ApplyError> {
     if dependencies
         .iter()
@@ -477,7 +546,6 @@ pub(crate) fn admit_work(
     dependencies.dedup();
 
     let revision = stored_u64(work.revision())?;
-    let transaction = connection.transaction()?;
     let readmission = transaction.query_row(
         ADMITTED_REVISION_EXISTS_SQL,
         params![scope.scope_id().as_str(), work.id().as_str(), revision],
@@ -501,7 +569,9 @@ pub(crate) fn admit_work(
             scope.scope_id().as_str(),
             work.id().as_str(),
             revision,
-            stored_u64(scope_epoch.get())?
+            stored_u64(scope_epoch.get())?,
+            stored_u64(bounds.max_attempts().get())?,
+            stored_u64(bounds.deadline_unix_ms().get())?
         ],
     )? == 0
     {
@@ -531,7 +601,82 @@ pub(crate) fn admit_work(
             )?;
         }
     }
-    transaction.commit()?;
+    Ok(())
+}
+
+/// Validates and records one first plan admission inside the caller's transaction.
+///
+/// The snapshot the gate sees and the rows it writes commit together, which is what makes the
+/// admission deterministic: same durable history, same verdict.
+fn admit_plan(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &ScopeProjectionEvent,
+    plan_digest: &Digest,
+    proposal: &PlanProposal,
+) -> Result<(), ApplyError> {
+    let scope_id = event.scope.scope_id().as_str();
+    let objective: String = transaction.query_row(OBJECTIVE_SQL, [scope_id], |row| row.get(0))?;
+    let objective = Digest::new(objective).map_err(|_| ApplyError::DatabaseOperationFailed)?;
+    let tail_sequence = event.envelope.sequence() - 1;
+    let mut observations = Vec::new();
+    for basis in proposal.bases() {
+        let crate::domain::proposal::ProposalBasis::Observation { event: cited } = basis else {
+            continue;
+        };
+        let fact: Option<(String, String)> = transaction
+            .query_row(
+                OBSERVATION_FACT_SQL,
+                params![scope_id, stored_u64(cited.sequence())?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        // A citation with no projected row is refused here, not deferred to the gate, so the
+        // gate's MissingBasis rule and this resolution cannot drift apart silently.
+        let Some((digest, payload_type)) = fact else {
+            return Err(ApplyError::Conflict);
+        };
+        let digest = Digest::new(digest).map_err(|_| ApplyError::DatabaseOperationFailed)?;
+        let reference = ScopeEventRef::new(cited.sequence(), digest)
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?;
+        observations.push(ObservationFact::new(
+            event.scope.scope_id().clone(),
+            reference,
+            payload_type,
+        ));
+    }
+    // The gate rules on the same snapshot the writes land on; any rejection is a conflict here.
+    let admissible = validate_proposal(
+        proposal,
+        // First admission only: the gate sees no active plan, and ADMIT_PLAN_SQL's rowcount is
+        // the durable refusal of a second plan. The supersession bead owns widening this.
+        &ProposalFacts::new(&event.scope, &objective, None, tail_sequence, &observations),
+    )
+    .map_err(|_| ApplyError::Conflict)?;
+    if admissible.plan_digest() != plan_digest {
+        return Err(ApplyError::Conflict);
+    }
+
+    for spec in proposal.work_specs() {
+        insert_work_row(
+            transaction,
+            &event.scope,
+            &WorkRef::new(spec.work_id().clone(), INITIAL_WORK_REVISION),
+            spec.dependencies(),
+            NonZeroU64::new(event.scope_epoch).ok_or(ApplyError::DatabaseOperationFailed)?,
+            spec.bounds(),
+        )?;
+    }
+    let updated = transaction.execute(
+        ADMIT_PLAN_SQL,
+        params![
+            scope_id,
+            plan_digest.as_str(),
+            stored_u64(proposal.reserved_budget_units())?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(ApplyError::Conflict);
+    }
     Ok(())
 }
 
@@ -578,6 +723,7 @@ pub(crate) fn record_claim(
 /// claim fence, or already carries different terminal evidence. Returns
 /// [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a value exceeds the
 /// stored-integer bound.
+#[cfg(test)]
 pub(crate) fn record_terminal(
     connection: &rusqlite::Connection,
     scope: &ScopeIdentity,
@@ -735,11 +881,12 @@ pub(crate) fn apply_scope_event(
         return Err(ApplyError::Conflict);
     }
     if let Some(digest) = historical {
-        return if digest == event.reference.digest().as_str() {
-            Ok(ApplyOutcome::AlreadyApplied)
-        } else {
-            Err(ApplyError::Conflict)
-        };
+        if digest != event.reference.digest().as_str() {
+            return Err(ApplyError::Conflict);
+        }
+        // A same-digest event with different admission content is unrepresentable: the event
+        // digest covers the payload, and the event and its rows commit in one transaction.
+        return Ok(ApplyOutcome::AlreadyApplied);
     }
 
     let parent_digest = event
@@ -748,30 +895,35 @@ pub(crate) fn apply_scope_event(
         .map(|parent| parent.digest().as_str());
     match current {
         None => {
-            if sequence != 1 || parent_digest.is_some() {
+            let ScopeProjectionPayload::RootGenesis { objective_digest } = &event.payload else {
+                return Err(ApplyError::Conflict);
+            };
+            // The payload/sequence biconditional in `ScopeProjectionEvent::new` proves this is
+            // sequence 1, and the envelope proved genesis carries no parent.
+            if parent_digest.is_some() {
                 return Err(ApplyError::Conflict);
             }
             transaction.execute(
                 "INSERT INTO scopes (scope_id, campaign_id, parent_scope_id, delegation_digest, \
-                 sequence, tail_event_digest, active_plan_digest, scope_epoch) \
-                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6)",
+                 sequence, tail_event_digest, active_plan_digest, scope_epoch, objective_digest, \
+                 reserved_budget_units) \
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, ?5, ?6, NULL)",
                 params![
                     scope_id,
                     event.scope.campaign_id().as_str(),
                     stored_sequence,
                     event.reference.digest().as_str(),
-                    event.active_plan_digest.as_ref().map(Digest::as_str),
                     stored_u64(event.scope_epoch)?,
+                    objective_digest.as_str(),
                 ],
             )?;
         }
-        Some((campaign_id, cursor, tail, active_plan, scope_epoch)) => {
+        Some((campaign_id, cursor, tail, _active_plan, scope_epoch)) => {
             // The projected epoch only advances: a mutation carrying an older epoch than the
             // projected row was produced under superseded authority.
             if campaign_id != event.scope.campaign_id().as_str()
                 || cursor.checked_add(1) != Some(stored_sequence)
                 || parent_digest != Some(tail.as_str())
-                || active_plan.as_deref() != event.active_plan_digest.as_ref().map(Digest::as_str)
                 || !u64::try_from(scope_epoch).is_ok_and(|epoch| epoch <= event.scope_epoch)
             {
                 return Err(ApplyError::Conflict);
@@ -800,6 +952,14 @@ pub(crate) fn apply_scope_event(
                 return Err(ApplyError::DatabaseOperationFailed);
             }
         }
+    }
+
+    if let ScopeProjectionPayload::PlanAdmitted {
+        plan_digest,
+        proposal,
+    } = &event.payload
+    {
+        admit_plan(&transaction, event, plan_digest, proposal)?;
     }
 
     let duplicate: bool = transaction.query_row(
@@ -932,6 +1092,9 @@ fn validate_text(connection: &rusqlite::Connection) -> Result<(), ValidateError>
             "SELECT CAST(scope_id AS BLOB) FROM scopes \
              UNION ALL SELECT CAST(campaign_id AS BLOB) FROM scopes \
              UNION ALL SELECT CAST(tail_event_digest AS BLOB) FROM scopes \
+             UNION ALL SELECT CAST(objective_digest AS BLOB) FROM scopes \
+             UNION ALL SELECT CAST(active_plan_digest AS BLOB) FROM scopes \
+               WHERE active_plan_digest IS NOT NULL \
              UNION ALL SELECT CAST(scope_id AS BLOB) FROM applied_scope_events \
              UNION ALL SELECT CAST(digest AS BLOB) FROM applied_scope_events \
              UNION ALL SELECT CAST(parent_digest AS BLOB) FROM applied_scope_events \
@@ -1051,7 +1214,22 @@ fn validate_history(connection: &rusqlite::Connection) -> Result<(), ValidateErr
         rows.retain(|payload_type| !payload_type_registered(payload_type));
         !rows.is_empty()
     };
-    if orphans != 0 || broken_parents != 0 || broken_cursors != 0 || unregistered {
+    let broken_admissions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM scopes AS scope \
+             WHERE (scope.active_plan_digest IS NOT NULL) != EXISTS(SELECT 1 \
+                 FROM applied_scope_events AS event \
+                 WHERE event.scope_id = scope.scope_id AND event.payload_type = ?1)",
+            [crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE],
+            |row| row.get(0),
+        )
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if orphans != 0
+        || broken_parents != 0
+        || broken_cursors != 0
+        || unregistered
+        || broken_admissions != 0
+    {
         return Err(ValidateError::InvalidHistory);
     }
     Ok(())
@@ -1146,7 +1324,13 @@ mod tests {
             scope.clone(),
             envelope,
             ScopeEventRef::new(sequence, Digest::new(digest.into()).unwrap()).unwrap(),
-            None,
+            if sequence == 1 {
+                ScopeProjectionPayload::RootGenesis {
+                    objective_digest: Digest::new("0".repeat(64)).unwrap(),
+                }
+            } else {
+                ScopeProjectionPayload::TestSuccessor
+            },
             1,
         )
         .unwrap()
@@ -1676,7 +1860,7 @@ mod tests {
             scope.clone(),
             envelope,
             ScopeEventRef::new(sequence, Digest::new(digest.into()).unwrap()).unwrap(),
-            None,
+            ScopeProjectionPayload::TestSuccessor,
             scope_epoch,
         )
         .unwrap()
@@ -2288,6 +2472,359 @@ mod tests {
 
         admit_work(&mut connection, &scope, &work("work-a", 1), &[], epoch(5)).unwrap();
         assert_eq!(ready(&connection, &scope, 1_000), vec!["work-a@1"]);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    fn plan_bounds(deadline_unix_ms: u64) -> TargetBounds {
+        TargetBounds::new(3, deadline_unix_ms).unwrap()
+    }
+
+    fn plan_proposal(
+        scope: &ScopeIdentity,
+        objective: &Digest,
+        deadline_unix_ms: u64,
+    ) -> PlanProposal {
+        let spec = |id: &str, deps: &[&str]| {
+            crate::domain::proposal::WorkSpec::new(
+                WorkId::new(id.into()).unwrap(),
+                deps.iter()
+                    .map(|dep| WorkId::new((*dep).into()).unwrap())
+                    .collect(),
+                plan_bounds(deadline_unix_ms),
+            )
+        };
+        PlanProposal::new(
+            scope.scope_id().clone(),
+            objective.clone(),
+            None,
+            vec![crate::domain::proposal::ProposalBasis::Observation {
+                event: ScopeEventRef::new(1, Digest::new(DIGEST_1.into()).unwrap()).unwrap(),
+            }],
+            vec![spec("work-a", &[]), spec("work-b", &["work-a"])],
+            7,
+        )
+    }
+
+    fn admission_event(
+        scope: &ScopeIdentity,
+        proposal: &PlanProposal,
+        operation: &str,
+    ) -> (ScopeProjectionEvent, Digest) {
+        admission_event_at_head_epoch(scope, proposal, operation, 1)
+    }
+
+    /// The event's writer epoch is 1; `head_epoch` may be higher.
+    fn admission_event_at_head_epoch(
+        scope: &ScopeIdentity,
+        proposal: &PlanProposal,
+        operation: &str,
+        head_epoch: u64,
+    ) -> (ScopeProjectionEvent, Digest) {
+        let objective = proposal.objective_digest().clone();
+        let facts = [ObservationFact::new(
+            scope.scope_id().clone(),
+            ScopeEventRef::new(1, Digest::new(DIGEST_1.into()).unwrap()).unwrap(),
+            crate::scope::ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        let admissible = validate_proposal(
+            proposal,
+            &ProposalFacts::new(scope, &objective, None, 1, &facts),
+        )
+        .unwrap();
+        let plan_digest = admissible.plan_digest().clone();
+        let envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            2,
+            Some(ScopeEventRef::new(1, Digest::new(DIGEST_1.into()).unwrap()).unwrap()),
+            1,
+            operation.into(),
+            crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let event = ScopeProjectionEvent::new(
+            scope.clone(),
+            envelope,
+            ScopeEventRef::new(2, Digest::new(DIGEST_2.into()).unwrap()).unwrap(),
+            ScopeProjectionPayload::PlanAdmitted {
+                plan_digest: plan_digest.clone(),
+                proposal: Box::new(proposal.clone()),
+            },
+            head_epoch,
+        )
+        .unwrap();
+        (event, plan_digest)
+    }
+
+    /// The genesis helper `mutation()` seeds `objective_digest` with all zeros, so admission
+    /// tests build their proposals against that objective.
+    fn zero_objective() -> Digest {
+        Digest::new("0".repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn plan_admission_records_everything_atomically_and_gates_readiness() {
+        let (db_path, mut connection, scope) = admitted_scope("plan-admission");
+        let objective = zero_objective();
+        let proposal = plan_proposal(&scope, &objective, 10_000);
+        let (event, plan_digest) = admission_event(&scope, &proposal, "admit-plan-1");
+
+        assert_eq!(
+            apply_scope_event(&mut connection, &event),
+            Ok(ApplyOutcome::Applied)
+        );
+        let (active, reserved): (Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT active_plan_digest, reserved_budget_units FROM scopes WHERE scope_id = ?1",
+                [scope.scope_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active.as_deref(), Some(plan_digest.as_str()));
+        assert_eq!(reserved, Some(7));
+        let (rows, edges, bounded): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM admitted_work), \
+                 (SELECT COUNT(*) FROM work_dependencies), \
+                 (SELECT COUNT(*) FROM admitted_work WHERE max_attempts = 3 \
+                    AND deadline_unix_ms = 10000)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, edges, bounded), (2, 1, 2));
+
+        // Only the dependency-free revision is ready, and only until its deadline passes.
+        assert_eq!(ready(&connection, &scope, 1), ["work-a@1"]);
+        assert_eq!(ready(&connection, &scope, 10_000), Vec::<String>::new());
+
+        // A claimed, granted revision resumes only until its deadline, though its lease is live.
+        record_claim(
+            &connection,
+            &scope,
+            &work("work-a", 1),
+            epoch(1),
+            epoch(20_000),
+            1,
+        )
+        .unwrap();
+        record_grant(&connection, &scope, &work("work-a", 1), epoch(1)).unwrap();
+        assert_eq!(
+            resumable_work(&connection, &scope, epoch(1), 1).unwrap(),
+            [work("work-a", 1)]
+        );
+        assert_eq!(
+            resumable_work(&connection, &scope, epoch(1), 10_000).unwrap(),
+            []
+        );
+
+        // Repeating the identical admission reports success and changes nothing.
+        assert_eq!(
+            apply_scope_event(&mut connection, &event),
+            Ok(ApplyOutcome::AlreadyApplied)
+        );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// `admitted_scope_epoch` records the projected head epoch, not the event's writer epoch.
+    #[test]
+    fn admission_at_a_head_above_its_writer_epoch_records_the_projected_epoch() {
+        let (db_path, mut connection, scope) = admitted_scope("plan-admission-epoch-lag");
+        let proposal = plan_proposal(&scope, &zero_objective(), 10_000);
+        let (event, _) = admission_event_at_head_epoch(&scope, &proposal, "admit-plan-lag", 3);
+
+        assert_eq!(
+            apply_scope_event(&mut connection, &event),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(projected_epoch(&connection, &scope), 3);
+        let admitted: Vec<(String, i64)> = connection
+            .prepare("SELECT work_id, admitted_scope_epoch FROM admitted_work ORDER BY work_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            admitted,
+            [("work-a".to_owned(), 3), ("work-b".to_owned(), 3)]
+        );
+
+        // At the head that admitted it, the work is still schedulable and resumable.
+        assert_eq!(ready(&connection, &scope, 1), ["work-a@1"]);
+        record_claim(
+            &connection,
+            &scope,
+            &work("work-a", 1),
+            epoch(1),
+            epoch(20_000),
+            1,
+        )
+        .unwrap();
+        record_grant(&connection, &scope, &work("work-a", 1), epoch(1)).unwrap();
+        assert_eq!(resumable(&connection, &scope, 3, 1), ["work-a@1"]);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_a_plan_pointer_without_its_admission_event() {
+        let (db_path, mut connection, scope) = admitted_scope("plan-pointer-tamper");
+        let proposal = plan_proposal(&scope, &zero_objective(), 10_000);
+        let (event, _) = admission_event(&scope, &proposal, "admit-plan-1");
+        apply_scope_event(&mut connection, &event).unwrap();
+        drop(connection);
+        drop(open_existing(&db_path).unwrap());
+
+        let tampered = rusqlite::Connection::open(&db_path).unwrap();
+        tampered
+            .execute(
+                "UPDATE scopes SET active_plan_digest = NULL, reserved_budget_units = NULL",
+                [],
+            )
+            .unwrap();
+        drop(tampered);
+        assert_eq!(
+            open_existing(&db_path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn plan_admission_fails_closed_and_writes_nothing_on_rejection() {
+        let (db_path, mut connection, scope) = admitted_scope("plan-admission-reject");
+        // The proposal cites an objective the scope does not hold, so the gate refuses it.
+        let foreign = plan_proposal(&scope, &Digest::new("9".repeat(64)).unwrap(), 10_000);
+        let (event, _) = admission_event(&scope, &foreign, "admit-plan-bad");
+
+        assert_eq!(
+            apply_scope_event(&mut connection, &event),
+            Err(ApplyError::Conflict)
+        );
+        let (rows, active, events): (i64, Option<String>, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM admitted_work), \
+                 (SELECT active_plan_digest FROM scopes), \
+                 (SELECT COUNT(*) FROM applied_scope_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, active, events), (0, None, 1));
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn a_second_plan_and_a_mismatched_address_are_refused() {
+        let (db_path, mut connection, scope) = admitted_scope("plan-admission-second");
+        let objective = zero_objective();
+        let first = plan_proposal(&scope, &objective, 10_000);
+        let (event, _) = admission_event(&scope, &first, "admit-plan-1");
+        apply_scope_event(&mut connection, &event).unwrap();
+
+        // A correctly addressed second plan passes every byte check and reaches the durable
+        // refusal: the scope already holds an active plan, so the guarded UPDATE matches no row.
+        // Its work rows are written before that refusal, so this also proves rollback.
+        let mut second = plan_proposal(&scope, &objective, 20_000);
+        second = PlanProposal::new(
+            second.scope_id().clone(),
+            objective.clone(),
+            None,
+            second.bases().to_vec(),
+            [
+                second.work_specs().to_vec(),
+                vec![crate::domain::proposal::WorkSpec::new(
+                    WorkId::new("work-z".into()).unwrap(),
+                    Vec::new(),
+                    plan_bounds(20_000),
+                )],
+            ]
+            .concat(),
+            second.reserved_budget_units(),
+        );
+        let second_facts = [ObservationFact::new(
+            scope.scope_id().clone(),
+            ScopeEventRef::new(1, Digest::new(DIGEST_1.into()).unwrap()).unwrap(),
+            crate::scope::ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        let second_digest = validate_proposal(
+            &second,
+            &ProposalFacts::new(&scope, &objective, None, 2, &second_facts),
+        )
+        .unwrap()
+        .plan_digest()
+        .clone();
+        let envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            3,
+            Some(ScopeEventRef::new(2, Digest::new(DIGEST_2.into()).unwrap()).unwrap()),
+            1,
+            "admit-plan-2".into(),
+            crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let second_event = ScopeProjectionEvent::new(
+            scope.clone(),
+            envelope,
+            ScopeEventRef::new(3, Digest::new(DIGEST_3.into()).unwrap()).unwrap(),
+            ScopeProjectionPayload::PlanAdmitted {
+                plan_digest: second_digest,
+                proposal: Box::new(second),
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            apply_scope_event(&mut connection, &second_event),
+            Err(ApplyError::Conflict)
+        );
+        // Rollback left no trace of the refused plan: its new work row is absent, the event
+        // count is unchanged, and the active plan is still the first admission.
+        let (work_z, events, active): (i64, i64, Option<String>) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM admitted_work WHERE work_id = 'work-z'), \
+                 (SELECT COUNT(*) FROM applied_scope_events), \
+                 (SELECT active_plan_digest FROM scopes)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(work_z, 0);
+        assert_eq!(events, 2);
+        assert!(active.is_some());
+
+        // Same operation identity with different event bytes is a conflict, not a replay: the
+        // historical row at sequence 2 holds another digest.
+        let conflicting = ScopeProjectionEvent::new(
+            scope.clone(),
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(ScopeEventRef::new(1, Digest::new(DIGEST_1.into()).unwrap()).unwrap()),
+                1,
+                "admit-plan-1".into(),
+                crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            ScopeEventRef::new(2, Digest::new(DIGEST_3.into()).unwrap()).unwrap(),
+            ScopeProjectionPayload::PlanAdmitted {
+                plan_digest: Digest::new("8".repeat(64)).unwrap(),
+                proposal: Box::new(plan_proposal(&scope, &objective, 30_000)),
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            apply_scope_event(&mut connection, &conflicting),
+            Err(ApplyError::Conflict)
+        );
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

@@ -406,7 +406,9 @@ mod tests {
             genesis.identity().clone(),
             root.envelope().clone(),
             genesis.event_ref().clone(),
-            None,
+            crate::db::projections::ScopeProjectionPayload::RootGenesis {
+                objective_digest: root.payload().config_digest().clone(),
+            },
             1,
         )
         .unwrap();

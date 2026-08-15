@@ -22,9 +22,12 @@ use crate::{
     db::projections::{
         self, ApplyError, ApplyOutcome, SchemaError, ScopeProjectionEvent, ValidateError,
     },
-    domain::work::{WorkId, WorkRef},
+    domain::work::WorkRef,
     scope::{Digest, ScopeEventRef, ScopeHead, ScopeIdentity},
 };
+
+#[cfg(test)]
+use crate::{db::projections::ScopeProjectionPayload, domain::work::WorkId};
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 
@@ -51,6 +54,9 @@ enum Command {
         head: Box<ScopeHead>,
         respond: oneshot::Sender<Result<bool, ApplyError>>,
     },
+    /// Work creation has no production command: admission through an applied plan event is the
+    /// only writer of `admitted_work`.
+    #[cfg(test)]
     AdmitWork {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
@@ -81,6 +87,8 @@ enum Command {
         now_ms: u64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
+    /// Terminal evidence has no production command until trusted sealed-claim intake lands.
+    #[cfg(test)]
     RecordTerminal {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
@@ -307,15 +315,15 @@ impl DbHandle {
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Dependency edges may name work ids that are not admitted yet. Re-admission requires the
-    /// same canonical dependency set.
+    /// Test-only direct admission; production work rows exist only through an applied plan event.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Conflict`] for a changed dependency set or self-dependency,
     /// [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
-    pub async fn admit_work(
+    #[cfg(test)]
+    pub(crate) async fn admit_work(
         &self,
         scope: &ScopeIdentity,
         work: WorkRef,
@@ -422,14 +430,16 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Records terminal evidence produced under the revision's current claim fence.
+    /// Test-only terminal evidence; no production completion path exists until trusted
+    /// sealed-claim intake lands.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Conflict`] for an unknown or unclaimed revision, a stale claim
     /// fence, or conflicting evidence, [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
-    pub async fn record_terminal(
+    #[cfg(test)]
+    pub(crate) async fn record_terminal(
         &self,
         scope: &ScopeIdentity,
         work: WorkRef,
@@ -521,6 +531,7 @@ fn run(
             Command::MatchesHead { head, respond } => {
                 let _ = respond.send(projections::scope_matches_head(&connection, &head));
             }
+            #[cfg(test)]
             Command::AdmitWork {
                 scope,
                 work,
@@ -582,6 +593,7 @@ fn run(
                     now_ms,
                 ));
             }
+            #[cfg(test)]
             Command::RecordTerminal {
                 scope,
                 work,
@@ -683,7 +695,9 @@ mod tests {
             genesis.identity().clone(),
             root.envelope().clone(),
             genesis.event_ref().clone(),
-            None,
+            ScopeProjectionPayload::RootGenesis {
+                objective_digest: root.payload().config_digest().clone(),
+            },
             1,
         )
         .unwrap()

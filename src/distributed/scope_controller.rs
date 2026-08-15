@@ -113,8 +113,8 @@ pub enum AuthorityError {
     ScopeMissing,
     /// The head read failed in transport; a later attempt may succeed.
     ScopeStorage,
-    /// The head is undecodable, carries an active plan digest, or names another owner after a
-    /// proven write. Retrying cannot change any of those.
+    /// The head is undecodable or names another owner after a proven write. Retrying cannot
+    /// change either.
     HeadInvalid,
     /// A caller supplied a witness from another store, or a term, epoch, or encoded head that
     /// cannot be represented.
@@ -326,16 +326,12 @@ async fn read_supported(
     store: &S3Store,
     scope: &ScopeIdentity,
 ) -> Result<ObservedScopeHead, AuthorityError> {
-    let observed = match head::read(store, scope).await {
-        Ok(Some(observed)) => observed,
-        Ok(None) => return Err(AuthorityError::ScopeMissing),
-        Err(ScopeHeadReadError::Storage(_)) => return Err(AuthorityError::ScopeStorage),
-        Err(ScopeHeadReadError::Invalid(_)) => return Err(AuthorityError::HeadInvalid),
-    };
-    if !head::root_head_supported(observed.head()) {
-        return Err(AuthorityError::HeadInvalid);
+    match head::read(store, scope).await {
+        Ok(Some(observed)) => Ok(observed),
+        Ok(None) => Err(AuthorityError::ScopeMissing),
+        Err(ScopeHeadReadError::Storage(_)) => Err(AuthorityError::ScopeStorage),
+        Err(ScopeHeadReadError::Invalid(_)) => Err(AuthorityError::HeadInvalid),
     }
-    Ok(observed)
 }
 
 fn next_head(observed: &ScopeHead, authority: ScopeAuthority) -> Result<ScopeHead, AuthorityError> {

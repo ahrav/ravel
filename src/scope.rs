@@ -22,6 +22,7 @@ use crate::{
 };
 
 pub(crate) const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
+pub(crate) const PLAN_ADMITTED_PAYLOAD_TYPE: &str = "plan_admitted";
 #[cfg(test)]
 pub(crate) const TEST_SUCCESSOR_PAYLOAD_TYPE: &str = "test_successor";
 const ROOT_SCOPE_DOMAIN: &[u8] = b"ravel.scope.root\0";
@@ -322,6 +323,52 @@ impl RootEvent {
     }
 
     pub fn payload(&self) -> &RootGenesisPayload {
+        &self.payload
+    }
+}
+
+/// Payload of the event that admits one plan revision.
+///
+/// It names only the address; the plan bytes live under [`plan_key`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanAdmittedPayload {
+    plan_digest: Digest,
+}
+
+impl PlanAdmittedPayload {
+    pub fn new(plan_digest: Digest) -> Self {
+        Self { plan_digest }
+    }
+
+    pub fn plan_digest(&self) -> &Digest {
+        &self.plan_digest
+    }
+}
+
+/// One validated plan-admission event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanAdmittedEvent {
+    envelope: EventEnvelope,
+    payload: PlanAdmittedPayload,
+}
+
+impl PlanAdmittedEvent {
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidValue`] unless the envelope carries the `plan_admitted` payload
+    /// type at a sequence above genesis.
+    pub fn new(envelope: EventEnvelope, payload: PlanAdmittedPayload) -> Result<Self, WireError> {
+        if envelope.payload_type() != PLAN_ADMITTED_PAYLOAD_TYPE || envelope.sequence() < 2 {
+            return Err(WireError::InvalidValue);
+        }
+        Ok(Self { envelope, payload })
+    }
+
+    pub fn envelope(&self) -> &EventEnvelope {
+        &self.envelope
+    }
+
+    pub fn payload(&self) -> &PlanAdmittedPayload {
         &self.payload
     }
 }
@@ -690,6 +737,12 @@ struct WireEventRef {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct WirePlanAdmittedPayload {
+    plan_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct WireRootGenesisPayload {
     campaign_id: String,
     parent_scope_id: Option<String>,
@@ -871,6 +924,68 @@ pub fn encode_root_event(event: &RootEvent) -> Result<EncodedScopeEvent, WireErr
     )
 }
 
+/// Encodes one validated plan-admission event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for serialization, compression, or size-limit failures.
+pub fn encode_plan_admitted_event(
+    event: &PlanAdmittedEvent,
+) -> Result<EncodedScopeEvent, WireError> {
+    encode_scope_event(
+        event.envelope(),
+        &WirePlanAdmittedPayload {
+            plan_digest: event.payload().plan_digest().as_str().to_owned(),
+        },
+    )
+}
+
+/// Converts one opaque decoded event into a plan-admission event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for a payload type other than `plan_admitted`, noncanonical payload
+/// bytes, or an invalid digest.
+pub(crate) fn plan_admitted_from_decoded(
+    decoded: DecodedScopeEvent<ciborium::Value>,
+) -> Result<PlanAdmittedEvent, WireError> {
+    if decoded.envelope.payload_type() != PLAN_ADMITTED_PAYLOAD_TYPE {
+        return Err(WireError::InvalidValue);
+    }
+    let mut original = Vec::new();
+    into_writer(&decoded.payload, &mut original).map_err(|_| WireError::InvalidEncoding)?;
+    let payload: WirePlanAdmittedPayload = decoded
+        .payload
+        .deserialized()
+        .map_err(|_| WireError::InvalidEncoding)?;
+    let mut canonical = Vec::new();
+    into_writer(&payload, &mut canonical).map_err(|_| WireError::InvalidEncoding)?;
+    if original != canonical {
+        return Err(WireError::NonCanonical);
+    }
+    let plan_digest = Digest::new(payload.plan_digest).map_err(|_| WireError::InvalidValue)?;
+    PlanAdmittedEvent::new(decoded.envelope, PlanAdmittedPayload { plan_digest })
+}
+
+/// Decodes only the exact plan-admission event for `expected_scope` at `expected_key`.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for framing, size, canonicality, identity, or key failures.
+pub fn decode_plan_admitted_event(
+    stored_bytes: &[u8],
+    expected_key: &str,
+    expected_scope: &ScopeIdentity,
+) -> Result<PlanAdmittedEvent, WireError> {
+    let decoded = decode_scope_event::<ciborium::Value>(
+        stored_bytes,
+        expected_key,
+        expected_scope,
+        Some(PLAN_ADMITTED_PAYLOAD_TYPE),
+    )?;
+    plan_admitted_from_decoded(decoded)
+}
+
 /// Decodes only the exact root-genesis event for `expected_scope` at `expected_key`.
 ///
 /// # Errors
@@ -900,7 +1015,7 @@ pub fn decode_root_event(
 }
 
 pub(crate) fn payload_type_registered(payload_type: &str) -> bool {
-    if payload_type == ROOT_GENESIS_PAYLOAD_TYPE {
+    if payload_type == ROOT_GENESIS_PAYLOAD_TYPE || payload_type == PLAN_ADMITTED_PAYLOAD_TYPE {
         return true;
     }
     #[cfg(test)]
@@ -1190,6 +1305,57 @@ mod codec_tests {
                 .unwrap()
                 .stored_bytes(),
             genesis.event_bytes()
+        );
+    }
+
+    #[test]
+    fn plan_admitted_events_round_trip_and_reject_foreign_payloads() {
+        let genesis = fixture();
+        let plan_digest = Digest::new("ab".repeat(32)).unwrap();
+        let event = PlanAdmittedEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "admit-plan-1".into(),
+                PLAN_ADMITTED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            PlanAdmittedPayload::new(plan_digest.clone()),
+        )
+        .unwrap();
+
+        let encoded = encode_plan_admitted_event(&event).unwrap();
+        let key = scope_event_key(genesis.identity(), encoded.event_ref());
+        assert_eq!(
+            decode_plan_admitted_event(encoded.stored_bytes(), &key, genesis.identity()).unwrap(),
+            event
+        );
+        // Genesis bytes are a registered event, but not this payload type.
+        assert_eq!(
+            decode_plan_admitted_event(
+                genesis.event_bytes(),
+                genesis.event_key(),
+                genesis.identity()
+            ),
+            Err(WireError::InvalidValue)
+        );
+        // An admission cannot occupy the genesis sequence.
+        assert_eq!(
+            PlanAdmittedEvent::new(
+                EventEnvelope::new(
+                    genesis.identity().scope_id().clone(),
+                    1,
+                    None,
+                    1,
+                    "admit-plan-1".into(),
+                    PLAN_ADMITTED_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                PlanAdmittedPayload::new(plan_digest),
+            ),
+            Err(WireError::InvalidValue)
         );
     }
 }

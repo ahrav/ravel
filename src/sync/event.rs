@@ -1,6 +1,6 @@
 //! Immutable event reads and publication witnesses.
 //!
-//! Production publication registers root genesis only; test-only successors exercise CAS and retained-chain behavior.
+//! Production publication registers root genesis and plan admission; test-only successors exercise CAS and retained-chain behavior.
 
 use std::{error::Error, fmt};
 
@@ -183,6 +183,15 @@ fn validate_registered(
         let root = crate::scope::decode_root_event(encoded.stored_bytes(), key, scope)
             .map_err(ScopeEventPublicationError::Invalid)?;
         return if root.envelope() == envelope {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
+    }
+    if envelope.payload_type() == crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE {
+        let admitted = crate::scope::decode_plan_admitted_event(encoded.stored_bytes(), key, scope)
+            .map_err(ScopeEventPublicationError::Invalid)?;
+        return if admitted.envelope() == envelope {
             Ok(())
         } else {
             Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))

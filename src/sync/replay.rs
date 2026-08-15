@@ -3,7 +3,7 @@
 //! Ready output carries the observed head whose tail matches the committed local row.
 //! Remote validation completes before the first projection write.
 //! A writer epoch may lag the head epoch but never exceeds it or its own child's.
-//! Replay limits are 4,096 unseen events and 64 MiB of stored event bytes.
+//! Replay limits are 4,096 unseen events and 64 MiB of stored event and plan bytes.
 
 use std::{collections::HashSet, error::Error, fmt, path::Path};
 
@@ -11,11 +11,17 @@ use ciborium::Value;
 
 use crate::{
     db::{
-        projections::{ApplyError, ApplyOutcome, ScopeProjectionEvent, ValidateError},
+        projections::{
+            ApplyError, ApplyOutcome, ScopeProjectionEvent, ScopeProjectionPayload, ValidateError,
+        },
         worker::{DbHandle, OpenExistingError},
     },
-    scope::{Digest, ScopeEventRef, ScopeIdentity, root_event_from_decoded},
-    storage::s3::S3Store,
+    domain::proposal::{MAX_PLAN_STORED_BYTES, PlanProposal, decode_plan},
+    scope::{
+        Digest, PLAN_ADMITTED_PAYLOAD_TYPE, ScopeEventRef, ScopeIdentity,
+        plan_admitted_from_decoded, plan_key, root_event_from_decoded,
+    },
+    storage::s3::{GetError, GetOutcome, S3Store},
 };
 
 use super::{
@@ -89,6 +95,9 @@ pub(crate) struct PreparedSuffix {
 
 struct Prepared {
     decoded: crate::scope::DecodedScopeEvent<Value>,
+    /// Present exactly for `plan_admitted` events: the decoded event and the verified plan object
+    /// replay re-admits from.
+    plan: Option<(crate::scope::PlanAdmittedEvent, PlanProposal)>,
 }
 
 /// Replays the unseen suffix through the projection-owning worker.
@@ -188,9 +197,6 @@ async fn prepare_suffix_with_limits(
             return Err(ScopeReplayError::HeadInvalid(error));
         }
     };
-    if !head::root_head_supported(observed.head()) {
-        return Err(ScopeReplayError::HeadInvalid(WireError::InvalidValue));
-    }
     let events = prepare_chain(
         store,
         scope,
@@ -224,38 +230,15 @@ pub(crate) async fn apply_suffix(
         }
     }
     prepared.events.reverse();
-    let head = prepared.observed.head();
-    let active_plan = head.active_plan_digest().cloned();
-    let scope_epoch = head.scope_epoch().get();
+    let scope_epoch = prepared.observed.head().scope_epoch().get();
     let mutations = prepared
         .events
         .into_iter()
         .map(|prepared| {
             let reference = prepared.decoded.event_ref().clone();
-            #[cfg(test)]
-            let envelope = if prepared.decoded.envelope().payload_type()
-                == crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE
-            {
-                prepared.decoded.envelope().clone()
-            } else {
-                root_event_from_decoded(prepared.decoded, scope)
-                    .map_err(ScopeReplayError::EventInvalid)?
-                    .envelope()
-                    .clone()
-            };
-            #[cfg(not(test))]
-            let envelope = root_event_from_decoded(prepared.decoded, scope)
-                .map_err(ScopeReplayError::EventInvalid)?
-                .envelope()
-                .clone();
-            ScopeProjectionEvent::new(
-                scope.clone(),
-                envelope,
-                reference,
-                active_plan.clone(),
-                scope_epoch,
-            )
-            .map_err(|_| ScopeReplayError::HistoryConflict)
+            let (envelope, payload) = typed_payload(prepared, scope)?;
+            ScopeProjectionEvent::new(scope.clone(), envelope, reference, payload, scope_epoch)
+                .map_err(|_| ScopeReplayError::HistoryConflict)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -277,6 +260,43 @@ pub(crate) async fn apply_suffix(
         prepared.observed.head().tail().digest().clone(),
     );
     Ok((local_cursor, prepared.observed))
+}
+
+/// Converts one prepared event into the typed content its apply writes.
+fn typed_payload(
+    prepared: Prepared,
+    scope: &ScopeIdentity,
+) -> Result<(crate::scope::EventEnvelope, ScopeProjectionPayload), ScopeReplayError> {
+    match prepared.decoded.envelope().payload_type() {
+        PLAN_ADMITTED_PAYLOAD_TYPE => {
+            let (event, proposal) = prepared.plan.ok_or(ScopeReplayError::HistoryConflict)?;
+            Ok((
+                event.envelope().clone(),
+                ScopeProjectionPayload::PlanAdmitted {
+                    plan_digest: event.payload().plan_digest().clone(),
+                    proposal: Box::new(proposal),
+                },
+            ))
+        }
+        crate::scope::ROOT_GENESIS_PAYLOAD_TYPE => {
+            let event = root_event_from_decoded(prepared.decoded, scope)
+                .map_err(ScopeReplayError::EventInvalid)?;
+            Ok((
+                event.envelope().clone(),
+                ScopeProjectionPayload::RootGenesis {
+                    objective_digest: event.payload().config_digest().clone(),
+                },
+            ))
+        }
+        #[cfg(test)]
+        crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE => Ok((
+            prepared.decoded.envelope().clone(),
+            ScopeProjectionPayload::TestSuccessor,
+        )),
+        // `prepare_chain` already refused unregistered payloads; a new registered type must be
+        // routed here explicitly rather than absorbed by a catch-all.
+        _ => Err(ScopeReplayError::UnsupportedPayload),
+    }
 }
 
 async fn prepare_chain(
@@ -353,7 +373,33 @@ async fn prepare_chain(
                 .cloned()
                 .ok_or(ScopeReplayError::HistoryConflict)?;
         }
-        prepared.push(Prepared { decoded });
+        let plan = if decoded.envelope().payload_type() == PLAN_ADMITTED_PAYLOAD_TYPE {
+            let event = plan_admitted_from_decoded(decoded.clone())
+                .map_err(ScopeReplayError::EventInvalid)?;
+            let key = plan_key(
+                scope.workspace_id(),
+                scope.campaign_id(),
+                event.payload().plan_digest(),
+            );
+            // Plan objects draw on the same byte budget as the events that cite them.
+            let bytes = match store
+                .get_object(&key, MAX_PLAN_STORED_BYTES)
+                .await
+                .map_err(|error| match error {
+                    GetError::TooLarge => ScopeReplayError::EventInvalid(WireError::LimitExceeded),
+                    _ => ScopeReplayError::EventStorage,
+                })? {
+                GetOutcome::Found { bytes, .. } => bytes,
+                GetOutcome::NotFound => return Err(ScopeReplayError::EventMissing),
+            };
+            total_bytes = checked_total(total_bytes, bytes.len(), limits.bytes)?;
+            let proposal = decode_plan(&bytes, event.payload().plan_digest())
+                .map_err(|_| ScopeReplayError::EventInvalid(WireError::InvalidValue))?;
+            Some((event, proposal))
+        } else {
+            None
+        };
+        prepared.push(Prepared { decoded, plan });
     }
     Ok(prepared)
 }
@@ -431,7 +477,9 @@ mod tests {
             genesis.identity().clone(),
             root.envelope().clone(),
             genesis.event_ref().clone(),
-            None,
+            ScopeProjectionPayload::RootGenesis {
+                objective_digest: root.payload().config_digest().clone(),
+            },
             1,
         )
         .unwrap()
@@ -650,28 +698,6 @@ mod tests {
             (0, None)
         );
 
-        let invalid_heads = [ScopeHead::new(
-            genesis.identity().clone(),
-            ScopeAuthority::Unowned,
-            1,
-            genesis.event_ref().clone(),
-            Some(Digest::new("a".repeat(64)).unwrap()),
-            "invalid-plan-head".into(),
-        )
-        .unwrap()];
-        for head in invalid_heads {
-            let (store, client) = replay_store(vec![head_response(encode_head(&head).unwrap())]);
-            assert!(matches!(
-                refresh(&store, &handle, genesis.identity()).await,
-                ScopeReadiness::NotReady(ScopeReplayError::HeadInvalid(WireError::InvalidValue))
-            ));
-            assert_eq!(client.actual_requests().count(), 1);
-            assert_eq!(
-                handle.scope_cursor(genesis.identity()).await.unwrap(),
-                (0, None)
-            );
-        }
-
         let tail = ScopeEventRef::new(4_097, Digest::new("f".repeat(64)).unwrap()).unwrap();
         let head = ScopeHead::new(
             genesis.identity().clone(),
@@ -692,6 +718,29 @@ mod tests {
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
         );
+
+        // A head claiming an active plan is decodable now, but a suffix that contains no
+        // admission event cannot substantiate it, so the mismatch surfaces after apply:
+        // genesis lands, the head comparison fails, and readiness is refused.
+        let unsubstantiated_plan_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            format!("root-genesis:{}", genesis.identity().scope_id().as_str()),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&unsubstantiated_plan_head).unwrap()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, genesis.identity()).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(handle.scope_cursor(genesis.identity()).await.unwrap().0, 1);
         drop(handle);
         fs::remove_file(path).unwrap();
     }
@@ -1125,5 +1174,204 @@ mod tests {
         );
         drop(handle);
         fs::remove_file(path).unwrap();
+    }
+
+    /// A deleted projection is rebuilt from durable history alone: genesis, the admission event,
+    /// and the plan object reproduce the same plan, work, dependencies, bounds, and reservation.
+    #[tokio::test]
+    async fn replay_reconstructs_an_admitted_plan_from_durable_history() {
+        use crate::domain::proposal::{
+            PlanProposal, ProposalBasis, ProposalFacts, TargetBounds, WorkSpec, validate_proposal,
+        };
+        use crate::domain::work::WorkId;
+        use crate::scope::{PlanAdmittedEvent, PlanAdmittedPayload, encode_plan_admitted_event};
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let objective = genesis.config_digest().clone();
+        let proposal = PlanProposal::new(
+            scope.scope_id().clone(),
+            objective.clone(),
+            None,
+            vec![ProposalBasis::Observation {
+                event: genesis.event_ref().clone(),
+            }],
+            vec![
+                WorkSpec::new(
+                    WorkId::new("work-a".into()).unwrap(),
+                    Vec::new(),
+                    TargetBounds::new(2, 60_000).unwrap(),
+                ),
+                WorkSpec::new(
+                    WorkId::new("work-b".into()).unwrap(),
+                    vec![WorkId::new("work-a".into()).unwrap()],
+                    TargetBounds::new(2, 60_000).unwrap(),
+                ),
+            ],
+            11,
+        );
+        let facts = [crate::domain::proposal::ObservationFact::new(
+            scope.scope_id().clone(),
+            genesis.event_ref().clone(),
+            ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        let admissible = validate_proposal(
+            &proposal,
+            &ProposalFacts::new(&scope, &objective, None, 1, &facts),
+        )
+        .unwrap();
+        let event = PlanAdmittedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "admit-plan-1".into(),
+                crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            PlanAdmittedPayload::new(admissible.plan_digest().clone()),
+        )
+        .unwrap();
+        let encoded = encode_plan_admitted_event(&event).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            Some(admissible.plan_digest().clone()),
+            "admit-plan-1".into(),
+        )
+        .unwrap();
+
+        let responses = || {
+            vec![
+                head_response(encode_head(&head).unwrap()),
+                event_response(encoded.stored_bytes().to_vec()),
+                response(
+                    200,
+                    &[("etag", "\"plan\"")],
+                    admissible.stored_bytes().to_vec(),
+                ),
+                event_response(genesis.event_bytes().to_vec()),
+            ]
+        };
+        // The oracle lists every work row field-by-field, so a wrong revision, bound, or edge
+        // in the rebuilt projection cannot hide behind matching counts.
+        let admitted_rows = |path: &Path| {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let scope_row = connection
+                .query_row(
+                    "SELECT (SELECT active_plan_digest FROM scopes), \
+                     (SELECT reserved_budget_units FROM scopes), \
+                     (SELECT objective_digest FROM scopes)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let work_rows = connection
+                .prepare(
+                    "SELECT work_id, work_revision, max_attempts, deadline_unix_ms \
+                     FROM admitted_work ORDER BY work_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let edges = connection
+                .prepare(
+                    "SELECT work_id, depends_on_work_id FROM work_dependencies ORDER BY work_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (scope_row, work_rows, edges)
+        };
+
+        let path = path("replay-admission");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let (store, _) = replay_store(responses());
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        drop(handle);
+        let first = admitted_rows(&path);
+        assert_eq!(
+            first,
+            (
+                (
+                    admissible.plan_digest().as_str().to_owned(),
+                    11,
+                    objective.as_str().to_owned(),
+                ),
+                vec![
+                    ("work-a".to_owned(), 1, 2, 60_000),
+                    ("work-b".to_owned(), 1, 2, 60_000),
+                ],
+                vec![("work-b".to_owned(), "work-a".to_owned())],
+            )
+        );
+
+        // Delete the file and replay the identical durable history: the rebuilt projection is
+        // byte-for-byte the same admission state.
+        fs::remove_file(&path).unwrap();
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let (store, _) = replay_store(responses());
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        drop(handle);
+        assert_eq!(admitted_rows(&path), first);
+
+        // Reject a head whose plan digest differs from its admission event's plan digest.
+        let disagreeing = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            "admit-plan-1".into(),
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&disagreeing).unwrap()),
+            event_response(encoded.stored_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                admissible.stored_bytes().to_vec(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
+        ));
+        drop(handle);
+        // The projection holds the event's admission, not the head's claim.
+        assert_eq!(admitted_rows(&path), first);
+        fs::remove_file(&path).unwrap();
     }
 }

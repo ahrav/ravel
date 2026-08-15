@@ -990,9 +990,13 @@ Each admitted revision names its parent and supersedes that predecessor for plan
 It does not rewrite old observations, attempts, work revisions, or claims.
 Applicability is derived from the current plan lineage and exact bindings.
 
-The serialized `ClaimSpec`, `WorkSpec`, `ChildScopeProposal`, `DelegationGrant`,
-`EffectGrant`, `Decision`, `CompletionCertificate`, and `Settlement` layouts remain
-open contract questions. Plan supersession also remains conservative: validity and
+The minimum root `WorkSpec` admitted today carries a work identity, its dependencies
+inside the same plan, and finite `max_attempts` and `deadline_unix_ms` bounds. Fields
+serialize in declaration order; the work and dependency lists are sorted and deduplicated
+before they reach the canonical plan bytes, so declared order does not change the digest.
+Instruction bindings and the remaining `WorkSpec` fields stay open. The serialized
+`ClaimSpec`, `ChildScopeProposal`, `DelegationGrant`, `EffectGrant`, `Decision`,
+`CompletionCertificate`, and `Settlement` layouts remain open contract questions. Plan supersession also remains conservative: validity and
 drain rules for unclaimed work, live claims, unexpired grants, and in-flight operations
 must be specified before supersession is enabled. No current authority is silently
 revoked or extended by an unspecified rule.

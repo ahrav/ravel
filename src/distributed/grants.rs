@@ -2,7 +2,7 @@
 //!
 //! A grant is an immutable JSON object at its claim generation's grant key, published
 //! create-if-absent and activated by the existing `grant_fence` projection marker. The object
-//! alone grants nothing: intake accepts a grant only while the projection still resumes its
+//! alone grants nothing: intake accepts a grant only while the projection still continues its
 //! exact work revision under its exact claim fence, so claim reclamation, terminal evidence,
 //! or expiry revokes it without a revocation record.
 //!
@@ -166,13 +166,13 @@ impl ExpectedGrant {
 pub enum GrantRejection {
     /// No object exists at the claim generation's grant key.
     Absent,
-    /// The projection resumes the work under a newer claim generation than the caller's.
+    /// The projection continues the work under a newer claim generation than the caller's.
     StaleFence,
     /// `IdentityMismatch` covers a grant whose binding differs from the expected binding.
     IdentityMismatch,
     Expired,
     WiderThanRequested,
-    /// The projection does not resume, or no longer resumes, the caller's claim generation.
+    /// The projection does not continue, or no longer continues, the caller's claim generation.
     Revoked,
     Malformed,
 }
@@ -305,7 +305,7 @@ fn elapsed_ms(started: tokio::time::Instant) -> u64 {
 /// may retry after activation; transport failure is retryable as [`GrantIntake::Unavailable`].
 ///
 /// `scope_epoch` caps which admissions count as current and must come from the same observed
-/// head as `expected`; a newer epoch can only widen the resumable set, never narrow a refusal.
+/// head as `expected`; a newer epoch can only widen the continuable set, never narrow a refusal.
 pub async fn intake(
     store: &S3Store,
     database: &DbHandle,
@@ -351,22 +351,22 @@ pub async fn intake(
     {
         return GrantIntake::Rejected(GrantRejection::WiderThanRequested);
     }
-    // A grant object alone is not authority: the resumable-work record authorizes only the grant
+    // A grant object alone is not authority: the continuable-work record authorizes only the grant
     // whose SHA-256 digest it stores.
     match database
-        .resumable_work(
+        .continuable_work(
             expected.identity.scope(),
             scope_epoch,
             now_ms.saturating_add(elapsed_ms(started)),
         )
         .await
     {
-        Ok(resumable) => {
+        Ok(continuable) => {
             let accepted_at_ms = now_ms.saturating_add(elapsed_ms(started));
             if grant.deadline_unix_ms.get() <= accepted_at_ms {
                 return GrantIntake::Rejected(GrantRejection::Expired);
             }
-            match resumable
+            match continuable
                 .iter()
                 .find(|row| row.work() == expected.identity.work())
             {
@@ -921,7 +921,7 @@ mod tests {
             intake(&store, &handle, &other_operation, epoch, NOW_MS).await,
             GrantIntake::Rejected(GrantRejection::IdentityMismatch)
         ));
-        // Valid bytes, but the projection resumes nothing: the object alone is not authority.
+        // Valid bytes, but the projection continues nothing: the object alone is not authority.
         let (store, _) = replay_store(vec![found(grant_bytes(&fixture(2, 5, NOW_MS + 60_000)))]);
         assert!(matches!(
             intake(
@@ -1234,7 +1234,7 @@ mod tests {
         let epoch = NonZeroU64::new(1).unwrap();
         let found = |bytes: Vec<u8>| response(200, &[("etag", "\"grant\"")], bytes);
 
-        // Published but not yet recorded: the projection resumes nothing.
+        // Published but not yet recorded: the projection continues nothing.
         let (store, _) = replay_store(vec![found(bytes.clone())]);
         assert!(matches!(
             intake(

@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     db::projections::{
-        self, ApplyError, ApplyOutcome, GrantActivation, ResumableWork, SchemaError,
+        self, ApplyError, ApplyOutcome, ContinuableWork, GrantActivation, SchemaError,
         ScopeProjectionEvent, ValidateError,
     },
     domain::work::WorkRef,
@@ -62,6 +62,7 @@ enum Command {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
         dependencies: Vec<WorkId>,
+        plan_digest: Digest,
         scope_epoch: NonZeroU64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
@@ -71,11 +72,11 @@ enum Command {
         now_ms: u64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
-    ResumableWork {
+    ContinuableWork {
         scope: Box<ScopeIdentity>,
         scope_epoch: NonZeroU64,
         now_ms: u64,
-        respond: oneshot::Sender<Result<Vec<ResumableWork>, ApplyError>>,
+        respond: oneshot::Sender<Result<Vec<ContinuableWork>, ApplyError>>,
     },
     Drain {
         respond: oneshot::Sender<Result<(), ApplyError>>,
@@ -97,7 +98,7 @@ enum Command {
         result: Digest,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
-    ReadyWork {
+    ClaimableWork {
         scope: Box<ScopeIdentity>,
         now_ms: u64,
         respond: oneshot::Sender<Result<Vec<WorkRef>, ApplyError>>,
@@ -320,15 +321,16 @@ impl DbHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::Conflict`] for a changed dependency set or self-dependency,
-    /// [`ApplyError::Full`], [`ApplyError::Stopping`], or
-    /// [`ApplyError::DatabaseOperationFailed`].
+    /// Returns [`ApplyError::Conflict`] for a changed dependency set, a self-dependency, a
+    /// different admitting plan, or a second revision under `plan_digest`, [`ApplyError::Full`],
+    /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
     #[cfg(test)]
     pub(crate) async fn admit_work(
         &self,
         scope: &ScopeIdentity,
         work: WorkRef,
         dependencies: Vec<WorkId>,
+        plan_digest: Digest,
         scope_epoch: NonZeroU64,
     ) -> Result<(), ApplyError> {
         let scope = Box::new(scope.clone());
@@ -336,6 +338,7 @@ impl DbHandle {
             scope,
             work,
             dependencies,
+            plan_digest,
             scope_epoch,
             respond,
         })?
@@ -369,20 +372,21 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Lists the revisions a restart may resume under `scope_epoch` at `now_ms`.
+    /// Lists the revisions an existing claim and grant may continue under `scope_epoch` at
+    /// `now_ms`.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
-    pub async fn resumable_work(
+    pub async fn continuable_work(
         &self,
         scope: &ScopeIdentity,
         scope_epoch: NonZeroU64,
         now_ms: u64,
-    ) -> Result<Vec<ResumableWork>, ApplyError> {
+    ) -> Result<Vec<ContinuableWork>, ApplyError> {
         let scope = Box::new(scope.clone());
-        self.enqueue(|respond| Command::ResumableWork {
+        self.enqueue(|respond| Command::ContinuableWork {
             scope,
             scope_epoch,
             now_ms,
@@ -461,19 +465,19 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Readiness is derived per call; it is never stored.
+    /// Claimability is derived per call; it is never stored.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
-    pub async fn ready_work(
+    pub async fn claimable_work(
         &self,
         scope: &ScopeIdentity,
         now_ms: u64,
     ) -> Result<Vec<WorkRef>, ApplyError> {
         let scope = Box::new(scope.clone());
-        self.enqueue(|respond| Command::ReadyWork {
+        self.enqueue(|respond| Command::ClaimableWork {
             scope,
             now_ms,
             respond,
@@ -539,6 +543,7 @@ fn run(
                 scope,
                 work,
                 dependencies,
+                plan_digest,
                 scope_epoch,
                 respond,
             } => {
@@ -547,6 +552,7 @@ fn run(
                     &scope,
                     &work,
                     &dependencies,
+                    &plan_digest,
                     scope_epoch,
                 ));
             }
@@ -563,13 +569,13 @@ fn run(
                     now_ms,
                 ));
             }
-            Command::ResumableWork {
+            Command::ContinuableWork {
                 scope,
                 scope_epoch,
                 now_ms,
                 respond,
             } => {
-                let _ = respond.send(projections::resumable_work(
+                let _ = respond.send(projections::continuable_work(
                     &connection,
                     &scope,
                     scope_epoch,
@@ -612,12 +618,12 @@ fn run(
                     &result,
                 ));
             }
-            Command::ReadyWork {
+            Command::ClaimableWork {
                 scope,
                 now_ms,
                 respond,
             } => {
-                let _ = respond.send(projections::ready_work(&connection, &scope, now_ms));
+                let _ = respond.send(projections::claimable_work(&connection, &scope, now_ms));
             }
             #[cfg(test)]
             Command::Diagnostics { respond } => {
@@ -790,7 +796,13 @@ mod tests {
         let fence = NonZeroU64::new(1).unwrap();
         [
             handle
-                .admit_work(scope, work.clone(), Vec::new(), fence)
+                .admit_work(
+                    scope,
+                    work.clone(),
+                    Vec::new(),
+                    genesis.config_digest().clone(),
+                    fence,
+                )
                 .await,
             handle
                 .record_claim(scope, work.clone(), fence, fence, 1)
@@ -817,8 +829,8 @@ mod tests {
                     1,
                 )
                 .await,
-            handle.ready_work(scope, 1).await.map(|_| ()),
-            handle.resumable_work(scope, fence, 1).await.map(|_| ()),
+            handle.claimable_work(scope, 1).await.map(|_| ()),
+            handle.continuable_work(scope, fence, 1).await.map(|_| ()),
             handle.drain().await,
         ]
     }

@@ -1256,8 +1256,8 @@ mod tests {
                 event_response(genesis.event_bytes().to_vec()),
             ]
         };
-        // The oracle lists every work row field-by-field, so a wrong revision, bound, or edge
-        // in the rebuilt projection cannot hide behind matching counts.
+        // Comparing complete rows detects incorrect revisions, plan digests, attempt limits, and
+        // deadlines even when row counts match.
         let admitted_rows = |path: &Path| {
             let connection = rusqlite::Connection::open(path).unwrap();
             let scope_row = connection
@@ -1277,7 +1277,7 @@ mod tests {
                 .unwrap();
             let work_rows = connection
                 .prepare(
-                    "SELECT work_id, work_revision, max_attempts, deadline_unix_ms \
+                    "SELECT work_id, work_revision, plan_digest, max_attempts, deadline_unix_ms \
                      FROM admitted_work ORDER BY work_id",
                 )
                 .unwrap()
@@ -1285,8 +1285,9 @@ mod tests {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 })
                 .unwrap()
@@ -1324,8 +1325,20 @@ mod tests {
                     objective.as_str().to_owned(),
                 ),
                 vec![
-                    ("work-a".to_owned(), 1, 2, 60_000),
-                    ("work-b".to_owned(), 1, 2, 60_000),
+                    (
+                        "work-a".to_owned(),
+                        1,
+                        admissible.plan_digest().as_str().to_owned(),
+                        2,
+                        60_000,
+                    ),
+                    (
+                        "work-b".to_owned(),
+                        1,
+                        admissible.plan_digest().as_str().to_owned(),
+                        2,
+                        60_000,
+                    ),
                 ],
                 vec![("work-b".to_owned(), "work-a".to_owned())],
             )

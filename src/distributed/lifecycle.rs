@@ -556,7 +556,13 @@ mod tests {
         // Accept writes without collecting their responses, then prove the barrier applied them.
         for index in 0..8 {
             let work = WorkRef::new(WorkId::new(format!("work-{index}")).unwrap(), 1);
-            let mut pending = Box::pin(database.admit_work(&scope, work, Vec::new(), epoch));
+            let mut pending = Box::pin(database.admit_work(
+                &scope,
+                work,
+                Vec::new(),
+                Digest::new("a".repeat(64)).unwrap(),
+                epoch,
+            ));
             let waker = std::task::Waker::noop();
             let mut context = std::task::Context::from_waker(waker);
             assert!(std::future::Future::poll(pending.as_mut(), &mut context).is_pending());

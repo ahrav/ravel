@@ -1295,11 +1295,16 @@ mod tests {
                 .unwrap();
             let edges = connection
                 .prepare(
-                    "SELECT work_id, depends_on_work_id FROM work_dependencies ORDER BY work_id",
+                    "SELECT work_id, depends_on_work_id, depends_on_work_revision \
+                     FROM work_dependencies ORDER BY work_id",
                 )
                 .unwrap()
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
                 })
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -1340,7 +1345,7 @@ mod tests {
                         60_000,
                     ),
                 ],
-                vec![("work-b".to_owned(), "work-a".to_owned())],
+                vec![("work-b".to_owned(), "work-a".to_owned(), 1)],
             )
         );
 

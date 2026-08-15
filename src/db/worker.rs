@@ -61,7 +61,7 @@ enum Command {
     AdmitWork {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
-        dependencies: Vec<WorkId>,
+        dependencies: Vec<WorkRef>,
         plan_digest: Digest,
         scope_epoch: NonZeroU64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
@@ -321,15 +321,16 @@ impl DbHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::Conflict`] for a changed dependency set, a self-dependency, a
-    /// different admitting plan, or a second revision under `plan_digest`, [`ApplyError::Full`],
-    /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
+    /// Returns [`ApplyError::Conflict`] for a changed dependency set, a self-dependency, one
+    /// work id bound at two revisions, a different admitting plan, or a second revision under
+    /// `plan_digest`, [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
     #[cfg(test)]
     pub(crate) async fn admit_work(
         &self,
         scope: &ScopeIdentity,
         work: WorkRef,
-        dependencies: Vec<WorkId>,
+        dependencies: Vec<WorkRef>,
         plan_digest: Digest,
         scope_epoch: NonZeroU64,
     ) -> Result<(), ApplyError> {

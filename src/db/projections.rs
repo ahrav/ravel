@@ -96,6 +96,10 @@ const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
 /// `?6 > ?7` refuses a grant whose own deadline has already passed, so an expired object cannot be
 /// activated and cannot charge units for authority nobody can use.
 ///
+/// The grant's own deadline is stored with the other grant columns so `continuable_work` can
+/// exclude authority that has already died; re-recording the identical object at the same fence
+/// carries the same deadline (the digest pins the object), so the SET needs no CASE.
+///
 /// Attempts are consumed, not merely labelled: `granted_attempt` records the last attempt this
 /// revision drew, a new fence must name a strictly higher one, and `?9 <= max_attempts` caps the
 /// series. Re-recording the identical object at the same fence repeats its attempt and draws
@@ -106,6 +110,7 @@ const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
 /// within `reserved_budget_units`.
 const RECORD_GRANT_SQL: &str = "UPDATE admitted_work \
      SET grant_fence = ?4, grant_digest = ?11, granted_attempt = ?9, \
+         grant_deadline_unix_ms = ?6, \
          granted_units = CASE WHEN grant_fence = ?4 AND grant_digest = ?11 \
              THEN granted_units ELSE COALESCE(granted_units, 0) + ?10 END \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
@@ -129,8 +134,9 @@ const RECORD_GRANT_SQL: &str = "UPDATE admitted_work \
 /// A restart continues a revision only while every binding is still current: the admitting epoch
 /// is not ahead of the controller's `?2`, the revision carries no terminal evidence, its deadline
 /// is still ahead of `?3`, its claim lease is live at `?3`, a grant is bound to that exact claim
-/// fence, and the scope's `active_plan_digest` is the plan that admitted it. `active_plan_digest
-/// IS NULL` matches no row, so a scope holding no plan continues nothing.
+/// fence, the grant's recorded deadline is still ahead of `?3`, and the scope's
+/// `active_plan_digest` is the plan that admitted it. `active_plan_digest IS NULL` matches no
+/// row, so a scope holding no plan continues nothing.
 ///
 /// No arm compares revisions: `UNIQUE (scope_id, work_id, plan_digest)` makes a second revision of
 /// one work id under one plan unrepresentable, so at most one revision of a work id can match.
@@ -143,14 +149,17 @@ const CONTINUABLE_WORK_SQL: &str = "SELECT work_id, work_revision, claim_fence, 
        AND continuable.admitted_scope_epoch <= ?2 \
        AND continuable.claim_lease_until > ?3 \
        AND continuable.grant_fence = continuable.claim_fence \
+       AND continuable.grant_deadline_unix_ms > ?3 \
        AND continuable.plan_digest = (SELECT active_plan_digest FROM scopes \
              WHERE scope_id = ?1) \
      ORDER BY work_id";
-const WORK_DEPENDENCIES_SQL: &str = "SELECT depends_on_work_id FROM work_dependencies \
+const WORK_DEPENDENCIES_SQL: &str = "SELECT depends_on_work_id, depends_on_work_revision \
+     FROM work_dependencies \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
      ORDER BY depends_on_work_id";
 const ADMIT_DEPENDENCY_SQL: &str = "INSERT INTO work_dependencies \
-     (scope_id, work_id, work_revision, depends_on_work_id) VALUES (?1, ?2, ?3, ?4)";
+     (scope_id, work_id, work_revision, depends_on_work_id, depends_on_work_revision) \
+     VALUES (?1, ?2, ?3, ?4, ?5)";
 /// A recorded fence never regresses. A higher `?4` replaces `claim_fence` only when
 /// `claim_lease_until <= ?6`; an equal `?4` only extends its own lease.
 const RECORD_CLAIM_SQL: &str = "UPDATE admitted_work \
@@ -171,12 +180,13 @@ const RECORD_TERMINAL_SQL: &str = "UPDATE admitted_work SET terminal_result_dige
 /// A revision is claimable while its deadline is still ahead of `?2`, it carries no terminal
 /// evidence, it holds no claim whose lease is still live at `?2`, the scope's `active_plan_digest`
 /// is the plan that admitted it, and every dependency it declares carries terminal evidence on the
-/// row that same plan admitted. `active_plan_digest IS NULL` matches no row, so a scope holding no
-/// plan hands out nothing.
+/// exact revision the edge bound at admission. The bound revision is a primary-key probe, so
+/// terminal evidence on any other revision of that work id — or on a row a dangling edge names
+/// that was never admitted — satisfies nothing.
 ///
-/// No arm compares revisions: `UNIQUE (scope_id, work_id, plan_digest)` makes a second revision of
-/// one work id under one plan unrepresentable, and a revision any other plan admitted fails the
-/// active-plan arm.
+/// No arm compares sibling revisions of the claimable row: `UNIQUE (scope_id, work_id,
+/// plan_digest)` makes a second revision of one work id under one plan unrepresentable, and a
+/// revision any other plan admitted fails the active-plan arm.
 ///
 /// Expiry gates scheduling only: `RECORD_CLAIM_SQL` and `RECORD_TERMINAL_SQL` name no deadline, so
 /// work claimed before its deadline can still be closed after it.
@@ -193,8 +203,8 @@ const CLAIMABLE_WORK_SQL: &str = "SELECT work_id, work_revision FROM admitted_wo
                AND NOT EXISTS (SELECT 1 FROM admitted_work AS resolved \
                      WHERE resolved.scope_id = dependency.scope_id \
                        AND resolved.work_id = dependency.depends_on_work_id \
-                       AND resolved.terminal_result_digest IS NOT NULL \
-                       AND resolved.plan_digest = claimable.plan_digest)) \
+                       AND resolved.work_revision = dependency.depends_on_work_revision \
+                       AND resolved.terminal_result_digest IS NOT NULL)) \
      ORDER BY work_id";
 
 const SCHEMA: &str = "
@@ -276,6 +286,7 @@ CREATE TABLE admitted_work (
     grant_digest TEXT,
     granted_attempt INTEGER,
     granted_units INTEGER,
+    grant_deadline_unix_ms INTEGER,
     terminal_result_digest TEXT,
     PRIMARY KEY (scope_id, work_id, work_revision),
     -- Scheduling asks which revision of a work id the active plan admitted, and this constraint
@@ -300,15 +311,17 @@ CREATE TABLE admitted_work (
             AND claim_fence BETWEEN 1 AND 9999999999999999
             AND claim_lease_until BETWEEN 1 AND 9999999999999999)),
     -- `granted_units` is the running total this revision has drawn from the plan reservation,
-    -- `granted_attempt` is the last attempt it drew, and `grant_digest` names the object the
-    -- latest fence activated, so the four grant columns are present or absent together.
+    -- `granted_attempt` is the last attempt it drew, `grant_digest` names the object the latest
+    -- fence activated, and `grant_deadline_unix_ms` is that object's own deadline, so the five
+    -- grant columns are present or absent together.
     CHECK ((grant_fence IS NULL AND grant_digest IS NULL AND granted_units IS NULL
-            AND granted_attempt IS NULL)
+            AND granted_attempt IS NULL AND grant_deadline_unix_ms IS NULL)
         OR (grant_fence IS NOT NULL AND grant_digest IS NOT NULL AND granted_units IS NOT NULL
-            AND granted_attempt IS NOT NULL
+            AND granted_attempt IS NOT NULL AND grant_deadline_unix_ms IS NOT NULL
             AND grant_fence BETWEEN 1 AND 9999999999999999
             AND granted_attempt BETWEEN 1 AND 9999999999999999
             AND granted_units BETWEEN 1 AND 9999999999999999
+            AND grant_deadline_unix_ms BETWEEN 1 AND 9999999999999999
             AND length(grant_digest) = 64
             AND length(CAST(grant_digest AS BLOB)) = 64
             AND grant_digest NOT GLOB '*[^0-9a-f]*')),
@@ -325,11 +338,13 @@ CREATE TABLE work_dependencies (
     work_id TEXT NOT NULL,
     work_revision INTEGER NOT NULL,
     depends_on_work_id TEXT NOT NULL,
+    depends_on_work_revision INTEGER NOT NULL,
     PRIMARY KEY (scope_id, work_id, work_revision, depends_on_work_id),
     FOREIGN KEY (scope_id, work_id, work_revision)
         REFERENCES admitted_work(scope_id, work_id, work_revision) ON DELETE CASCADE,
     CHECK (length(CAST(depends_on_work_id AS BLOB)) BETWEEN 1 AND 128
         AND instr(CAST(depends_on_work_id AS BLOB), CAST('/' AS BLOB)) = 0),
+    CHECK (depends_on_work_revision BETWEEN 0 AND 9999999999999999),
     CHECK (depends_on_work_id <> work_id)
 ) STRICT, WITHOUT ROWID;
 ";
@@ -578,22 +593,24 @@ pub(crate) fn scope_matches_head(
     )
 }
 
-/// Re-admitting a revision is idempotent only when its canonical dependency set is unchanged.
-/// Dependency edges name work ids, so a dependency may be admitted after the revision that
-/// requires it. The scope's own projected row must already exist.
+/// Re-admitting a revision is idempotent only when its canonical dependency set — the sorted,
+/// deduplicated `(work id, revision)` pairs — is unchanged. Dependency edges name work ids that
+/// may be admitted after the revision that requires them. The scope's own projected row must
+/// already exist.
 ///
 /// # Errors
 ///
-/// Returns [`ApplyError::Conflict`] when a dependency names the revision's own work id, an
-/// existing revision has a different dependency set or another admitting plan, or `plan_digest`
-/// already admitted a different revision of this work id. Returns
-/// [`ApplyError::DatabaseOperationFailed`] when the scope has no projected row or SQLite fails.
+/// Returns [`ApplyError::Conflict`] when a dependency names the revision's own work id, two
+/// dependencies bind one work id to different revisions, an existing revision has a different
+/// dependency set or another admitting plan, or `plan_digest` already admitted a different
+/// revision of this work id. Returns [`ApplyError::DatabaseOperationFailed`] when the scope has
+/// no projected row or SQLite fails.
 #[cfg(test)]
 pub(crate) fn admit_work(
     connection: &mut rusqlite::Connection,
     scope: &ScopeIdentity,
     work: &WorkRef,
-    dependencies: &[WorkId],
+    dependencies: &[WorkRef],
     plan_digest: &Digest,
     scope_epoch: NonZeroU64,
 ) -> Result<(), ApplyError> {
@@ -626,25 +643,34 @@ fn constraint_conflict(error: rusqlite::Error) -> ApplyError {
     }
 }
 
-/// Writes one admitted revision and its edges inside the caller's transaction.
+/// Writes one admitted revision and its edges inside the caller's transaction. Each edge stores
+/// the exact revision it binds, so dependency resolution never re-derives it at query time.
 fn insert_work_row(
     transaction: &rusqlite::Transaction<'_>,
     scope: &ScopeIdentity,
     work: &WorkRef,
-    dependencies: &[WorkId],
+    dependencies: &[WorkRef],
     plan_digest: &Digest,
     scope_epoch: NonZeroU64,
     bounds: TargetBounds,
 ) -> Result<(), ApplyError> {
     if dependencies
         .iter()
-        .any(|dependency| dependency == work.id())
+        .any(|dependency| dependency.id() == work.id())
     {
         return Err(ApplyError::Conflict);
     }
-    let mut dependencies = dependencies.iter().map(WorkId::as_str).collect::<Vec<_>>();
+    let mut dependencies = dependencies
+        .iter()
+        .map(|dependency| Ok((dependency.id().as_str(), stored_u64(dependency.revision())?)))
+        .collect::<Result<Vec<_>, ApplyError>>()?;
     dependencies.sort_unstable();
     dependencies.dedup();
+    // Two edges binding one work id to different revisions would be two answers to one question,
+    // and letting the PK refuse them would surface as `DatabaseOperationFailed`.
+    if dependencies.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(ApplyError::Conflict);
+    }
 
     let revision = stored_u64(work.revision())?;
     let readmission = transaction.query_row(
@@ -686,21 +712,26 @@ fn insert_work_row(
         let stored = statement
             .query_map(
                 params![scope.scope_id().as_str(), work.id().as_str(), revision],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        if stored != dependencies {
+        if !stored
+            .iter()
+            .map(|(id, revision)| (id.as_str(), *revision))
+            .eq(dependencies.iter().copied())
+        {
             return Err(ApplyError::Conflict);
         }
     } else {
-        for dependency in dependencies {
+        for (dependency_id, dependency_revision) in dependencies {
             transaction.execute(
                 ADMIT_DEPENDENCY_SQL,
                 params![
                     scope.scope_id().as_str(),
                     work.id().as_str(),
                     revision,
-                    dependency
+                    dependency_id,
+                    dependency_revision
                 ],
             )?;
         }
@@ -761,11 +792,19 @@ fn admit_plan(
     }
 
     for spec in proposal.work_specs() {
+        // Every spec in the proposal is admitted at `INITIAL_WORK_REVISION` and the proposal
+        // gate refuses a dependency naming a work id outside it, so the revision this plan
+        // admits for each dependency is known here, at edge-writing time.
+        let dependencies = spec
+            .dependencies()
+            .iter()
+            .map(|dependency| WorkRef::new(dependency.clone(), INITIAL_WORK_REVISION))
+            .collect::<Vec<_>>();
         insert_work_row(
             transaction,
             &event.scope,
             &WorkRef::new(spec.work_id().clone(), INITIAL_WORK_REVISION),
-            spec.dependencies(),
+            &dependencies,
             plan_digest,
             NonZeroU64::new(event.scope_epoch).ok_or(ApplyError::DatabaseOperationFailed)?,
             spec.bounds(),
@@ -2195,7 +2234,7 @@ mod tests {
         connection: &mut rusqlite::Connection,
         scope: &ScopeIdentity,
         work: &WorkRef,
-        dependencies: &[WorkId],
+        dependencies: &[WorkRef],
         scope_epoch: NonZeroU64,
     ) -> Result<(), ApplyError> {
         admit_work(
@@ -2240,14 +2279,13 @@ mod tests {
     #[test]
     fn claimability_follows_dependencies_claims_and_terminal_evidence() {
         let (db_path, mut connection, scope) = admitted_scope("claimable-work");
-        let first = WorkId::new("work-a".into()).unwrap();
 
         admit(&mut connection, &scope, &work("work-a", 1), &[], epoch(1)).unwrap();
         admit(
             &mut connection,
             &scope,
             &work("work-b", 1),
-            std::slice::from_ref(&first),
+            &[work("work-a", 1)],
             epoch(1),
         )
         .unwrap();
@@ -2346,7 +2384,6 @@ mod tests {
     #[test]
     fn a_dependency_is_resolved_only_at_the_revision_the_active_plan_admitted() {
         let (db_path, mut connection, scope) = admitted_scope("dependency-supersession");
-        let blocker = WorkId::new("work-a".into()).unwrap();
         let result = Digest::new(DIGEST_2.into()).unwrap();
         let fence = NonZeroU64::new(1).unwrap();
         let lease = NonZeroU64::new(31_000).unwrap();
@@ -2355,7 +2392,7 @@ mod tests {
             &mut connection,
             &scope,
             &work("work-b", 1),
-            std::slice::from_ref(&blocker),
+            &[work("work-a", 1)],
             epoch(1),
         )
         .unwrap();
@@ -2363,7 +2400,8 @@ mod tests {
         record_terminal(&connection, &scope, &work("work-a", 1), fence, &result).unwrap();
         assert_eq!(claimable(&connection, &scope, 1_000), vec!["work-b@1"]);
 
-        // A second plan admits its own revision of both work ids.
+        // A second plan admits its own revision of both work ids, binding `work-b@2`'s edge to
+        // the revision it admits.
         supersede_plan(&connection, &scope, DIGEST_3);
         admit_work(
             &mut connection,
@@ -2378,7 +2416,7 @@ mod tests {
             &mut connection,
             &scope,
             &work("work-b", 2),
-            std::slice::from_ref(&blocker),
+            &[work("work-a", 2)],
             &plan(DIGEST_3),
             epoch(1),
         )
@@ -2392,6 +2430,65 @@ mod tests {
         record_claim(&connection, &scope, &work("work-a", 2), fence, lease, 1_000).unwrap();
         record_terminal(&connection, &scope, &work("work-a", 2), fence, &result).unwrap();
         assert_eq!(claimable(&connection, &scope, 1_000), vec!["work-b@2"]);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// A terminal result for `work-a@5` does not satisfy `work-b@1`'s dependency on `work-a@1`.
+    #[test]
+    fn a_dependency_edge_is_satisfied_only_at_its_bound_revision() {
+        let (db_path, mut connection, scope) = admitted_scope("dependency-bound-revision");
+        let fence = NonZeroU64::new(1).unwrap();
+        let lease = NonZeroU64::new(31_000).unwrap();
+        let result = Digest::new(DIGEST_2.into()).unwrap();
+        admit(&mut connection, &scope, &work("work-a", 1), &[], epoch(1)).unwrap();
+        admit(
+            &mut connection,
+            &scope,
+            &work("work-b", 1),
+            &[work("work-a", 1)],
+            epoch(1),
+        )
+        .unwrap();
+
+        // The direct insert creates a terminal `work-a@5` row under another plan.
+        connection
+            .execute(
+                "INSERT INTO admitted_work \
+                 (scope_id, work_id, work_revision, plan_digest, admitted_scope_epoch, \
+                  max_attempts, deadline_unix_ms, claim_fence, claim_lease_until, \
+                  terminal_result_digest) \
+                 VALUES (?1, 'work-a', 5, ?2, 1, 3, 9999999999999999, 1, 31000, ?3)",
+                params![scope.scope_id().as_str(), DIGEST_3, DIGEST_1],
+            )
+            .unwrap();
+        // A dangling edge fails closed: `(work-x, 1)` was never admitted, and the terminal
+        // `work-x@7` row under `ADMITTING_PLAN_DIGEST` does not stand in for it.
+        admit(
+            &mut connection,
+            &scope,
+            &work("work-c", 1),
+            &[work("work-x", 1)],
+            epoch(1),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO admitted_work \
+                 (scope_id, work_id, work_revision, plan_digest, admitted_scope_epoch, \
+                  max_attempts, deadline_unix_ms, claim_fence, claim_lease_until, \
+                  terminal_result_digest) \
+                 VALUES (?1, 'work-x', 7, ?2, 1, 3, 9999999999999999, 1, 31000, ?3)",
+                params![scope.scope_id().as_str(), ADMITTING_PLAN_DIGEST, DIGEST_1],
+            )
+            .unwrap();
+        assert_eq!(claimable(&connection, &scope, 1_000), vec!["work-a@1"]);
+
+        // Terminal evidence on the exact bound revision is what satisfies the edge.
+        record_claim(&connection, &scope, &work("work-a", 1), fence, lease, 1_000).unwrap();
+        record_terminal(&connection, &scope, &work("work-a", 1), fence, &result).unwrap();
+        assert_eq!(claimable(&connection, &scope, 1_000), vec!["work-b@1"]);
 
         drop(connection);
         fs::remove_file(db_path).unwrap();
@@ -2603,7 +2700,7 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_rejects_a_half_recorded_claim_and_unclaimed_terminal_evidence() {
+    fn the_schema_rejects_a_half_recorded_claim_grant_or_unclaimed_terminal_evidence() {
         let (db_path, mut connection, scope) = admitted_scope("claim-column-checks");
         let target = work("work-a", 1);
         admit(&mut connection, &scope, &target, &[], epoch(1)).unwrap();
@@ -2627,6 +2724,31 @@ mod tests {
         assert!(tamper(None, Some(31_000), None).is_err());
         assert!(tamper(None, None, Some(DIGEST_2)).is_err());
         tamper(Some(1), Some(31_000), Some(DIGEST_2)).unwrap();
+
+        // The five grant columns are present or absent together, so a recorded grant cannot
+        // lose its deadline and a deadline cannot exist without its grant.
+        let grant = |rest: Option<i64>, deadline: Option<i64>| {
+            connection.execute(
+                "UPDATE admitted_work SET grant_fence = ?4, grant_digest = ?5, \
+                 granted_attempt = ?4, granted_units = ?4, grant_deadline_unix_ms = ?6 \
+                 WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3",
+                params![
+                    scope.scope_id().as_str(),
+                    target.id().as_str(),
+                    target.revision() as i64,
+                    rest,
+                    rest.map(|_| DIGEST_3),
+                    deadline
+                ],
+            )
+        };
+        for (rest, deadline) in [(Some(1), None), (None, Some(10_000))] {
+            assert_eq!(
+                grant(rest, deadline).unwrap_err().sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ConstraintViolation)
+            );
+        }
+        grant(Some(1), Some(10_000)).unwrap();
 
         drop(connection);
         fs::remove_file(db_path).unwrap();
@@ -2730,8 +2852,8 @@ mod tests {
     #[test]
     fn re_admission_requires_the_same_dependency_set_and_rejects_a_self_edge() {
         let (db_path, mut connection, scope) = admitted_scope("dependency-immutability");
-        let first = WorkId::new("work-a".into()).unwrap();
-        let second = WorkId::new("work-c".into()).unwrap();
+        let first = work("work-a", 1);
+        let second = work("work-c", 1);
         admit(
             &mut connection,
             &scope,
@@ -2757,6 +2879,18 @@ mod tests {
                 &scope,
                 &work("work-b", 1),
                 std::slice::from_ref(&first),
+                epoch(1),
+            ),
+            Err(ApplyError::Conflict)
+        );
+        // The canonical set is pairs: the same work ids bound at another revision are a
+        // different set, not a reordering.
+        assert_eq!(
+            admit(
+                &mut connection,
+                &scope,
+                &work("work-b", 1),
+                &[work("work-a", 2), second.clone()],
                 epoch(1),
             ),
             Err(ApplyError::Conflict)
@@ -2800,7 +2934,19 @@ mod tests {
                 &mut connection,
                 &scope,
                 &work("work-b", 2),
-                &[WorkId::new("work-b".into()).unwrap()],
+                &[work("work-b", 1)],
+                epoch(1),
+            ),
+            Err(ApplyError::Conflict)
+        );
+        // A single admission cannot bind one work id to two revisions.
+        // `work-d` has no prior admission; only the duplicate `work-a` pair can conflict.
+        assert_eq!(
+            admit(
+                &mut connection,
+                &scope,
+                &work("work-d", 1),
+                &[work("work-a", 1), work("work-a", 2)],
                 epoch(1),
             ),
             Err(ApplyError::Conflict)
@@ -3028,6 +3174,51 @@ mod tests {
             continuable(&connection, &scope, 5, 1_000),
             vec!["work-a@1#3"]
         );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// The recorded lease and the admitted work deadline are both far past the grant deadline,
+    /// so the grant-deadline arm alone decides both sides of the boundary.
+    #[test]
+    fn an_expired_grant_deadline_ends_continuation_at_exactly_the_deadline() {
+        let (db_path, mut connection, scope) = admitted_scope("grant-deadline-boundary");
+        let target = work("work-a", 1);
+        let fence = NonZeroU64::new(2).unwrap();
+        admit(&mut connection, &scope, &target, &[], epoch(1)).unwrap();
+        record_claim(
+            &connection,
+            &scope,
+            &target,
+            fence,
+            NonZeroU64::new(31_000).unwrap(),
+            1_000,
+        )
+        .unwrap();
+        let deadline = NonZeroU64::new(10_000).unwrap();
+        grant_bounded(&connection, &scope, &target, fence, 1, deadline, 1, 1).unwrap();
+
+        // The stored row fact is the activation's own deadline.
+        let stored: i64 = connection
+            .query_row(
+                "SELECT grant_deadline_unix_ms FROM admitted_work \
+                 WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3",
+                params![
+                    scope.scope_id().as_str(),
+                    target.id().as_str(),
+                    target.revision() as i64
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 10_000);
+
+        assert_eq!(
+            continuable(&connection, &scope, 1, 9_999),
+            vec!["work-a@1#2"]
+        );
+        assert!(continuable(&connection, &scope, 1, 10_000).is_empty());
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

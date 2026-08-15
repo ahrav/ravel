@@ -60,6 +60,16 @@ impl ControllerAuthority {
         self.lease_until
     }
 
+    /// A mutation against any store other than this one proves nothing about ownership there.
+    pub(crate) fn namespace(&self) -> &str {
+        self.observed.namespace()
+    }
+
+    /// Milliseconds of positively known term left at `now_ms`.
+    pub(crate) fn remaining_term_ms(&self, now_ms: u64) -> u64 {
+        self.remaining_ms(now_ms)
+    }
+
     /// Reports whether less than [`STOP_MARGIN_MS`] of the positively known term remains.
     pub fn must_stop(&self, now_ms: u64) -> bool {
         self.remaining_ms(now_ms) < STOP_MARGIN_MS

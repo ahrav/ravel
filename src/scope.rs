@@ -596,7 +596,6 @@ pub fn scope_event_key(scope: &ScopeIdentity, event: &ScopeEventRef) -> String {
     )
 }
 
-/// Builds the full root-scoped work-claim key.
 /// Builds the full claim key, which locates a claim by scope and work revision only.
 ///
 /// Plan lineage and claim fence are bindings inside the record, not part of its location, so a
@@ -609,6 +608,23 @@ pub fn scope_claim_key(scope: &ScopeIdentity, work: &WorkRef) -> String {
         scope.scope_id().as_str(),
         work.id().as_str(),
         work.revision()
+    )
+}
+
+/// Builds the full key of one claim generation's effect grant.
+///
+/// Unlike [`scope_claim_key`], the fence is part of the location: create-only publication then
+/// yields one immutable object per claim generation, and a reader must already know its fence
+/// to address a grant.
+pub fn scope_grant_key(scope: &ScopeIdentity, work: &WorkRef, claim_fence: NonZeroU64) -> String {
+    format!(
+        "workspace/{}/campaigns/{}/scopes/{}/grants/{}/{}/{}",
+        scope.workspace_id().as_str(),
+        scope.campaign_id().as_str(),
+        scope.scope_id().as_str(),
+        work.id().as_str(),
+        work.revision(),
+        claim_fence
     )
 }
 

@@ -9,7 +9,7 @@ use ravel::{
         AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ScopeAuthority,
         ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeId, ScopeIdentity, artifact_key,
         decode_head, decode_root_event, encode_head, encode_root_event, plan_key, root_genesis,
-        root_scope_id, scope_claim_key, scope_event_key, scope_head_key,
+        root_scope_id, scope_claim_key, scope_event_key, scope_grant_key, scope_head_key,
     },
     sync::WireError,
 };
@@ -217,6 +217,10 @@ fn scope_keys_cover_the_exact_identity_axis() {
     assert_eq!(
         scope_claim_key(claim.scope(), claim.work()),
         format!("workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/claims/work-17/4")
+    );
+    assert_eq!(
+        scope_grant_key(claim.scope(), claim.work(), claim.claim_fence()),
+        format!("workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/grants/work-17/4/9")
     );
     assert_eq!(claim.plan_digest(), &digest);
     assert_eq!(claim.claim_fence().get(), 9);

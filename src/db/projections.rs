@@ -1214,7 +1214,22 @@ fn validate_history(connection: &rusqlite::Connection) -> Result<(), ValidateErr
         rows.retain(|payload_type| !payload_type_registered(payload_type));
         !rows.is_empty()
     };
-    if orphans != 0 || broken_parents != 0 || broken_cursors != 0 || unregistered {
+    let broken_admissions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM scopes AS scope \
+             WHERE (scope.active_plan_digest IS NOT NULL) != EXISTS(SELECT 1 \
+                 FROM applied_scope_events AS event \
+                 WHERE event.scope_id = scope.scope_id AND event.payload_type = ?1)",
+            [crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE],
+            |row| row.get(0),
+        )
+        .map_err(|_| ValidateError::DatabaseOperationFailed)?;
+    if orphans != 0
+        || broken_parents != 0
+        || broken_cursors != 0
+        || unregistered
+        || broken_admissions != 0
+    {
         return Err(ValidateError::InvalidHistory);
     }
     Ok(())
@@ -2653,6 +2668,30 @@ mod tests {
         assert_eq!(resumable(&connection, &scope, 3, 1), ["work-a@1"]);
 
         drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_a_plan_pointer_without_its_admission_event() {
+        let (db_path, mut connection, scope) = admitted_scope("plan-pointer-tamper");
+        let proposal = plan_proposal(&scope, &zero_objective(), 10_000);
+        let (event, _) = admission_event(&scope, &proposal, "admit-plan-1");
+        apply_scope_event(&mut connection, &event).unwrap();
+        drop(connection);
+        drop(open_existing(&db_path).unwrap());
+
+        let tampered = rusqlite::Connection::open(&db_path).unwrap();
+        tampered
+            .execute(
+                "UPDATE scopes SET active_plan_digest = NULL, reserved_budget_units = NULL",
+                [],
+            )
+            .unwrap();
+        drop(tampered);
+        assert_eq!(
+            open_existing(&db_path).unwrap_err(),
+            ValidateError::InvalidHistory
+        );
         fs::remove_file(db_path).unwrap();
     }
 

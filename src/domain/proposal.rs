@@ -105,8 +105,8 @@ pub enum ProposalBasis {
 
 /// Finite per-work-revision execution limits.
 ///
-/// `deadline_unix_ms` is absolute on the clock base claim leases use, so the same rows and the same
-/// clock reading derive the same ready set.
+/// `deadline_unix_ms` is absolute on the clock base claim leases use, so `claimable_work` reads it
+/// against the same clock the lease arms use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TargetBounds {
     max_attempts: NonZeroU64,

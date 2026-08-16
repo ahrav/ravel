@@ -172,14 +172,8 @@ impl ScopeHeadTransition {
         events: Vec<ResolvedScopeEventPublication>,
     ) -> Result<Self, WireError> {
         let active_plan = {
-            let views: Vec<BatchEventView<'_>> = events
-                .iter()
-                .map(|event| BatchEventView {
-                    envelope: event.envelope(),
-                    reference: event.event_ref(),
-                    bytes: event.canonical_bytes(),
-                })
-                .collect();
+            let views: Vec<BatchEventView<'_>> =
+                events.iter().map(BatchEventView::of_publication).collect();
             validate_batch_chain(&parent, &views)?
         };
         // All members must be witnessed in one store namespace: `commit` compares only the stored final publication against its target store, so agreement across the batch is proven here. commentlint: allow(JUDGE)
@@ -190,6 +184,7 @@ impl ScopeHeadTransition {
         {
             return Err(WireError::InvalidValue);
         }
+        // The fallback is unreachable: validate_batch_chain rejects an empty batch.
         let event = events
             .into_iter()
             .next_back()
@@ -200,13 +195,13 @@ impl ScopeHeadTransition {
             || candidate.operation_id() != envelope.operation_id()
             || envelope.scope_id() != candidate.scope().scope_id()
             || envelope.writer_epoch() != candidate.scope_epoch()
+            || candidate.active_plan_digest() != active_plan.as_ref()
         {
             return Err(WireError::InvalidValue);
         }
         match &parent {
             ScopeHeadParent::Genesis => {
-                if candidate.active_plan_digest().is_some()
-                    || !matches!(candidate.authority(), ScopeAuthority::Unowned)
+                if !matches!(candidate.authority(), ScopeAuthority::Unowned)
                     || candidate.scope_epoch().get() != 1
                 {
                     return Err(WireError::InvalidValue);
@@ -216,7 +211,6 @@ impl ScopeHeadTransition {
                 if candidate.scope() != observed.head.scope()
                     || candidate.authority() != observed.head.authority()
                     || candidate.scope_epoch() != observed.head.scope_epoch()
-                    || candidate.active_plan_digest() != active_plan.as_ref()
                 {
                     return Err(WireError::InvalidValue);
                 }
@@ -285,6 +279,24 @@ struct BatchEventView<'a> {
     bytes: &'a [u8],
 }
 
+impl<'a> BatchEventView<'a> {
+    fn of_publication(event: &'a ResolvedScopeEventPublication) -> Self {
+        Self {
+            envelope: event.envelope(),
+            reference: event.event_ref(),
+            bytes: event.canonical_bytes(),
+        }
+    }
+
+    fn of_encoded(pair: &'a (EventEnvelope, EncodedScopeEvent)) -> Self {
+        Self {
+            envelope: &pair.0,
+            reference: pair.1.event_ref(),
+            bytes: pair.1.stored_bytes(),
+        }
+    }
+}
+
 /// The batch-internal chain rules, shared by the pre-publication preflight and the transition
 /// constructor so a doomed batch is refused before any byte is published and re-proven after.
 ///
@@ -306,10 +318,14 @@ fn validate_batch_chain(
     parent: &ScopeHeadParent,
     events: &[BatchEventView<'_>],
 ) -> Result<Option<Digest>, WireError> {
-    let (first, rest) = events.split_first().ok_or(WireError::InvalidValue)?;
+    // Reject empty batches because an Existing parent would otherwise return its active-plan
+    // digest untouched below.
+    let Some(first) = events.first() else {
+        return Err(WireError::InvalidValue);
+    };
     let observed = match parent {
         ScopeHeadParent::Genesis => {
-            if !rest.is_empty()
+            if events.len() != 1
                 || first.envelope.sequence() != 1
                 || first.envelope.parent_event().is_some()
             {
@@ -320,42 +336,34 @@ fn validate_batch_chain(
         ScopeHeadParent::Existing(observed) => observed,
     };
     let head = observed.head();
-    let expected_first = head
+    let mut expected_sequence = head
         .tail()
         .sequence()
         .checked_add(1)
         .ok_or(WireError::InvalidValue)?;
-    if first.envelope.sequence() != expected_first
-        || first.envelope.parent_event() != Some(head.tail())
-    {
-        return Err(WireError::InvalidValue);
-    }
-    let mut operations = HashSet::new();
+    let mut expected_parent = head.tail();
+    let mut operations: HashSet<&str> = HashSet::with_capacity(events.len());
     let mut active_plan = head.active_plan_digest().cloned();
-    let mut previous: Option<&BatchEventView<'_>> = None;
     for event in events {
-        if event.envelope.scope_id() != head.scope().scope_id()
+        if event.envelope.sequence() != expected_sequence
+            || event.envelope.parent_event() != Some(expected_parent)
+            || event.envelope.sequence() > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS
+            || event.envelope.scope_id() != head.scope().scope_id()
             || event.envelope.writer_epoch() != head.scope_epoch()
             || event.envelope.operation_id() == head.operation_id()
-            || !operations.insert(event.envelope.operation_id().to_owned())
-            || event.envelope.sequence() > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS
         {
             return Err(WireError::InvalidValue);
         }
-        if let Some(previous) = previous {
-            let expected = previous
-                .envelope
-                .sequence()
-                .checked_add(1)
-                .ok_or(WireError::InvalidValue)?;
-            if event.envelope.sequence() != expected
-                || event.envelope.parent_event() != Some(previous.reference)
-            {
-                return Err(WireError::InvalidValue);
-            }
+        if !operations.insert(event.envelope.operation_id()) {
+            return Err(WireError::InvalidValue);
         }
         active_plan = next_active_plan_digest(active_plan, head.scope(), event)?;
-        previous = Some(event);
+        expected_sequence = event
+            .envelope
+            .sequence()
+            .checked_add(1)
+            .ok_or(WireError::InvalidValue)?;
+        expected_parent = event.reference;
     }
     Ok(active_plan)
 }
@@ -651,14 +659,8 @@ pub async fn append_batch(
         }
     }
     let active_plan = {
-        let views: Vec<BatchEventView<'_>> = events
-            .iter()
-            .map(|(envelope, encoded)| BatchEventView {
-                envelope,
-                reference: encoded.event_ref(),
-                bytes: encoded.stored_bytes(),
-            })
-            .collect();
+        let views: Vec<BatchEventView<'_>> =
+            events.iter().map(BatchEventView::of_encoded).collect();
         validate_batch_chain(&parent, &views).map_err(|_| ScopeAppendError::InvalidInput)?
     };
     // A plan-admission member must name a readable plan object before the first event PUT: an event that names an address must never win the head race while that address is unreadable (`append_plan_admitted`'s ordering rule). The proof is the same bounded, digest-checked read replay performs. commentlint: allow(JUDGE)
@@ -698,9 +700,8 @@ pub async fn append_batch(
         .map_err(ScopeAppendError::Publication)?;
         publications.push(publication);
     }
-    let Some(last) = publications.last() else {
-        return Err(ScopeAppendError::InvalidInput);
-    };
+    // The fallback is unreachable: validate_batch_chain rejects an empty batch.
+    let last = publications.last().ok_or(ScopeAppendError::InvalidInput)?;
     let candidate = ScopeHead::new(
         scope.clone(),
         authority,

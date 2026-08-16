@@ -1353,6 +1353,7 @@ mod tests {
             1,
             Digest::new("ab".repeat(32)).unwrap(),
             1,
+            None,
         )
         .unwrap();
         let event = ArtifactReferenceEvent::new(
@@ -2226,6 +2227,7 @@ mod tests {
                     1,
                     grant.clone(),
                     1,
+                    None,
                 )
                 .unwrap(),
             )

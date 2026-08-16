@@ -26,7 +26,7 @@ use crate::{
     },
     distributed::scope_controller::ControllerAuthority,
     domain::work::WorkRef,
-    scope::{Digest, ScopeClaimIdentity, ScopeHead, ScopeIdentity},
+    scope::{ArtifactReferencePayload, Digest, ScopeClaimIdentity, ScopeHead, ScopeIdentity},
 };
 
 #[cfg(test)]
@@ -93,6 +93,11 @@ enum Command {
         operation_id: String,
         grant_digest: Digest,
         respond: oneshot::Sender<Result<projections::GrantActivationProbe, ApplyError>>,
+    },
+    ArtifactReferenceAdmissible {
+        scope: Box<ScopeIdentity>,
+        payload: Box<ArtifactReferencePayload>,
+        respond: oneshot::Sender<Result<bool, ApplyError>>,
     },
     AdmittedWorkRefs {
         scope: Box<ScopeIdentity>,
@@ -473,6 +478,41 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
+    /// Whether the artifact-reference fold would admit `payload` against applied history.
+    ///
+    /// An appender probes this before publishing: an event that commits to the durable log
+    /// but fails its own fold leaves the scope unrebuildable. The projection may lag the
+    /// durable head, so a `false` is a refusal to proceed now, not proof the reference can
+    /// never resolve; callers gate on [`Self::scope_matches_head`] first, as `issue` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only tests call this; `expect` (not `allow`) flags this attribute for \
+                      removal if a non-test caller is added"
+        )
+    )]
+    pub(crate) async fn artifact_reference_admissible(
+        &self,
+        scope: &ScopeIdentity,
+        payload: &ArtifactReferencePayload,
+    ) -> Result<bool, ApplyError> {
+        let scope = Box::new(scope.clone());
+        let payload = Box::new(payload.clone());
+        self.enqueue(|respond| Command::ArtifactReferenceAdmissible {
+            scope,
+            payload,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
     /// Lists every admitted `(work, revision)` row of one scope beside the plan that admitted it.
     ///
     /// # Errors
@@ -794,6 +834,17 @@ fn run(
                     &grant_digest,
                 ));
             }
+            Command::ArtifactReferenceAdmissible {
+                scope,
+                payload,
+                respond,
+            } => {
+                let _ = respond.send(projections::artifact_reference_admissible(
+                    &connection,
+                    &scope,
+                    &payload,
+                ));
+            }
             Command::AdmittedWorkRefs { scope, respond } => {
                 let _ = respond.send(projections::admitted_work_refs(&connection, &scope));
             }
@@ -992,7 +1043,7 @@ mod tests {
         let authority = test_authority(&genesis).await;
         assert_eq!(
             work_commands(&handle, &genesis, &authority).await,
-            [Err(ApplyError::Full); 10]
+            [Err(ApplyError::Full); 11]
         );
 
         drop(receiver.recv().unwrap());
@@ -1027,7 +1078,7 @@ mod tests {
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Stopping));
         assert_eq!(
             work_commands(&handle, &genesis, &authority).await,
-            [Err(ApplyError::Stopping); 10]
+            [Err(ApplyError::Stopping); 11]
         );
         drop(pending);
     }
@@ -1063,7 +1114,7 @@ mod tests {
         handle: &DbHandle,
         genesis: &crate::scope::RootGenesis,
         authority: &crate::distributed::scope_controller::ControllerAuthority,
-    ) -> [Result<(), ApplyError>; 10] {
+    ) -> [Result<(), ApplyError>; 11] {
         let scope = genesis.identity();
         let work = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
         let fence = NonZeroU64::new(1).unwrap();
@@ -1081,6 +1132,25 @@ mod tests {
             deadline_unix_ms: fence,
             digest: genesis.config_digest().clone(),
         };
+        let kind = crate::scope::ArtifactKind::InvocationManifest;
+        let reference = ArtifactReferencePayload::new(
+            kind,
+            crate::domain::artifact::ArtifactRef::new(
+                genesis.config_digest().as_str().to_owned(),
+                1,
+                kind.media_type().into(),
+                "attempt-1".into(),
+                1,
+                None,
+            )
+            .unwrap(),
+            WorkId::new("work-17".into()).unwrap(),
+            1,
+            genesis.config_digest().clone(),
+            1,
+            None,
+        )
+        .unwrap();
         [
             handle
                 .admit_work(
@@ -1101,6 +1171,10 @@ mod tests {
             handle.grant_admissible(&identity, activation(), 1).await,
             handle
                 .grant_activation_probe(scope, "operation", genesis.config_digest())
+                .await
+                .map(|_| ()),
+            handle
+                .artifact_reference_admissible(scope, &reference)
                 .await
                 .map(|_| ()),
             handle.admitted_work_refs(scope).await.map(|_| ()),

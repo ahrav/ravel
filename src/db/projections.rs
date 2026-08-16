@@ -31,8 +31,8 @@ use crate::{
         work::{WorkId, WorkRef},
     },
     scope::{
-        ArtifactKind, ArtifactReferencePayload, Digest, EventEnvelope, GrantActivatedPayload,
-        ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeIdentity, payload_type_registered,
+        ArtifactReferencePayload, Digest, EventEnvelope, GrantActivatedPayload, ScopeClaimIdentity,
+        ScopeEventRef, ScopeHead, ScopeIdentity, payload_type_registered,
     },
 };
 
@@ -78,17 +78,32 @@ const ARTIFACT_REFERENCE_RESOLVABLE_SQL: &str = "SELECT \
      AND EXISTS(SELECT 1 FROM applied_scope_events \
        WHERE scope_id = ?1 AND payload_type = 'grant_activated' AND grant_digest = ?4 \
          AND work_id = ?2 AND work_revision = ?3 AND attempt = ?5)";
-/// Whether the attempt an incoming trace names has already admitted its manifest.
+/// Whether the attempt an incoming trace names has already admitted the exact manifest the
+/// trace's event bytes declare.
 ///
 /// A trace is terminal evidence about an invocation whose starting record must be durable
 /// before provider contact; a history holding the trace without the manifest would attest an
-/// ending with no beginning. The manifest row's columns are written once and never rewritten,
-/// so this predicate is as fold-order-safe as the resolution above.
+/// ending with no beginning. The address match (`?6`) is what pins the pairing: a trace whose
+/// body names a manifest from another binding, or one that was never admitted, finds no row.
+/// The manifest row's columns are written once and never rewritten, so this predicate is as
+/// fold-order-safe as the resolution above.
 const ARTIFACT_TRACE_MANIFEST_PRECEDES_SQL: &str = "SELECT \
      EXISTS(SELECT 1 FROM applied_scope_events \
        WHERE scope_id = ?1 AND payload_type = 'artifact_reference' \
          AND artifact_kind = 'invocation_manifest' \
-         AND work_id = ?2 AND work_revision = ?3 AND grant_digest = ?4 AND attempt = ?5)";
+         AND work_id = ?2 AND work_revision = ?3 AND grant_digest = ?4 AND attempt = ?5 \
+         AND artifact_digest = ?6)";
+/// Whether this attempt already admitted a record of this kind.
+///
+/// One manifest starts an attempt and one trace ends it; a second record of either kind for
+/// one attempt would let history carry two contradictory accounts of the same invocation,
+/// when a retry is required to draw a new attempt. The schema's UNIQUE mirror of this
+/// predicate is defense in depth against a writer bypassing the fold.
+const ARTIFACT_DUPLICATE_SQL: &str = "SELECT \
+     EXISTS(SELECT 1 FROM applied_scope_events \
+       WHERE scope_id = ?1 AND payload_type = 'artifact_reference' \
+         AND artifact_kind = ?2 \
+         AND work_id = ?3 AND work_revision = ?4 AND attempt = ?5)";
 const SCOPE_UPDATE_SQL: &str = "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2, \
      scope_epoch = ?3 WHERE scope_id = ?4";
 const TAIL_WRITER_EPOCH_SQL: &str = "SELECT writer_epoch FROM applied_scope_events \
@@ -321,11 +336,17 @@ CREATE TABLE applied_scope_events (
     work_id TEXT,
     work_revision INTEGER,
     attempt INTEGER,
-    -- What an artifact-reference event admitted, so a trace can require its manifest.
+    -- What an artifact-reference event admitted and the address it admitted it at, so a
+    -- trace can require the exact manifest its body names.
     artifact_kind TEXT,
+    artifact_digest TEXT,
     PRIMARY KEY (scope_id, sequence),
     UNIQUE (scope_id, digest),
     UNIQUE (scope_id, operation_id),
+    -- One record of each kind per invocation attempt: a second manifest or a contradictory
+    -- second trace for one attempt is unrepresentable, because a retry is a new attempt.
+    -- Rows without an artifact kind never collide: SQLite treats NULL as distinct here.
+    UNIQUE (scope_id, work_id, work_revision, attempt, artifact_kind),
     FOREIGN KEY (scope_id) REFERENCES scopes(scope_id) ON DELETE CASCADE,
     CHECK (sequence BETWEEN 1 AND 9999999999999999),
     CHECK (length(digest) = 64 AND length(CAST(digest AS BLOB)) = 64
@@ -355,7 +376,11 @@ CREATE TABLE applied_scope_events (
     CHECK (attempt IS NULL OR attempt BETWEEN 1 AND 9999999999999999),
     CHECK ((payload_type = 'artifact_reference') = (artifact_kind IS NOT NULL)),
     CHECK (artifact_kind IS NULL
-        OR artifact_kind IN ('invocation_manifest', 'invocation_trace'))
+        OR artifact_kind IN ('invocation_manifest', 'invocation_trace')),
+    CHECK ((payload_type = 'artifact_reference') = (artifact_digest IS NOT NULL)),
+    CHECK (artifact_digest IS NULL OR (length(artifact_digest) = 64
+        AND length(CAST(artifact_digest AS BLOB)) = 64
+        AND artifact_digest NOT GLOB '*[^0-9a-f]*'))
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE admitted_work (
@@ -1393,6 +1418,83 @@ fn stored_u64(value: u64) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::DatabaseOperationFailed)
 }
 
+/// Whether the fold would admit `payload` against the currently applied history.
+///
+/// One function answers for both sides of the boundary: the apply fold refuses a reference
+/// with exactly this predicate, and an appender probes it before publishing, because an event
+/// that commits to the durable log but fails its own fold leaves the scope unrebuildable.
+/// Reads only columns no later fold rewrites, so the answer cannot change with fold order.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a bound exceeds the
+/// stored-integer range.
+pub(crate) fn artifact_reference_admissible(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+    payload: &ArtifactReferencePayload,
+) -> Result<bool, ApplyError> {
+    reference_admissible(connection, scope.scope_id().as_str(), payload)
+}
+
+fn reference_admissible(
+    connection: &rusqlite::Connection,
+    scope_id: &str,
+    payload: &ArtifactReferencePayload,
+) -> Result<bool, ApplyError> {
+    let resolved: bool = connection.query_row(
+        ARTIFACT_REFERENCE_RESOLVABLE_SQL,
+        params![
+            scope_id,
+            payload.work_id().as_str(),
+            stored_u64(payload.work_revision().get())?,
+            payload.grant_digest().as_str(),
+            stored_u64(payload.attempt().get())?,
+        ],
+        |row| row.get(0),
+    )?;
+    if !resolved {
+        return Ok(false);
+    }
+    // One record of each kind per attempt: a duplicate would let history carry two
+    // contradictory accounts of one invocation, when a retry must draw a new attempt.
+    let duplicate: bool = connection.query_row(
+        ARTIFACT_DUPLICATE_SQL,
+        params![
+            scope_id,
+            payload.kind().as_str(),
+            payload.work_id().as_str(),
+            stored_u64(payload.work_revision().get())?,
+            stored_u64(payload.attempt().get())?,
+        ],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Ok(false);
+    }
+    // A trace ends an invocation whose manifest had to be durable before provider contact,
+    // and its event bytes name that manifest's address, so history without exactly that
+    // manifest is refused.
+    if let Some(manifest_digest) = payload.manifest_digest() {
+        let manifest_precedes: bool = connection.query_row(
+            ARTIFACT_TRACE_MANIFEST_PRECEDES_SQL,
+            params![
+                scope_id,
+                payload.work_id().as_str(),
+                stored_u64(payload.work_revision().get())?,
+                payload.grant_digest().as_str(),
+                stored_u64(payload.attempt().get())?,
+                manifest_digest.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        if !manifest_precedes {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// # Errors
 ///
 /// Returns [`ApplyError::DatabaseOperationFailed`] when the scope row is missing or SQLite
@@ -1584,39 +1686,10 @@ fn apply_scope_event_in_transaction(
     // those move to the latest fold, and `claim_fence` is still NULL while a rebuild applies
     // its suffix, because claim columns are restored only after the suffix commits. Either
     // mistake would make the same bytes pass or fail by fold order and could brick a rebuild.
-    if let ScopeProjectionPayload::ArtifactReference { payload } = &event.payload {
-        let resolved: bool = transaction.query_row(
-            ARTIFACT_REFERENCE_RESOLVABLE_SQL,
-            params![
-                scope_id,
-                payload.work_id().as_str(),
-                stored_u64(payload.work_revision().get())?,
-                payload.grant_digest().as_str(),
-                stored_u64(payload.attempt().get())?,
-            ],
-            |row| row.get(0),
-        )?;
-        if !resolved {
-            return Err(ApplyError::Conflict);
-        }
-        // A trace ends an invocation whose manifest had to be durable before provider
-        // contact, so history without that manifest is refused in the same transaction.
-        if payload.kind() == ArtifactKind::InvocationTrace {
-            let manifest_precedes: bool = transaction.query_row(
-                ARTIFACT_TRACE_MANIFEST_PRECEDES_SQL,
-                params![
-                    scope_id,
-                    payload.work_id().as_str(),
-                    stored_u64(payload.work_revision().get())?,
-                    payload.grant_digest().as_str(),
-                    stored_u64(payload.attempt().get())?,
-                ],
-                |row| row.get(0),
-            )?;
-            if !manifest_precedes {
-                return Err(ApplyError::Conflict);
-            }
-        }
+    if let ScopeProjectionPayload::ArtifactReference { payload } = &event.payload
+        && !reference_admissible(transaction, scope_id, payload)?
+    {
+        return Err(ApplyError::Conflict);
     }
 
     let duplicate: bool = transaction.query_row(
@@ -1632,29 +1705,33 @@ fn apply_scope_event_in_transaction(
         return Err(ApplyError::Conflict);
     }
     // The identity columns an activation or reference row retains are exactly the facts the
-    // two predicates above read back, written once here and never rewritten by a later fold.
-    let (work_id, work_revision, attempt, artifact_kind, grant_digest) = match &event.payload {
-        ScopeProjectionPayload::GrantActivated { payload } => (
-            Some(payload.work_id().as_str()),
-            Some(stored_u64(payload.work_revision().get())?),
-            Some(stored_u64(payload.attempt().get())?),
-            None,
-            Some(payload.grant_digest().as_str()),
-        ),
-        ScopeProjectionPayload::ArtifactReference { payload } => (
-            Some(payload.work_id().as_str()),
-            Some(stored_u64(payload.work_revision().get())?),
-            Some(stored_u64(payload.attempt().get())?),
-            Some(payload.kind().as_str()),
-            Some(payload.grant_digest().as_str()),
-        ),
-        _ => (None, None, None, None, None),
-    };
+    // admission predicates above read back, written once here and never rewritten by a later
+    // fold.
+    let (work_id, work_revision, attempt, artifact_kind, artifact_digest, grant_digest) =
+        match &event.payload {
+            ScopeProjectionPayload::GrantActivated { payload } => (
+                Some(payload.work_id().as_str()),
+                Some(stored_u64(payload.work_revision().get())?),
+                Some(stored_u64(payload.attempt().get())?),
+                None,
+                None,
+                Some(payload.grant_digest().as_str()),
+            ),
+            ScopeProjectionPayload::ArtifactReference { payload } => (
+                Some(payload.work_id().as_str()),
+                Some(stored_u64(payload.work_revision().get())?),
+                Some(stored_u64(payload.attempt().get())?),
+                Some(payload.kind().as_str()),
+                Some(payload.artifact().digest()),
+                Some(payload.grant_digest().as_str()),
+            ),
+            _ => (None, None, None, None, None, None),
+        };
     transaction.execute(
         "INSERT INTO applied_scope_events \
          (scope_id, sequence, digest, parent_digest, operation_id, writer_epoch, payload_type, \
-          grant_digest, work_id, work_revision, attempt, artifact_kind) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+          grant_digest, work_id, work_revision, attempt, artifact_kind, artifact_digest) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             scope_id,
             stored_sequence,
@@ -1669,6 +1746,7 @@ fn apply_scope_event_in_transaction(
             work_revision,
             attempt,
             artifact_kind,
+            artifact_digest,
         ],
     )?;
     Ok(ApplyOutcome::Applied)
@@ -1819,6 +1897,8 @@ const VALIDATE_TEXT_SQL: &str = "SELECT CAST(scope_id AS BLOB) FROM scopes \
        WHERE work_id IS NOT NULL \
      UNION ALL SELECT CAST(artifact_kind AS BLOB) FROM applied_scope_events \
        WHERE artifact_kind IS NOT NULL \
+     UNION ALL SELECT CAST(artifact_digest AS BLOB) FROM applied_scope_events \
+       WHERE artifact_digest IS NOT NULL \
      UNION ALL SELECT CAST(work_id AS BLOB) FROM admitted_work \
      UNION ALL SELECT CAST(plan_digest AS BLOB) FROM admitted_work \
      UNION ALL SELECT CAST(grant_digest AS BLOB) FROM admitted_work \
@@ -2345,7 +2425,12 @@ mod tests {
             query_plan(
                 &connection,
                 ARTIFACT_TRACE_MANIFEST_PRECEDES_SQL,
-                &[&scope_id, &work_id, &revision, &digest, &sequence],
+                &[&scope_id, &work_id, &revision, &digest, &sequence, &digest],
+            ),
+            query_plan(
+                &connection,
+                ARTIFACT_DUPLICATE_SQL,
+                &[&scope_id, &operation, &work_id, &revision, &sequence],
             ),
             query_plan(
                 &connection,
@@ -3014,6 +3099,7 @@ mod tests {
             revision,
             grant_digest,
             1,
+            None,
         )
     }
 
@@ -3023,6 +3109,7 @@ mod tests {
         revision: u64,
         grant_digest: &str,
         attempt: u64,
+        manifest_digest: Option<&str>,
     ) -> ArtifactReferencePayload {
         ArtifactReferencePayload::new(
             kind,
@@ -3039,6 +3126,7 @@ mod tests {
             revision,
             Digest::new(grant_digest.into()).unwrap(),
             attempt,
+            manifest_digest.map(|digest| Digest::new(digest.into()).unwrap()),
         )
         .unwrap()
     }
@@ -3100,8 +3188,18 @@ mod tests {
         .unwrap();
 
         // A reference naming that revision and that grant is admitted, and the projection
-        // gains nothing but the event row: the fold writes no columns.
+        // gains nothing but the event row: the fold writes no columns. The probe an appender
+        // consults answers the same as the fold acts, before and after the fold runs: the
+        // reference is admissible exactly once.
         let before = snapshot(&connection);
+        assert!(
+            artifact_reference_admissible(
+                &connection,
+                &scope,
+                &artifact_reference_payload("work-a", 1, grant.as_str()),
+            )
+            .unwrap()
+        );
         apply_scope_event(
             &mut connection,
             &artifact_event(
@@ -3121,6 +3219,15 @@ mod tests {
             "the work row's columns stay where the admission left them"
         );
         assert!(before != snapshot(&connection), "the event row is recorded");
+        assert!(
+            !artifact_reference_admissible(
+                &connection,
+                &scope,
+                &artifact_reference_payload("work-a", 1, grant.as_str()),
+            )
+            .unwrap(),
+            "a second record of the same kind for one attempt is no longer admissible"
+        );
 
         // A second scope in the same database, holding work and a grant that this scope never
         // released. Both halves of the predicate are scoped, and without another scope's rows
@@ -3192,6 +3299,7 @@ mod tests {
                     1,
                     grant.as_str(),
                     2,
+                    None,
                 ),
             ),
         ] {
@@ -3301,6 +3409,7 @@ mod tests {
                     1,
                     late.as_str(),
                     2,
+                    None,
                 ),
             ),
         )
@@ -3355,6 +3464,7 @@ mod tests {
                         1,
                         grant.as_str(),
                         1,
+                        Some(DIGEST_3),
                     ),
                 ),
             ),
@@ -3376,10 +3486,61 @@ mod tests {
                     1,
                     grant.as_str(),
                     1,
+                    None,
                 ),
             ),
         )
         .unwrap();
+
+        // A second manifest for the same attempt is refused outright: one attempt gets one
+        // starting record, and a retry is required to draw a new attempt.
+        assert_eq!(
+            apply_scope_event(
+                &mut connection,
+                &artifact_event(
+                    &scope,
+                    4,
+                    &event_digest(0xa3),
+                    &event_digest(0xa4),
+                    "artifact-op-4",
+                    artifact_reference_payload_of(
+                        ArtifactKind::InvocationManifest,
+                        "work-a",
+                        1,
+                        grant.as_str(),
+                        1,
+                        None,
+                    ),
+                ),
+            ),
+            Err(ApplyError::Conflict),
+            "second manifest for one attempt"
+        );
+
+        // A trace naming an address other than the admitted manifest's is refused even though
+        // a manifest for the binding exists: the pairing is by exact digest, not by tuple.
+        assert_eq!(
+            apply_scope_event(
+                &mut connection,
+                &artifact_event(
+                    &scope,
+                    4,
+                    &event_digest(0xa3),
+                    &event_digest(0xa4),
+                    "artifact-op-4",
+                    artifact_reference_payload_of(
+                        ArtifactKind::InvocationTrace,
+                        "work-a",
+                        1,
+                        grant.as_str(),
+                        1,
+                        Some(DIGEST_1),
+                    ),
+                ),
+            ),
+            Err(ApplyError::Conflict),
+            "trace naming a manifest that was never admitted"
+        );
 
         // A second attempt activates under its own grant, so its trace passes resolution —
         // and is still refused, because the manifest on file belongs to attempt 1. The axis
@@ -3415,6 +3576,7 @@ mod tests {
                         1,
                         late_grant.as_str(),
                         2,
+                        Some(DIGEST_3),
                     ),
                 ),
             ),
@@ -3436,6 +3598,7 @@ mod tests {
                     1,
                     grant.as_str(),
                     1,
+                    Some(DIGEST_3),
                 ),
             ),
         )

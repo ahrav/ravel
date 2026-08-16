@@ -546,7 +546,9 @@ impl ArtifactKind {
 ///
 /// Anything more the record must bind lives in the published artifact body, not here: this
 /// payload rides in an event bounded at 256 KiB
-/// compressed, while a prompt or completion is bounded at 1 MiB on its own.
+/// compressed, while a prompt or completion is bounded at 1 MiB on its own. The one exception
+/// is a trace's manifest address, because replay must prove the pairing after retention may
+/// have deleted the blob whose body carries it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactReferencePayload {
     kind: ArtifactKind,
@@ -555,6 +557,7 @@ pub struct ArtifactReferencePayload {
     work_revision: NonZeroU64,
     grant_digest: Digest,
     attempt: NonZeroU64,
+    manifest_digest: Option<Digest>,
 }
 
 impl ArtifactReferencePayload {
@@ -566,15 +569,19 @@ impl ArtifactReferencePayload {
     /// namespace. `ArtifactRef::new` is public over plain values, so a payload constructor
     /// could not make an unwitnessed reference unrepresentable even if it tried.
     ///
+    /// `manifest_digest` is the address of the manifest a trace terminates, present exactly
+    /// when `kind` is a trace: a manifest starts an invocation and has no predecessor to name.
+    ///
     /// # Errors
     ///
     /// Returns [`ValidationError::OutOfRange`] when the revision, attempt, artifact size, or
     /// creation time is zero or exceeds the stored-integer range. `ArtifactRef` accepts any
     /// size by design, so this is where an artifact entering durable history is bounded.
     /// Returns [`ValidationError::InvalidIdentity`] when the artifact's media type is not the
-    /// one `kind` pins, or its producer-attempt string names an attempt other than `attempt`:
-    /// each pair is two records of one fact, and both paths into history — the append boundary
-    /// and the replay decoder — route through here, so neither can admit a contradiction.
+    /// one `kind` pins, its producer-attempt string names an attempt other than `attempt`, or
+    /// the manifest address is present or absent against the kind's rule: each pair is two
+    /// records of one fact, and both paths into history — the append boundary and the replay
+    /// decoder — route through here, so neither can admit a contradiction.
     pub(crate) fn new(
         kind: ArtifactKind,
         artifact: ArtifactRef,
@@ -582,6 +589,7 @@ impl ArtifactReferencePayload {
         work_revision: u64,
         grant_digest: Digest,
         attempt: u64,
+        manifest_digest: Option<Digest>,
     ) -> Result<Self, ValidationError> {
         let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
         bounded(artifact.size())?;
@@ -590,6 +598,7 @@ impl ArtifactReferencePayload {
         let attempt_bound = bounded(attempt)?;
         if artifact.media_type() != kind.media_type()
             || artifact.producer_attempt() != format!("attempt-{attempt}")
+            || (kind == ArtifactKind::InvocationTrace) != manifest_digest.is_some()
         {
             return Err(ValidationError::InvalidIdentity);
         }
@@ -600,6 +609,7 @@ impl ArtifactReferencePayload {
             work_revision,
             grant_digest,
             attempt: attempt_bound,
+            manifest_digest,
         })
     }
 
@@ -626,6 +636,11 @@ impl ArtifactReferencePayload {
 
     pub fn attempt(&self) -> NonZeroU64 {
         self.attempt
+    }
+
+    /// The manifest a trace terminates; `None` exactly when this reference is a manifest.
+    pub fn manifest_digest(&self) -> Option<&Digest> {
+        self.manifest_digest.as_ref()
     }
 }
 
@@ -1181,6 +1196,9 @@ struct WireArtifactReferencePayload {
     work_revision: u64,
     grant_digest: String,
     attempt: u64,
+    /// The manifest a trace terminates, present exactly for traces: replay proves the pairing
+    /// from event bytes because retention may delete the blob whose body also carries it.
+    manifest_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1578,6 +1596,9 @@ pub fn encode_artifact_reference_event(
             work_revision: payload.work_revision().get(),
             grant_digest: payload.grant_digest().as_str().to_owned(),
             attempt: payload.attempt().get(),
+            manifest_digest: payload
+                .manifest_digest()
+                .map(|digest| digest.as_str().to_owned()),
         },
     )
 }
@@ -1622,6 +1643,11 @@ pub(crate) fn artifact_reference_from_decoded(
         payload.work_revision,
         Digest::new(payload.grant_digest).map_err(|_| WireError::InvalidValue)?,
         payload.attempt,
+        payload
+            .manifest_digest
+            .map(Digest::new)
+            .transpose()
+            .map_err(|_| WireError::InvalidValue)?,
     )
     .map_err(|_| WireError::InvalidValue)?;
     ArtifactReferenceEvent::new(decoded.envelope, payload)
@@ -1961,7 +1987,7 @@ mod codec_tests {
     /// compressed CBOR, so both the `ciborium` and `zstd-sys` lockfile pins are byte-affecting
     /// for this value, as is any change to the wire struct's field set or declaration order.
     const ARTIFACT_REFERENCE_EVENT_DIGEST: &str =
-        "9078b178c3d70a5d2188bceaed3b95a5bf58db810dac81fbfcc83e38b0f472fa";
+        "96f6bc7d738e56fe818440dea8bf4fd76f9d04329dc57bd5a1b5dd238187920f";
 
     /// Stored-byte address of the activation event
     /// `grant_activated_events_round_trip_and_reject_corruption` builds. The preimage is the
@@ -2218,6 +2244,7 @@ mod codec_tests {
             3,
             Digest::new("ab".repeat(32)).unwrap(),
             7,
+            Some(Digest::new("ef".repeat(32)).unwrap()),
         )
         .unwrap()
     }
@@ -2278,6 +2305,10 @@ mod codec_tests {
         assert_eq!(payload.work_revision().get(), 3);
         assert_eq!(payload.grant_digest().as_str(), "ab".repeat(32));
         assert_eq!(payload.attempt().get(), 7);
+        assert_eq!(
+            payload.manifest_digest().map(Digest::as_str),
+            Some("ef".repeat(32)).as_deref()
+        );
 
         // Genesis bytes are a registered event, but not this payload type.
         assert_eq!(
@@ -2354,6 +2385,11 @@ mod codec_tests {
                 "producer_attempt",
                 Value::Text("attempt-8".into()),
             ),
+            (
+                "a trace with no manifest address",
+                "manifest_digest",
+                Value::Null,
+            ),
         ] {
             let (bytes, key) = repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
                 let slot = map(payload)
@@ -2394,6 +2430,7 @@ mod codec_tests {
                 revision,
                 Digest::new("ab".repeat(32)).unwrap(),
                 attempt,
+                None,
             )
         };
 

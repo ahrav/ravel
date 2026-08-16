@@ -697,19 +697,22 @@ pub(crate) async fn append_artifact_reference(
     // kind the event declares. The digest check pins `record_bytes` to the witnessed blob, and
     // the binding comparison pins the record's own attribution to the one being admitted, so a
     // blob whose immutable body names another scope, plan, work, grant, or attempt is refused
-    // before the head CAS.
-    let recorded_binding = match kind {
+    // before the head CAS. A trace's manifest address is read out of the decoded record — not
+    // taken from the caller — so the event bytes replay proves the pairing against cannot
+    // disagree with the blob they admit.
+    let (recorded_binding, manifest_digest) = match kind {
         ArtifactKind::InvocationManifest => {
-            decode_manifest(record_bytes, witness.artifact_ref().digest())
-                .map_err(|_| ScopeAppendError::InvalidInput)?
-                .binding()
-                .clone()
+            let record = decode_manifest(record_bytes, witness.artifact_ref().digest())
+                .map_err(|_| ScopeAppendError::InvalidInput)?;
+            (record.binding().clone(), None)
         }
         ArtifactKind::InvocationTrace => {
-            decode_trace(record_bytes, witness.artifact_ref().digest())
-                .map_err(|_| ScopeAppendError::InvalidInput)?
-                .binding()
-                .clone()
+            let record = decode_trace(record_bytes, witness.artifact_ref().digest())
+                .map_err(|_| ScopeAppendError::InvalidInput)?;
+            (
+                record.binding().clone(),
+                Some(record.manifest_digest().clone()),
+            )
         }
     };
     if &recorded_binding != binding {
@@ -722,6 +725,7 @@ pub(crate) async fn append_artifact_reference(
         binding.work_revision().get(),
         binding.grant_digest().clone(),
         binding.attempt().get(),
+        manifest_digest,
     )
     .map_err(|_| ScopeAppendError::InvalidInput)?;
     let event = ArtifactReferenceEvent::new(

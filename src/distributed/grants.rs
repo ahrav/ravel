@@ -379,9 +379,9 @@ pub async fn issue(
         }
         GrantAppend::Unresolved => return IssueOutcome::Spent(IssueError::Unresolved),
     };
-    // The fold goes through the event-apply path so the applied-events cursor advances with the
-    // columns; a bare grant UPDATE would leave the cursor behind and the next refresh would
-    // fold the event a second time.
+    // The fold, cursor advance, and post-append head verification commit together. A head
+    // mismatch reports CommittedProjectionBehind for the durably committed grant; the next
+    // refresh folds it. A bare grant UPDATE could fold the event twice.
     let scope_epoch = envelope.writer_epoch().get();
     let Ok(mutation) = ScopeProjectionEvent::new(
         scope,
@@ -392,8 +392,13 @@ pub async fn issue(
     ) else {
         return IssueOutcome::CommittedProjectionBehind(authority);
     };
-    match tokio::time::timeout_at(deadline, database.apply(mutation)).await {
-        Ok(Ok(_)) => IssueOutcome::Issued(authority),
+    match tokio::time::timeout_at(
+        deadline,
+        database.apply_suffix(vec![mutation], authority.head()),
+    )
+    .await
+    {
+        Ok(Ok(())) => IssueOutcome::Issued(authority),
         Ok(Err(_)) | Err(_) => IssueOutcome::CommittedProjectionBehind(authority),
     }
 }

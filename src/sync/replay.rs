@@ -1,8 +1,9 @@
 //! Scope replay separates asynchronous object reads from blocking SQLite transactions.
 //!
 //! Ready output carries the observed head whose tail matches the committed local row.
-//! Remote validation completes before the first projection write.
-//! A writer epoch may lag the head epoch but never exceeds it or its own child's.
+//! Remote validation completes before the first projection write. The whole suffix and observed-
+//! head comparison apply in one transaction; any failure rolls back the suffix and leaves the
+//! cursor unchanged. A writer epoch may lag the head epoch but never exceeds it or its own child's.
 //! Replay limits are 4,096 unseen events and 64 MiB of stored event and plan bytes.
 
 use std::{collections::HashSet, error::Error, fmt, path::Path};
@@ -11,9 +12,7 @@ use ciborium::Value;
 
 use crate::{
     db::{
-        projections::{
-            ApplyError, ApplyOutcome, ScopeProjectionEvent, ScopeProjectionPayload, ValidateError,
-        },
+        projections::{ApplyError, ScopeProjectionEvent, ScopeProjectionPayload, ValidateError},
         worker::{DbHandle, OpenExistingError},
     },
     distributed::claims::{MAX_CLAIM_BYTES, ScopeClaimState, decode_claim},
@@ -112,8 +111,9 @@ struct Prepared {
 
 /// Replays the unseen suffix through the projection-owning worker.
 ///
-/// Remote reads and validation complete before the first projection write; the worker
-/// applies one event per transaction and advances that scope's cursor atomically.
+/// Remote reads and validation complete before the first projection write; the worker applies
+/// the whole suffix and the observed-head comparison in one transaction. Any failure rolls back
+/// the entire suffix and leaves the cursor unchanged.
 pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) -> ScopeReadiness {
     let cursor = match handle.scope_cursor(scope).await {
         Ok(cursor) => cursor,
@@ -301,19 +301,6 @@ pub(crate) async fn apply_suffix(
     scope: &ScopeIdentity,
     mut prepared: PreparedSuffix,
 ) -> Result<((u64, Digest), ObservedScopeHead), ScopeReplayError> {
-    for event in &prepared.events {
-        if handle
-            .scope_conflicting_operation(
-                scope,
-                event.decoded.envelope().operation_id(),
-                event.decoded.event_ref(),
-            )
-            .await
-            .map_err(ScopeReplayError::Apply)?
-        {
-            return Err(ScopeReplayError::HistoryConflict);
-        }
-    }
     prepared.events.reverse();
     let scope_epoch = prepared.observed.head().scope_epoch().get();
     let mutations = prepared
@@ -327,18 +314,13 @@ pub(crate) async fn apply_suffix(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    for mutation in mutations {
-        match handle.apply(mutation).await {
-            Ok(ApplyOutcome::Applied | ApplyOutcome::AlreadyApplied) => {}
-            Err(error) => return Err(ScopeReplayError::Apply(error)),
-        }
-    }
-    if !handle
-        .scope_matches_head(prepared.observed.head())
+    match handle
+        .apply_suffix(mutations, prepared.observed.head())
         .await
-        .map_err(ScopeReplayError::Apply)?
     {
-        return Err(ScopeReplayError::HistoryConflict);
+        Ok(()) => {}
+        Err(ApplyError::Conflict) => return Err(ScopeReplayError::HistoryConflict),
+        Err(error) => return Err(ScopeReplayError::Apply(error)),
     }
     let local_cursor = (
         prepared.observed.head().tail().sequence(),
@@ -682,6 +664,44 @@ mod tests {
 
         assert_eq!(second_cursor, first_cursor);
         assert_eq!(row_counts(&path), rows);
+
+        let successor_envelope = EventEnvelope::new(
+            genesis.identity().scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "mixed-overlap".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let successor = encode_scope_event(&successor_envelope, &Value::Null).unwrap();
+        let successor_head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            successor.event_ref().clone(),
+            None,
+            "mixed-overlap".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&successor_head).unwrap()),
+            event_response(successor.stored_bytes().to_vec()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        let prepared = prepare_suffix(&store, genesis.identity(), (0, None))
+            .await
+            .unwrap();
+        let (mixed_cursor, _) = apply_suffix(&other, genesis.identity(), prepared)
+            .await
+            .expect("an already-applied prefix continues into the unseen suffix");
+
+        assert_eq!(mixed_cursor, (2, successor.event_ref().digest().clone()));
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (2, Some(successor.event_ref().digest().clone()))
+        );
+        assert_eq!(row_counts(&path), (1, 2));
         drop((handle, other));
         fs::remove_file(path).unwrap();
     }
@@ -815,8 +835,8 @@ mod tests {
         );
 
         // A head claiming an active plan is decodable now, but a suffix that contains no
-        // admission event cannot substantiate it, so the mismatch surfaces after apply:
-        // genesis lands, the head comparison fails, and readiness is refused.
+        // admission event cannot substantiate it. The in-transaction head mismatch rolls back
+        // the whole suffix and refuses readiness.
         let unsubstantiated_plan_head = ScopeHead::new(
             genesis.identity().clone(),
             ScopeAuthority::Unowned,
@@ -835,7 +855,10 @@ mod tests {
             ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
         assert_eq!(client.actual_requests().count(), 2);
-        assert_eq!(handle.scope_cursor(genesis.identity()).await.unwrap().0, 1);
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (0, None)
+        );
         drop(handle);
         fs::remove_file(path).unwrap();
     }
@@ -915,9 +938,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_failure_keeps_a_valid_committed_prefix_not_ready() {
+    async fn a_database_failure_rolls_back_the_entire_suffix() {
         let genesis = genesis();
-        let path = path("committed-prefix");
+        let path = path("suffix-rollback");
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         rusqlite::Connection::open(&path)
             .unwrap()
@@ -956,15 +979,30 @@ mod tests {
         ));
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
-            (1, Some(genesis.event_ref().digest().clone()))
+            (0, None)
         );
         drop(handle);
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute_batch("DROP TRIGGER fail_second_event")
             .unwrap();
-        // The committed prefix is still a valid projection after the injected failure.
         drop(projections::open_existing(&path).unwrap());
+
+        let recovered = open_projection(&path).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&successor_head).unwrap()),
+            event_response(successor.stored_bytes().to_vec()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &recovered, genesis.identity()).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(
+            recovered.scope_cursor(genesis.identity()).await.unwrap(),
+            (2, Some(successor.event_ref().digest().clone()))
+        );
+        drop(recovered);
         fs::remove_file(path).unwrap();
     }
 
@@ -996,7 +1034,6 @@ mod tests {
 
     /// Builds one canonical chain of `LIMITS.events` events: root genesis at sequence 1 and
     /// test-only successors above it.
-    #[cfg(target_os = "linux")]
     fn benchmark_chain(
         genesis: &crate::scope::RootGenesis,
     ) -> (Vec<Vec<u8>>, Vec<crate::scope::ScopeEventRef>) {
@@ -1020,6 +1057,45 @@ mod tests {
             references.push(encoded.event_ref().clone());
         }
         (bytes, references)
+    }
+
+    #[tokio::test]
+    #[ignore = "9s full-limit gate: cargo test -- --ignored"]
+    async fn a_full_limit_suffix_commits_in_one_transaction() {
+        let genesis = genesis();
+        let path = path("full-limit-suffix");
+        let (bytes, references) = benchmark_chain(&genesis);
+        let last = LIMITS.events as usize - 1;
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            references[last].clone(),
+            None,
+            format!("benchmark-operation-{}", LIMITS.events),
+        )
+        .unwrap();
+        let mut responses = Vec::with_capacity(bytes.len() + 1);
+        responses.push(head_response(encode_head(&head).unwrap()));
+        responses.extend(bytes.into_iter().rev().map(event_response));
+        let (store, _) = replay_store(responses);
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+
+        match refresh(&store, &handle, genesis.identity()).await {
+            ScopeReadiness::Ready { local_cursor, .. } => {
+                assert_eq!(
+                    local_cursor,
+                    (LIMITS.events, references[last].digest().clone())
+                );
+            }
+            ScopeReadiness::NotReady(error) => panic!("full suffix replay failed: {error}"),
+        }
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (LIMITS.events, Some(references[last].digest().clone()))
+        );
+        drop(handle);
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -1484,9 +1560,10 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
+        // Atomic suffix application leaves the fresh projection empty on head mismatch.
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap(), (0, None));
+        assert_eq!(row_counts(&path), (0, 0));
         drop(handle);
-        // The projection holds the event's admission, not the head's claim.
-        assert_eq!(admitted_rows(&path), first);
         fs::remove_file(&path).unwrap();
     }
     /// Shared fixture for the grant round-trip tests: a validated two-work proposal, its

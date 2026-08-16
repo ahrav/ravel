@@ -1,8 +1,9 @@
 //! A dedicated blocking thread owns one SQLite connection and serializes mutations.
 //!
 //! Reads and writes share one queue bounded at 64. Admission fails with full or stopping
-//! instead of blocking. Accepted commands remain owned by the detached worker if callers drop
-//! response futures. SQLite values and guards remain on the worker thread. The connection runs in
+//! instead of blocking. One suffix application is one command and one transaction. Accepted
+//! commands remain owned by the detached worker if callers drop response futures. SQLite values
+//! and guards remain on the worker thread. The connection runs in
 //! rollback-journal `delete` mode, which keeps the projection a single file with no
 //! write-ahead-log sidecars. The worker creates a fresh projection or opens an existing file
 //! after validating it.
@@ -20,16 +21,20 @@ use tokio::sync::oneshot;
 
 use crate::{
     db::projections::{
-        self, ApplyError, ApplyOutcome, ContinuableWork, GrantActivation, SchemaError,
-        ScopeProjectionEvent, ValidateError,
+        self, ApplyError, ContinuableWork, GrantActivation, SchemaError, ScopeProjectionEvent,
+        ValidateError,
     },
     distributed::scope_controller::ControllerAuthority,
     domain::work::WorkRef,
-    scope::{Digest, ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeIdentity},
+    scope::{Digest, ScopeClaimIdentity, ScopeHead, ScopeIdentity},
 };
 
 #[cfg(test)]
-use crate::{db::projections::ScopeProjectionPayload, domain::work::WorkId};
+use crate::{
+    db::projections::{ApplyOutcome, ScopeProjectionPayload},
+    domain::work::WorkId,
+    scope::ScopeEventRef,
+};
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 
@@ -38,14 +43,25 @@ fn command_channel() -> (SyncSender<Command>, Receiver<Command>) {
 }
 
 enum Command {
+    /// Direct event application has no production command: `ApplySuffix` is the production
+    /// projection writer.
+    #[cfg(test)]
     Apply {
         mutation: Box<ScopeProjectionEvent>,
         respond: oneshot::Sender<Result<ApplyOutcome, ApplyError>>,
+    },
+    ApplySuffix {
+        mutations: Vec<ScopeProjectionEvent>,
+        head: Box<ScopeHead>,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     Cursor {
         scope: Box<ScopeIdentity>,
         respond: oneshot::Sender<Result<(u64, Option<Digest>), ApplyError>>,
     },
+    /// Standalone conflict probes have no production command: `ApplySuffix` performs duplicate
+    /// checks inside the suffix transaction.
+    #[cfg(test)]
     ConflictingOperation {
         scope: Box<ScopeIdentity>,
         operation_id: String,
@@ -271,12 +287,41 @@ impl DbHandle {
     /// [`ApplyError::Stopping`] when the worker is disconnected, errors from
     /// [`projections::apply_scope_event`], or [`ApplyError::DatabaseOperationFailed`] when an
     /// accepted command loses its response.
+    #[cfg(test)]
     pub(crate) async fn apply(
         &self,
         mutation: ScopeProjectionEvent,
     ) -> Result<ApplyOutcome, ApplyError> {
         self.enqueue(|respond| Command::Apply {
             mutation: Box::new(mutation),
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Applies one validated suffix and its observed-head comparison atomically.
+    ///
+    /// Dropping the returned future does not revoke a command that was already accepted;
+    /// the suffix still applies, and only the response is discarded. A lost response does not
+    /// indicate whether the accepted suffix committed. Any apply error or head mismatch rolls
+    /// back the whole suffix and leaves the cursor unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`] when admission is saturated,
+    /// [`ApplyError::Stopping`] when the worker is disconnected, errors from
+    /// [`projections::apply_scope_suffix`], or [`ApplyError::DatabaseOperationFailed`] when an
+    /// accepted command loses its response.
+    pub(crate) async fn apply_suffix(
+        &self,
+        mutations: Vec<ScopeProjectionEvent>,
+        head: &ScopeHead,
+    ) -> Result<(), ApplyError> {
+        let head = Box::new(head.clone());
+        self.enqueue(|respond| Command::ApplySuffix {
+            mutations,
+            head,
             respond,
         })?
         .await
@@ -306,6 +351,7 @@ impl DbHandle {
     ///
     /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
+    #[cfg(test)]
     pub(crate) async fn scope_conflicting_operation(
         &self,
         scope: &ScopeIdentity,
@@ -645,18 +691,33 @@ fn run(
     let mut apply_count = 0;
     while let Ok(command) = commands.recv() {
         match command {
+            #[cfg(test)]
             Command::Apply { mutation, respond } => {
+                last_apply_thread = Some(thread::current().id());
+                apply_count += 1;
+                let outcome = projections::apply_scope_event(&mut connection, &mutation);
+                let _ = respond.send(outcome);
+            }
+            Command::ApplySuffix {
+                mutations,
+                head,
+                respond,
+            } => {
                 #[cfg(test)]
                 {
                     last_apply_thread = Some(thread::current().id());
-                    apply_count += 1;
+                    apply_count += mutations.len();
                 }
-                let outcome = projections::apply_scope_event(&mut connection, &mutation);
-                let _ = respond.send(outcome);
+                let _ = respond.send(projections::apply_scope_suffix(
+                    &mut connection,
+                    &mutations,
+                    &head,
+                ));
             }
             Command::Cursor { scope, respond } => {
                 let _ = respond.send(projections::scope_cursor(&connection, &scope));
             }
+            #[cfg(test)]
             Command::ConflictingOperation {
                 scope,
                 operation_id,
@@ -901,6 +962,12 @@ mod tests {
 
         assert_eq!(handle.apply(test_mutation()).await, Err(ApplyError::Full));
         assert_eq!(
+            handle
+                .apply_suffix(vec![test_mutation()], genesis.head())
+                .await,
+            Err(ApplyError::Full)
+        );
+        assert_eq!(
             handle.scope_cursor(genesis.identity()).await,
             Err(ApplyError::Full)
         );
@@ -934,6 +1001,12 @@ mod tests {
         drop(receiver);
         assert_eq!(
             handle.apply(test_mutation()).await,
+            Err(ApplyError::Stopping)
+        );
+        assert_eq!(
+            handle
+                .apply_suffix(vec![test_mutation()], genesis.head())
+                .await,
             Err(ApplyError::Stopping)
         );
         assert_eq!(

@@ -10,14 +10,15 @@
 //! bounds. Invocation marks [`AttemptHistory`] before awaiting the SDK, so cancellation
 //! retains possible-send evidence: only a pre-dispatch refusal and a construction failure
 //! with clean history prove no request was sent, while transport, timeout, malformed
-//! response, and unclassified service failures leave the outcome unknown.
+//! response, and unclassified service failures all leave dispatch uncertainty in place.
 //!
-//! No provider type crosses this boundary, and no type that does carries text into a log.
-//! `Converse`'s own request and response types print prompt and completion text in full
-//! under `Debug`, redacting only `prompt_variables`, `request_metadata`, and reasoning
-//! content. This module neither logs nor debug-prints them, and [`InvocationRequest`] and
-//! [`InvocationOutcome`] implement `Debug` by hand over lengths and digests, so a caller
-//! that formats one cannot leak what a derived implementation would have exposed.
+//! No provider type appears in an invocation's request or outcome, only in client
+//! construction, and no type that does cross carries text into a log. `Converse`'s own
+//! request and response types print prompt and completion text in full under `Debug`; the
+//! few fields they do redact are ones this module never sets. This module neither logs nor
+//! debug-prints them, and [`InvocationRequest`] and [`InvocationOutcome`] implement `Debug`
+//! by hand over lengths and digests, so a caller that formats one cannot leak what a
+//! derived implementation would have exposed.
 
 use std::{error::Error, fmt, num::NonZeroU32, time::Duration};
 
@@ -110,8 +111,8 @@ pub const MAX_STOP_SEQUENCES: usize = 4;
 /// One fixed model configuration, pinned before any request is built.
 ///
 /// Sampling knobs are stored as thousandths rather than floats because the profile digest
-/// covers them: two runs must derive one address from one configuration, and `f32` gives no
-/// such guarantee across formatting or platforms.
+/// covers them: an integer has exactly one byte form per value, while a float's address
+/// depends on how it is rendered and admits several bit patterns for one configuration.
 ///
 /// `output_token_ceiling` is the permitted range this boundary validates a cap against. It
 /// is part of the pinned configuration rather than a vendor table, because a per-model
@@ -398,8 +399,9 @@ impl TerminalReason {
 
 /// Knowledge retained after one physical invocation attempt.
 ///
-/// Every variant except `Refused` and `Completed` leaves the remote outcome either known
-/// to have failed or unknown; none of them asserts the provider did no work.
+/// `ProvenNotSent` is the only variant that asserts the provider did no work, and it is
+/// sound only against a clean history. Every other variant leaves the remote outcome either
+/// known to have failed or unknown.
 #[derive(Clone, Eq, PartialEq)]
 pub enum InvocationOutcome {
     /// The provider returned a completion.
@@ -432,12 +434,18 @@ pub enum InvocationOutcome {
     /// A bound elapsed locally or the provider reported its own timeout. Whether the
     /// provider completed the work is unknown.
     TimedOut,
-    /// The request never reached construction, so no dispatch was possible.
+    /// No request was constructed, so no dispatch was possible.
+    ///
+    /// Neither leg is reachable through this boundary: the message is built from values set
+    /// unconditionally, and a missing credential provider still resolves far enough to fail
+    /// at the connector, which is [`Self::Unknown`]. The variant stays because the outcome
+    /// has to be total, and no test demonstrates the one claim that matters most.
     ProvenNotSent,
     /// A response arrived that this boundary cannot read as a completion, either because a
     /// stop reason this crate does not model carried no usable text or because the frame
-    /// itself would not decode. Any evidence that did arrive is kept: a frame that reports
-    /// token use was billed whether or not this crate could interpret the rest of it.
+    /// itself would not decode. Whatever evidence arrived is kept: a frame that reported
+    /// token use was billed whether or not this crate could interpret the rest of it, and a
+    /// frame that failed to decode still carries the request id that correlates the call.
     MalformedResponse {
         provider_request_id: Option<String>,
         reported_use: Option<ReportedUse>,
@@ -613,10 +621,10 @@ fn classify(result: Result<ConverseResponse, SdkError<ConverseError>>) -> Invoca
 /// Non-text blocks are dropped: this boundary requests no tools, documents, or images, so
 /// a response carrying them is answering a request this crate did not make.
 ///
-/// A completion past [`MAX_COMPLETION_BYTES`] is refused rather than truncated. The cap
-/// this boundary sent bounds output tokens, so exceeding a byte bound this far above it
-/// means the response did not honor the request; handing back a silently shortened answer
-/// would let a caller treat a partial completion as a whole one.
+/// A completion past [`MAX_COMPLETION_BYTES`] is refused rather than truncated: handing back
+/// a silently shortened answer would let a caller treat a partial completion as a whole one.
+/// The bound is this boundary's own retention limit and not an inference from the cap, so a
+/// profile whose cap can produce more text than this cannot complete through here.
 fn completion_text(response: &ConverseResponse) -> Option<String> {
     let ResponseBody::Message(message) = response.output()? else {
         return None;
@@ -664,13 +672,19 @@ fn terminal_reason(reason: &StopReason) -> TerminalReason {
 /// of them: the SDK would have retried it on its own, and disabling retries moves that
 /// decision here.
 fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
+    use aws_sdk_bedrockruntime::operation::RequestId;
+
+    let provider_request_id = error.request_id().map(str::to_owned);
     match error {
         SdkError::ConstructionFailure(_) => InvocationOutcome::ProvenNotSent,
         SdkError::TimeoutError(_) => InvocationOutcome::TimedOut,
         SdkError::DispatchFailure(_) => InvocationOutcome::Unknown,
-        // A frame that would not decode carries no evidence this boundary can trust.
+        // No fake here reaches this arm: a body the deserializer rejects arrives as a
+        // service error whose source is a deserialization failure, which the success-status
+        // guard below catches. It yields no usage either way, and the request id comes off
+        // the raw response rather than the decoded body.
         SdkError::ResponseError(_) => InvocationOutcome::MalformedResponse {
-            provider_request_id: None,
+            provider_request_id,
             reported_use: None,
         },
         SdkError::ServiceError(service) => match service.err() {
@@ -691,7 +705,7 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
             // On a failure status it is a service condition this crate does not model, and
             // an unnamed condition says nothing about whether the provider did work.
             _ if service.raw().status().is_success() => InvocationOutcome::MalformedResponse {
-                provider_request_id: None,
+                provider_request_id,
                 reported_use: None,
             },
             _ => InvocationOutcome::Unknown,
@@ -1019,7 +1033,11 @@ mod tests {
         ))]);
 
         let outcome = invoke(&transport).await;
-        let InvocationOutcome::MalformedResponse { reported_use, .. } = outcome else {
+        let InvocationOutcome::MalformedResponse {
+            reported_use,
+            provider_request_id,
+        } = outcome
+        else {
             panic!("expected an unreadable frame, got {outcome:?}");
         };
         assert_eq!(
@@ -1028,6 +1046,23 @@ mod tests {
                 .input_tokens(),
             900_000
         );
+        assert_eq!(provider_request_id.as_deref(), Some(PROVIDER_REQUEST_ID));
+
+        // A frame the deserializer rejects yields no usage, but the call stays correlatable:
+        // the request id comes off the raw response, not the decoded body.
+        let (undecodable, _) = replay(vec![json(String::from("not json"))]);
+        let outcome = undecodable
+            .invoke(&request(), &mut AttemptHistory::default())
+            .await;
+        let InvocationOutcome::MalformedResponse {
+            reported_use,
+            provider_request_id,
+        } = outcome
+        else {
+            panic!("expected an unreadable frame, got {outcome:?}");
+        };
+        assert_eq!(reported_use, None);
+        assert_eq!(provider_request_id.as_deref(), Some(PROVIDER_REQUEST_ID));
     }
 
     /// A body that is not a `Converse` frame at all fails inside the SDK's deserializer.
@@ -1389,9 +1424,9 @@ mod tests {
         assert!(history.may_have_been_sent());
     }
 
-    /// Formatting a request or an outcome must not reproduce the prompt or the completion.
-    /// The derived implementations did, which is what these hand-written ones replace, and a
-    /// single `#[derive(Debug)]` added back would undo it silently.
+    /// Formatting a request or an outcome must not reproduce the prompt or the completion. A
+    /// single `#[derive(Debug)]` in place of either hand-written impl would undo that
+    /// silently.
     #[tokio::test]
     async fn formatting_a_request_or_an_outcome_never_reveals_its_text() {
         const SECRET_PROMPT: &str = "a-prompt-that-must-not-be-logged";

@@ -12,10 +12,12 @@
 //! with clean history prove no request was sent, while transport, timeout, malformed
 //! response, and unclassified service failures leave the outcome unknown.
 //!
-//! No provider type crosses this boundary. `Converse`'s request and response types print
-//! prompt and completion text in full under `Debug` — only `prompt_variables`,
-//! `request_metadata`, and reasoning content are redacted — so nothing here logs or
-//! debug-prints them, and every outcome carries owned domain values instead.
+//! No provider type crosses this boundary, and no type that does carries text into a log.
+//! `Converse`'s own request and response types print prompt and completion text in full
+//! under `Debug`, redacting only `prompt_variables`, `request_metadata`, and reasoning
+//! content. This module neither logs nor debug-prints them, and [`InvocationRequest`] and
+//! [`InvocationOutcome`] implement `Debug` by hand over lengths and digests, so a caller
+//! that formats one cannot leak what a derived implementation would have exposed.
 
 use std::{error::Error, fmt, num::NonZeroU32, time::Duration};
 
@@ -79,6 +81,7 @@ pub enum ProfileError {
     TooManyStopSequences,
     TextTooLarge,
     TextEmpty,
+    OperationIdentityInvalid,
 }
 
 impl fmt::Display for ProfileError {
@@ -92,14 +95,17 @@ impl fmt::Display for ProfileError {
             Self::TooManyStopSequences => "profile declares more stop sequences than permitted",
             Self::TextTooLarge => "request text exceeds the prompt limit",
             Self::TextEmpty => "request text is empty",
+            Self::OperationIdentityInvalid => "operation identity is empty or too long",
         })
     }
 }
 
 impl Error for ProfileError {}
 
-const MAX_IDENTIFIER_BYTES: usize = 256;
-const MAX_STOP_SEQUENCES: usize = 4;
+/// Bound on a model identifier, a configuration identifier, and an operation identity.
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+/// Bound on the stop sequences one profile may pin.
+pub const MAX_STOP_SEQUENCES: usize = 4;
 
 /// One fixed model configuration, pinned before any request is built.
 ///
@@ -168,20 +174,8 @@ impl ModelProfile {
         })
     }
 
-    pub fn provider(&self) -> ModelProvider {
-        self.provider
-    }
-
     pub fn model_id(&self) -> &str {
         &self.model_id
-    }
-
-    pub fn configuration_id(&self) -> &str {
-        &self.configuration_id
-    }
-
-    pub fn output_token_ceiling(&self) -> NonZeroU32 {
-        self.output_token_ceiling
     }
 
     /// Address of this exact configuration, over every field that reaches the provider.
@@ -197,7 +191,15 @@ impl ModelProfile {
         }
         absorb_number(&mut hasher, u64::from(self.output_token_ceiling.get()));
         for probability in [self.temperature_thousandths, self.top_p_thousandths] {
-            absorb_number(&mut hasher, probability.map_or(u64::MAX, u64::from));
+            // A presence byte rather than a reserved value: an absent knob and any present
+            // one stay distinguishable without depending on a value being unreachable.
+            match probability {
+                None => hasher.update([0]),
+                Some(value) => {
+                    hasher.update([1]);
+                    absorb_number(&mut hasher, u64::from(value));
+                }
+            }
         }
         absorb_number(&mut hasher, self.stop_sequences.len() as u64);
         for sequence in &self.stop_sequences {
@@ -230,7 +232,7 @@ impl ModelProfile {
 /// The cap is a required field with no default and no zero: a request that does not bound
 /// its own output is unrepresentable. Campaign-wide token and spend limits are not this
 /// boundary's concern and it reads no budget state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct InvocationRequest {
     profile: ModelProfile,
     system: String,
@@ -243,8 +245,10 @@ impl InvocationRequest {
     /// # Errors
     ///
     /// Returns [`ProfileError::CapAboveCeiling`] when `max_output_tokens` exceeds the
-    /// profile's ceiling, [`ProfileError::TextEmpty`] for an empty prompt, and
-    /// [`ProfileError::TextTooLarge`] above [`MAX_PROMPT_BYTES`].
+    /// profile's ceiling, [`ProfileError::TextEmpty`] for an empty prompt,
+    /// [`ProfileError::TextTooLarge`] above [`MAX_PROMPT_BYTES`], and
+    /// [`ProfileError::OperationIdentityInvalid`] when `operation_id` is empty or above
+    /// [`MAX_IDENTIFIER_BYTES`].
     pub fn new(
         profile: ModelProfile,
         system: String,
@@ -255,7 +259,10 @@ impl InvocationRequest {
         if max_output_tokens > profile.output_token_ceiling {
             return Err(ProfileError::CapAboveCeiling);
         }
-        if prompt.is_empty() || operation_id.is_empty() {
+        if operation_id.is_empty() || operation_id.len() > MAX_IDENTIFIER_BYTES {
+            return Err(ProfileError::OperationIdentityInvalid);
+        }
+        if prompt.is_empty() {
             return Err(ProfileError::TextEmpty);
         }
         if system.len() > MAX_PROMPT_BYTES || prompt.len() > MAX_PROMPT_BYTES {
@@ -268,14 +275,6 @@ impl InvocationRequest {
             max_output_tokens,
             operation_id,
         })
-    }
-
-    pub fn profile(&self) -> &ModelProfile {
-        &self.profile
-    }
-
-    pub fn max_output_tokens(&self) -> NonZeroU32 {
-        self.max_output_tokens
     }
 
     pub fn operation_id(&self) -> &str {
@@ -310,6 +309,25 @@ fn absorb(hasher: &mut Sha256, bytes: &[u8]) {
 
 fn absorb_number(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_be_bytes());
+}
+
+/// Prints what identifies the request, never what it says.
+///
+/// A derived implementation would reproduce the prompt in any log line that formats a
+/// request, which is the exposure this boundary exists to contain.
+impl fmt::Debug for InvocationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InvocationRequest")
+            .field("model_id", &self.profile.model_id)
+            .field("configuration_digest", &self.profile.configuration_digest())
+            .field("request_digest", &self.request_digest())
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("operation_id", &self.operation_id)
+            .field("system_bytes", &self.system.len())
+            .field("prompt_bytes", &self.prompt.len())
+            .finish()
+    }
 }
 
 /// Provider-reported token use, copied out of the response as scalars.
@@ -353,9 +371,20 @@ pub enum TerminalReason {
 }
 
 impl TerminalReason {
-    /// A refusal produced no usable completion, whatever text accompanied it.
-    fn is_refusal(self) -> bool {
-        matches!(self, Self::ContentFiltered | Self::GuardrailIntervened)
+    /// Whether this reason is a definite answer that cannot carry a usable completion.
+    ///
+    /// Each of these arrives on a success status with no assistant text, so deciding the
+    /// outcome from the reason rather than from the text is what keeps the reason, the
+    /// provider request id, and the reported use that came with it. A context-window
+    /// rejection in particular reports the input tokens the account was billed for.
+    fn precludes_completion(self) -> bool {
+        matches!(
+            self,
+            Self::ContentFiltered
+                | Self::GuardrailIntervened
+                | Self::ContextWindowExceeded
+                | Self::ModelOutputMalformed
+        )
     }
 }
 
@@ -363,7 +392,7 @@ impl TerminalReason {
 ///
 /// Every variant except `Refused` and `Completed` leaves the remote outcome either known
 /// to have failed or unknown; none of them asserts the provider did no work.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum InvocationOutcome {
     /// The provider returned a completion.
     ///
@@ -378,7 +407,10 @@ pub enum InvocationOutcome {
         provider_request_id: Option<String>,
         reported_use: Option<ReportedUse>,
     },
-    /// The provider declined to answer. Any accompanying text is discarded.
+    /// The provider gave a definite answer that carries no usable completion: it filtered
+    /// the content, a guardrail intervened, the input exceeded the context window, or it
+    /// reported its own output as malformed. Any accompanying text is discarded, and the
+    /// evidence that came with the verdict is kept.
     Refused {
         reason: TerminalReason,
         provider_request_id: Option<String>,
@@ -398,6 +430,45 @@ pub enum InvocationOutcome {
     MalformedResponse,
     /// No available evidence proves whether the provider accepted the request.
     Unknown,
+}
+
+/// Prints a completion's length, never its text.
+///
+/// Only `Completed` carries model output. A derived implementation would put it in any log
+/// line that formats an outcome, including a test assertion message.
+impl fmt::Debug for InvocationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed {
+                text,
+                reason,
+                provider_request_id,
+                reported_use,
+            } => formatter
+                .debug_struct("Completed")
+                .field("text_bytes", &text.len())
+                .field("reason", reason)
+                .field("provider_request_id", provider_request_id)
+                .field("reported_use", reported_use)
+                .finish(),
+            Self::Refused {
+                reason,
+                provider_request_id,
+                reported_use,
+            } => formatter
+                .debug_struct("Refused")
+                .field("reason", reason)
+                .field("provider_request_id", provider_request_id)
+                .field("reported_use", reported_use)
+                .finish(),
+            Self::RateLimited => formatter.write_str("RateLimited"),
+            Self::Rejected => formatter.write_str("Rejected"),
+            Self::TimedOut => formatter.write_str("TimedOut"),
+            Self::ProvenNotSent => formatter.write_str("ProvenNotSent"),
+            Self::MalformedResponse => formatter.write_str("MalformedResponse"),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
+    }
 }
 
 /// Narrow Bedrock client with enforced retry and timeout policy.
@@ -430,7 +501,9 @@ impl BedrockTransport {
             .build()
         {
             Ok(message) => message,
-            // A build error means no request exists to send, and history stays clean.
+            // `MessageBuilder::build` fails only on an absent role or content, both set
+            // above, so no input reaches this arm. It stays because the outcome has to be
+            // total, and because a request that cannot be built was never dispatched.
             Err(_) => return InvocationOutcome::ProvenNotSent,
         };
         let mut call = self
@@ -444,22 +517,22 @@ impl BedrockTransport {
         }
 
         history.bind(request.operation_id());
-        let prior_unknown = history.may_have_been_sent;
-        history.may_have_been_sent = true;
+        let prior_unknown = history.mark_possible_send();
         let outcome = classify(call.send().await);
-        // Only a definite provider verdict clears possible-send evidence. Every other
-        // outcome carries the prior value forward, which can over-report uncertainty and
-        // never under-report it.
-        history.may_have_been_sent = match outcome {
-            InvocationOutcome::Completed { .. }
-            | InvocationOutcome::Refused { .. }
-            | InvocationOutcome::Rejected => false,
-            InvocationOutcome::ProvenNotSent => prior_unknown,
-            InvocationOutcome::RateLimited
-            | InvocationOutcome::TimedOut
-            | InvocationOutcome::MalformedResponse
-            | InvocationOutcome::Unknown => true,
-        };
+        // A verdict about this attempt is not a verdict about an earlier one. An invocation
+        // has no remote state to reconcile, so nothing retires the possibility that a prior
+        // attempt already reached the provider and was billed; the prior value therefore
+        // always carries forward, and this attempt can only add uncertainty.
+        history.resolve(
+            prior_unknown
+                || matches!(
+                    outcome,
+                    InvocationOutcome::RateLimited
+                        | InvocationOutcome::TimedOut
+                        | InvocationOutcome::MalformedResponse
+                        | InvocationOutcome::Unknown
+                ),
+        );
         outcome
     }
 }
@@ -493,7 +566,7 @@ fn classify(result: Result<ConverseResponse, SdkError<ConverseError>>) -> Invoca
         total_tokens: usage.total_tokens().max(0) as u32,
     });
     let provider_request_id = request_id(&response);
-    if reason.is_refusal() {
+    if reason.precludes_completion() {
         return InvocationOutcome::Refused {
             reason,
             provider_request_id,
@@ -912,33 +985,312 @@ mod tests {
         assert!(history.may_have_been_sent());
     }
 
-    /// Dispatch evidence survives every outcome that does not prove the provider's verdict.
+    /// No attempt's result retires an earlier attempt's possible billable work, so once
+    /// evidence is set nothing this boundary learns later can clear it. Without a prior
+    /// attempt, only an unresolved result sets it.
     #[tokio::test]
-    async fn possible_send_evidence_clears_only_on_a_definite_verdict() {
+    async fn evidence_never_clears_and_only_unresolved_results_set_it() {
+        let definite = converse_body("end_turn", Some((1, 1, 2)), "answer");
+        let refused = converse_body("content_filtered", Some((1, 0, 1)), "no");
+        let rejected = || {
+            response(
+                400,
+                &[("x-amzn-errortype", "ValidationException")],
+                SdkBody::from("{}"),
+            )
+        };
+        let throttled = || {
+            response(
+                429,
+                &[("x-amzn-errortype", "ThrottlingException")],
+                SdkBody::from("{}"),
+            )
+        };
+
+        // On a fresh history only an unresolved result sets the evidence.
+        for (frame, expected_clean) in [
+            (json(definite.clone()), true),
+            (json(refused.clone()), true),
+            (rejected(), true),
+            (throttled(), false),
+            (json(String::from("not json")), false),
+            (
+                response(
+                    500,
+                    &[("x-amzn-errortype", "InternalServerException")],
+                    SdkBody::from("{}"),
+                ),
+                false,
+            ),
+        ] {
+            let (transport, _) = replay(vec![frame]);
+            let mut history = AttemptHistory::default();
+            let outcome = transport.invoke(&request(), &mut history).await;
+            assert_eq!(
+                !history.may_have_been_sent(),
+                expected_clean,
+                "{outcome:?} left the wrong evidence"
+            );
+        }
+
+        // With a prior attempt on record every outcome keeps the evidence, the definite ones
+        // included: this attempt's verdict says nothing about that earlier dispatch.
+        for frame in [json(definite), json(refused), rejected(), throttled()] {
+            let (transport, _) = replay(vec![frame]);
+            let mut history = AttemptHistory::default();
+            history.bind(OPERATION_ID);
+            history.mark_possible_send();
+            let outcome = transport.invoke(&request(), &mut history).await;
+            assert!(
+                history.may_have_been_sent(),
+                "{outcome:?} discarded a prior attempt's evidence"
+            );
+        }
+    }
+
+    /// One history covers one operation identity, and the provider path binds its own.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "one operation identity")]
+    async fn one_history_cannot_span_two_provider_operations() {
         let (transport, _) = replay(vec![json(converse_body(
             "end_turn",
             Some((1, 1, 2)),
             "answer",
         ))]);
         let mut history = AttemptHistory::default();
-        history.bind(OPERATION_ID);
-        history.may_have_been_sent = true;
+        history.bind("some-other-operation");
 
-        assert!(matches!(
-            transport.invoke(&request(), &mut history).await,
-            InvocationOutcome::Completed { .. }
-        ));
-        assert!(!history.may_have_been_sent());
+        let _ = transport.invoke(&request(), &mut history).await;
+    }
 
-        let (transport, _) = replay(vec![response(
-            429,
-            &[("x-amzn-errortype", "ThrottlingException")],
-            SdkBody::from("{}"),
-        )]);
+    /// A connector that cannot reach the service is the one failure that never produced a
+    /// response, and it is still unknown rather than proven-not-sent: the bytes may have
+    /// left the process. A closed loopback port refuses immediately, so no network is used.
+    #[tokio::test]
+    async fn a_connector_failure_is_unknown_and_keeps_possible_send_evidence() {
+        let transport = BedrockTransport::new(
+            Region::new("us-east-1"),
+            aws_sdk_bedrockruntime::Config::builder()
+                .credentials_provider(Credentials::for_tests())
+                .endpoint_url("http://127.0.0.1:1"),
+        );
         let mut history = AttemptHistory::default();
+
         assert_eq!(
             transport.invoke(&request(), &mut history).await,
-            InvocationOutcome::RateLimited
+            InvocationOutcome::Unknown
+        );
+        assert!(history.may_have_been_sent());
+    }
+
+    /// A definite verdict that carries no completion keeps the reason and the reported use.
+    /// A context-window rejection is the case that matters: it arrives on a success status
+    /// with no text and reports the input tokens the account was billed for, so collapsing
+    /// it to an unreadable frame would discard the billing evidence.
+    #[tokio::test]
+    async fn a_textless_definite_verdict_keeps_its_reason_and_reported_use() {
+        for (wire, expected) in [
+            (
+                "model_context_window_exceeded",
+                TerminalReason::ContextWindowExceeded,
+            ),
+            (
+                "malformed_model_output",
+                TerminalReason::ModelOutputMalformed,
+            ),
+        ] {
+            let (transport, _) = replay(vec![json(format!(
+                "{{\"output\":{{\"message\":{{\"role\":\"assistant\",\"content\":[]}}}},\
+                 \"stopReason\":\"{wire}\",\
+                 \"usage\":{{\"inputTokens\":900000,\"outputTokens\":0,\
+                 \"totalTokens\":900000}}}}"
+            ))]);
+
+            let outcome = transport
+                .invoke(&request(), &mut AttemptHistory::default())
+                .await;
+            let InvocationOutcome::Refused {
+                reason,
+                reported_use,
+                ..
+            } = outcome
+            else {
+                panic!("expected a definite verdict for {wire}, got {outcome:?}");
+            };
+            assert_eq!(reason, expected);
+            assert_eq!(
+                reported_use
+                    .expect("usage survives the verdict")
+                    .input_tokens(),
+                900_000
+            );
+        }
+    }
+
+    /// Every stop reason maps to its own terminal reason, and one this crate does not model
+    /// is named rather than folded into a clean end of turn.
+    #[tokio::test]
+    async fn every_stop_reason_maps_to_its_own_terminal_reason() {
+        for (wire, expected) in [
+            ("end_turn", TerminalReason::EndTurn),
+            ("stop_sequence", TerminalReason::StopSequence),
+            ("max_tokens", TerminalReason::CapReached),
+            (
+                "a_reason_added_after_this_crate",
+                TerminalReason::Unrecognized,
+            ),
+        ] {
+            let (transport, _) = replay(vec![json(converse_body(wire, Some((1, 1, 2)), "text"))]);
+            let outcome = transport
+                .invoke(&request(), &mut AttemptHistory::default())
+                .await;
+            let InvocationOutcome::Completed { reason, .. } = outcome else {
+                panic!("expected a completion for {wire}, got {outcome:?}");
+            };
+            assert_eq!(reason, expected, "{wire}");
+        }
+    }
+
+    /// A completion past the retained bound is refused rather than truncated, so a caller
+    /// cannot mistake a shortened answer for a whole one.
+    #[tokio::test]
+    async fn a_completion_past_the_retained_bound_is_refused() {
+        let oversized = "x".repeat(MAX_COMPLETION_BYTES + 1);
+        let (transport, _) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((1, 1, 2)),
+            &oversized,
+        ))]);
+
+        assert_eq!(
+            transport
+                .invoke(&request(), &mut AttemptHistory::default())
+                .await,
+            InvocationOutcome::MalformedResponse
+        );
+    }
+
+    /// The system text and the prompt reach distinct places on the wire, so exchanging them
+    /// is a different request rather than the same one.
+    #[tokio::test]
+    async fn the_system_text_and_the_prompt_reach_distinct_wire_positions() {
+        let (transport, client) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((1, 1, 2)),
+            "answer",
+        ))]);
+        let _ = invoke(&transport).await;
+
+        let sent = client.actual_requests().next().expect("one request");
+        let body = std::str::from_utf8(sent.body().bytes().expect("in-memory body"))
+            .expect("utf-8 body")
+            .to_owned();
+        let system_at = body.find("be terse").expect("system text on the wire");
+        let prompt_at = body
+            .find("why is the sky blue")
+            .expect("prompt text on the wire");
+        let system_block = body.find("\"system\"").expect("a system block");
+        let message_block = body.find("\"messages\"").expect("a messages block");
+        // Each text sits under its own key, so a swap moves both.
+        assert!(system_at > system_block, "{body}");
+        assert!(prompt_at > message_block, "{body}");
+        assert!(
+            (system_at < message_block) == (system_block < message_block),
+            "{body}"
+        );
+    }
+
+    /// The pinned sampling knobs reach their own wire fields, so exchanging the two
+    /// probabilities is observable.
+    #[tokio::test]
+    async fn each_sampling_knob_reaches_its_own_wire_field() {
+        let profile = ModelProfile::new(
+            ModelProvider::Bedrock,
+            MODEL_ID.into(),
+            "profile-a".into(),
+            cap(4096),
+            Some(250),
+            Some(900),
+            Vec::new(),
+        )
+        .unwrap();
+        let request = InvocationRequest::new(
+            profile,
+            "be terse".into(),
+            "why is the sky blue".into(),
+            cap(512),
+            OPERATION_ID.into(),
+        )
+        .unwrap();
+        let (transport, client) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((1, 1, 2)),
+            "answer",
+        ))]);
+        let _ = transport
+            .invoke(&request, &mut AttemptHistory::default())
+            .await;
+
+        let sent = client.actual_requests().next().expect("one request");
+        let body = std::str::from_utf8(sent.body().bytes().expect("in-memory body"))
+            .expect("utf-8 body")
+            .to_owned();
+        assert!(body.contains("\"temperature\":0.25"), "{body}");
+        // 0.9 has no exact `f32`, so the wire carries the widened approximation while the
+        // digest covers the exact thousandths. Only the digest has to be stable.
+        assert!(body.contains("\"topP\":0.8999999761581421"), "{body}");
+    }
+
+    /// The enforced policy is read back off the built configuration, which covers the whole
+    /// operation bound and stalled-stream protection: both are otherwise only observable
+    /// against a slow body no fake here produces.
+    #[test]
+    fn the_built_configuration_carries_every_enforced_policy() {
+        let config = configured(
+            Region::new("us-east-1"),
+            aws_sdk_bedrockruntime::Config::builder()
+                .credentials_provider(Credentials::for_tests())
+                .retry_config(
+                    aws_sdk_bedrockruntime::config::retry::RetryConfig::standard()
+                        .with_max_attempts(5),
+                )
+                .timeout_config(aws_sdk_bedrockruntime::config::timeout::TimeoutConfig::disabled()),
+        );
+
+        let timeouts = config.timeout_config().expect("timeouts are enforced");
+        assert_eq!(timeouts.operation_timeout(), Some(OPERATION_TIMEOUT));
+        assert_eq!(timeouts.operation_attempt_timeout(), Some(ATTEMPT_TIMEOUT));
+        assert_eq!(
+            config.retry_config().map(|retry| retry.max_attempts()),
+            Some(1)
+        );
+        assert!(
+            config
+                .stalled_stream_protection()
+                .expect("stalled-stream protection is enforced")
+                .is_enabled()
+        );
+    }
+
+    /// Evidence is written before the await, not after it. Dropping the future partway is
+    /// the only way to observe that, and it is the case the boundary exists for: a cancelled
+    /// invocation must not read as proof the provider did no work.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_invocation_still_records_possible_dispatch() {
+        let transport =
+            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+        let mut history = AttemptHistory::default();
+
+        // One second is far inside the enforced attempt bound, so the future is dropped
+        // while the request is still in flight rather than resolved by a timeout.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                transport.invoke(&request(), &mut history),
+            )
+            .await
+            .is_err()
         );
         assert!(history.may_have_been_sent());
     }
@@ -1035,6 +1387,19 @@ mod tests {
             )
             .unwrap(),
         );
+        // Same count, different text: the length prefix alone must not satisfy this.
+        vary(
+            ModelProfile::new(
+                ModelProvider::Bedrock,
+                MODEL_ID.into(),
+                "profile-a".into(),
+                cap(4096),
+                Some(250),
+                None,
+                vec!["</halt>".into()],
+            )
+            .unwrap(),
+        );
     }
 
     #[test]
@@ -1057,8 +1422,46 @@ mod tests {
         // Two calls differing only in cap are two invocations, not one repeated.
         vary("be terse", "why is the sky blue", 513, OPERATION_ID);
         vary("be terse", "why is the sky blue", 512, "invoke-op-2");
-        // Length prefixing keeps one concatenation from splitting two ways.
+
+        // The profile is digested too, so one prompt against two configurations is two
+        // invocations.
+        let other_profile = ModelProfile::new(
+            ModelProvider::Bedrock,
+            MODEL_ID.into(),
+            "profile-b".into(),
+            cap(4096),
+            Some(250),
+            None,
+            vec!["</done>".into()],
+        )
+        .unwrap();
+        assert_ne!(
+            InvocationRequest::new(
+                other_profile,
+                "be terse".into(),
+                "why is the sky blue".into(),
+                cap(512),
+                OPERATION_ID.into(),
+            )
+            .unwrap()
+            .request_digest(),
+            baseline
+        );
+
+        // Length prefixing is what keeps one concatenation from splitting two ways: these
+        // two requests carry the same bytes across the system/prompt boundary.
         let shifted = InvocationRequest::new(
+            profile(),
+            "be ters".into(),
+            "ewhy is the sky blue".into(),
+            cap(512),
+            OPERATION_ID.into(),
+        )
+        .unwrap();
+        assert_ne!(shifted.request_digest(), baseline);
+
+        // Identical inputs derive one address.
+        let repeated = InvocationRequest::new(
             profile(),
             "be terse".into(),
             "why is the sky blue".into(),
@@ -1066,7 +1469,7 @@ mod tests {
             OPERATION_ID.into(),
         )
         .unwrap();
-        assert_eq!(shifted.request_digest(), baseline);
+        assert_eq!(repeated.request_digest(), baseline);
     }
 
     #[test]
@@ -1096,6 +1499,19 @@ mod tests {
                     Vec::new(),
                 ),
                 ProfileError::IdentifierTooLong,
+            ),
+            (
+                // This guard is the only thing making the cap's `as i32` conversion sound.
+                ModelProfile::new(
+                    ModelProvider::Bedrock,
+                    MODEL_ID.into(),
+                    "profile-a".into(),
+                    cap(MAX_OUTPUT_TOKEN_CEILING + 1),
+                    None,
+                    None,
+                    Vec::new(),
+                ),
+                ProfileError::CeilingOutOfRange,
             ),
             (
                 ModelProfile::new(
@@ -1137,6 +1553,21 @@ mod tests {
             assert_eq!(result.unwrap_err(), expected);
         }
 
+        // A probability of exactly one is inside the range, so the boundary is pinned where
+        // it holds as well as where it fails.
+        assert!(
+            ModelProfile::new(
+                ModelProvider::Bedrock,
+                MODEL_ID.into(),
+                "profile-a".into(),
+                cap(1),
+                Some(1_000),
+                Some(1_000),
+                Vec::new(),
+            )
+            .is_ok()
+        );
+
         // The cap is the one bound this boundary enforces before send, and the profile's
         // own ceiling is what it is enforced against.
         assert_eq!(
@@ -1171,7 +1602,7 @@ mod tests {
                 String::new(),
                 String::from("prompt"),
                 "",
-                ProfileError::TextEmpty,
+                ProfileError::OperationIdentityInvalid,
             ),
             (
                 "s".repeat(MAX_PROMPT_BYTES + 1),

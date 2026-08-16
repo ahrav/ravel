@@ -137,12 +137,31 @@ pub(crate) enum VerificationOutcome {
 /// Debug builds assert the single-identity binding.
 #[derive(Default)]
 pub struct AttemptHistory {
-    pub(crate) may_have_been_sent: bool,
+    may_have_been_sent: bool,
     #[cfg(debug_assertions)]
     identity: Option<String>,
 }
 
 impl AttemptHistory {
+    /// Records that a dispatch is about to be attempted, returning what was known before it.
+    ///
+    /// Callers mark before awaiting, so a cancelled await still leaves the evidence set.
+    pub(crate) fn mark_possible_send(&mut self) -> bool {
+        let prior = self.may_have_been_sent;
+        self.may_have_been_sent = true;
+        prior
+    }
+
+    /// Replaces the evidence with the caller's verdict for the attempt that just finished.
+    ///
+    /// What retires uncertainty differs by boundary, so the verdict is the caller's to compute:
+    /// an object store has a final object state that a definite result reconciles, while a model
+    /// invocation has none, and there no later attempt's result can retire an earlier attempt's
+    /// possible billable work.
+    pub(crate) fn resolve(&mut self, still_uncertain: bool) {
+        self.may_have_been_sent = still_uncertain;
+    }
+
     pub(crate) fn bind(&mut self, identity: &str) {
         #[cfg(debug_assertions)]
         match &self.identity {
@@ -158,7 +177,7 @@ impl AttemptHistory {
 }
 
 impl AttemptHistory {
-    /// An earlier attempt in this publication may have reached S3.
+    /// An earlier attempt for this operation identity may have reached the remote service.
     pub fn may_have_been_sent(&self) -> bool {
         self.may_have_been_sent
     }
@@ -409,20 +428,20 @@ impl S3Store {
         request: PutObjectFluentBuilder,
         history: &mut AttemptHistory,
     ) -> MutationOutcome {
-        let prior_unknown = history.may_have_been_sent;
-        history.may_have_been_sent = true;
+        let prior_unknown = history.mark_possible_send();
         let outcome = classify_mutation_result(request.send().await, prior_unknown);
-        // `Committed` and `ProvenNotSent` clear `may_have_been_sent`. `NotFound`,
-        // `Conflict`, `PreconditionFailed`, and `TooLarge` do not determine whether a
-        // prior request was sent, so they carry the prior value forward.
-        history.may_have_been_sent = match outcome {
+        // `Committed` and `ProvenNotSent` clear `may_have_been_sent`: both resolve the object's
+        // final state, which is what the ambiguity was about. `NotFound`, `Conflict`,
+        // `PreconditionFailed`, and `TooLarge` do not determine whether a prior request was
+        // sent, so they carry the prior value forward.
+        history.resolve(match outcome {
             MutationOutcome::Committed { .. } | MutationOutcome::ProvenNotSent => false,
             MutationOutcome::Unknown | MutationOutcome::AmbiguousConflict => true,
             MutationOutcome::Conflict
             | MutationOutcome::PreconditionFailed
             | MutationOutcome::NotFound
             | MutationOutcome::TooLarge => prior_unknown,
-        };
+        });
         outcome
     }
 }

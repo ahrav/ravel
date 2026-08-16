@@ -4137,7 +4137,7 @@ mod tests {
     /// the serial walk row for row.
     #[tokio::test]
     async fn a_checkpoint_cold_start_reproduces_plan_and_grant_state() {
-        use crate::domain::work::{WorkId, WorkRef};
+        use crate::domain::work::WorkId;
         use crate::scope::{GrantActivatedEvent, GrantActivatedPayload};
 
         const NOW: u64 = 1_700_000_000_000;
@@ -4158,7 +4158,8 @@ mod tests {
             )
             .unwrap(),
             GrantActivatedPayload::new(
-                WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1),
+                WorkId::new("work-a".into()).unwrap(),
+                1,
                 2,
                 Digest::new("d".repeat(64)).unwrap(),
                 1,

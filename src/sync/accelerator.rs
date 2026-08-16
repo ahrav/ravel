@@ -679,11 +679,23 @@ pub(crate) async fn packed_events(
     first: u64,
     last: u64,
 ) -> Option<Vec<StoredEvent>> {
+    let (catalog, _) = read_current_catalog(store, scope).await?;
+    packed_events_from_catalog(store, scope, &catalog, first, last).await
+}
+
+/// Reads packed events through an already validated `catalog`, sparing a reread of the
+/// pointer when the caller holds one.
+pub(crate) async fn packed_events_from_catalog(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    catalog: &ReplayCatalog,
+    first: u64,
+    last: u64,
+) -> Option<Vec<StoredEvent>> {
     if first == 0 || last < first {
         return None;
     }
-    let (catalog, _) = read_current_catalog(store, scope).await?;
-    let chosen = coverage(&catalog, first, last)?;
+    let chosen = coverage(catalog, first, last)?;
     let packs = bounded_map(chosen.len(), CONCURRENT_FETCHES, |index| {
         let entry = chosen[index];
         async move {

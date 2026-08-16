@@ -38,7 +38,7 @@ const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Opaque S3 version token passed unchanged to `If-Match`.
 ///
 /// The type exposes no content-hash, ordering, parsing, or string-access API.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ETag(String);
 
 /// Result of a bounded full-object read.

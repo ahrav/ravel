@@ -590,6 +590,29 @@ pub(crate) fn scope_cursor(
     }
 }
 
+/// Reads the projected active-plan digest of `scope`, `None` when absent.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::Conflict`] for an undecodable digest and
+/// [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
+pub(crate) fn scope_active_plan(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+) -> Result<Option<Digest>, ApplyError> {
+    let stored: Option<Option<String>> = connection
+        .query_row(
+            "SELECT active_plan_digest FROM scopes WHERE scope_id = ?1",
+            [scope.scope_id().as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    stored
+        .flatten()
+        .map(|digest| Digest::new(digest).map_err(|_| ApplyError::Conflict))
+        .transpose()
+}
+
 pub(crate) fn scope_matches_head(
     connection: &rusqlite::Connection,
     head: &ScopeHead,

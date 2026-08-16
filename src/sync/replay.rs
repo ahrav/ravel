@@ -6,7 +6,12 @@
 //! cursor unchanged. A writer epoch may lag the head epoch but never exceeds it or its own child's.
 //! Replay limits are 4,096 unseen events and 64 MiB of stored event and plan bytes.
 
-use std::{collections::HashSet, error::Error, fmt, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+    path::Path,
+};
 
 use ciborium::Value;
 
@@ -27,6 +32,7 @@ use crate::{
 
 use super::{
     WireError,
+    accelerator::{self, RetainedEvent, StoredEvent},
     event::{ScopeEventReadError, payload_registered, read_opaque, root_domain_valid},
     head::{self, ObservedScopeHead, ScopeHeadReadError},
 };
@@ -100,10 +106,14 @@ pub enum ScopeReadiness {
 pub(crate) struct PreparedSuffix {
     observed: ObservedScopeHead,
     events: Vec<Prepared>,
+    /// True when the pack rung supplied the whole suffix; republishing it adds nothing.
+    from_packs: bool,
 }
 
 struct Prepared {
     decoded: crate::scope::DecodedScopeEvent<Value>,
+    /// Exact stored compressed bytes, retained for opportunistic pack publication.
+    bytes: Vec<u8>,
     /// Present exactly for `plan_admitted` events: the decoded event and the verified plan object
     /// replay re-admits from.
     plan: Option<(crate::scope::PlanAdmittedEvent, PlanProposal)>,
@@ -124,26 +134,34 @@ pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) 
     // failure part-way through a rebuild leaves the cursor advanced but the flag down, and
     // gating on a blank cursor would skip the remaining restore forever.
     match prepare_suffix(store, scope, cursor).await {
-        Ok(prepared) => match apply_suffix(handle, scope, prepared).await {
-            Ok((local_cursor, observed_head)) => {
-                match handle.claims_restored(scope).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Err(error) = restore_claims(store, handle, scope).await {
-                            return ScopeReadiness::NotReady(error);
+        Ok(prepared) => {
+            let publish = !prepared.from_packs;
+            match apply_suffix(handle, scope, prepared).await {
+                Ok((local_cursor, observed_head, retained)) => {
+                    // Publication is a best-effort hint: any failure inside it leaves the
+                    // just-committed replay result untouched.
+                    if publish {
+                        accelerator::publish_packs_after_replay(store, scope, &retained).await;
+                    }
+                    match handle.claims_restored(scope).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Err(error) = restore_claims(store, handle, scope).await {
+                                return ScopeReadiness::NotReady(error);
+                            }
+                        }
+                        Err(error) => {
+                            return ScopeReadiness::NotReady(ScopeReplayError::Apply(error));
                         }
                     }
-                    Err(error) => {
-                        return ScopeReadiness::NotReady(ScopeReplayError::Apply(error));
+                    ScopeReadiness::Ready {
+                        local_cursor,
+                        observed_head: Box::new(observed_head),
                     }
                 }
-                ScopeReadiness::Ready {
-                    local_cursor,
-                    observed_head: Box::new(observed_head),
-                }
+                Err(error) => ScopeReadiness::NotReady(error),
             }
-            Err(error) => ScopeReadiness::NotReady(error),
-        },
+        }
         Err(error) => ScopeReadiness::NotReady(error),
     }
 }
@@ -283,32 +301,188 @@ async fn prepare_suffix_with_limits(
             return Err(ScopeReplayError::HeadInvalid(error));
         }
     };
-    let events = prepare_chain(
-        store,
-        scope,
-        cursor,
-        observed.head().tail().clone(),
-        observed.head().scope_epoch().get(),
-        observed.head().operation_id(),
-        limits,
-    )
-    .await?;
-    Ok(PreparedSuffix { observed, events })
+    let tail = observed.head().tail().clone();
+    let scope_epoch = observed.head().scope_epoch().get();
+    let head_operation = observed.head().operation_id().to_owned();
+    let unseen = precheck(&cursor, &tail, limits)?;
+    if unseen == 0 {
+        return Ok(PreparedSuffix {
+            observed,
+            events: Vec::new(),
+            from_packs: false,
+        });
+    }
+    // The accelerator ladder: packed events, then LIST-assisted reads, then the serial
+    // walk. Every rung feeds the same chain validator; an accelerator failure of any kind
+    // falls through without changing the projection, and only the final serial rung
+    // surfaces errors.
+    let mut events = None;
+    let mut from_packs = false;
+    if let Some(stored) =
+        accelerator::packed_events(store, scope, cursor.0 + 1, tail.sequence()).await
+    {
+        events = prepare_chain(
+            store,
+            scope,
+            cursor.clone(),
+            tail.clone(),
+            scope_epoch,
+            &head_operation,
+            limits,
+            ChainEvents::prefetched(stored),
+        )
+        .await
+        .ok();
+        from_packs = events.is_some();
+    }
+    if events.is_none()
+        && let Some(stored) = listed_events(store, scope, cursor.0, &tail).await
+    {
+        events = prepare_chain(
+            store,
+            scope,
+            cursor.clone(),
+            tail.clone(),
+            scope_epoch,
+            &head_operation,
+            limits,
+            ChainEvents::prefetched(stored),
+        )
+        .await
+        .ok();
+    }
+    let events = match events {
+        Some(events) => events,
+        None => {
+            prepare_chain(
+                store,
+                scope,
+                cursor,
+                tail,
+                scope_epoch,
+                &head_operation,
+                limits,
+                ChainEvents::Serial,
+            )
+            .await?
+        }
+    };
+    Ok(PreparedSuffix {
+        observed,
+        events,
+        from_packs,
+    })
+}
+
+/// Cursor, tail, and limit checks that run once, ahead of the accelerator ladder.
+///
+/// Returns the unseen event count; zero means the suffix is empty.
+fn precheck(
+    cursor: &(u64, Option<Digest>),
+    tail: &ScopeEventRef,
+    limits: Limits,
+) -> Result<u64, ScopeReplayError> {
+    if tail.sequence() < cursor.0 {
+        return Err(ScopeReplayError::CursorAhead);
+    }
+    if tail.sequence() == cursor.0 {
+        return if cursor.1.as_ref() == Some(tail.digest()) {
+            Ok(0)
+        } else {
+            Err(ScopeReplayError::TailMismatch)
+        };
+    }
+    let unseen = tail.sequence() - cursor.0;
+    if unseen > limits.events {
+        return Err(ScopeReplayError::Overflow);
+    }
+    Ok(unseen)
+}
+
+/// LIST-assisted candidate discovery for the unseen range `(cursor, tail]`.
+///
+/// LIST is a hint, never a snapshot: candidates below the cursor or beyond the pinned
+/// tail are ignored, and any in-range gap, duplicate sequence, malformed key, missing
+/// object, or invalid event returns `None` so the caller falls through.
+async fn listed_events(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    cursor_sequence: u64,
+    tail: &ScopeEventRef,
+) -> Option<Vec<StoredEvent>> {
+    let unseen = tail.sequence().checked_sub(cursor_sequence)?;
+    let prefix = accelerator::scope_events_prefix(scope);
+    // Keys embed zero-padded 16-digit sequences, so lexicographic listing order is
+    // numeric. `.` sorts after `-`, so this boundary skips every key at the cursor
+    // sequence and none above it.
+    let start_after = (cursor_sequence > 0).then(|| format!("{prefix}{cursor_sequence:016}."));
+    // `MAX_SCOPE_REPLAY_EVENTS` covers the lifetime sequence ceiling, so keys beyond the
+    // pinned tail are ignored rather than causing failure.
+    let keys = store
+        .list_keys(
+            &prefix,
+            start_after.as_deref(),
+            MAX_SCOPE_REPLAY_EVENTS as usize,
+        )
+        .await
+        .ok()?;
+    let mut references: Vec<ScopeEventRef> = Vec::with_capacity(unseen as usize);
+    let mut next = cursor_sequence + 1;
+    for key in &keys {
+        let reference = parse_event_key(key, &prefix)?;
+        if reference.sequence() > tail.sequence() {
+            // Beyond the pinned tail is not part of this replay; later keys only sort higher.
+            break;
+        }
+        if reference.sequence() != next {
+            // A duplicate sequence is an orphaned rival; a skipped one is a gap.
+            return None;
+        }
+        next += 1;
+        references.push(reference);
+    }
+    if next != tail.sequence() + 1 {
+        return None;
+    }
+    accelerator::fetch_events(store, scope, &references).await
+}
+
+/// Parses `{sequence:016}-{digest}.cbor.zst` after `prefix`; any deviation is a miss.
+fn parse_event_key(key: &str, prefix: &str) -> Option<ScopeEventRef> {
+    let name = key.strip_prefix(prefix)?;
+    let name = name.strip_suffix(".cbor.zst")?;
+    let (sequence, digest) = name.split_at_checked(16)?;
+    let digest = digest.strip_prefix('-')?;
+    if sequence.len() != 16 || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let sequence: u64 = sequence.parse().ok()?;
+    ScopeEventRef::new(sequence, Digest::new(digest.to_owned()).ok()?).ok()
 }
 
 /// Converts the prepared suffix, then applies its events through the worker.
+///
+/// The returned retained events are the verified suffix in chain order, kept for
+/// opportunistic pack publication after the commit.
 pub(crate) async fn apply_suffix(
     handle: &DbHandle,
     scope: &ScopeIdentity,
     mut prepared: PreparedSuffix,
-) -> Result<((u64, Digest), ObservedScopeHead), ScopeReplayError> {
+) -> Result<((u64, Digest), ObservedScopeHead, Vec<RetainedEvent>), ScopeReplayError> {
     prepared.events.reverse();
     let scope_epoch = prepared.observed.head().scope_epoch().get();
+    let mut retained = Vec::with_capacity(prepared.events.len());
     let mutations = prepared
         .events
         .into_iter()
-        .map(|prepared| {
+        .map(|mut prepared| {
             let reference = prepared.decoded.event_ref().clone();
+            retained.push(RetainedEvent {
+                reference: reference.clone(),
+                parent: prepared.decoded.envelope().parent_event().cloned(),
+                payload_type: prepared.decoded.envelope().payload_type().to_owned(),
+                bytes: std::mem::take(&mut prepared.bytes),
+            });
             let (envelope, payload) = typed_payload(prepared, scope)?;
             ScopeProjectionEvent::new(scope.clone(), envelope, reference, payload, scope_epoch)
                 .map_err(|_| ScopeReplayError::HistoryConflict)
@@ -327,7 +501,7 @@ pub(crate) async fn apply_suffix(
         prepared.observed.head().tail().sequence(),
         prepared.observed.head().tail().digest().clone(),
     );
-    Ok((local_cursor, prepared.observed))
+    Ok((local_cursor, prepared.observed, retained))
 }
 
 /// Converts one prepared event into the typed content its apply writes.
@@ -377,6 +551,38 @@ fn typed_payload(
     }
 }
 
+/// Where the chain validator draws each event from.
+///
+/// `Serial` reads newest-to-oldest through [`read_opaque`], preserving the final rung's
+/// behavior and error classification. `Prefetched` consumes accelerator-supplied events
+/// already re-verified against their synthesized keys; the validator still enforces every
+/// source-independent check on them.
+enum ChainEvents {
+    Serial,
+    Prefetched(HashMap<u64, StoredEvent>),
+}
+
+impl ChainEvents {
+    fn prefetched(events: Vec<StoredEvent>) -> Self {
+        Self::Prefetched(
+            events
+                .into_iter()
+                .map(|event| (event.decoded.event_ref().sequence(), event))
+                .collect(),
+        )
+    }
+}
+
+/// Source-independent chain validation and plan loading shared by every replay rung.
+///
+/// Enforces the exact tail named by the pinned head, newest-to-oldest parent continuity,
+/// the writer-epoch bounds, unique operation IDs, the head operation at hop zero, the
+/// exact cursor or genesis boundary, and the event and byte limits. Plan objects load
+/// serially and draw on the same byte budget regardless of the event source.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one internal call shape per rung"
+)]
 async fn prepare_chain(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -385,20 +591,11 @@ async fn prepare_chain(
     scope_epoch: u64,
     head_operation: &str,
     limits: Limits,
+    mut source: ChainEvents,
 ) -> Result<Vec<Prepared>, ScopeReplayError> {
-    if tail.sequence() < cursor.0 {
-        return Err(ScopeReplayError::CursorAhead);
-    }
-    if tail.sequence() == cursor.0 {
-        return if cursor.1.as_ref() == Some(tail.digest()) {
-            Ok(Vec::new())
-        } else {
-            Err(ScopeReplayError::TailMismatch)
-        };
-    }
-    let unseen = tail.sequence() - cursor.0;
-    if unseen > limits.events {
-        return Err(ScopeReplayError::Overflow);
+    let unseen = precheck(&cursor, &tail, limits)?;
+    if unseen == 0 {
+        return Ok(Vec::new());
     }
 
     let mut current = tail;
@@ -408,13 +605,21 @@ async fn prepare_chain(
     let mut highest_epoch = scope_epoch;
     let mut prepared = Vec::with_capacity(unseen as usize);
     for hop in 0..unseen {
-        let (decoded, bytes) = match read_opaque(store, scope, &current).await {
-            Ok(Some(event)) => event,
-            Ok(None) => return Err(ScopeReplayError::EventMissing),
-            Err(ScopeEventReadError::Invalid(error)) => {
-                return Err(ScopeReplayError::EventInvalid(error));
+        let (decoded, bytes) = match &mut source {
+            ChainEvents::Serial => match read_opaque(store, scope, &current).await {
+                Ok(Some(event)) => event,
+                Ok(None) => return Err(ScopeReplayError::EventMissing),
+                Err(ScopeEventReadError::Invalid(error)) => {
+                    return Err(ScopeReplayError::EventInvalid(error));
+                }
+                Err(ScopeEventReadError::Storage(_)) => return Err(ScopeReplayError::EventStorage),
+            },
+            ChainEvents::Prefetched(events) => {
+                let stored = events
+                    .remove(&current.sequence())
+                    .ok_or(ScopeReplayError::EventMissing)?;
+                (stored.decoded, stored.bytes)
             }
-            Err(ScopeEventReadError::Storage(_)) => return Err(ScopeReplayError::EventStorage),
         };
         total_bytes = checked_total(total_bytes, bytes.len(), limits.bytes)?;
         if decoded.event_ref() != &current
@@ -477,7 +682,11 @@ async fn prepare_chain(
         } else {
             None
         };
-        prepared.push(Prepared { decoded, plan });
+        prepared.push(Prepared {
+            decoded,
+            bytes,
+            plan,
+        });
     }
     Ok(prepared)
 }
@@ -592,6 +801,11 @@ mod tests {
         response(200, &[("etag", "\"event\"")], bytes)
     }
 
+    /// Returns 404 for an accelerator pointer read or LIST probe.
+    fn accel_miss() -> http::Response<SdkBody> {
+        response(404, &[], SdkBody::empty())
+    }
+
     #[tokio::test]
     async fn replay_is_idempotent_and_returns_the_observed_head_witness() {
         let genesis = genesis();
@@ -599,6 +813,8 @@ mod tests {
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, client) = replay_store(vec![
             head_response(genesis.head_bytes().to_vec()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         match refresh(&store, &handle, genesis.identity()).await {
@@ -616,7 +832,7 @@ mod tests {
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (1, Some(genesis.event_ref().digest().clone()))
         );
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         let before = row_counts(&path);
         let (store, client) = replay_store(vec![head_response(genesis.head_bytes().to_vec())]);
         assert!(matches!(
@@ -644,6 +860,8 @@ mod tests {
         for _ in 0..2 {
             let (store, _) = replay_store(vec![
                 head_response(genesis.head_bytes().to_vec()),
+                accel_miss(),
+                accel_miss(),
                 event_response(genesis.event_bytes().to_vec()),
             ]);
             prepared.push(
@@ -655,11 +873,11 @@ mod tests {
         let second = prepared.pop().unwrap();
         let first = prepared.pop().unwrap();
 
-        let (first_cursor, _) = apply_suffix(&handle, genesis.identity(), first)
+        let (first_cursor, _, _) = apply_suffix(&handle, genesis.identity(), first)
             .await
             .unwrap();
         let rows = row_counts(&path);
-        let (second_cursor, _) = apply_suffix(&other, genesis.identity(), second)
+        let (second_cursor, _, _) = apply_suffix(&other, genesis.identity(), second)
             .await
             .expect("a suffix the first caller committed is not a history conflict");
 
@@ -687,13 +905,15 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         let prepared = prepare_suffix(&store, genesis.identity(), (0, None))
             .await
             .unwrap();
-        let (mixed_cursor, _) = apply_suffix(&other, genesis.identity(), prepared)
+        let (mixed_cursor, _, _) = apply_suffix(&other, genesis.identity(), prepared)
             .await
             .expect("an already-applied prefix continues into the unseen suffix");
 
@@ -714,6 +934,8 @@ mod tests {
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(genesis.head_bytes().to_vec()),
+            accel_miss(),
+            accel_miss(),
             event_response(b"not-zstd".to_vec()),
         ]);
         assert!(matches!(
@@ -746,13 +968,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::UnsupportedPayload)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -779,13 +1003,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&invalid_root_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(invalid_root.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(WireError::InvalidValue))
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -802,13 +1028,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&mismatched_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -849,13 +1077,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&unsubstantiated_plan_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -971,6 +1201,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
             event_response(genesis.event_bytes().to_vec()),
         ]);
@@ -992,6 +1224,8 @@ mod tests {
         let recovered = open_projection(&path).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
             event_response(genesis.event_bytes().to_vec()),
         ]);
@@ -1078,6 +1312,8 @@ mod tests {
         .unwrap();
         let mut responses = Vec::with_capacity(bytes.len() + 1);
         responses.push(head_response(encode_head(&head).unwrap()));
+        responses.push(accel_miss());
+        responses.push(accel_miss());
         responses.extend(bytes.into_iter().rev().map(event_response));
         let (store, _) = replay_store(responses);
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
@@ -1124,8 +1360,10 @@ mod tests {
             format!("benchmark-operation-{size}"),
         )
         .unwrap();
-        let mut responses = Vec::with_capacity(size + 1);
+        let mut responses = Vec::with_capacity(size + 3);
         responses.push(head_response(encode_head(&head).unwrap()));
+        responses.push(accel_miss());
+        responses.push(accel_miss());
         responses.extend(
             (0..size)
                 .rev()
@@ -1220,6 +1458,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&owned).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
@@ -1284,6 +1524,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(encoded.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
@@ -1336,6 +1578,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(second_encoded.stored_bytes().to_vec()),
             event_response(first_encoded.stored_bytes().to_vec()),
         ]);
@@ -1422,6 +1666,8 @@ mod tests {
         let responses = || {
             vec![
                 head_response(encode_head(&head).unwrap()),
+                accel_miss(),
+                accel_miss(),
                 event_response(encoded.stored_bytes().to_vec()),
                 response(
                     200,
@@ -1429,6 +1675,7 @@ mod tests {
                     admissible.stored_bytes().to_vec(),
                 ),
                 event_response(genesis.event_bytes().to_vec()),
+                accel_miss(),
                 response(404, &[], Vec::new()),
                 response(404, &[], Vec::new()),
             ]
@@ -1552,6 +1799,8 @@ mod tests {
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&disagreeing).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(encoded.stored_bytes().to_vec()),
             response(
                 200,
@@ -1816,6 +2065,8 @@ mod tests {
         let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -1823,6 +2074,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            accel_miss(),
             response(404, &[], Vec::new()),
             response(404, &[], Vec::new()),
         ]);
@@ -1942,6 +2194,8 @@ mod tests {
         let rebuilt = DbHandle::spawn(rebuild_path.clone()).await.unwrap();
         let (store, rebuild_client) = replay_store(vec![
             head_response(final_head.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(event_bytes(9)),
             event_response(event_bytes(6)),
             event_response(event_bytes(3)),
@@ -1952,6 +2206,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2032,6 +2287,8 @@ mod tests {
         // object sits at its fence key, and the rebuild must never request it.
         let (store, client) = replay_store(vec![
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -2039,6 +2296,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2079,7 +2337,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 6);
+        assert_eq!(client.actual_requests().count(), 9);
         assert!(
             client
                 .actual_requests()
@@ -2123,6 +2381,8 @@ mod tests {
             // First refresh: replay admits both works, work-a's claim restores at fence 2,
             // then work-b's claim GET returns 500, so claims_restored remains false.
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -2130,6 +2390,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2173,7 +2434,7 @@ mod tests {
             ScopeReadiness::Ready { .. }
         ));
         assert!(handle.claims_restored(&scope).await.unwrap());
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(client.actual_requests().count(), 12);
 
         handle.drain().await.unwrap();
         drop(handle);
@@ -2203,6 +2464,8 @@ mod tests {
         let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
         let (store, client) = replay_store(vec![
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -2210,6 +2473,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2231,7 +2495,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 6);
+        assert_eq!(client.actual_requests().count(), 9);
         assert!(handle.claims_restored(&scope).await.unwrap());
 
         handle.drain().await.unwrap();
@@ -2240,5 +2504,480 @@ mod tests {
         assert_eq!(rows[0].claim_fence, None);
         assert_eq!(rows[0].claim_lease_until, None);
         fs::remove_file(db_path).unwrap();
+    }
+
+    /// Builds a canonical chain of `count` events: genesis plus test successors, beside the
+    /// unowned head naming the final event.
+    fn accel_chain(
+        genesis: &crate::scope::RootGenesis,
+        count: usize,
+    ) -> (Vec<(ScopeEventRef, Vec<u8>)>, ScopeHead) {
+        accel_chain_with(genesis, count, "accel-op")
+    }
+
+    fn accel_chain_with(
+        genesis: &crate::scope::RootGenesis,
+        count: usize,
+        operation_prefix: &str,
+    ) -> (Vec<(ScopeEventRef, Vec<u8>)>, ScopeHead) {
+        let mut events = Vec::with_capacity(count);
+        events.push((genesis.event_ref().clone(), genesis.event_bytes().to_vec()));
+        for sequence in 2..=count as u64 {
+            let parent = events[(sequence - 2) as usize].0.clone();
+            let envelope = EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                sequence,
+                Some(parent),
+                1,
+                format!("{operation_prefix}-{sequence}"),
+                TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+            )
+            .unwrap();
+            let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+            events.push((encoded.event_ref().clone(), encoded.stored_bytes().to_vec()));
+        }
+        let operation = if count == 1 {
+            genesis.head().operation_id().to_owned()
+        } else {
+            format!("{operation_prefix}-{count}")
+        };
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            events[count - 1].0.clone(),
+            None,
+            operation,
+        )
+        .unwrap();
+        (events, head)
+    }
+
+    fn event_keys(scope: &ScopeIdentity, events: &[(ScopeEventRef, Vec<u8>)]) -> Vec<String> {
+        events
+            .iter()
+            .map(|(reference, _)| crate::scope::scope_event_key(scope, reference))
+            .collect()
+    }
+
+    /// The LIST rung replays exactly what the serial walk replays, at the same cursor.
+    #[tokio::test]
+    async fn list_replay_is_equivalent_to_the_serial_walk() {
+        use crate::storage::s3::test_support::list_response;
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 2);
+        let keys = event_keys(&scope, &events);
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+
+        let serial_path = path("list-equivalence-serial");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(events[1].1.clone()),
+            event_response(events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        drop(serial);
+
+        let listed_path = path("list-equivalence-listed");
+        let listed = DbHandle::spawn(listed_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            list_response(&key_refs, false, None),
+            event_response(events[0].1.clone()),
+            event_response(events[1].1.clone()),
+        ]);
+        match refresh(&store, &listed, &scope).await {
+            ScopeReadiness::Ready { local_cursor, .. } => {
+                assert_eq!(local_cursor.0, 2);
+                assert_eq!(local_cursor.1, *events[1].0.digest());
+            }
+            ScopeReadiness::NotReady(error) => panic!("LIST replay failed: {error}"),
+        }
+        assert_eq!(listed.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        assert_eq!(row_counts(&listed_path), row_counts(&serial_path));
+        // Head, pointer miss, LIST, and one bounded GET per candidate; publication attempts
+        // run against the exhausted script and are not recorded.
+        assert_eq!(client.actual_requests().count(), 5);
+        drop(listed);
+        fs::remove_file(serial_path).unwrap();
+        fs::remove_file(listed_path).unwrap();
+    }
+
+    /// Anomalous listings fall back to the serial walk without changing the outcome, and a
+    /// candidate beyond the pinned tail is ignored rather than treated as an anomaly.
+    #[tokio::test]
+    async fn list_anomalies_fall_back_and_beyond_tail_candidates_are_ignored() {
+        use crate::storage::s3::test_support::list_response;
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 4);
+        let keys = event_keys(&scope, &events);
+        let prefix = crate::sync::accelerator::scope_events_prefix(&scope);
+        let orphan_key = format!("{prefix}0000000000000002-{}.cbor.zst", "e".repeat(64));
+
+        // Each anomaly is detected while scanning keys, before any candidate fetch.
+        let listings = [
+            // An in-range gap: sequence 2 is missing from the listing.
+            vec![keys[0].clone(), keys[2].clone(), keys[3].clone()],
+            // An in-range orphan: a rival object at an expected sequence.
+            vec![
+                keys[0].clone(),
+                orphan_key.clone(),
+                keys[1].clone(),
+                keys[2].clone(),
+            ],
+            // A malformed key inside the range.
+            vec![
+                keys[0].clone(),
+                format!("{prefix}not-an-event"),
+                keys[2].clone(),
+            ],
+        ];
+        for listing in listings {
+            let key_refs: Vec<&str> = listing.iter().map(String::as_str).collect();
+            let path = path("list-fallback");
+            let handle = DbHandle::spawn(path.clone()).await.unwrap();
+            let (store, _) = replay_store(vec![
+                head_response(encode_head(&head).unwrap()),
+                accel_miss(),
+                list_response(&key_refs, false, None),
+                event_response(events[3].1.clone()),
+                event_response(events[2].1.clone()),
+                event_response(events[1].1.clone()),
+                event_response(events[0].1.clone()),
+            ]);
+            assert!(matches!(
+                refresh(&store, &handle, &scope).await,
+                ScopeReadiness::Ready { .. }
+            ));
+            assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 4);
+            drop(handle);
+            fs::remove_file(path).unwrap();
+        }
+
+        // A listed-but-missing object forces the serial fallback.
+        let (short_events, short_head) = accel_chain(&genesis, 2);
+        let short_keys = event_keys(&scope, &short_events);
+        let short_refs: Vec<&str> = short_keys.iter().map(String::as_str).collect();
+        let path_missing = path("list-missing-object");
+        let handle = DbHandle::spawn(path_missing.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&short_head).unwrap()),
+            accel_miss(),
+            list_response(&short_refs, false, None),
+            event_response(short_events[0].1.clone()),
+            response(404, &[], Vec::new()),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        drop(handle);
+        fs::remove_file(path_missing).unwrap();
+
+        // A listed candidate answered with foreign event bytes fails its synthesized-key
+        // check and forces the serial fallback.
+        let invalid_path = path("list-invalid-event");
+        let handle = DbHandle::spawn(invalid_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&short_head).unwrap()),
+            accel_miss(),
+            list_response(&short_refs, false, None),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        drop(handle);
+        fs::remove_file(invalid_path).unwrap();
+
+        // Candidates beyond the pinned tail are ignored: the head pins sequence 2 while the
+        // listing also names sequences 3 and 4.
+        let beyond_path = path("list-beyond-tail");
+        let handle = DbHandle::spawn(beyond_path.clone()).await.unwrap();
+        let beyond_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&short_head).unwrap()),
+            accel_miss(),
+            list_response(&beyond_refs[..3], false, None),
+            event_response(events[0].1.clone()),
+            event_response(events[1].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 2);
+        assert_eq!(client.actual_requests().count(), 5);
+        drop(handle);
+        fs::remove_file(beyond_path).unwrap();
+    }
+
+    /// The pack rung replays exactly what the serial walk replays and re-verifies every
+    /// embedded event; corrupt, wrong-scope, range-mismatch, and tail-mismatch packs fall
+    /// through.
+    #[tokio::test]
+    async fn packed_replay_is_equivalent_and_bad_packs_fall_back() {
+        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 3);
+        let slices: Vec<&[u8]> = events.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        let pack = build_pack(&scope, None, 1, &slices).unwrap();
+        let entry = PackEntry::new(1, 3, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let serial_path = path("pack-equivalence-serial");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(events[2].1.clone()),
+            event_response(events[1].1.clone()),
+            event_response(events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        drop(serial);
+
+        let packed_path = path("pack-equivalence-packed");
+        let packed = DbHandle::spawn(packed_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes.clone()),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes.clone()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &packed, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(packed.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        assert_eq!(row_counts(&packed_path), row_counts(&serial_path));
+        // Head, pointer, catalog, and one pack: no per-event GET and no republication.
+        assert_eq!(client.actual_requests().count(), 4);
+        drop(packed);
+        fs::remove_file(packed_path).unwrap();
+
+        // A corrupt pack, a wrong-scope pack, a pack that mismatches its catalog range, and
+        // a pack whose final event misses the pinned tail all fall through to the serial
+        // walk without changing the outcome.
+        let foreign_config = AdmittedCampaignConfig::new(
+            WorkspaceId::new("workspace-b".into()).unwrap(),
+            CampaignId::new("campaign-b".into()).unwrap(),
+            b"admitted".to_vec(),
+        )
+        .unwrap();
+        let foreign_genesis = crate::scope::root_genesis(&foreign_config).unwrap();
+        let (foreign_events, _) = accel_chain(&foreign_genesis, 3);
+        let foreign_slices: Vec<&[u8]> = foreign_events
+            .iter()
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect();
+        let foreign_pack =
+            build_pack(foreign_genesis.identity(), None, 1, &foreign_slices).unwrap();
+        let short_slices: Vec<&[u8]> = slices[..2].to_vec();
+        let short_pack = build_pack(&scope, None, 1, &short_slices).unwrap();
+        let (alternate_events, _) = accel_chain_with(&genesis, 3, "rival-op");
+        let alternate_slices: Vec<&[u8]> = alternate_events
+            .iter()
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect();
+        let alternate_pack = build_pack(&scope, None, 1, &alternate_slices).unwrap();
+        let mut corrupt = pack.bytes().to_vec();
+        corrupt[20] ^= 0xff;
+        let bad_packs = [
+            (pack.digest().clone(), corrupt),
+            (foreign_pack.digest().clone(), foreign_pack.bytes().to_vec()),
+            (short_pack.digest().clone(), short_pack.bytes().to_vec()),
+            (
+                alternate_pack.digest().clone(),
+                alternate_pack.bytes().to_vec(),
+            ),
+        ];
+        for (digest, bytes) in bad_packs {
+            let entry = PackEntry::new(1, 3, digest).unwrap();
+            let (bad_catalog, bad_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+            let bad_pointer = encode_pointer(&scope, &bad_digest).unwrap();
+            let fallback_path = path("pack-fallback");
+            let handle = DbHandle::spawn(fallback_path.clone()).await.unwrap();
+            let (store, _) = replay_store(vec![
+                head_response(encode_head(&head).unwrap()),
+                response(200, &[("etag", "\"pointer\"")], bad_pointer),
+                response(200, &[("etag", "\"catalog\"")], bad_catalog),
+                response(200, &[("etag", "\"pack\"")], bytes),
+                accel_miss(),
+                event_response(events[2].1.clone()),
+                event_response(events[1].1.clone()),
+                event_response(events[0].1.clone()),
+            ]);
+            assert!(matches!(
+                refresh(&store, &handle, &scope).await,
+                ScopeReadiness::Ready { .. }
+            ));
+            assert_eq!(handle.scope_cursor(&scope).await.unwrap(), serial_cursor);
+            drop(handle);
+            fs::remove_file(fallback_path).unwrap();
+        }
+        fs::remove_file(serial_path).unwrap();
+    }
+
+    /// For an N-event history served through packs, event-data GETs drop from N to
+    /// `ceil(N / 256)`; the fixed head/pointer/catalog requests are asserted separately.
+    #[tokio::test]
+    async fn packed_replay_reduces_event_data_requests_to_pack_count() {
+        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
+
+        const EVENTS: usize = 300;
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, EVENTS);
+        let mut entries = Vec::new();
+        let mut packs = Vec::new();
+        for group in (0..EVENTS).collect::<Vec<_>>().chunks(256) {
+            let start = group[0];
+            let end = group[group.len() - 1];
+            let parent = (start > 0).then(|| events[start - 1].0.clone());
+            let slices: Vec<&[u8]> = events[start..=end]
+                .iter()
+                .map(|(_, bytes)| bytes.as_slice())
+                .collect();
+            let pack = build_pack(&scope, parent.as_ref(), start as u64 + 1, &slices).unwrap();
+            entries.push(
+                PackEntry::new(start as u64 + 1, end as u64 + 1, pack.digest().clone()).unwrap(),
+            );
+            packs.push(pack);
+        }
+        assert_eq!(packs.len(), EVENTS.div_ceil(256));
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &entries, &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let path = path("pack-request-count");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let mut responses = vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+        ];
+        responses.extend(
+            packs
+                .iter()
+                .map(|pack| response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec())),
+        );
+        let (store, client) = replay_store(responses);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, EVENTS as u64);
+        let requests: Vec<String> = client
+            .actual_requests()
+            .map(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .to_owned()
+            })
+            .collect();
+        let event_gets = requests
+            .iter()
+            .filter(|path| path.contains("/events/"))
+            .count();
+        let pack_gets = requests
+            .iter()
+            .filter(|path| path.contains("/replay-packs/"))
+            .count();
+        assert_eq!(event_gets, 0);
+        assert_eq!(pack_gets, EVENTS.div_ceil(256));
+        assert_eq!(requests.len(), 1 + 2 + pack_gets);
+        drop(handle);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A LIST-served replay publishes packs, and a second cold projection then replays
+    /// through them: the acceptance path from serial cost to `ceil(N / 256)` GETs.
+    #[tokio::test]
+    async fn a_replay_publishes_packs_that_serve_the_next_cold_projection() {
+        use crate::storage::s3::test_support::list_response;
+        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 2);
+        let keys = event_keys(&scope, &events);
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let slices: Vec<&[u8]> = events.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        let expected_pack = build_pack(&scope, None, 1, &slices).unwrap();
+        let entry = PackEntry::new(1, 2, expected_pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let first_path = path("publish-first");
+        let first = DbHandle::spawn(first_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            list_response(&key_refs, false, None),
+            event_response(events[0].1.clone()),
+            event_response(events[1].1.clone()),
+            // Publication: pack PUT, pointer probe, catalog PUT, pointer create.
+            response(200, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &first, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests[5].body().bytes(), Some(expected_pack.bytes()));
+        assert_eq!(requests[7].body().bytes(), Some(catalog_bytes.as_slice()));
+        assert_eq!(requests[8].body().bytes(), Some(pointer_bytes.as_slice()));
+        drop(first);
+        fs::remove_file(first_path).unwrap();
+
+        let second_path = path("publish-second");
+        let second = DbHandle::spawn(second_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], expected_pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &second, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(second.scope_cursor(&scope).await.unwrap().0, 2);
+        assert_eq!(client.actual_requests().count(), 4);
+        drop(second);
+        fs::remove_file(second_path).unwrap();
     }
 }

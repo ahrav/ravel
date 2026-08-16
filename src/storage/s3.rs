@@ -321,9 +321,7 @@ impl S3Store {
             if output.is_truncated() != Some(true) {
                 return Ok(keys);
             }
-            let next = output
-                .next_continuation_token()
-                .ok_or(ListError::Invalid)?;
+            let next = output.next_continuation_token().ok_or(ListError::Invalid)?;
             if token.as_deref() == Some(next) {
                 return Err(ListError::Invalid);
             }
@@ -591,6 +589,30 @@ pub(crate) mod test_support {
         builder.body(body.into()).expect("valid test response")
     }
 
+    /// Builds one scripted `ListObjectsV2` page naming `keys` in order.
+    pub(crate) fn list_response(
+        keys: &[&str],
+        truncated: bool,
+        next_token: Option<&str>,
+    ) -> http::Response<SdkBody> {
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>test-bucket</Name>",
+        );
+        for key in keys {
+            body.push_str(&format!("<Contents><Key>{key}</Key></Contents>"));
+        }
+        body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+        if let Some(token) = next_token {
+            body.push_str(&format!(
+                "<NextContinuationToken>{token}</NextContinuationToken>"
+            ));
+        }
+        body.push_str("</ListBucketResult>");
+        response(200, &[("content-type", "application/xml")], body)
+    }
+
     pub(crate) fn replay_store(
         responses: Vec<http::Response<SdkBody>>,
     ) -> (S3Store, StaticReplayClient) {
@@ -622,7 +644,7 @@ mod tests {
     use bytes::Bytes;
     use http_body::{Body, Frame};
 
-    use super::test_support::{replay_store, response, test_builder};
+    use super::test_support::{list_response, replay_store, response, test_builder};
 
     const TEST_ETAG: &str = "\"opaque-token:part-7\"";
 
@@ -1166,29 +1188,6 @@ mod tests {
             "listing response is invalid"
         );
         assert_eq!(ListError::Transport.to_string(), "listing failed");
-    }
-
-    fn list_response(
-        keys: &[&str],
-        truncated: bool,
-        next_token: Option<&str>,
-    ) -> http::Response<SdkBody> {
-        let mut body = String::from(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <Name>test-bucket</Name>",
-        );
-        for key in keys {
-            body.push_str(&format!("<Contents><Key>{key}</Key></Contents>"));
-        }
-        body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
-        if let Some(token) = next_token {
-            body.push_str(&format!(
-                "<NextContinuationToken>{token}</NextContinuationToken>"
-            ));
-        }
-        body.push_str("</ListBucketResult>");
-        response(200, &[("content-type", "application/xml")], body)
     }
 
     #[tokio::test]

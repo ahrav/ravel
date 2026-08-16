@@ -25,6 +25,7 @@ use crate::{
 pub(crate) const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
 pub(crate) const PLAN_ADMITTED_PAYLOAD_TYPE: &str = "plan_admitted";
 pub(crate) const GRANT_ACTIVATED_PAYLOAD_TYPE: &str = "grant_activated";
+pub(crate) const PROJECTION_CHECKPOINT_PAYLOAD_TYPE: &str = "projection_checkpoint_published";
 #[cfg(test)]
 pub(crate) const TEST_SUCCESSOR_PAYLOAD_TYPE: &str = "test_successor";
 const ROOT_SCOPE_DOMAIN: &[u8] = b"ravel.scope.root\0";

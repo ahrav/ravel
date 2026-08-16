@@ -443,8 +443,9 @@ impl ReportedUse {
     ///   so some input was billed. Zero input is possible only when a cache read covers it.
     ///
     /// The remaining count, generated tokens, cannot be judged from the usage block alone: a
-    /// completion that stops on its first stop sequence legitimately generates none. Its
-    /// caller checks it against the text that arrived.
+    /// completion that stops on its first stop sequence legitimately generates none, while one
+    /// that reached the output cap cannot. [`generation_is_credible`] judges it against the
+    /// text and the stop reason together.
     fn contradicts_the_response(self) -> bool {
         u64::from(self.total_tokens) < u64::from(self.input_tokens) + u64::from(self.output_tokens)
             || (self.input_tokens == 0 && self.cache_read_input_tokens.unwrap_or(0) == 0)
@@ -788,13 +789,7 @@ fn classify(
         };
     }
     match completion_text(&response) {
-        // A frame that returned text generated tokens for it, so a zero generated count beside
-        // a non-empty completion is the omitted-scalar default rather than a provider claim.
-        // This is the one count the usage block cannot judge on its own.
-        Some(text)
-            if !text.is_empty()
-                && reported_use.is_some_and(|reported| reported.output_tokens == 0) =>
-        {
+        Some(text) if !generation_is_credible(&text, reason, reported_use) => {
             InvocationOutcome::MalformedResponse {
                 provider_request_id,
                 reported_use: None,
@@ -851,6 +846,27 @@ fn completion_text(response: &ConverseResponse) -> Option<String> {
         text.push_str(chunk);
     }
     answered.then_some(text)
+}
+
+/// Whether a completion's text and generated-token count agree with each other and with the
+/// stop reason.
+///
+/// This is the generated count's half of the usage check that [`ReportedUse`] cannot make on
+/// its own, and it reads the stop reason for the same reason it reads the text: both are facts
+/// about the response that a count can contradict. Reaching the output cap requires generating
+/// up to it, so that reason proves generation even before the text is read, while an immediate
+/// stop sequence proves the opposite and makes an empty completion reporting no generated
+/// tokens credible. Once generation is established it has to show in both the text and the
+/// count, because zero is also the value an omitted counter deserializes to.
+fn generation_is_credible(
+    text: &str,
+    reason: TerminalReason,
+    reported: Option<ReportedUse>,
+) -> bool {
+    if text.is_empty() && reason != TerminalReason::CapReached {
+        return true;
+    }
+    !text.is_empty() && reported.is_none_or(|reported| reported.output_tokens > 0)
 }
 
 /// Reads the provider's token counts, refusing a negative one rather than normalizing it.
@@ -1771,6 +1787,41 @@ mod tests {
             panic!("expected a completion, got {outcome:?}");
         };
         assert!(text.is_empty());
+    }
+
+    /// The stop reason is evidence about generation too. Reaching the output cap requires
+    /// generating up to it, so a cap-reached frame reporting no generated tokens, or carrying no
+    /// text to show for them, contradicts itself even though an empty completion is credible
+    /// under a stop sequence.
+    #[tokio::test]
+    async fn a_cap_reached_frame_must_show_the_generation_it_implies() {
+        for usage in [
+            r#""usage":{"inputTokens":10,"totalTokens":10}"#,
+            r#""usage":{"inputTokens":10,"outputTokens":0,"totalTokens":10}"#,
+        ] {
+            let (transport, _) = replay(vec![json(format!(
+                r#"{{"output":{{"message":{{"role":"assistant","content":[{{"text":""}}]}}}},"stopReason":"max_tokens",{usage}}}"#
+            ))]);
+
+            let outcome = invoke(&transport).await;
+            assert!(
+                matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
+                "{usage} gave {outcome:?}"
+            );
+        }
+
+        // The same reason with the generation it implies is a completion, capped rather than
+        // whole, which is what CapReached exists to say.
+        let (capped, _) = replay(vec![json(converse_body(
+            "max_tokens",
+            Some((10, 5, 15)),
+            "as much as fit",
+        ))]);
+        let outcome = invoke(&capped).await;
+        let InvocationOutcome::Completed { reason, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        assert_eq!(*reason, TerminalReason::CapReached);
     }
 
     /// Zero input tokens are impossible unless a cache read covers them: the prompt is

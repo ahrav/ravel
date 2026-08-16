@@ -393,6 +393,11 @@ impl fmt::Debug for InvocationRequest {
 /// deciding which categories cost reconciliation needs is not this boundary's decision to
 /// make: a gateway or a later configuration that enables prompt caching would otherwise lose
 /// the counters between the response and the trace.
+///
+/// The provider's per-TTL cache breakdown is not represented. Mirroring it would put the
+/// provider's own cache-lifetime vocabulary into this crate's public usage type, and no
+/// request this boundary builds can produce one, so a caller reconciling a cached response
+/// from a gateway gets the total cached tokens without the lifetime split that prices them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReportedUse {
     input_tokens: u32,
@@ -444,6 +449,12 @@ pub enum TerminalReason {
     /// text that is not a whole answer.
     ToolUseRequested,
     /// A stop reason this crate does not model, which a provider may add at any time.
+    ///
+    /// It precludes a completion for the reason the tool-use stop does: a new stop can denote
+    /// a pause, a request, or another partial-output condition, and the text that came with it
+    /// would then be a fragment. Handing back a fragment as a whole answer is the failure this
+    /// boundary refuses elsewhere by refusing rather than truncating, so an unmodelled stop is
+    /// a definite verdict that keeps its evidence until the reason is modelled.
     Unrecognized,
 }
 
@@ -463,6 +474,7 @@ impl TerminalReason {
                 | Self::ContextWindowExceeded
                 | Self::ModelOutputMalformed
                 | Self::ToolUseRequested
+                | Self::Unrecognized
         )
     }
 }
@@ -769,8 +781,10 @@ fn classify(
 
 /// Concatenates the response's text blocks, refusing a response with no text at all.
 ///
-/// Non-text blocks are dropped: this boundary requests no tools, documents, or images, so
-/// a response carrying them is answering a request this crate did not make.
+/// A non-text block fails the frame rather than being filtered out of it. This boundary
+/// requests no tools, documents, or images, so a response carrying one is answering a request
+/// this crate did not make, and the text beside it is then one part of an answer to that other
+/// request. Dropping the block would keep the fragment and hide why it is a fragment.
 ///
 /// A completion past [`MAX_COMPLETION_BYTES`] is refused rather than truncated: handing back
 /// a silently shortened answer would let a caller treat a partial completion as a whole one.
@@ -793,13 +807,14 @@ fn completion_text(response: &ConverseResponse) -> Option<String> {
     // dispatch uncertainty for an attempt the provider had already answered.
     let mut answered = false;
     for block in message.content() {
-        if let ContentBlock::Text(chunk) = block {
-            answered = true;
-            if text.len().saturating_add(chunk.len()) > MAX_COMPLETION_BYTES {
-                return None;
-            }
-            text.push_str(chunk);
+        let ContentBlock::Text(chunk) = block else {
+            return None;
+        };
+        answered = true;
+        if text.len().saturating_add(chunk.len()) > MAX_COMPLETION_BYTES {
+            return None;
         }
+        text.push_str(chunk);
     }
     answered.then_some(text)
 }
@@ -1328,14 +1343,14 @@ mod tests {
         }
     }
 
-    /// An unreadable frame keeps whatever evidence arrived with it. A stop reason this crate
-    /// does not model is the reachable case, and dropping its usage would lose spend the
-    /// account was charged for the same way a modelled reason would.
+    /// An unreadable frame keeps whatever evidence arrived with it. A clean end of turn that
+    /// carries no text block at all is the reachable case, and dropping its usage would lose
+    /// spend the account was charged for the same way a definite verdict would.
     #[tokio::test]
     async fn an_unreadable_frame_keeps_the_evidence_that_arrived_with_it() {
         let (transport, _) = replay(vec![json(String::from(
             "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[]}},\
-             \"stopReason\":\"a_reason_added_after_this_crate\",\
+             \"stopReason\":\"end_turn\",\
              \"usage\":{\"inputTokens\":900000,\"outputTokens\":0,\"totalTokens\":900000}}",
         ))]);
 
@@ -1556,22 +1571,43 @@ mod tests {
         }
     }
 
-    /// A tool-use stop is not a completion even when text came with it. This boundary offers
-    /// no tools, so such a frame answers a request it did not make, and the text before the
-    /// tool call is a fragment rather than a whole answer.
+    /// A stop that cannot certify a whole answer refuses even when text came with it. A
+    /// tool-use stop is one: this boundary offers no tools, so the text before the call is a
+    /// fragment. A stop this crate does not model is the other, for the same reason and
+    /// without knowing which reason it is. Both keep the evidence that arrived.
     #[tokio::test]
-    async fn a_tool_use_stop_with_text_is_refused_rather_than_completed() {
-        let (transport, _) = replay(vec![json(converse_body(
-            "tool_use",
-            Some((1, 1, 2)),
-            "let me look that up",
-        ))]);
+    async fn a_stop_that_cannot_certify_an_answer_refuses_even_with_text() {
+        for (wire, expected) in [
+            ("tool_use", TerminalReason::ToolUseRequested),
+            (
+                "a_reason_added_after_this_crate",
+                TerminalReason::Unrecognized,
+            ),
+        ] {
+            let (transport, _) = replay(vec![json(converse_body(
+                wire,
+                Some((1, 1, 2)),
+                "let me look that up",
+            ))]);
 
-        let outcome = invoke(&transport).await;
-        let InvocationOutcome::Refused { reason, .. } = &outcome else {
-            panic!("expected a refusal, got {outcome:?}");
-        };
-        assert_eq!(*reason, TerminalReason::ToolUseRequested);
+            let outcome = invoke(&transport).await;
+            let InvocationOutcome::Refused {
+                reason,
+                reported_use,
+                ..
+            } = &outcome
+            else {
+                panic!("expected a refusal for {wire}, got {outcome:?}");
+            };
+            assert_eq!(*reason, expected, "{wire}");
+            assert_eq!(
+                reported_use
+                    .expect("usage survives the verdict")
+                    .total_tokens(),
+                2,
+                "{wire}"
+            );
+        }
     }
 
     /// Only the assistant's own message is a completion. A frame carrying the user role is
@@ -1749,18 +1785,37 @@ mod tests {
         );
     }
 
-    /// Every stop reason maps to its own terminal reason, and one this crate does not model
-    /// is named rather than folded into a clean end of turn.
+    /// A block this boundary never requested fails the frame instead of being filtered out
+    /// of it. The text beside a tool-use block is one part of an answer to a request this
+    /// crate did not make, so keeping it would keep a fragment and hide why it is one.
+    #[tokio::test]
+    async fn an_unrequested_content_block_makes_the_frame_malformed() {
+        let (transport, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"partial"},{"toolUse":{"toolUseId":"t1","name":"lookup","input":{}}}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}"#,
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::MalformedResponse { reported_use, .. } = &outcome else {
+            panic!("expected an unreadable frame, got {outcome:?}");
+        };
+        // The frame is unanswerable, not evidence-free: it still reports what was billed.
+        assert_eq!(
+            reported_use
+                .expect("usage survives the frame")
+                .total_tokens(),
+            2
+        );
+    }
+
+    /// Every stop reason that can certify an answer maps to its own terminal reason. The ones
+    /// that cannot are covered by the refusal test above, which is where an unmodelled reason
+    /// now lands rather than being folded into a clean end of turn.
     #[tokio::test]
     async fn every_stop_reason_maps_to_its_own_terminal_reason() {
         for (wire, expected) in [
             ("end_turn", TerminalReason::EndTurn),
             ("stop_sequence", TerminalReason::StopSequence),
             ("max_tokens", TerminalReason::CapReached),
-            (
-                "a_reason_added_after_this_crate",
-                TerminalReason::Unrecognized,
-            ),
         ] {
             let (transport, _) = replay(vec![json(converse_body(wire, Some((1, 1, 2)), "text"))]);
             let outcome = transport

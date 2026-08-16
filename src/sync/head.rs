@@ -17,12 +17,13 @@ use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 use crate::{
     domain::proposal::AdmissibleProposal,
     scope::{
-        EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent, GrantActivatedPayload,
-        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PROJECTION_CHECKPOINT_PAYLOAD_TYPE,
-        PlanAdmittedEvent, ProjectionCheckpointEvent, ProjectionCheckpointPayload, ScopeAuthority,
-        ScopeHead, ScopeIdentity, decode_head, decode_plan_admitted_event,
-        encode_grant_activated_event, encode_head, encode_plan_admitted_event,
-        encode_projection_checkpoint_event, plan_key, scope_event_key, scope_head_key,
+        Digest, EncodedScopeEvent, EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE,
+        GrantActivatedEvent, GrantActivatedPayload, MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE,
+        PROJECTION_CHECKPOINT_PAYLOAD_TYPE, PlanAdmittedEvent, ProjectionCheckpointEvent,
+        ProjectionCheckpointPayload, ScopeAuthority, ScopeEventRef, ScopeHead, ScopeIdentity,
+        decode_head, decode_plan_admitted_event, encode_grant_activated_event, encode_head,
+        encode_plan_admitted_event, encode_projection_checkpoint_event, plan_key, scope_event_key,
+        scope_head_key,
     },
     storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
 };
@@ -33,6 +34,7 @@ use super::{
     event::{
         ResolvedScopeEventPublication, ScopeEventPublicationError, payload_registered,
         publish_encoded, publish_root, read_opaque, root_domain_valid, root_payload_valid,
+        validate_registered,
     },
 };
 
@@ -148,10 +150,43 @@ impl ScopeHeadTransition {
         candidate: ScopeHead,
         event: ResolvedScopeEventPublication,
     ) -> Result<Self, WireError> {
+        Self::new_batch(parent, candidate, vec![event])
+    }
+
+    /// Binds an ordered batch of canonical event publications to one candidate head.
+    ///
+    /// The batch commits atomically at the single head CAS: the candidate carries the final
+    /// event's reference and operation identity, so the existing commit, resolution, and
+    /// reconciliation mechanics treat the whole batch as one transition identified by its final
+    /// event. Only that final publication is stored; the earlier members are chain-proven here
+    /// and reachable from it through their parent references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidValue`] when the batch-internal chain or any candidate
+    /// binding fails, or another [`WireError`] when the candidate head cannot be canonically
+    /// encoded.
+    fn new_batch(
+        parent: ScopeHeadParent,
+        candidate: ScopeHead,
+        events: Vec<ResolvedScopeEventPublication>,
+    ) -> Result<Self, WireError> {
+        let active_plan = {
+            let views: Vec<BatchEventView<'_>> = events
+                .iter()
+                .map(|event| BatchEventView {
+                    envelope: event.envelope(),
+                    reference: event.event_ref(),
+                    bytes: event.canonical_bytes(),
+                })
+                .collect();
+            validate_batch_chain(&parent, &views)?
+        };
+        let event = events
+            .into_iter()
+            .next_back()
+            .ok_or(WireError::InvalidValue)?;
         let envelope = event.envelope();
-        if envelope.sequence() > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS {
-            return Err(WireError::InvalidValue);
-        }
         if candidate.scope() != event.scope()
             || candidate.tail() != event.event_ref()
             || candidate.operation_id() != envelope.operation_id()
@@ -162,9 +197,7 @@ impl ScopeHeadTransition {
         }
         match &parent {
             ScopeHeadParent::Genesis => {
-                if envelope.sequence() != 1
-                    || envelope.parent_event().is_some()
-                    || candidate.active_plan_digest().is_some()
+                if candidate.active_plan_digest().is_some()
                     || !matches!(candidate.authority(), ScopeAuthority::Unowned)
                     || candidate.scope_epoch().get() != 1
                 {
@@ -172,22 +205,13 @@ impl ScopeHeadTransition {
                 }
             }
             ScopeHeadParent::Existing(observed) => {
-                let expected = observed
-                    .head
-                    .tail()
-                    .sequence()
-                    .checked_add(1)
-                    .ok_or(WireError::InvalidValue)?;
                 if candidate.scope() != observed.head.scope()
                     || candidate.authority() != observed.head.authority()
                     || candidate.scope_epoch() != observed.head.scope_epoch()
-                    || envelope.sequence() != expected
-                    || envelope.parent_event() != Some(observed.head.tail())
-                    || candidate.operation_id() == observed.head.operation_id()
+                    || candidate.active_plan_digest() != active_plan.as_ref()
                 {
                     return Err(WireError::InvalidValue);
                 }
-                validate_active_plan_transition(observed.head(), &candidate, &event)?;
             }
         }
         let head_bytes = encode_head(&candidate)?;
@@ -244,35 +268,114 @@ impl fmt::Display for ScopeAppendError {
 
 impl Error for ScopeAppendError {}
 
+/// One batch member's envelope, reference, and canonical bytes, viewed uniformly whether the
+/// event awaits publication or is already resolved, so the pre-PUT preflight and the transition
+/// constructor cannot drift apart in what they accept.
+struct BatchEventView<'a> {
+    envelope: &'a EventEnvelope,
+    reference: &'a ScopeEventRef,
+    bytes: &'a [u8],
+}
+
+/// The batch-internal chain rules, shared by the pre-publication preflight and the transition
+/// constructor so a doomed batch is refused before any byte is published and re-proven after.
+///
+/// An existing parent requires one contiguous chain rooted at the observed tail: every member
+/// in the parent's scope at the parent's epoch, gapless sequences within the replay ceiling,
+/// each `parent_event` naming its predecessor, operation IDs pairwise distinct and distinct
+/// from the parent head's (so the final operation cannot be confused with the unchanged parent
+/// during lost-CAS resolution), and the active plan folded left-to-right through the one
+/// transition rule. Genesis stays a one-event transition: the first head names exactly one
+/// root event, so a wider batch has no parent boundary to chain from.
+///
+/// Returns the active-plan digest the candidate head must carry.
+///
+/// # Errors
+///
+/// Returns [`WireError::InvalidValue`] for an empty batch or any violated rule, and plan
+/// payload decode errors verbatim.
+fn validate_batch_chain(
+    parent: &ScopeHeadParent,
+    events: &[BatchEventView<'_>],
+) -> Result<Option<Digest>, WireError> {
+    let (first, rest) = events.split_first().ok_or(WireError::InvalidValue)?;
+    let observed = match parent {
+        ScopeHeadParent::Genesis => {
+            if !rest.is_empty()
+                || first.envelope.sequence() != 1
+                || first.envelope.parent_event().is_some()
+            {
+                return Err(WireError::InvalidValue);
+            }
+            return Ok(None);
+        }
+        ScopeHeadParent::Existing(observed) => observed,
+    };
+    let head = observed.head();
+    let expected_first = head
+        .tail()
+        .sequence()
+        .checked_add(1)
+        .ok_or(WireError::InvalidValue)?;
+    if first.envelope.sequence() != expected_first
+        || first.envelope.parent_event() != Some(head.tail())
+    {
+        return Err(WireError::InvalidValue);
+    }
+    let mut operations = HashSet::new();
+    let mut active_plan = head.active_plan_digest().cloned();
+    let mut previous: Option<&BatchEventView<'_>> = None;
+    for event in events {
+        if event.envelope.scope_id() != head.scope().scope_id()
+            || event.envelope.writer_epoch() != head.scope_epoch()
+            || event.envelope.operation_id() == head.operation_id()
+            || !operations.insert(event.envelope.operation_id().to_owned())
+            || event.envelope.sequence() > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS
+        {
+            return Err(WireError::InvalidValue);
+        }
+        if let Some(previous) = previous {
+            let expected = previous
+                .envelope
+                .sequence()
+                .checked_add(1)
+                .ok_or(WireError::InvalidValue)?;
+            if event.envelope.sequence() != expected
+                || event.envelope.parent_event() != Some(previous.reference)
+            {
+                return Err(WireError::InvalidValue);
+            }
+        }
+        active_plan = next_active_plan_digest(active_plan, head.scope(), event)?;
+        previous = Some(event);
+    }
+    Ok(active_plan)
+}
+
 /// The one rule for how an event may move a head's active plan.
 ///
 /// A `plan_admitted` event moves it from none to exactly the digest its own payload names; every
 /// other event preserves it. The payload is re-decoded from the published bytes, so the head
-/// cannot disagree with the event that authorized it.
+/// cannot disagree with the event that authorized it, and a second admission is refused because
+/// the digest is already occupied.
 ///
 /// # Errors
 ///
 /// Returns [`WireError::InvalidValue`] for any other movement, and decode errors verbatim.
-fn validate_active_plan_transition(
-    observed: &ScopeHead,
-    candidate: &ScopeHead,
-    event: &ResolvedScopeEventPublication,
-) -> Result<(), WireError> {
-    if event.envelope().payload_type() != PLAN_ADMITTED_PAYLOAD_TYPE {
-        return if candidate.active_plan_digest() == observed.active_plan_digest() {
-            Ok(())
-        } else {
-            Err(WireError::InvalidValue)
-        };
+fn next_active_plan_digest(
+    current: Option<Digest>,
+    scope: &ScopeIdentity,
+    event: &BatchEventView<'_>,
+) -> Result<Option<Digest>, WireError> {
+    if event.envelope.payload_type() != PLAN_ADMITTED_PAYLOAD_TYPE {
+        return Ok(current);
     }
-    let key = scope_event_key(candidate.scope(), event.event_ref());
-    let admitted = decode_plan_admitted_event(event.canonical_bytes(), &key, candidate.scope())?;
-    if observed.active_plan_digest().is_some()
-        || candidate.active_plan_digest() != Some(admitted.payload().plan_digest())
-    {
+    if current.is_some() {
         return Err(WireError::InvalidValue);
     }
-    Ok(())
+    let key = scope_event_key(scope, event.reference);
+    let admitted = decode_plan_admitted_event(event.bytes, &key, scope)?;
+    Ok(Some(admitted.payload().plan_digest().clone()))
 }
 
 /// Publishes the plan object and its admission event, then commits the head that activates it.
@@ -499,6 +602,85 @@ pub(crate) async fn append_checkpoint(
     )
     .map_err(|_| ScopeAppendError::InvalidInput)?;
     let transition = ScopeHeadTransition::new(parent, candidate, publication)
+        .map_err(|_| ScopeAppendError::InvalidInput)?;
+    Ok(commit(store, transition, head_history).await)
+}
+
+/// Publishes an ordered batch of encoded events, then commits the head that appends them all.
+///
+/// The batch is atomic at the head: every event object is published create-only before the
+/// single conditional CAS, so a reader that observes the committed head reaches all of the
+/// batch through one contiguous chain, and a failed or losing CAS leaves at worst inert
+/// immutable orphans. The whole batch-internal chain is validated before the first byte is
+/// published, so a doomed batch sends nothing, and the first publication failure stops the
+/// batch before the CAS. The candidate head carries the final event's operation identity, so
+/// lost-CAS resolution and reconciliation identify the batch exactly as a single append.
+///
+/// # Errors
+///
+/// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent (genesis stays a one-event
+/// transition through [`append_root`]), an empty batch, any batch-internal chain violation, or
+/// an invalid transition, and publication errors verbatim.
+pub async fn append_batch(
+    store: &S3Store,
+    parent: ScopeHeadParent,
+    scope: &ScopeIdentity,
+    events: Vec<(EventEnvelope, EncodedScopeEvent)>,
+    head_history: &mut AttemptHistory,
+) -> Result<ScopeHeadCommitOutcome, ScopeAppendError> {
+    let ScopeHeadParent::Existing(observed) = &parent else {
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    // Same pre-publication discipline as the single-event appends, widened to the whole batch:
+    // every member must decode consistently and the chain must hold before any object exists.
+    for (envelope, encoded) in &events {
+        let key = scope_event_key(scope, encoded.event_ref());
+        validate_registered(scope, envelope, encoded, &key)
+            .map_err(ScopeAppendError::Publication)?;
+    }
+    let active_plan = {
+        let views: Vec<BatchEventView<'_>> = events
+            .iter()
+            .map(|(envelope, encoded)| BatchEventView {
+                envelope,
+                reference: encoded.event_ref(),
+                bytes: encoded.stored_bytes(),
+            })
+            .collect();
+        validate_batch_chain(&parent, &views).map_err(|_| ScopeAppendError::InvalidInput)?
+    };
+    let (authority, scope_epoch) = (
+        observed.head().authority().clone(),
+        observed.head().scope_epoch().get(),
+    );
+    let mut publications = Vec::with_capacity(events.len());
+    for (envelope, encoded) in events {
+        // Each publication is its own logical dispatch: sharing one history across keys would
+        // leak the first object's send uncertainty into the rest.
+        let publication = publish_encoded(
+            store,
+            scope,
+            &envelope,
+            encoded,
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .map_err(ScopeAppendError::Publication)?;
+        publications.push(publication);
+    }
+    let Some(last) = publications.last() else {
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    let candidate = ScopeHead::new(
+        scope.clone(),
+        authority,
+        scope_epoch,
+        last.event_ref().clone(),
+        active_plan,
+        last.envelope().operation_id().to_owned(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let transition = ScopeHeadTransition::new_batch(parent, candidate, publications)
         .map_err(|_| ScopeAppendError::InvalidInput)?;
     Ok(commit(store, transition, head_history).await)
 }

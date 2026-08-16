@@ -170,7 +170,7 @@ pub(crate) fn root_payload_valid(
         || crate::scope::root_event_from_decoded(decoded.clone(), scope).is_ok()
 }
 
-fn validate_registered(
+pub(super) fn validate_registered(
     scope: &ScopeIdentity,
     envelope: &EventEnvelope,
     encoded: &EncodedScopeEvent,

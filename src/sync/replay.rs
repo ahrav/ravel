@@ -3488,7 +3488,67 @@ mod tests {
             ]
         };
 
-        for responses in [uncertified, wrong_digest, junk_fixture] {
+        // Wrong plan: the certificate claims an active plan the snapshot does not hold.
+        let wrong_plan = {
+            use crate::scope::{
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE, ProjectionCheckpointEvent,
+                ProjectionCheckpointPayload, encode_projection_checkpoint_event,
+            };
+            use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
+            let payload = ProjectionCheckpointPayload::new(
+                Digest::new(sha256_hex(&fixture.snapshot)).unwrap(),
+                fixture.snapshot.len() as u64,
+                1,
+                genesis.event_ref().digest().clone(),
+                Some(Digest::new("a".repeat(64)).unwrap()),
+            )
+            .unwrap();
+            let certificate = ProjectionCheckpointEvent::new(
+                EventEnvelope::new(
+                    scope.scope_id().clone(),
+                    2,
+                    Some(genesis.event_ref().clone()),
+                    1,
+                    "planned-checkpoint-op".into(),
+                    PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                payload,
+            )
+            .unwrap();
+            let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+            let head = ScopeHead::new(
+                scope.clone(),
+                ScopeAuthority::Unowned,
+                1,
+                encoded.event_ref().clone(),
+                Some(Digest::new("a".repeat(64)).unwrap()),
+                "planned-checkpoint-op".into(),
+            )
+            .unwrap();
+            let pack = build_pack(
+                &scope,
+                Some(genesis.event_ref()),
+                2,
+                &[encoded.stored_bytes()],
+            )
+            .unwrap();
+            let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
+            let (catalog, digest) =
+                encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref()))
+                    .unwrap();
+            let pointer = encode_pointer(&scope, &digest).unwrap();
+            vec![
+                head_response(encode_head(&head).unwrap()),
+                response(200, &[("etag", "\"pointer\"")], pointer),
+                response(200, &[("etag", "\"catalog\"")], catalog),
+                event_response(encoded.stored_bytes().to_vec()),
+                response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+                response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+            ]
+        };
+
+        for responses in [uncertified, wrong_digest, junk_fixture, wrong_plan] {
             let cold_path = path("checkpoint-fallback");
             let _ = fs::remove_file(&cold_path);
             let (store, _) = replay_store(responses);

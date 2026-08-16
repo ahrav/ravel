@@ -1401,6 +1401,34 @@ mod tests {
         assert_eq!((packs[1].start(), packs[1].end()), (3, 3));
     }
 
+    #[test]
+    fn new_error_displays_are_static_and_data_free() {
+        for (error, text) in [
+            (
+                CheckpointPublishError::InvalidInput,
+                "checkpoint input is invalid",
+            ),
+            (
+                CheckpointPublishError::ProjectionMismatch,
+                "projection does not match the covered head",
+            ),
+            (
+                CheckpointPublishError::SnapshotFailed,
+                "checkpoint snapshot failed",
+            ),
+            (
+                CheckpointPublishError::SnapshotStorage,
+                "checkpoint snapshot publication failed",
+            ),
+            (
+                CheckpointPublishError::Append(ScopeAppendError::InvalidInput),
+                "checkpoint certificate append failed",
+            ),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
+    }
+
     #[tokio::test]
     async fn checkpoint_publication_snapshots_then_appends_through_the_head_cas() {
         use crate::sync::head::read;

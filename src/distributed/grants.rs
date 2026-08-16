@@ -189,15 +189,20 @@ pub enum GrantRejection {
 /// children can still build one, and the crate boundary contributes nothing because every
 /// caller is in-crate.
 ///
-/// It carries the lease's stop instant as well as the grant, because either can run out first
-/// and nothing at issuance bounds the grant's deadline by the lease: issuance refuses only a
-/// grant already expired, while the authority that proved current ownership stops within
-/// [`STOP_MARGIN_MS`] of its own term. A call bounded only by the grant could outlive the lease,
-/// and a successor that legitimately took the claim could be dispatching at the same time.
+/// It carries a stop instant as well as the grant, because either can run out first and
+/// nothing at issuance bounds the grant's deadline by a lease: issuance refuses only a
+/// grant already expired. The stop instant is the shorter of the two leases that prove
+/// current ownership — the controller's term and the work claim's lease — each less
+/// [`STOP_MARGIN_MS`], because they expire independently: the controller renews its own
+/// term while a claim lease is not renewed by anything in this crate, and an unexpired
+/// claim survives controller takeover. A call bounded only by the grant, or by only one
+/// of the leases, could outlive the other one, and a successor that legitimately took the
+/// claim could be dispatching at the same time.
 #[must_use]
 pub struct EffectAuthority {
     grant: EffectGrant,
-    /// Instant past which the proving authority must stop, derived from its lease term.
+    /// Instant past which the proving authority must stop: the shorter of the controller
+    /// lease and the work-claim lease, less [`STOP_MARGIN_MS`].
     authority_stop_unix_ms: u64,
 }
 
@@ -617,11 +622,17 @@ pub async fn intake(
                 }
                 Some(row) if row.claim_fence() == expected.identity.claim_fence() => {
                     if row.grant_digest().as_str() == format!("{:x}", Sha256::digest(&bytes)) {
+                        // The controller lease and the work-claim lease expire independently:
+                        // the controller renews its own term, while nothing renews a claim
+                        // lease, and a claim survives controller takeover. Whichever ends
+                        // first is when a successor can legitimately be dispatching, so the
+                        // stop instant takes the shorter of the two.
                         GrantIntake::Accepted(Box::new(EffectAuthority {
                             grant,
                             authority_stop_unix_ms: authority
                                 .lease_until()
                                 .get()
+                                .min(row.claim_lease_until().get())
                                 .saturating_sub(STOP_MARGIN_MS),
                         }))
                     } else {
@@ -1693,11 +1704,7 @@ mod tests {
         // Each intake consumes one GET from the store used to acquire its authority.
         let (reader, store, _) = authority_with_plan(
             Some(plan()),
-            vec![
-                found(bytes.clone()),
-                found(bytes.clone()),
-                found(encode_grant(&rival).unwrap()),
-            ],
+            vec![found(bytes.clone()), found(encode_grant(&rival).unwrap())],
         )
         .await;
 
@@ -1725,12 +1732,25 @@ mod tests {
         )
         .await;
         let _ = issued(issue_once(&publish, &handle, issuer, &grant, NOW_MS).await);
+        // Acquired later than the seeding, so this reader's term outlives the claim lease
+        // and the two clocks in the minted stop instant are distinguishable.
+        let later_head = ScopeHead::new(
+            genesis().identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis().event_ref().clone(),
+            Some(plan()),
+            "op-authority".into(),
+        )
+        .unwrap();
+        let (later_reader, later_store, _) =
+            authority_from_head(later_head, vec![found(bytes.clone())], NOW_MS + 10_000).await;
         let accepted = intake(
-            &store,
+            &later_store,
             &handle,
             &expected(2, 5, NOW_MS + 60_000),
-            &reader,
-            NOW_MS,
+            &later_reader,
+            NOW_MS + 10_000,
         )
         .await;
         let GrantIntake::Accepted(accepted) = accepted else {
@@ -1739,9 +1759,13 @@ mod tests {
         // Reading the private fields is what this test is for: every other test hands them
         // literals, so without this the stop instant could be minted as `u64::MAX` unnoticed.
         assert_eq!(accepted.grant, grant);
+        // The claim lease (seeded at NOW_MS + 30_000) ends before this reader's term, so it
+        // is the clock that must set the stop instant; a stop minted from the controller
+        // lease alone would end STOP_MARGIN_MS short of that later term instead.
+        assert!(later_reader.lease_until().get() > NOW_MS + 30_000);
         assert_eq!(
             accepted.authority_stop_unix_ms,
-            reader.lease_until().get() - STOP_MARGIN_MS
+            NOW_MS + 30_000 - STOP_MARGIN_MS
         );
 
         // A grant with matching bindings must equal the projection's recorded grant.

@@ -83,7 +83,7 @@ enum Command {
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     GrantActivationProbe {
-        identity: Box<ScopeClaimIdentity>,
+        scope: Box<ScopeIdentity>,
         operation_id: String,
         grant_digest: Digest,
         respond: oneshot::Sender<Result<projections::GrantActivationProbe, ApplyError>>,
@@ -435,15 +435,15 @@ impl DbHandle {
     /// [`ApplyError::DatabaseOperationFailed`].
     pub(crate) async fn grant_activation_probe(
         &self,
-        identity: &ScopeClaimIdentity,
+        scope: &ScopeIdentity,
         operation_id: &str,
         grant_digest: &Digest,
     ) -> Result<projections::GrantActivationProbe, ApplyError> {
-        let identity = Box::new(identity.clone());
+        let scope = Box::new(scope.clone());
         let operation_id = operation_id.to_owned();
         let grant_digest = grant_digest.clone();
         self.enqueue(|respond| Command::GrantActivationProbe {
-            identity,
+            scope,
             operation_id,
             grant_digest,
             respond,
@@ -719,14 +719,14 @@ fn run(
                 ));
             }
             Command::GrantActivationProbe {
-                identity,
+                scope,
                 operation_id,
                 grant_digest,
                 respond,
             } => {
                 let _ = respond.send(projections::grant_activation_probe(
                     &connection,
-                    &identity,
+                    &scope,
                     &operation_id,
                     &grant_digest,
                 ));
@@ -1026,7 +1026,7 @@ mod tests {
             handle.record_grant(&identity, activation(), 1).await,
             handle.grant_admissible(&identity, activation(), 1).await,
             handle
-                .grant_activation_probe(&identity, "operation", genesis.config_digest())
+                .grant_activation_probe(scope, "operation", genesis.config_digest())
                 .await
                 .map(|_| ()),
             handle.admitted_work_refs(scope).await.map(|_| ()),

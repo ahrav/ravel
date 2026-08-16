@@ -295,7 +295,7 @@ pub async fn issue(
     // fact, while the lease and budget the dry-run reads can move between attempts.
     match tokio::time::timeout_at(
         deadline,
-        database.grant_activation_probe(&grant.identity, grant.operation_id(), &grant_digest),
+        database.grant_activation_probe(&scope, grant.operation_id(), &grant_digest),
     )
     .await
     {

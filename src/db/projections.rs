@@ -57,15 +57,13 @@ const EVENT_AT_SEQUENCE_SQL: &str =
     "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
 const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
-/// `issue()`'s pre-append probe. Operation ids are caller-supplied and share one namespace with
-/// every other event type, so mere existence proves nothing about this grant: the second column
-/// proves the activation itself folded, by the fence and content digest only these bytes carry.
-/// An id recorded without those bindings belongs to another event, and appending under it would
-/// bury a duplicate operation id in the chain.
+/// `issue()`'s pre-append probe. One id namespace holds every payload type, so the second column
+/// asks the narrower question: did the event applied under this id name this exact grant? The
+/// answer comes from the activation event's own row, which no later fold rewrites.
 const GRANT_ACTIVATION_PROBE_SQL: &str = "SELECT \
      EXISTS(SELECT 1 FROM applied_scope_events WHERE scope_id = ?1 AND operation_id = ?2), \
-     EXISTS(SELECT 1 FROM admitted_work WHERE scope_id = ?1 AND work_id = ?3 \
-       AND work_revision = ?4 AND grant_fence = ?5 AND grant_digest = ?6)";
+     EXISTS(SELECT 1 FROM applied_scope_events WHERE scope_id = ?1 AND operation_id = ?2 \
+       AND payload_type = 'grant_activated' AND grant_digest = ?3)";
 const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
 const SCOPE_UPDATE_SQL: &str = "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2, \
@@ -289,6 +287,9 @@ CREATE TABLE applied_scope_events (
     operation_id TEXT NOT NULL,
     writer_epoch INTEGER NOT NULL,
     payload_type TEXT NOT NULL,
+    -- The grant an activation event names, kept per event because `admitted_work.grant_digest`
+    -- moves to the latest fold and cannot attest which operation committed.
+    grant_digest TEXT,
     PRIMARY KEY (scope_id, sequence),
     UNIQUE (scope_id, digest),
     UNIQUE (scope_id, operation_id),
@@ -308,7 +309,11 @@ CREATE TABLE applied_scope_events (
         AND instr(CAST(payload_type AS BLOB), CAST('/' AS BLOB)) = 0),
     CHECK ((sequence = 1 AND payload_type = 'root_genesis'
             AND operation_id = 'root-genesis:' || scope_id)
-        OR (sequence > 1 AND payload_type <> 'root_genesis'))
+        OR (sequence > 1 AND payload_type <> 'root_genesis')),
+    CHECK ((payload_type = 'grant_activated') = (grant_digest IS NOT NULL)),
+    CHECK (grant_digest IS NULL OR (length(grant_digest) = 64
+        AND length(CAST(grant_digest AS BLOB)) = 64
+        AND grant_digest NOT GLOB '*[^0-9a-f]*'))
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE admitted_work (
@@ -1213,13 +1218,12 @@ pub(crate) fn admitted_work_refs(
 /// What one scope already applied under `operation_id`, as it bears on appending this activation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GrantActivationProbe {
-    /// Neither the operation id nor this activation's bindings are recorded: the append is the
-    /// first for both.
+    /// No event is applied under this operation id, so the append is the first for it.
     Absent,
-    /// This exact grant's activation already folded, so an earlier attempt committed it and a
+    /// This exact grant's activation is already applied, so an earlier attempt committed it and a
     /// retry must not append again.
     Activated,
-    /// The operation id is recorded by some other event. Appending under it would bury a
+    /// The operation id is applied by some other event. Appending under it would bury a
     /// duplicate operation id in the chain, so the issuance is refused instead.
     ForeignOperation,
 }
@@ -1232,24 +1236,20 @@ pub(crate) enum GrantActivationProbe {
 /// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
 pub(crate) fn grant_activation_probe(
     connection: &rusqlite::Connection,
-    identity: &ScopeClaimIdentity,
+    scope: &ScopeIdentity,
     operation_id: &str,
     grant_digest: &Digest,
 ) -> Result<GrantActivationProbe, ApplyError> {
-    let (operation_recorded, activation_folded): (bool, bool) = connection.query_row(
+    let (operation_recorded, activation_recorded): (bool, bool) = connection.query_row(
         GRANT_ACTIVATION_PROBE_SQL,
         params![
-            identity.scope().scope_id().as_str(),
+            scope.scope_id().as_str(),
             operation_id,
-            identity.work().id().as_str(),
-            stored_u64(identity.work().revision())?,
-            stored_u64(identity.claim_fence().get())?,
             grant_digest.as_str(),
         ],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(match (activation_folded, operation_recorded) {
-        // The digest covers the operation id, so folded bindings can only be this activation's.
+    Ok(match (activation_recorded, operation_recorded) {
         (true, _) => GrantActivationProbe::Activated,
         (false, true) => GrantActivationProbe::ForeignOperation,
         (false, false) => GrantActivationProbe::Absent,
@@ -1448,8 +1448,9 @@ pub(crate) fn apply_scope_event(
     }
     transaction.execute(
         "INSERT INTO applied_scope_events \
-         (scope_id, sequence, digest, parent_digest, operation_id, writer_epoch, payload_type) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (scope_id, sequence, digest, parent_digest, operation_id, writer_epoch, payload_type, \
+          grant_digest) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             scope_id,
             stored_sequence,
@@ -1459,6 +1460,11 @@ pub(crate) fn apply_scope_event(
             i64::try_from(event.envelope.writer_epoch().get())
                 .map_err(|_| ApplyError::DatabaseOperationFailed)?,
             event.envelope.payload_type(),
+            match &event.payload {
+                ScopeProjectionPayload::GrantActivated { payload } =>
+                    Some(payload.grant_digest().as_str()),
+                _ => None,
+            },
         ],
     )?;
     transaction.commit()?;
@@ -1571,6 +1577,8 @@ const VALIDATE_TEXT_SQL: &str = "SELECT CAST(scope_id AS BLOB) FROM scopes \
        WHERE parent_digest IS NOT NULL \
      UNION ALL SELECT CAST(operation_id AS BLOB) FROM applied_scope_events \
      UNION ALL SELECT CAST(payload_type AS BLOB) FROM applied_scope_events \
+     UNION ALL SELECT CAST(grant_digest AS BLOB) FROM applied_scope_events \
+       WHERE grant_digest IS NOT NULL \
      UNION ALL SELECT CAST(work_id AS BLOB) FROM admitted_work \
      UNION ALL SELECT CAST(plan_digest AS BLOB) FROM admitted_work \
      UNION ALL SELECT CAST(grant_digest AS BLOB) FROM admitted_work \
@@ -2039,9 +2047,7 @@ mod tests {
             query_plan(
                 &connection,
                 GRANT_ACTIVATION_PROBE_SQL,
-                &[
-                    &scope_id, &operation, &work_id, &revision, &sequence, &digest,
-                ],
+                &[&scope_id, &operation, &digest],
             ),
             query_plan(
                 &connection,
@@ -2703,65 +2709,88 @@ mod tests {
     fn a_grant_activation_probe_separates_its_own_activation_from_a_foreign_operation() {
         let (db_path, mut connection, scope) = admitted_scope("grant-activation-probe");
         let target = work("work-a", 1);
-        let fence = NonZeroU64::new(2).unwrap();
         admit(&mut connection, &scope, &target, &[], epoch(1)).unwrap();
-        let identity = ScopeClaimIdentity::new(
-            scope.clone(),
-            plan(ADMITTING_PLAN_DIGEST),
-            target.clone(),
-            fence.get(),
-        )
-        .unwrap();
-        let digest = grant_digest(fence.get(), 1);
+        let digest = grant_digest(2, 1);
+        let activation = |sequence: u64,
+                          parent: &str,
+                          reference: &str,
+                          fence: u64,
+                          attempt: u64,
+                          grant: &Digest,
+                          operation_id: &str| {
+            ScopeProjectionEvent::new(
+                scope.clone(),
+                EventEnvelope::new(
+                    scope.scope_id().clone(),
+                    sequence,
+                    Some(
+                        ScopeEventRef::new(sequence - 1, Digest::new(parent.into()).unwrap())
+                            .unwrap(),
+                    ),
+                    1,
+                    operation_id.to_owned(),
+                    crate::scope::GRANT_ACTIVATED_PAYLOAD_TYPE.into(),
+                )
+                .unwrap(),
+                ScopeEventRef::new(sequence, Digest::new(reference.into()).unwrap()).unwrap(),
+                ScopeProjectionPayload::GrantActivated {
+                    payload: GrantActivatedPayload::new(
+                        target.clone(),
+                        fence,
+                        grant.clone(),
+                        attempt,
+                        1,
+                        MAX_STORED_INTEGER,
+                    )
+                    .unwrap(),
+                },
+                1,
+            )
+            .unwrap()
+        };
 
         assert_eq!(
-            grant_activation_probe(&connection, &identity, "grant-op-2", &digest),
+            grant_activation_probe(&connection, &scope, "grant-op-2", &digest),
             Ok(GrantActivationProbe::Absent)
         );
-        // Genesis already applied its own operation id, and this grant never folded.
+        // Genesis applied its own operation id under a different payload type.
         assert_eq!(
-            grant_activation_probe(&connection, &identity, &operation(&scope, 1), &digest),
+            grant_activation_probe(&connection, &scope, &operation(&scope, 1), &digest),
             Ok(GrantActivationProbe::ForeignOperation)
         );
 
-        record_claim(
-            &connection,
-            &scope,
-            &target,
-            fence,
-            NonZeroU64::new(31_000).unwrap(),
-            1_000,
-        )
-        .unwrap();
-        grant_at(&connection, &scope, &target, fence, 1, 1).unwrap();
         assert_eq!(
-            grant_activation_probe(&connection, &identity, "grant-op-2", &digest),
+            apply_scope_event(
+                &mut connection,
+                &activation(2, DIGEST_1, DIGEST_2, 2, 1, &digest, "grant-op-2")
+            ),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            grant_activation_probe(&connection, &scope, "grant-op-2", &digest),
             Ok(GrantActivationProbe::Activated)
         );
         assert_eq!(
-            grant_activation_probe(
-                &connection,
-                &identity,
-                "grant-op-2",
-                &grant_digest(fence.get(), 2)
+            grant_activation_probe(&connection, &scope, "grant-op-2", &grant_digest(2, 2)),
+            Ok(GrantActivationProbe::ForeignOperation)
+        );
+
+        // A later activation at a higher fence overwrites `admitted_work`'s grant columns; the
+        // first operation's own event row still answers for it.
+        let higher = grant_digest(3, 1);
+        assert_eq!(
+            apply_scope_event(
+                &mut connection,
+                &activation(3, DIGEST_2, DIGEST_3, 3, 2, &higher, "grant-op-3")
             ),
-            Ok(GrantActivationProbe::Absent)
-        );
-        // At the claim lease deadline, `grant_admissible` returns `ApplyError::Conflict`.
-        // `issue` probes first so a committed activation still reports as issued.
-        let activation = GrantActivation {
-            scope_epoch: epoch(1),
-            attempt: NonZeroU64::new(1).unwrap(),
-            units: NonZeroU64::new(1).unwrap(),
-            deadline_unix_ms: NonZeroU64::new(MAX_STORED_INTEGER).unwrap(),
-            digest: digest.clone(),
-        };
-        assert_eq!(
-            grant_admissible(&connection, &identity, &activation, 31_000),
-            Err(ApplyError::Conflict)
+            Ok(ApplyOutcome::Applied)
         );
         assert_eq!(
-            grant_activation_probe(&connection, &identity, "grant-op-2", &digest),
+            grant_activation_probe(&connection, &scope, "grant-op-2", &digest),
+            Ok(GrantActivationProbe::Activated)
+        );
+        assert_eq!(
+            grant_activation_probe(&connection, &scope, "grant-op-3", &higher),
             Ok(GrantActivationProbe::Activated)
         );
 

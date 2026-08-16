@@ -30,7 +30,7 @@ use aws_sdk_bedrockruntime::{
     operation::converse::{ConverseError, ConverseOutput as ConverseResponse},
     types::{
         ContentBlock, ConversationRole, ConverseOutput as ResponseBody, InferenceConfiguration,
-        Message, StopReason, SystemContentBlock,
+        Message, StopReason, SystemContentBlock, TokenUsage,
     },
 };
 use sha2::{Digest as _, Sha256};
@@ -80,6 +80,7 @@ pub enum ProfileError {
     CapAboveCeiling,
     ProbabilityOutOfRange,
     TooManyStopSequences,
+    StopSequenceTooLong,
     TextTooLarge,
     TextEmpty,
     OperationIdentityInvalid,
@@ -94,6 +95,7 @@ impl fmt::Display for ProfileError {
             Self::CapAboveCeiling => "output-token cap exceeds the profile ceiling",
             Self::ProbabilityOutOfRange => "sampling probability is outside 0..=1",
             Self::TooManyStopSequences => "profile declares more stop sequences than permitted",
+            Self::StopSequenceTooLong => "profile stop sequence exceeds the sendable length",
             Self::TextTooLarge => "request text exceeds the prompt limit",
             Self::TextEmpty => "request text is empty",
             Self::OperationIdentityInvalid => "operation identity is empty or too long",
@@ -107,6 +109,13 @@ impl Error for ProfileError {}
 pub const MAX_IDENTIFIER_BYTES: usize = 256;
 /// Bound on the stop sequences one profile may pin.
 pub const MAX_STOP_SEQUENCES: usize = 4;
+/// Bound on one stop sequence's byte length.
+///
+/// Counting the sequences bounds how many reach the provider but not how large each one is,
+/// and a stop sequence is provider-bound text that neither the prompt nor the system bound
+/// covers. Without this, an oversized sequence is serialized and rejected only after
+/// dispatch, which is the one failure this boundary exists to make impossible.
+pub const MAX_STOP_SEQUENCE_BYTES: usize = 256;
 
 /// One fixed model configuration, pinned before any request is built.
 ///
@@ -163,6 +172,12 @@ impl ModelProfile {
         }
         if stop_sequences.len() > MAX_STOP_SEQUENCES {
             return Err(ProfileError::TooManyStopSequences);
+        }
+        if stop_sequences
+            .iter()
+            .any(|sequence| sequence.len() > MAX_STOP_SEQUENCE_BYTES)
+        {
+            return Err(ProfileError::StopSequenceTooLong);
         }
         Ok(Self {
             provider,
@@ -428,12 +443,16 @@ pub enum InvocationOutcome {
     },
     /// The provider throttled, exhausted a quota, was unavailable, or was not ready.
     /// Retrying is permitted; the request identity does not change.
-    RateLimited,
+    RateLimited { provider_request_id: Option<String> },
     /// The provider rejected the request as invalid. Retrying it unchanged cannot succeed.
-    Rejected,
+    Rejected { provider_request_id: Option<String> },
     /// A bound elapsed locally or the provider reported its own timeout. Whether the
     /// provider completed the work is unknown.
-    TimedOut,
+    ///
+    /// A locally elapsed bound carries no request id; a provider-reported timeout does, and
+    /// it is the case where remote work may already have been done and billed, so the
+    /// correlation handle has to survive the mapping into this vocabulary.
+    TimedOut { provider_request_id: Option<String> },
     /// No request was constructed, so no dispatch was possible.
     ///
     /// Neither leg is reachable through this boundary: the message is built from values set
@@ -451,7 +470,23 @@ pub enum InvocationOutcome {
         reported_use: Option<ReportedUse>,
     },
     /// No available evidence proves whether the provider accepted the request.
-    Unknown,
+    ///
+    /// The request id is the one thing that can still be known here, and it is what a trace
+    /// reconciles an uncertain attempt against later. It is absent when the failure happened
+    /// before any response arrived.
+    Unknown { provider_request_id: Option<String> },
+}
+
+/// Prints an outcome that carries no evidence beyond the call's correlation handle.
+fn correlated(
+    formatter: &mut fmt::Formatter<'_>,
+    name: &str,
+    provider_request_id: &Option<String>,
+) -> fmt::Result {
+    formatter
+        .debug_struct(name)
+        .field("provider_request_id", provider_request_id)
+        .finish()
 }
 
 /// Prints a completion's length, never its text.
@@ -483,9 +518,15 @@ impl fmt::Debug for InvocationOutcome {
                 .field("provider_request_id", provider_request_id)
                 .field("reported_use", reported_use)
                 .finish(),
-            Self::RateLimited => formatter.write_str("RateLimited"),
-            Self::Rejected => formatter.write_str("Rejected"),
-            Self::TimedOut => formatter.write_str("TimedOut"),
+            Self::RateLimited {
+                provider_request_id,
+            } => correlated(formatter, "RateLimited", provider_request_id),
+            Self::Rejected {
+                provider_request_id,
+            } => correlated(formatter, "Rejected", provider_request_id),
+            Self::TimedOut {
+                provider_request_id,
+            } => correlated(formatter, "TimedOut", provider_request_id),
             Self::ProvenNotSent => formatter.write_str("ProvenNotSent"),
             Self::MalformedResponse {
                 provider_request_id,
@@ -495,7 +536,9 @@ impl fmt::Debug for InvocationOutcome {
                 .field("provider_request_id", provider_request_id)
                 .field("reported_use", reported_use)
                 .finish(),
-            Self::Unknown => formatter.write_str("Unknown"),
+            Self::Unknown {
+                provider_request_id,
+            } => correlated(formatter, "Unknown", provider_request_id),
         }
     }
 }
@@ -556,10 +599,10 @@ impl BedrockTransport {
             prior_unknown
                 || matches!(
                     outcome,
-                    InvocationOutcome::RateLimited
-                        | InvocationOutcome::TimedOut
+                    InvocationOutcome::RateLimited { .. }
+                        | InvocationOutcome::TimedOut { .. }
                         | InvocationOutcome::MalformedResponse { .. }
-                        | InvocationOutcome::Unknown
+                        | InvocationOutcome::Unknown { .. }
                 ),
         );
         outcome
@@ -589,12 +632,23 @@ fn classify(result: Result<ConverseResponse, SdkError<ConverseError>>) -> Invoca
         Err(error) => return classify_error(error),
     };
     let reason = terminal_reason(response.stop_reason());
-    let reported_use = response.usage().map(|usage| ReportedUse {
-        input_tokens: usage.input_tokens().max(0) as u32,
-        output_tokens: usage.output_tokens().max(0) as u32,
-        total_tokens: usage.total_tokens().max(0) as u32,
-    });
     let provider_request_id = request_id(&response);
+    let reported_use = match response.usage() {
+        None => None,
+        // A frame whose own accounting will not read is a frame this boundary cannot read.
+        // Clamping a negative count to zero would be worse than losing it: zero is itself a
+        // claim that nothing was billed, and cost reconciliation would treat the fabricated
+        // claim as provider-reported fact.
+        Some(usage) => match token_use(usage) {
+            Some(reported) => Some(reported),
+            None => {
+                return InvocationOutcome::MalformedResponse {
+                    provider_request_id,
+                    reported_use: None,
+                };
+            }
+        },
+    };
     if reason.precludes_completion() {
         return InvocationOutcome::Refused {
             reason,
@@ -641,6 +695,19 @@ fn completion_text(response: &ConverseResponse) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Reads the provider's token counts, refusing a negative one rather than normalizing it.
+///
+/// The SDK models each count as an `i32` because the wire format does; a negative value is
+/// outside what the operation can mean, so it is rejected at the boundary instead of being
+/// carried inward as a plausible number.
+fn token_use(usage: &TokenUsage) -> Option<ReportedUse> {
+    Some(ReportedUse {
+        input_tokens: u32::try_from(usage.input_tokens()).ok()?,
+        output_tokens: u32::try_from(usage.output_tokens()).ok()?,
+        total_tokens: u32::try_from(usage.total_tokens()).ok()?,
+    })
+}
+
 fn request_id(response: &ConverseResponse) -> Option<String> {
     use aws_sdk_bedrockruntime::operation::RequestId;
 
@@ -677,8 +744,12 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
     let provider_request_id = error.request_id().map(str::to_owned);
     match error {
         SdkError::ConstructionFailure(_) => InvocationOutcome::ProvenNotSent,
-        SdkError::TimeoutError(_) => InvocationOutcome::TimedOut,
-        SdkError::DispatchFailure(_) => InvocationOutcome::Unknown,
+        SdkError::TimeoutError(_) => InvocationOutcome::TimedOut {
+            provider_request_id,
+        },
+        SdkError::DispatchFailure(_) => InvocationOutcome::Unknown {
+            provider_request_id,
+        },
         // No fake here reaches this arm: a body the deserializer rejects arrives as a
         // service error whose source is a deserialization failure, which the success-status
         // guard below catches. It yields no usage either way, and the request id comes off
@@ -690,15 +761,23 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
         SdkError::ServiceError(service) => match service.err() {
             ConverseError::ThrottlingException(_)
             | ConverseError::ServiceUnavailableException(_)
-            | ConverseError::ModelNotReadyException(_) => InvocationOutcome::RateLimited,
-            ConverseError::ModelTimeoutException(_) => InvocationOutcome::TimedOut,
+            | ConverseError::ModelNotReadyException(_) => InvocationOutcome::RateLimited {
+                provider_request_id,
+            },
+            ConverseError::ModelTimeoutException(_) => InvocationOutcome::TimedOut {
+                provider_request_id,
+            },
             ConverseError::ValidationException(_)
             | ConverseError::AccessDeniedException(_)
-            | ConverseError::ResourceNotFoundException(_) => InvocationOutcome::Rejected,
+            | ConverseError::ResourceNotFoundException(_) => InvocationOutcome::Rejected {
+                provider_request_id,
+            },
             // `InternalServerException` and `ModelErrorException` say the provider failed,
             // not that it did no work, so neither is a definite refusal.
             ConverseError::InternalServerException(_) | ConverseError::ModelErrorException(_) => {
-                InvocationOutcome::Unknown
+                InvocationOutcome::Unknown {
+                    provider_request_id,
+                }
             }
             // An unmodelled error on a success status is a frame this boundary could not
             // read — a body-deserialization failure arrives here, not as `ResponseError`.
@@ -708,9 +787,13 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
                 provider_request_id,
                 reported_use: None,
             },
-            _ => InvocationOutcome::Unknown,
+            _ => InvocationOutcome::Unknown {
+                provider_request_id,
+            },
         },
-        _ => InvocationOutcome::Unknown,
+        _ => InvocationOutcome::Unknown {
+            provider_request_id,
+        },
     }
 }
 
@@ -932,7 +1015,12 @@ mod tests {
             SdkBody::from("{\"message\":\"slow down\"}"),
         )]);
 
-        assert_eq!(invoke(&transport).await, InvocationOutcome::RateLimited);
+        assert_eq!(
+            invoke(&transport).await,
+            InvocationOutcome::RateLimited {
+                provider_request_id: None
+            }
+        );
         assert_eq!(client.actual_requests().count(), 1);
     }
 
@@ -953,7 +1041,9 @@ mod tests {
             )]);
             assert_eq!(
                 invoke(&transport).await,
-                InvocationOutcome::RateLimited,
+                InvocationOutcome::RateLimited {
+                    provider_request_id: None
+                },
                 "{error_type}"
             );
         }
@@ -965,7 +1055,12 @@ mod tests {
     async fn a_status_without_an_error_type_discriminator_is_unknown_not_rate_limited() {
         let (transport, _) = replay(vec![response(429, &[], SdkBody::from("{}"))]);
 
-        assert_eq!(invoke(&transport).await, InvocationOutcome::Unknown);
+        assert_eq!(
+            invoke(&transport).await,
+            InvocationOutcome::Unknown {
+                provider_request_id: None
+            }
+        );
     }
 
     /// An invalid request is refused definitively: repeating it unchanged cannot succeed,
@@ -978,7 +1073,12 @@ mod tests {
             SdkBody::from("{\"message\":\"bad input\"}"),
         )]);
 
-        assert_eq!(invoke(&transport).await, InvocationOutcome::Rejected);
+        assert_eq!(
+            invoke(&transport).await,
+            InvocationOutcome::Rejected {
+                provider_request_id: None
+            }
+        );
     }
 
     /// A provider failure says the provider failed, not that it did no work.
@@ -995,8 +1095,81 @@ mod tests {
             )]);
             assert_eq!(
                 invoke(&transport).await,
-                InvocationOutcome::Unknown,
+                InvocationOutcome::Unknown {
+                    provider_request_id: None
+                },
                 "{error_type}"
+            );
+        }
+    }
+
+    /// A service error keeps the call's correlation handle. An attempt whose remote work or
+    /// cost stays uncertain is exactly the attempt a trace has to reconcile against the
+    /// provider later, so the request id has to survive the mapping into this vocabulary
+    /// rather than being dropped with the SDK's error type.
+    #[tokio::test]
+    async fn a_service_error_keeps_the_request_id() {
+        for (status, error_type) in [
+            (429, "ThrottlingException"),
+            (400, "ValidationException"),
+            (424, "ModelTimeoutException"),
+            (500, "InternalServerException"),
+        ] {
+            let (transport, _) = replay(vec![response(
+                status,
+                &[
+                    ("x-amzn-errortype", error_type),
+                    ("x-amzn-requestid", PROVIDER_REQUEST_ID),
+                ],
+                SdkBody::from("{\"message\":\"failed\"}"),
+            )]);
+
+            let outcome = invoke(&transport).await;
+            let (InvocationOutcome::RateLimited {
+                provider_request_id,
+            }
+            | InvocationOutcome::Rejected {
+                provider_request_id,
+            }
+            | InvocationOutcome::TimedOut {
+                provider_request_id,
+            }
+            | InvocationOutcome::Unknown {
+                provider_request_id,
+            }) = &outcome
+            else {
+                panic!("{error_type} gave {outcome:?}");
+            };
+            assert_eq!(
+                provider_request_id.as_deref(),
+                Some(PROVIDER_REQUEST_ID),
+                "{error_type}"
+            );
+        }
+    }
+
+    /// A negative token count makes the frame unreadable rather than reporting zero use. Zero
+    /// is itself a claim that nothing was billed, so normalizing one would hand cost
+    /// reconciliation a fabricated provider report; the correlation handle still survives.
+    #[tokio::test]
+    async fn a_negative_token_count_makes_the_frame_malformed() {
+        for usage in [(-1, 0, 0), (0, -1, 0), (0, 0, -1)] {
+            let (transport, _) =
+                replay(vec![json(converse_body("end_turn", Some(usage), "answer"))]);
+
+            let outcome = invoke(&transport).await;
+            let InvocationOutcome::MalformedResponse {
+                provider_request_id,
+                reported_use,
+            } = &outcome
+            else {
+                panic!("{usage:?} gave {outcome:?}");
+            };
+            assert_eq!(*reported_use, None, "{usage:?}");
+            assert_eq!(
+                provider_request_id.as_deref(),
+                Some(PROVIDER_REQUEST_ID),
+                "{usage:?}"
             );
         }
     }
@@ -1086,7 +1259,12 @@ mod tests {
         let mut history = AttemptHistory::default();
 
         let outcome = transport.invoke(&request(), &mut history).await;
-        assert_eq!(outcome, InvocationOutcome::TimedOut);
+        assert_eq!(
+            outcome,
+            InvocationOutcome::TimedOut {
+                provider_request_id: None
+            }
+        );
         assert!(history.may_have_been_sent());
     }
 
@@ -1189,7 +1367,9 @@ mod tests {
 
         assert_eq!(
             transport.invoke(&request(), &mut history).await,
-            InvocationOutcome::Unknown
+            InvocationOutcome::Unknown {
+                provider_request_id: None
+            }
         );
         assert!(history.may_have_been_sent());
     }
@@ -1719,9 +1899,38 @@ mod tests {
                 ),
                 ProfileError::TooManyStopSequences,
             ),
+            // Counting the sequences is not bounding them: one oversized sequence carries
+            // provider-bound text past every other bound this boundary applies.
+            (
+                ModelProfile::new(
+                    ModelProvider::Bedrock,
+                    MODEL_ID.into(),
+                    "profile-a".into(),
+                    cap(1),
+                    None,
+                    None,
+                    vec!["a".repeat(MAX_STOP_SEQUENCE_BYTES + 1)],
+                ),
+                ProfileError::StopSequenceTooLong,
+            ),
         ] {
             assert_eq!(result.unwrap_err(), expected);
         }
+
+        // A sequence of exactly the permitted length is accepted, so the stop-sequence
+        // bound is pinned where it holds as well as where it fails.
+        assert!(
+            ModelProfile::new(
+                ModelProvider::Bedrock,
+                MODEL_ID.into(),
+                "profile-a".into(),
+                cap(1),
+                None,
+                None,
+                vec!["a".repeat(MAX_STOP_SEQUENCE_BYTES)],
+            )
+            .is_ok()
+        );
 
         // A probability of exactly one is inside the range, so the boundary is pinned where
         // it holds as well as where it fails.
@@ -1864,7 +2073,12 @@ mod tests {
             ),
         );
 
-        assert_eq!(invoke(&transport).await, InvocationOutcome::RateLimited);
+        assert_eq!(
+            invoke(&transport).await,
+            InvocationOutcome::RateLimited {
+                provider_request_id: None
+            }
+        );
         assert_eq!(client.actual_requests().count(), 1);
     }
 
@@ -1884,6 +2098,11 @@ mod tests {
         )
         .await
         .expect("the enforced bound fires before this one");
-        assert_eq!(outcome, InvocationOutcome::TimedOut);
+        assert_eq!(
+            outcome,
+            InvocationOutcome::TimedOut {
+                provider_request_id: None
+            }
+        );
     }
 }

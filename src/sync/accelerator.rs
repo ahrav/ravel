@@ -37,7 +37,7 @@ pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PACK_OBJECT_BYTES: usize = MAX_PACK_EVENT_BYTES + 64 * 1024;
 const MAX_POINTER_BYTES: usize = 4 * 1024;
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
-/// Sequences never exceed the lifetime replay ceiling, so neither can catalog rows.
+/// Caps lifetime catalog rows (one appended batch per advancing refresh), not sequences; a catalog at the cap refuses new rows while replay stays correct. commentlint: allow(JUDGE)
 const MAX_CATALOG_ROWS: usize = crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS as usize;
 /// Accumulated pack bytes one read may fetch; matches the replay byte budget.
 const MAX_FETCH_BYTES: usize = 64 * 1024 * 1024;
@@ -427,9 +427,10 @@ pub struct PackEntry {
 impl PackEntry {
     /// # Errors
     ///
-    /// Returns [`WireError::InvalidValue`] for a zero start or inverted range.
+    /// Returns [`WireError::InvalidValue`] when `start == 0`, `end < start`, or the range
+    /// is wider than [`MAX_PACK_EVENTS`].
     pub fn new(start: u64, end: u64, digest: Digest) -> Result<Self, WireError> {
-        if start == 0 || end < start {
+        if start == 0 || end < start || end - start + 1 > MAX_PACK_EVENTS as u64 {
             return Err(WireError::InvalidValue);
         }
         Ok(Self { start, end, digest })
@@ -483,8 +484,9 @@ fn rows_valid(entries: &[PackEntry], checkpoints: &[ScopeEventRef]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`WireError::InvalidValue`] for unsorted or overlapping rows and encoding
-/// failures verbatim.
+/// Returns [`WireError::InvalidValue`] for unsorted or overlapping rows,
+/// [`WireError::LimitExceeded`] when the encoding exceeds `MAX_CATALOG_BYTES`, and
+/// encoding failures verbatim.
 pub fn encode_catalog(
     scope: &ScopeIdentity,
     entries: &[PackEntry],
@@ -507,6 +509,9 @@ pub fn encode_catalog(
         checkpoints: checkpoints.iter().map(WireEventRef::from_ref).collect(),
     };
     let bytes = encode_cbor(&wire)?;
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(WireError::LimitExceeded);
+    }
     let digest = Digest::new(sha256(&bytes)).map_err(|_| WireError::InvalidValue)?;
     Ok((bytes, digest))
 }
@@ -692,30 +697,39 @@ pub(crate) async fn packed_events_from_catalog(
     first: u64,
     last: u64,
 ) -> Option<Vec<StoredEvent>> {
-    if first == 0 || last < first {
+    if first == 0
+        || last < first
+        || last - first + 1 > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS
+    {
         return None;
     }
     let chosen = coverage(catalog, first, last)?;
-    let packs = bounded_map(chosen.len(), CONCURRENT_FETCHES, |index| {
-        let entry = chosen[index];
-        async move {
-            let key = replay_pack_key(scope, entry.start(), entry.end(), entry.digest());
-            match store.get_object(&key, MAX_PACK_OBJECT_BYTES).await {
-                Ok(GetOutcome::Found { bytes, .. }) => Some(bytes),
-                Ok(GetOutcome::NotFound) | Err(_) => None,
-            }
-        }
-    })
-    .await;
+    let mut packs = Vec::with_capacity(chosen.len());
     let mut total_bytes = 0_usize;
-    let mut events = Vec::with_capacity((last - first + 1) as usize);
+    for window in chosen.chunks(CONCURRENT_FETCHES.get()) {
+        let fetched = bounded_map(window.len(), CONCURRENT_FETCHES, |index| {
+            let entry = window[index];
+            async move {
+                let key = replay_pack_key(scope, entry.start(), entry.end(), entry.digest());
+                match store.get_object(&key, MAX_PACK_OBJECT_BYTES).await {
+                    Ok(GetOutcome::Found { bytes, .. }) => Some(bytes),
+                    Ok(GetOutcome::NotFound) | Err(_) => None,
+                }
+            }
+        })
+        .await;
+        for bytes in fetched {
+            let bytes = bytes?;
+            total_bytes = total_bytes.checked_add(bytes.len())?;
+            if total_bytes > MAX_FETCH_BYTES {
+                return None;
+            }
+            packs.push(bytes);
+        }
+    }
+    let mut events = Vec::new();
     let mut expected = first;
     for (entry, bytes) in chosen.iter().zip(packs) {
-        let bytes = bytes?;
-        total_bytes = total_bytes.checked_add(bytes.len())?;
-        if total_bytes > MAX_FETCH_BYTES {
-            return None;
-        }
         let pack = decode_pack(&bytes, entry.digest(), scope).ok()?;
         if pack.start() != entry.start() || pack.end() != entry.end() {
             return None;
@@ -753,28 +767,30 @@ pub(crate) async fn fetch_events(
     scope: &ScopeIdentity,
     references: &[ScopeEventRef],
 ) -> Option<Vec<StoredEvent>> {
-    let fetched = bounded_map(references.len(), CONCURRENT_FETCHES, |index| {
-        let reference = &references[index];
-        async move {
-            let key = scope_event_key(scope, reference);
-            let bytes = match store.get_object(&key, MAX_COMPRESSED_BYTES).await {
-                Ok(GetOutcome::Found { bytes, .. }) => bytes,
-                Ok(GetOutcome::NotFound) | Err(_) => return None,
-            };
-            let decoded = decode_scope_event(&bytes, &key, scope, None).ok()?;
-            Some(StoredEvent { decoded, bytes })
-        }
-    })
-    .await;
+    let mut events = Vec::with_capacity(references.len());
     let mut total_bytes = 0_usize;
-    let mut events = Vec::with_capacity(fetched.len());
-    for stored in fetched {
-        let stored = stored?;
-        total_bytes = total_bytes.checked_add(stored.bytes.len())?;
-        if total_bytes > MAX_FETCH_BYTES {
-            return None;
+    for window in references.chunks(CONCURRENT_FETCHES.get()) {
+        let fetched = bounded_map(window.len(), CONCURRENT_FETCHES, |index| {
+            let reference = &window[index];
+            async move {
+                let key = scope_event_key(scope, reference);
+                let bytes = match store.get_object(&key, MAX_COMPRESSED_BYTES).await {
+                    Ok(GetOutcome::Found { bytes, .. }) => bytes,
+                    Ok(GetOutcome::NotFound) | Err(_) => return None,
+                };
+                let decoded = decode_scope_event(&bytes, &key, scope, None).ok()?;
+                Some(StoredEvent { decoded, bytes })
+            }
+        })
+        .await;
+        for stored in fetched {
+            let stored = stored?;
+            total_bytes = total_bytes.checked_add(stored.bytes.len())?;
+            if total_bytes > MAX_FETCH_BYTES {
+                return None;
+            }
+            events.push(stored);
         }
-        events.push(stored);
     }
     Some(events)
 }

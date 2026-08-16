@@ -284,8 +284,8 @@ impl S3Store {
     ///
     /// Returns [`ListError::TooMany`] when the prefix holds more keys than `max_keys`,
     /// [`ListError::Invalid`] for a truncated page without a fresh continuation token, a
-    /// repeated token, or an entry without a key, and [`ListError::Transport`] for every
-    /// SDK or service failure.
+    /// repeated token, an entry without a key, or an endpoint that pages without
+    /// delivering keys, and [`ListError::Transport`] for every SDK or service failure.
     pub async fn list_keys(
         &self,
         prefix: &str,
@@ -294,10 +294,12 @@ impl S3Store {
     ) -> Result<Vec<String>, ListError> {
         let mut keys: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
+        // The page allowance refuses an endpoint that keeps paging without progress.
+        let mut pages = max_keys.div_ceil(1_000) + 2;
         loop {
+            pages = pages.checked_sub(1).ok_or(ListError::Invalid)?;
             let remaining = max_keys.saturating_sub(keys.len());
-            let page = i32::try_from(remaining.saturating_add(1).min(1_000))
-                .map_err(|_| ListError::Invalid)?;
+            let page = remaining.saturating_add(1).min(1_000) as i32;
             let mut request = self
                 .client
                 .list_objects_v2()

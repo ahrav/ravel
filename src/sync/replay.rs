@@ -324,6 +324,8 @@ async fn install_candidate(
         certificate.payload().covered_sequence(),
         Some(certificate.payload().covered_tail_digest().clone()),
     );
+    // `precheck` bounds the covered-to-tail interval before any pack fetch.
+    precheck(&covered, observed.head().tail(), LIMITS).ok()?;
 
     // The certificate and suffix must reach the pinned head through packed events and
     // the common chain validator before any snapshot byte is trusted.
@@ -597,6 +599,9 @@ async fn listed_events(
     let mut references: Vec<ScopeEventRef> = Vec::with_capacity(unseen as usize);
     let mut next = cursor_sequence + 1;
     for key in &keys {
+        if next == tail.sequence() + 1 {
+            break;
+        }
         let reference = parse_event_key(key, &prefix)?;
         if reference.sequence() > tail.sequence() {
             // Beyond the pinned tail is not part of this replay; later keys only sort higher.
@@ -621,7 +626,7 @@ fn parse_event_key(key: &str, prefix: &str) -> Option<ScopeEventRef> {
     let name = name.strip_suffix(".cbor.zst")?;
     let (sequence, digest) = name.split_at_checked(16)?;
     let digest = digest.strip_prefix('-')?;
-    if sequence.len() != 16 || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+    if !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     let sequence: u64 = sequence.parse().ok()?;

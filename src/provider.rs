@@ -428,25 +428,26 @@ impl ReportedUse {
         self.cache_write_input_tokens
     }
 
-    /// Whether the total is below the counts it is documented to include.
+    /// Whether these counts contradict something already known about the response.
     ///
-    /// The provider defines `total_tokens` as the total of input and generated tokens, so a
-    /// smaller total is a count the response did not actually report: an omitted scalar
-    /// deserializes to zero the same way an omitted block does. This is a lower bound rather
-    /// than an equality because whether a cached read is folded into the total is not part of
-    /// that definition, and demanding equality would refuse a frame whose total legitimately
-    /// counts more than these two fields.
-    fn understates_its_total(self) -> bool {
+    /// Every count is a required member of the usage block, so an omitted one deserializes to
+    /// zero rather than to nothing, and a zero cannot be told apart from a provider claim that
+    /// nothing was billed in that category. Rather than enumerate which omissions are
+    /// plausible, this checks what the response itself makes impossible:
+    ///
+    /// - The total is defined as the total of input and generated tokens, so it cannot be
+    ///   below their sum. It is a lower bound rather than an equality because whether a cached
+    ///   read is folded into the total is not part of that definition, and demanding equality
+    ///   would refuse a cached frame the provider reported correctly.
+    /// - A request carries a non-empty prompt, which this boundary validates before dispatch,
+    ///   so some input was billed. Zero input is possible only when a cache read covers it.
+    ///
+    /// The remaining count, generated tokens, cannot be judged from the usage block alone: a
+    /// completion that stops on its first stop sequence legitimately generates none. Its
+    /// caller checks it against the text that arrived.
+    fn contradicts_the_response(self) -> bool {
         u64::from(self.total_tokens) < u64::from(self.input_tokens) + u64::from(self.output_tokens)
-    }
-
-    /// Whether every category this type carries is zero or absent.
-    fn reports_nothing(self) -> bool {
-        self.input_tokens == 0
-            && self.output_tokens == 0
-            && self.total_tokens == 0
-            && self.cache_read_input_tokens.unwrap_or(0) == 0
-            && self.cache_write_input_tokens.unwrap_or(0) == 0
+            || (self.input_tokens == 0 && self.cache_read_input_tokens.unwrap_or(0) == 0)
     }
 }
 
@@ -787,6 +788,18 @@ fn classify(
         };
     }
     match completion_text(&response) {
+        // A frame that returned text generated tokens for it, so a zero generated count beside
+        // a non-empty completion is the omitted-scalar default rather than a provider claim.
+        // This is the one count the usage block cannot judge on its own.
+        Some(text)
+            if !text.is_empty()
+                && reported_use.is_some_and(|reported| reported.output_tokens == 0) =>
+        {
+            InvocationOutcome::MalformedResponse {
+                provider_request_id,
+                reported_use: None,
+            }
+        }
         Some(text) => InvocationOutcome::Completed {
             text,
             reason,
@@ -860,13 +873,11 @@ fn token_use(usage: &TokenUsage) -> Option<ReportedUse> {
         cache_read_input_tokens: optional(usage.cache_read_input_tokens())?,
         cache_write_input_tokens: optional(usage.cache_write_input_tokens())?,
     };
-    // A response the provider produced consumed something, so a report of no use at all is
-    // not a report. `usage` is a required member of the output, so an omitted block
-    // deserializes to zeros rather than to nothing, and those zeros cannot be told apart from
-    // a genuine claim that nothing was billed. Refusing the shape keeps the fabricated claim
-    // out of cost reconciliation, on the same terms a negative count is refused. A fully
-    // cached prompt still reports its cache counters, so it is unaffected.
-    (!reported.reports_nothing() && !reported.understates_its_total()).then_some(reported)
+    // An omitted count is indistinguishable from a reported zero, so a shape the response
+    // contradicts is refused rather than passed on as provider-reported fact. This is the
+    // same refusal a negative count gets, and it covers an omitted usage block too: that
+    // deserializes to zero input with no cache read.
+    (!reported.contradicts_the_response()).then_some(reported)
 }
 
 fn request_id(response: &ConverseResponse) -> Option<String> {
@@ -1731,6 +1742,66 @@ mod tests {
         let reported = reported_use.expect("usage block present");
         assert_eq!(reported.cache_read_input_tokens(), None);
         assert_eq!(reported.cache_write_input_tokens(), None);
+    }
+
+    /// A count the response contradicts is refused whichever count it is. Generated tokens are
+    /// the one the usage block cannot judge alone: zero is right for a completion that stops on
+    /// its first stop sequence and impossible for one that returned text.
+    #[tokio::test]
+    async fn a_zero_generated_count_beside_text_makes_the_frame_malformed() {
+        let (transport, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"totalTokens":10}}"#,
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::MalformedResponse { reported_use, .. } = &outcome else {
+            panic!("expected an unreadable frame, got {outcome:?}");
+        };
+        assert_eq!(*reported_use, None);
+
+        // The same counts with no text are a completion that generated nothing, which is what
+        // an immediate stop sequence reports.
+        let (immediate, _) = replay(vec![json(converse_body(
+            "stop_sequence",
+            Some((10, 0, 10)),
+            "",
+        ))]);
+        let outcome = invoke(&immediate).await;
+        let InvocationOutcome::Completed { text, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        assert!(text.is_empty());
+    }
+
+    /// Zero input tokens are impossible unless a cache read covers them: the prompt is
+    /// non-empty by construction, so something was billed for reading it.
+    #[tokio::test]
+    async fn a_zero_input_count_needs_a_cache_read_to_be_credible() {
+        let (transport, _) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((0, 5, 5)),
+            "answer",
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        assert!(
+            matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
+            "{outcome:?}"
+        );
+
+        let (cached, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":0,"outputTokens":5,"totalTokens":5,"cacheReadInputTokens":400}}"#,
+        ))]);
+        let outcome = invoke(&cached).await;
+        let InvocationOutcome::Completed { reported_use, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        assert_eq!(
+            reported_use
+                .expect("usage block present")
+                .cache_read_input_tokens(),
+            Some(400)
+        );
     }
 
     /// An omitted scalar inside a present usage block is refused for the same reason an

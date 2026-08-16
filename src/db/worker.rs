@@ -1303,12 +1303,45 @@ mod tests {
         let genesis = genesis();
         let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
         handle.apply(test_mutation()).await.unwrap();
-        // Populate restore-derived columns the sanitize step must clear.
+        // Populate restore-derived columns the sanitize step must clear, beside the
+        // event-derived grant columns it must keep.
+        let plan_digest = Digest::new("c".repeat(64)).unwrap();
+        let work = WorkRef::new(
+            crate::domain::work::WorkId::new("work-a".into()).unwrap(),
+            1,
+        );
+        handle
+            .admit_work(
+                genesis.identity(),
+                work.clone(),
+                Vec::new(),
+                plan_digest,
+                NonZeroU64::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        handle
+            .record_claim(
+                genesis.identity(),
+                work,
+                NonZeroU64::new(2).unwrap(),
+                NonZeroU64::new(10_000).unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
         handle.drain().await.unwrap();
         {
             let side = rusqlite::Connection::open(&live_path).unwrap();
             side.execute("UPDATE scopes SET claims_restored = 1", [])
                 .unwrap();
+            side.execute(
+                "UPDATE admitted_work SET grant_fence = 2, grant_digest = ?1, \
+                 granted_attempt = 1, granted_units = 5, grant_deadline_unix_ms = 9_000, \
+                 terminal_result_digest = ?2",
+                rusqlite::params!["d".repeat(64), "e".repeat(64)],
+            )
+            .unwrap();
         }
 
         // A head the projection does not match refuses before any copy.
@@ -1340,6 +1373,31 @@ mod tests {
             .unwrap();
         assert_eq!(claims_restored, 0);
         assert_eq!(sequence, 1);
+        // Claim and terminal columns clear; the grant columns survive untouched.
+        let row: Vec<Option<String>> = copy
+            .query_row(
+                "SELECT CAST(claim_fence AS TEXT), CAST(claim_lease_until AS TEXT), \
+                 terminal_result_digest, CAST(grant_fence AS TEXT), grant_digest, \
+                 CAST(granted_attempt AS TEXT), CAST(granted_units AS TEXT), \
+                 CAST(grant_deadline_unix_ms AS TEXT) \
+                 FROM admitted_work",
+                [],
+                |row| (0..8).map(|index| row.get(index)).collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            vec![
+                None,
+                None,
+                None,
+                Some("2".to_owned()),
+                Some("d".repeat(64)),
+                Some("1".to_owned()),
+                Some("5".to_owned()),
+                Some("9000".to_owned()),
+            ]
+        );
         drop(copy);
         // The copy passes the full open-time validation on its own.
         drop(projections::open_existing(&destination).unwrap());

@@ -31,7 +31,10 @@ use ravel::{
     },
     storage::s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
     sync::{
-        accelerator::{publish_checkpoint, replay_pointer_key},
+        accelerator::{
+            decode_catalog, decode_pointer, publish_checkpoint, replay_catalog_key,
+            replay_pointer_key, scope_events_prefix,
+        },
         event::publish_root,
         head::{
             ObservedScopeHead, ScopeAppendError, ScopeHeadCommitOutcome, ScopeHeadParent,
@@ -50,6 +53,8 @@ const EXPECTED_REGION: &str = "us-east-1";
 // The library keeps these decode caps private, so the suite restates them.
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_HEAD_BYTES: usize = 4 * 1024;
+const MAX_POINTER_BYTES: usize = 4 * 1024;
+const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 
 const CONFIG_BYTES: &[u8] = br#"{"budget":7,"campaign":"live"}"#;
 
@@ -476,6 +481,13 @@ async fn list_assisted_replay_then_pack_reads_reach_the_same_cursor() {
         ScopeHeadCommitOutcome::Committed(_)
     ));
 
+    // Real S3 LIST semantics: the events prefix names exactly the genesis key.
+    let listed = store
+        .list_keys(&scope_events_prefix(scope), None, 8)
+        .await
+        .expect("listing succeeds");
+    assert_eq!(listed, vec![scope_event_key(scope, genesis.event_ref())]);
+
     // With no pointer yet, the first cold replay is LIST-assisted and then publishes
     // packs, a catalog, and the pointer.
     let (first, first_path) = fresh_projection(&store, scope, "list-first").await;
@@ -541,6 +553,37 @@ async fn contending_publishers_leave_replay_successful_and_one_valid_pointer() {
     drop((first, second));
     let _ = std::fs::remove_file(&first_path);
     let _ = std::fs::remove_file(&second_path);
+
+    // The surviving pointer names a decodable catalog whose rows cover the replayed
+    // range.
+    let pointer_bytes = match store_a
+        .get_object(&replay_pointer_key(scope), MAX_POINTER_BYTES)
+        .await
+        .expect("pointer read succeeds")
+    {
+        GetOutcome::Found { bytes, .. } => bytes,
+        GetOutcome::NotFound => panic!("a publisher must have won the pointer CAS"),
+    };
+    let catalog_digest = decode_pointer(&pointer_bytes, scope).expect("pointer decodes");
+    let catalog_bytes = match store_a
+        .get_object(
+            &replay_catalog_key(scope, &catalog_digest),
+            MAX_CATALOG_BYTES,
+        )
+        .await
+        .expect("catalog read succeeds")
+    {
+        GetOutcome::Found { bytes, .. } => bytes,
+        GetOutcome::NotFound => panic!("the surviving pointer must name a stored catalog"),
+    };
+    let catalog = decode_catalog(&catalog_bytes, &catalog_digest, scope).expect("catalog decodes");
+    assert!(
+        catalog
+            .entries()
+            .iter()
+            .any(|entry| entry.start() <= 1 && 1 <= entry.end()),
+        "the surviving catalog must cover the replayed range"
+    );
 
     // Whichever pointer won, a third cold projection replays through it.
     let (third, third_path) = fresh_projection(&store_a, scope, "contend-c").await;
@@ -629,7 +672,18 @@ async fn a_checkpoint_certified_cold_start_reaches_the_pinned_head() {
     let _ = std::fs::remove_file(&live_path);
 
     // A cold start now installs the certified snapshot and applies the packed suffix.
+    // Only an installed snapshot leaves the destination at the pinned head before any
+    // refresh; a rung miss would leave a fresh empty projection at cursor 0.
     let (cold, cold_path) = fresh_projection(&store, scope, "checkpoint-cold").await;
+    let installed_cursor: (i64, String) = rusqlite::Connection::open(&cold_path)
+        .expect("the installed projection opens")
+        .query_row(
+            "SELECT sequence, tail_event_digest FROM scopes WHERE scope_id = ?1",
+            [scope.scope_id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the installed projection holds this scope's row");
+    assert_eq!(installed_cursor.0, 2);
     assert_eq!(cursor_of(refresh(&store, &cold, scope).await).0, 2);
     drop(cold);
     let _ = std::fs::remove_file(&cold_path);

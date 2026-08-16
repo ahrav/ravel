@@ -916,11 +916,14 @@ mod tests {
         db::{projections, worker::DbHandle},
         distributed::identity::{InstanceId, WorkspaceId},
         scope::{
-            AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ROOT_GENESIS_PAYLOAD_TYPE,
-            ScopeAuthority, ScopeEventRef, ScopeHead, TEST_SUCCESSOR_PAYLOAD_TYPE, encode_head,
-            encode_scope_event, root_genesis,
+            AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope,
+            PROJECTION_CHECKPOINT_PAYLOAD_TYPE, ProjectionCheckpointEvent,
+            ProjectionCheckpointPayload, ROOT_GENESIS_PAYLOAD_TYPE, ScopeAuthority, ScopeEventRef,
+            ScopeHead, TEST_SUCCESSOR_PAYLOAD_TYPE, encode_head,
+            encode_projection_checkpoint_event, encode_scope_event, root_genesis, sha256,
         },
-        storage::s3::test_support::{replay_store, response},
+        storage::s3::test_support::{keyed_store, list_response, replay_store, response},
+        sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer},
     };
 
     use super::*;
@@ -971,6 +974,41 @@ mod tests {
             .unwrap()
             .execute(sql, rusqlite::params_from_iter(params.iter().copied()))
             .unwrap();
+    }
+
+    /// Dumps every table's rows (sorted) so two projections compare by content, not by
+    /// row counts.
+    fn projection_content(path: &Path) -> Vec<String> {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let tables: Vec<String> = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut dump = Vec::new();
+        for table in tables {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    let cells: Vec<String> = (0..columns)
+                        .map(|index| {
+                            format!("{:?}", row.get::<_, rusqlite::types::Value>(index).unwrap())
+                        })
+                        .collect();
+                    Ok(cells.join("|"))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows.sort();
+            dump.extend(rows.into_iter().map(|row| format!("{table}: {row}")));
+        }
+        dump
     }
 
     /// Reads projection rows over a short-lived connection while the worker is idle.
@@ -2774,16 +2812,50 @@ mod tests {
             .collect()
     }
 
+    /// Builds a keyed route serving `head` plus the listed events, with a 404 pointer
+    /// and 500 for anything else, so concurrent fetch order cannot skew the script.
+    fn accel_route(
+        scope: &ScopeIdentity,
+        head: &ScopeHead,
+        events: &[(ScopeEventRef, Vec<u8>)],
+        listed: Vec<String>,
+    ) -> impl Fn(&str) -> http::Response<SdkBody> + Send + Sync + 'static {
+        let head_bytes = encode_head(head).unwrap();
+        let events: Vec<(String, Vec<u8>)> = events
+            .iter()
+            .map(|(reference, bytes)| {
+                (
+                    format!("/{}", crate::scope::scope_event_key(scope, reference)),
+                    bytes.clone(),
+                )
+            })
+            .collect();
+        move |uri: &str| {
+            let path = uri.split('?').next().unwrap();
+            if uri.contains("list-type=2") {
+                let refs: Vec<&str> = listed.iter().map(String::as_str).collect();
+                return list_response(&refs, false, None);
+            }
+            if path.ends_with("/head") {
+                return head_response(head_bytes.clone());
+            }
+            if path.ends_with("/replay-index/current") {
+                return accel_miss();
+            }
+            if let Some((_, bytes)) = events.iter().find(|(key, _)| path == key) {
+                return event_response(bytes.clone());
+            }
+            response(500, &[], SdkBody::empty())
+        }
+    }
+
     /// The LIST rung replays exactly what the serial walk replays, at the same cursor.
     #[tokio::test]
     async fn list_replay_is_equivalent_to_the_serial_walk() {
-        use crate::storage::s3::test_support::list_response;
-
         let genesis = genesis();
         let scope = genesis.identity().clone();
         let (events, head) = accel_chain(&genesis, 2);
         let keys = event_keys(&scope, &events);
-        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
 
         let serial_path = path("list-equivalence-serial");
         let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
@@ -2803,13 +2875,7 @@ mod tests {
 
         let listed_path = path("list-equivalence-listed");
         let listed = DbHandle::spawn(listed_path.clone()).await.unwrap();
-        let (store, client) = replay_store(vec![
-            head_response(encode_head(&head).unwrap()),
-            accel_miss(),
-            list_response(&key_refs, false, None),
-            event_response(events[0].1.clone()),
-            event_response(events[1].1.clone()),
-        ]);
+        let (store, requests) = keyed_store(accel_route(&scope, &head, &events, keys.clone()));
         match refresh(&store, &listed, &scope).await {
             ScopeReadiness::Ready { local_cursor, .. } => {
                 assert_eq!(local_cursor.0, 2);
@@ -2818,10 +2884,30 @@ mod tests {
             ScopeReadiness::NotReady(error) => panic!("LIST replay failed: {error}"),
         }
         assert_eq!(listed.scope_cursor(&scope).await.unwrap(), serial_cursor);
-        assert_eq!(row_counts(&listed_path), row_counts(&serial_path));
-        // Head, pointer miss, LIST, and one bounded GET per candidate; publication attempts
-        // run against the exhausted script and are not recorded.
-        assert_eq!(client.actual_requests().count(), 5);
+        assert_eq!(
+            projection_content(&listed_path),
+            projection_content(&serial_path)
+        );
+        // Head, pointer miss, LIST, one bounded GET per candidate, and the failed pack
+        // publication PUT; the keyed route records every request, so a surplus request
+        // would raise the count.
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 7);
+        assert!(recorded[0].contains("/head"));
+        assert!(recorded[1].contains("/replay-index/current"));
+        assert!(recorded[2].contains("list-type=2"));
+        let mut candidate_gets = vec![recorded[3].clone(), recorded[4].clone()];
+        candidate_gets.sort();
+        let candidate = |index: usize| {
+            format!(
+                "GET /{}?x-id=GetObject",
+                crate::scope::scope_event_key(&scope, &events[index].0)
+            )
+        };
+        assert_eq!(candidate_gets, vec![candidate(0), candidate(1)]);
+        // The failed pack PUT and its ambiguity probe end publication.
+        assert!(recorded[5].starts_with("PUT ") && recorded[5].contains("/replay-packs/"));
+        assert!(recorded[6].starts_with("GET ") && recorded[6].contains("/replay-packs/"));
         drop(listed);
         fs::remove_file(serial_path).unwrap();
         fs::remove_file(listed_path).unwrap();
@@ -2831,8 +2917,6 @@ mod tests {
     /// candidate beyond the pinned tail is ignored rather than treated as an anomaly.
     #[tokio::test]
     async fn list_anomalies_fall_back_and_beyond_tail_candidates_are_ignored() {
-        use crate::storage::s3::test_support::list_response;
-
         let genesis = genesis();
         let scope = genesis.identity().clone();
         let (events, head) = accel_chain(&genesis, 4);
@@ -2923,23 +3007,28 @@ mod tests {
         fs::remove_file(invalid_path).unwrap();
 
         // Candidates beyond the pinned tail are ignored: the head pins sequence 2 while the
-        // listing also names sequences 3 and 4.
+        // listing also names sequence 3.
         let beyond_path = path("list-beyond-tail");
         let handle = DbHandle::spawn(beyond_path.clone()).await.unwrap();
-        let beyond_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let (store, client) = replay_store(vec![
-            head_response(encode_head(&short_head).unwrap()),
-            accel_miss(),
-            list_response(&beyond_refs[..3], false, None),
-            event_response(events[0].1.clone()),
-            event_response(events[1].1.clone()),
-        ]);
+        let (store, requests) = keyed_store(accel_route(
+            &scope,
+            &short_head,
+            &events[..2],
+            keys[..3].to_vec(),
+        ));
         assert!(matches!(
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
         assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 2);
-        assert_eq!(client.actual_requests().count(), 5);
+        // Head, pointer miss, LIST, two candidate GETs, and the failed publication PUT
+        // plus its ambiguity probe: the beyond-tail candidate is never fetched.
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 7);
+        assert!(recorded.iter().all(|line| !line.contains(&format!(
+            "/{}",
+            crate::scope::scope_event_key(&scope, &events[2].0)
+        ))));
         drop(handle);
         fs::remove_file(beyond_path).unwrap();
     }
@@ -2949,8 +3038,6 @@ mod tests {
     /// through.
     #[tokio::test]
     async fn packed_replay_is_equivalent_and_bad_packs_fall_back() {
-        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
-
         let genesis = genesis();
         let scope = genesis.identity().clone();
         let (events, head) = accel_chain(&genesis, 3);
@@ -2984,14 +3071,20 @@ mod tests {
             response(200, &[("etag", "\"pointer\"")], pointer_bytes.clone()),
             response(200, &[("etag", "\"catalog\"")], catalog_bytes.clone()),
             response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
         ]);
         assert!(matches!(
             refresh(&store, &packed, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
         assert_eq!(packed.scope_cursor(&scope).await.unwrap(), serial_cursor);
-        assert_eq!(row_counts(&packed_path), row_counts(&serial_path));
+        assert_eq!(
+            projection_content(&packed_path),
+            projection_content(&serial_path)
+        );
         // Head, pointer, catalog, and one pack: no per-event GET and no republication.
+        // The surplus scripted failures would record any extra request.
         assert_eq!(client.actual_requests().count(), 4);
         drop(packed);
         fs::remove_file(packed_path).unwrap();
@@ -3063,8 +3156,6 @@ mod tests {
     /// `ceil(N / 256)`; the fixed head/pointer/catalog requests are asserted separately.
     #[tokio::test]
     async fn packed_replay_reduces_event_data_requests_to_pack_count() {
-        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
-
         const EVENTS: usize = 300;
         let genesis = genesis();
         let scope = genesis.identity().clone();
@@ -3137,9 +3228,6 @@ mod tests {
     /// through them: the acceptance path from serial cost to `ceil(N / 256)` GETs.
     #[tokio::test]
     async fn a_replay_publishes_packs_that_serve_the_next_cold_projection() {
-        use crate::storage::s3::test_support::list_response;
-        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
-
         let genesis = genesis();
         let scope = genesis.identity().clone();
         let (events, head) = accel_chain(&genesis, 2);
@@ -3214,12 +3302,6 @@ mod tests {
         genesis: &crate::scope::RootGenesis,
         label: &str,
     ) -> CheckpointFixture {
-        use crate::scope::{
-            PROJECTION_CHECKPOINT_PAYLOAD_TYPE, ProjectionCheckpointEvent,
-            ProjectionCheckpointPayload, encode_projection_checkpoint_event,
-        };
-        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
-
         let scope = genesis.identity().clone();
         let live_path = path(&format!("checkpoint-fixture-live-{label}"));
         let snap_path = path(&format!("checkpoint-fixture-snap-{label}"));
@@ -3233,7 +3315,7 @@ mod tests {
         let snapshot = fs::read(&snap_path).unwrap();
         fs::remove_file(&live_path).unwrap();
         fs::remove_file(&snap_path).unwrap();
-        let snapshot_digest = Digest::new(crate::scope::sha256(&snapshot)).unwrap();
+        let snapshot_digest = Digest::new(sha256(&snapshot)).unwrap();
 
         let payload = ProjectionCheckpointPayload::new(
             snapshot_digest,
@@ -3402,9 +3484,69 @@ mod tests {
         fs::remove_file(cold_path).unwrap();
     }
 
-    /// Uncertified, wrong-scope, wrong-cursor, wrong-digest, and invalid-SQLite
-    /// checkpoints all fall through to the empty projection, which later replays from
-    /// genesis.
+    /// Builds the six-response script certifying `snapshot` at covered sequence 1
+    /// through a certificate at sequence 2 under `operation`.
+    fn certified_responses(
+        genesis: &crate::scope::RootGenesis,
+        snapshot: Vec<u8>,
+        active_plan: Option<Digest>,
+        operation: &str,
+    ) -> Vec<http::Response<SdkBody>> {
+        let scope = genesis.identity().clone();
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&snapshot)).unwrap(),
+            snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            active_plan.clone(),
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                operation.into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            active_plan,
+            operation.into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
+        let (catalog, digest) =
+            encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref())).unwrap();
+        let pointer = encode_pointer(&scope, &digest).unwrap();
+        vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer),
+            response(200, &[("etag", "\"catalog\"")], catalog),
+            event_response(encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], snapshot),
+        ]
+    }
+
+    /// Uncertified, wrong-digest, invalid-SQLite, wrong-plan, wrong-scope, and
+    /// wrong-cursor checkpoints all fall through to the empty projection.
     #[tokio::test]
     async fn bad_checkpoints_fall_through_to_an_empty_projection() {
         let genesis = genesis();
@@ -3412,11 +3554,9 @@ mod tests {
         let scope = fixture.scope.clone();
 
         // Uncertified: the catalog names packs but no checkpoint certificate.
-        let entry =
-            crate::sync::accelerator::PackEntry::new(2, 3, fixture.pack.digest().clone()).unwrap();
-        let (bare_catalog, bare_digest) =
-            crate::sync::accelerator::encode_catalog(&scope, &[entry], &[]).unwrap();
-        let bare_pointer = crate::sync::accelerator::encode_pointer(&scope, &bare_digest).unwrap();
+        let entry = PackEntry::new(2, 3, fixture.pack.digest().clone()).unwrap();
+        let (bare_catalog, bare_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let bare_pointer = encode_pointer(&scope, &bare_digest).unwrap();
         let uncertified = vec![
             head_response(encode_head(&fixture.head).unwrap()),
             response(200, &[("etag", "\"pointer\"")], bare_pointer),
@@ -3445,138 +3585,23 @@ mod tests {
         ];
 
         // Invalid SQLite: the certified length and digest match arbitrary junk.
-        let junk = b"not-a-sqlite-database".repeat(64);
-        let junk_fixture = {
-            use crate::scope::{
-                PROJECTION_CHECKPOINT_PAYLOAD_TYPE, ProjectionCheckpointEvent,
-                ProjectionCheckpointPayload, encode_projection_checkpoint_event,
-            };
-            use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
-            let payload = ProjectionCheckpointPayload::new(
-                Digest::new(crate::scope::sha256(&junk)).unwrap(),
-                junk.len() as u64,
-                1,
-                genesis.event_ref().digest().clone(),
-                None,
-            )
-            .unwrap();
-            let certificate = ProjectionCheckpointEvent::new(
-                EventEnvelope::new(
-                    scope.scope_id().clone(),
-                    2,
-                    Some(genesis.event_ref().clone()),
-                    1,
-                    "junk-checkpoint-op".into(),
-                    PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
-                )
-                .unwrap(),
-                payload,
-            )
-            .unwrap();
-            let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
-            let head = ScopeHead::new(
-                scope.clone(),
-                ScopeAuthority::Unowned,
-                1,
-                encoded.event_ref().clone(),
-                None,
-                "junk-checkpoint-op".into(),
-            )
-            .unwrap();
-            let pack = build_pack(
-                &scope,
-                Some(genesis.event_ref()),
-                2,
-                &[encoded.stored_bytes()],
-            )
-            .unwrap();
-            let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
-            let (catalog, digest) =
-                encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref()))
-                    .unwrap();
-            let pointer = encode_pointer(&scope, &digest).unwrap();
-            vec![
-                head_response(encode_head(&head).unwrap()),
-                response(200, &[("etag", "\"pointer\"")], pointer),
-                response(200, &[("etag", "\"catalog\"")], catalog),
-                event_response(encoded.stored_bytes().to_vec()),
-                response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
-                response(200, &[("etag", "\"snapshot\"")], junk),
-            ]
-        };
+        let junk = certified_responses(
+            &genesis,
+            b"not-a-sqlite-database".repeat(64),
+            None,
+            "junk-checkpoint-op",
+        );
 
         // Wrong plan: the certificate claims an active plan the snapshot does not hold.
-        let wrong_plan = {
-            use crate::scope::{
-                PROJECTION_CHECKPOINT_PAYLOAD_TYPE, ProjectionCheckpointEvent,
-                ProjectionCheckpointPayload, encode_projection_checkpoint_event,
-            };
-            use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
-            let payload = ProjectionCheckpointPayload::new(
-                Digest::new(crate::scope::sha256(&fixture.snapshot)).unwrap(),
-                fixture.snapshot.len() as u64,
-                1,
-                genesis.event_ref().digest().clone(),
-                Some(Digest::new("a".repeat(64)).unwrap()),
-            )
-            .unwrap();
-            let certificate = ProjectionCheckpointEvent::new(
-                EventEnvelope::new(
-                    scope.scope_id().clone(),
-                    2,
-                    Some(genesis.event_ref().clone()),
-                    1,
-                    "planned-checkpoint-op".into(),
-                    PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
-                )
-                .unwrap(),
-                payload,
-            )
-            .unwrap();
-            let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
-            let head = ScopeHead::new(
-                scope.clone(),
-                ScopeAuthority::Unowned,
-                1,
-                encoded.event_ref().clone(),
-                Some(Digest::new("a".repeat(64)).unwrap()),
-                "planned-checkpoint-op".into(),
-            )
-            .unwrap();
-            let pack = build_pack(
-                &scope,
-                Some(genesis.event_ref()),
-                2,
-                &[encoded.stored_bytes()],
-            )
-            .unwrap();
-            let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
-            let (catalog, digest) =
-                encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref()))
-                    .unwrap();
-            let pointer = encode_pointer(&scope, &digest).unwrap();
-            vec![
-                head_response(encode_head(&head).unwrap()),
-                response(200, &[("etag", "\"pointer\"")], pointer),
-                response(200, &[("etag", "\"catalog\"")], catalog),
-                event_response(encoded.stored_bytes().to_vec()),
-                response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
-                response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
-            ]
-        };
+        let wrong_plan = certified_responses(
+            &genesis,
+            fixture.snapshot.clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            "planned-checkpoint-op",
+        );
 
-        for responses in [uncertified, wrong_digest, junk_fixture, wrong_plan] {
-            let cold_path = path("checkpoint-fallback");
-            let _ = fs::remove_file(&cold_path);
-            let (store, _) = replay_store(responses);
-            let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
-            assert_eq!(handle.scope_cursor(&scope).await.unwrap(), (0, None));
-            drop(handle);
-            fs::remove_file(cold_path).unwrap();
-        }
-
-        // Wrong scope and wrong cursor: the snapshot is a valid projection of a foreign
-        // scope, so the certified scope binding refuses it before installation.
+        // Wrong scope: the snapshot is a valid projection of a foreign scope, so the
+        // certified scope binding refuses it before installation.
         let foreign_genesis = root_genesis(
             &AdmittedCampaignConfig::new(
                 WorkspaceId::new("workspace-b".into()).unwrap(),
@@ -3598,70 +3623,616 @@ mod tests {
         let foreign_snapshot = fs::read(&foreign_snap).unwrap();
         fs::remove_file(&foreign_live).unwrap();
         fs::remove_file(&foreign_snap).unwrap();
-        let wrong_scope = {
-            use crate::scope::{
-                PROJECTION_CHECKPOINT_PAYLOAD_TYPE, ProjectionCheckpointEvent,
-                ProjectionCheckpointPayload, encode_projection_checkpoint_event,
-            };
-            use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
-            let payload = ProjectionCheckpointPayload::new(
-                Digest::new(crate::scope::sha256(&foreign_snapshot)).unwrap(),
-                foreign_snapshot.len() as u64,
-                1,
-                genesis.event_ref().digest().clone(),
-                None,
-            )
-            .unwrap();
-            let certificate = ProjectionCheckpointEvent::new(
-                EventEnvelope::new(
-                    scope.scope_id().clone(),
-                    2,
-                    Some(genesis.event_ref().clone()),
-                    1,
-                    "foreign-checkpoint-op".into(),
-                    PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
-                )
-                .unwrap(),
-                payload,
-            )
-            .unwrap();
-            let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
-            let head = ScopeHead::new(
+        let wrong_scope =
+            certified_responses(&genesis, foreign_snapshot, None, "foreign-checkpoint-op");
+
+        // Wrong cursor: the snapshot is a valid projection of this scope, two events
+        // deep, while the certificate covers cursor 1.
+        let two_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "two-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let two_encoded = encode_scope_event(&two_envelope, &Value::Null).unwrap();
+        let two_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            two_encoded.event_ref().clone(),
+            None,
+            "two-op".into(),
+        )
+        .unwrap();
+        let two_live = path("checkpoint-two-live");
+        let two_snap = path("checkpoint-two-snap");
+        let _ = fs::remove_file(&two_snap);
+        let live = DbHandle::spawn(two_live.clone()).await.unwrap();
+        live.apply(root_mutation(&genesis)).await.unwrap();
+        live.apply(
+            ScopeProjectionEvent::new(
                 scope.clone(),
-                ScopeAuthority::Unowned,
+                two_envelope,
+                two_encoded.event_ref().clone(),
+                ScopeProjectionPayload::TestSuccessor,
                 1,
-                encoded.event_ref().clone(),
-                None,
-                "foreign-checkpoint-op".into(),
             )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        live.snapshot_to(&two_head, two_snap.clone()).await.unwrap();
+        drop(live);
+        let two_snapshot = fs::read(&two_snap).unwrap();
+        fs::remove_file(&two_live).unwrap();
+        fs::remove_file(&two_snap).unwrap();
+        let wrong_cursor = certified_responses(&genesis, two_snapshot, None, "wrong-cursor-op");
+
+        for responses in [
+            uncertified,
+            wrong_digest,
+            junk,
+            wrong_plan,
+            wrong_scope,
+            wrong_cursor,
+        ] {
+            let cold_path = path("checkpoint-fallback");
+            let _ = fs::remove_file(&cold_path);
+            let (store, _) = replay_store(responses);
+            let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+            assert_eq!(handle.scope_cursor(&scope).await.unwrap(), (0, None));
+            assert_eq!(
+                row_counts(&cold_path),
+                (0, 0),
+                "a refused checkpoint must leave a fresh empty projection"
+            );
+            let leaked = fs::read_dir(cold_path.parent().unwrap())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .starts_with(&format!(
+                            "{}.checkpoint-",
+                            cold_path.file_name().unwrap().to_str().unwrap()
+                        ))
+                })
+                .count();
+            assert_eq!(leaked, 0, "a refused install must remove its staging file");
+            drop(handle);
+            fs::remove_file(cold_path).unwrap();
+        }
+    }
+
+    /// Candidates are attempted newest first; a failing newer candidate falls to an
+    /// older one, and a candidate beyond the pinned tail is skipped without a read.
+    #[tokio::test]
+    async fn checkpoint_candidates_try_newest_first_and_fall_to_older_ones() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+
+        let live_path = path("candidates-live");
+        let snap_path = path("candidates-snap");
+        let _ = fs::remove_file(&snap_path);
+        let live = DbHandle::spawn(live_path.clone()).await.unwrap();
+        live.apply(root_mutation(&genesis)).await.unwrap();
+        live.snapshot_to(genesis.head(), snap_path.clone())
+            .await
             .unwrap();
-            let pack = build_pack(
-                &scope,
-                Some(genesis.event_ref()),
+        drop(live);
+        let old_snapshot = fs::read(&snap_path).unwrap();
+        fs::remove_file(&live_path).unwrap();
+        fs::remove_file(&snap_path).unwrap();
+
+        let old_payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&old_snapshot)).unwrap(),
+            old_snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let old_certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
                 2,
-                &[encoded.stored_bytes()],
+                Some(genesis.event_ref().clone()),
+                1,
+                "old-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            old_payload,
+        )
+        .unwrap();
+        let old_encoded = encode_projection_checkpoint_event(&old_certificate).unwrap();
+        let mid_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            3,
+            Some(old_encoded.event_ref().clone()),
+            1,
+            "mid-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let mid = encode_scope_event(&mid_envelope, &Value::Null).unwrap();
+        // The newer certificate is fully certified but its snapshot object is missing.
+        let new_payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(b"missing-snapshot")).unwrap(),
+            1_024,
+            3,
+            mid.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let new_certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                4,
+                Some(mid.event_ref().clone()),
+                1,
+                "new-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            new_payload,
+        )
+        .unwrap();
+        let new_encoded = encode_projection_checkpoint_event(&new_certificate).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            new_encoded.event_ref().clone(),
+            None,
+            "new-cert-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[
+                old_encoded.stored_bytes(),
+                mid.stored_bytes(),
+                new_encoded.stored_bytes(),
+            ],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 4, pack.digest().clone()).unwrap();
+        let beyond = ScopeEventRef::new(99, Digest::new("9".repeat(64)).unwrap()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            &scope,
+            &[entry],
+            &[
+                old_encoded.event_ref().clone(),
+                new_encoded.event_ref().clone(),
+                beyond,
+            ],
+        )
+        .unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let cold_path = path("candidates-cold");
+        let _ = fs::remove_file(&cold_path);
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            event_response(new_encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(404, &[], SdkBody::empty()),
+            event_response(old_encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], old_snapshot),
+        ]);
+        let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+        assert_eq!(
+            handle.scope_cursor(&scope).await.unwrap(),
+            (4, Some(new_encoded.event_ref().digest().clone()))
+        );
+        let requests: Vec<String> = client
+            .actual_requests()
+            .map(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(requests.len(), 9);
+        // Newest first: the sequence-4 certificate and its snapshot are attempted
+        // before the sequence-2 certificate.
+        assert!(requests[3].contains("/events/0000000000000004-"));
+        assert!(requests[5].contains("/checkpoints/0000000000000003-"));
+        assert!(requests[6].contains("/events/0000000000000002-"));
+        assert!(requests[8].contains("/checkpoints/0000000000000001-"));
+        // The beyond-tail candidate is never read.
+        assert!(
+            requests
+                .iter()
+                .all(|path| !path.contains("0000000000000099"))
+        );
+        drop(handle);
+        fs::remove_file(cold_path).unwrap();
+    }
+
+    /// A warm refresh lists strictly after the cursor sequence: the boundary key ends
+    /// with `.`, which sorts between the cursor key and every later sequence.
+    #[tokio::test]
+    async fn a_warm_list_refresh_starts_after_the_cursor_boundary() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 3);
+        let keys = event_keys(&scope, &events);
+        let db_path = path("list-warm-cursor");
+        let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(genesis.head_bytes().to_vec()),
+            accel_miss(),
+            accel_miss(),
+            event_response(events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 1);
+
+        let (store, requests) =
+            keyed_store(accel_route(&scope, &head, &events[1..], keys[1..].to_vec()));
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 3);
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 7);
+        assert!(recorded[2].contains("list-type=2"));
+        assert!(
+            recorded[2].contains("start-after=") && recorded[2].contains("0000000000000001."),
+            "the listing must start after every key at the cursor sequence: {}",
+            recorded[2]
+        );
+        drop(handle);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// A checkpointed cold start over a suffix wider than one pack performs one
+    /// snapshot GET plus `ceil(suffix / 256)` pack GETs.
+    #[tokio::test]
+    async fn a_checkpoint_cold_start_reads_the_suffix_in_pack_sized_requests() {
+        const COUNT: usize = 302;
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+
+        let live_path = path("ratio-live");
+        let snap_path = path("ratio-snap");
+        let _ = fs::remove_file(&snap_path);
+        let live = DbHandle::spawn(live_path.clone()).await.unwrap();
+        live.apply(root_mutation(&genesis)).await.unwrap();
+        live.snapshot_to(genesis.head(), snap_path.clone())
+            .await
+            .unwrap();
+        drop(live);
+        let snapshot = fs::read(&snap_path).unwrap();
+        fs::remove_file(&live_path).unwrap();
+        fs::remove_file(&snap_path).unwrap();
+
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&snapshot)).unwrap(),
+            snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "ratio-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let cert_encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let mut suffix: Vec<(ScopeEventRef, Vec<u8>)> = vec![(
+            cert_encoded.event_ref().clone(),
+            cert_encoded.stored_bytes().to_vec(),
+        )];
+        for sequence in 3..=COUNT as u64 {
+            let parent = suffix.last().unwrap().0.clone();
+            let envelope = EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent),
+                1,
+                format!("ratio-op-{sequence}"),
+                TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
             )
             .unwrap();
-            let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
-            let (catalog, digest) =
-                encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref()))
-                    .unwrap();
-            let pointer = encode_pointer(&scope, &digest).unwrap();
-            vec![
-                head_response(encode_head(&head).unwrap()),
-                response(200, &[("etag", "\"pointer\"")], pointer),
-                response(200, &[("etag", "\"catalog\"")], catalog),
-                event_response(encoded.stored_bytes().to_vec()),
-                response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
-                response(200, &[("etag", "\"snapshot\"")], foreign_snapshot),
-            ]
-        };
-        let cold_path = path("checkpoint-wrong-scope");
+            let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+            suffix.push((encoded.event_ref().clone(), encoded.stored_bytes().to_vec()));
+        }
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            suffix.last().unwrap().0.clone(),
+            None,
+            format!("ratio-op-{COUNT}"),
+        )
+        .unwrap();
+        let mut entries = Vec::new();
+        let mut packs = Vec::new();
+        let mut parent = genesis.event_ref().clone();
+        let mut start = 2_u64;
+        for group in suffix.chunks(256) {
+            let slices: Vec<&[u8]> = group.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+            let pack = build_pack(&scope, Some(&parent), start, &slices).unwrap();
+            entries.push(
+                PackEntry::new(start, start + group.len() as u64 - 1, pack.digest().clone())
+                    .unwrap(),
+            );
+            parent = group.last().unwrap().0.clone();
+            start += group.len() as u64;
+            packs.push(pack);
+        }
+        let suffix_len = COUNT - 1;
+        assert_eq!(packs.len(), suffix_len.div_ceil(256));
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            &scope,
+            &entries,
+            std::slice::from_ref(cert_encoded.event_ref()),
+        )
+        .unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let cold_path = path("ratio-cold");
         let _ = fs::remove_file(&cold_path);
-        let (store, _) = replay_store(wrong_scope);
+        let mut responses = vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            event_response(cert_encoded.stored_bytes().to_vec()),
+        ];
+        responses.extend(
+            packs
+                .iter()
+                .map(|pack| response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec())),
+        );
+        responses.push(response(200, &[("etag", "\"snapshot\"")], snapshot));
+        let (store, client) = replay_store(responses);
         let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
-        assert_eq!(handle.scope_cursor(&scope).await.unwrap(), (0, None));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, COUNT as u64);
+        let requests: Vec<String> = client
+            .actual_requests()
+            .map(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .to_owned()
+            })
+            .collect();
+        let count_of = |segment: &str| {
+            requests
+                .iter()
+                .filter(|path| path.contains(segment))
+                .count()
+        };
+        assert_eq!(count_of("/checkpoints/"), 1);
+        assert_eq!(count_of("/replay-packs/"), suffix_len.div_ceil(256));
+        assert_eq!(count_of("/events/"), 1);
+        assert_eq!(requests.len(), 3 + 1 + suffix_len.div_ceil(256) + 1);
         drop(handle);
+        fs::remove_file(cold_path).unwrap();
+    }
+
+    /// A checkpoint cold start over a plan-, work-, and grant-bearing history matches
+    /// the serial walk row for row.
+    #[tokio::test]
+    async fn a_checkpoint_cold_start_reproduces_plan_and_grant_state() {
+        use crate::domain::work::{WorkId, WorkRef};
+        use crate::scope::{GrantActivatedEvent, GrantActivatedPayload};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let genesis = genesis();
+        let fixture = admitted_fixture(&genesis, NOW);
+        let scope = fixture.scope.clone();
+        let plan = fixture.plan_digest.clone();
+        let admission_ref =
+            ScopeEventRef::new(2, Digest::new(sha256(&fixture.admission_bytes)).unwrap()).unwrap();
+        let grant_event = GrantActivatedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                3,
+                Some(admission_ref.clone()),
+                1,
+                "grant-op-3".into(),
+                GRANT_ACTIVATED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            GrantActivatedPayload::new(
+                WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1),
+                2,
+                Digest::new("d".repeat(64)).unwrap(),
+                1,
+                5,
+                NOW + 20_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let grant_encoded = crate::scope::encode_grant_activated_event(&grant_event).unwrap();
+        let head3 = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            grant_encoded.event_ref().clone(),
+            Some(plan.clone()),
+            "grant-op-3".into(),
+        )
+        .unwrap();
+
+        // The live projection replays the grant-bearing chain and is snapshotted.
+        let live_path = path("grant-checkpoint-live");
+        let snap_path = path("grant-checkpoint-snap");
+        let _ = fs::remove_file(&snap_path);
+        let live = DbHandle::spawn(live_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head3).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(grant_encoded.stored_bytes().to_vec()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &live, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        live.snapshot_to(&head3, snap_path.clone()).await.unwrap();
+        drop(live);
+        let snapshot = fs::read(&snap_path).unwrap();
+        fs::remove_file(&live_path).unwrap();
+        fs::remove_file(&snap_path).unwrap();
+
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&snapshot)).unwrap(),
+            snapshot.len() as u64,
+            3,
+            grant_encoded.event_ref().digest().clone(),
+            Some(plan.clone()),
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                4,
+                Some(grant_encoded.event_ref().clone()),
+                1,
+                "grant-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let cert_encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let head4 = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            cert_encoded.event_ref().clone(),
+            Some(plan.clone()),
+            "grant-cert-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(grant_encoded.event_ref()),
+            4,
+            &[cert_encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(4, 4, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            &scope,
+            &[entry],
+            std::slice::from_ref(cert_encoded.event_ref()),
+        )
+        .unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        // The serial baseline replays the whole chain from genesis.
+        let serial_path = path("grant-checkpoint-serial");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head4).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(cert_encoded.stored_bytes().to_vec()),
+            event_response(grant_encoded.stored_bytes().to_vec()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        serial.drain().await.unwrap();
+        drop(serial);
+
+        // The cold start installs the snapshot, applies the packed suffix, and restores
+        // claims on its first refresh.
+        let cold_path = path("grant-checkpoint-cold");
+        let _ = fs::remove_file(&cold_path);
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head4).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            event_response(cert_encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], snapshot),
+        ]);
+        let cold = open_projection(&store, &scope, &cold_path).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head4).unwrap()),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &cold, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(cold.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        cold.drain().await.unwrap();
+        drop(cold);
+
+        // The fixture genuinely carries plan, work, and grant state.
+        let rows = scheduling_rows(&cold_path);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].granted_units, Some(5));
+        assert_eq!(rows[0].plan_digest, plan.as_str());
+        assert_eq!(
+            projection_content(&cold_path),
+            projection_content(&serial_path)
+        );
+        fs::remove_file(serial_path).unwrap();
         fs::remove_file(cold_path).unwrap();
     }
 

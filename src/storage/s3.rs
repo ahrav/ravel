@@ -630,6 +630,30 @@ pub(crate) mod test_support {
         );
         (store, client)
     }
+
+    /// Routes responses by path and query so concurrent requests cannot consume
+    /// responses by fetch order.
+    pub(crate) fn keyed_store(
+        route: impl Fn(&str) -> http::Response<SdkBody> + Send + Sync + 'static,
+    ) -> (S3Store, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let client = aws_smithy_http_client::test_util::infallible_client_fn(move |request| {
+            let uri = request.uri();
+            let line = match uri.query() {
+                Some(query) => format!("{} {}?{query}", request.method(), uri.path()),
+                None => format!("{} {}", request.method(), uri.path()),
+            };
+            recorded.lock().unwrap().push(line);
+            route(uri.path_and_query().map_or("", |value| value.as_str()))
+        });
+        let store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(client),
+        );
+        (store, requests)
+    }
 }
 
 #[cfg(test)]
@@ -1268,6 +1292,39 @@ mod tests {
         assert_eq!(
             store.list_keys("events/", None, 8).await,
             Err(ListError::Transport)
+        );
+
+        // An entry without a key is a malformed listing.
+        let keyless = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>test-bucket</Name>\
+             <Contents><Size>1</Size></Contents>\
+             <IsTruncated>false</IsTruncated>\
+             </ListBucketResult>";
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("content-type", "application/xml")],
+            keyless.to_owned(),
+        )]);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Invalid)
+        );
+
+        // An endpoint that keeps paging fresh tokens without progress exhausts the page
+        // allowance instead of looping forever.
+        let mut endless = Vec::new();
+        for page in 0..16 {
+            endless.push(list_response(&[], true, Some(&format!("token-{page}"))));
+        }
+        let (store, client) = replay_store(endless);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Invalid)
+        );
+        assert_eq!(
+            client.actual_requests().count(),
+            8_usize.div_ceil(1_000) + 2
         );
     }
 

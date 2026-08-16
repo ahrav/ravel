@@ -2030,6 +2030,17 @@ mod codec_tests {
             ),
             Err(WireError::InvalidValue)
         );
+        // The bound itself is accepted.
+        assert!(
+            ProjectionCheckpointPayload::new(
+                snapshot_digest.clone(),
+                crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            )
+            .is_ok()
+        );
 
         // A future payload version fails closed.
         let cbor = zstd::bulk::decompress(encoded.stored_bytes(), MAX_DECOMPRESSED_BYTES).unwrap();

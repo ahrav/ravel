@@ -1960,6 +1960,269 @@ mod tests {
         assert_eq!(client.actual_requests().count(), 5);
     }
 
+    /// A pack holding a rival object at an expected sequence cannot feed the packed
+    /// walk; the serial walk decides from authoritative event reads.
+    #[tokio::test]
+    async fn a_pack_rival_at_an_expected_sequence_falls_through_to_the_serial_walk() {
+        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let parent = genesis.head().clone();
+        let (candidate_envelope, candidate_encoded) =
+            successor(&scope, genesis.event_ref(), 2, "candidate-op");
+        let candidate_ref = candidate_encoded.event_ref().clone();
+        let candidate_bytes = candidate_encoded.stored_bytes().to_vec();
+        let (_, later_encoded) = successor(&scope, &candidate_ref, 3, "later-op");
+        let later_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            later_encoded.event_ref().clone(),
+            None,
+            "later-op".into(),
+        )
+        .unwrap();
+        // The pack names the covering range but holds a rival at sequence 3.
+        let (_, rival_encoded) = successor(&scope, &candidate_ref, 3, "rival-op");
+        let rival_pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[&candidate_bytes, rival_encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 3, rival_pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+        let publication = published(&scope, &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            candidate_ref.clone(),
+            None,
+            "candidate-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&later_head).unwrap(),
+            ),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], rival_pack.bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"e3\"")],
+                later_encoded.stored_bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"e2\"")], candidate_bytes),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::CommittedSuperseded
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 7);
+        let event_gets = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .contains("/events/")
+            })
+            .count();
+        assert_eq!(
+            event_gets, 2,
+            "the serial walk must decide from event reads"
+        );
+    }
+
+    /// Reconciliation from a genesis parent proves a positive verdict through packs at
+    /// the genesis boundary with no per-event read.
+    #[tokio::test]
+    async fn packed_reconciliation_reaches_the_genesis_boundary() {
+        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let absent_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            1,
+            None,
+            1,
+            "absent-root-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let absent_encoded = encode_scope_event(&absent_envelope, &Value::Null).unwrap();
+        let publication = published(&scope, &absent_envelope, absent_encoded).await;
+        let candidate_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            publication.event_ref().clone(),
+            None,
+            "absent-root-op".into(),
+        )
+        .unwrap();
+        let transition =
+            ScopeHeadTransition::new(ScopeHeadParent::Genesis, candidate_head, publication)
+                .unwrap();
+        let pack = build_pack(&scope, None, 1, &[genesis.event_bytes()]).unwrap();
+        let entry = PackEntry::new(1, 1, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                genesis.head_bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::ProvenNotCommitted
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|request| {
+            !request
+                .uri()
+                .parse::<http::Uri>()
+                .unwrap()
+                .path()
+                .contains("/events/")
+        }));
+    }
+
+    /// The committed head keeps the fenced parent's active plan and the certificate
+    /// payload carries the same binding.
+    #[tokio::test]
+    async fn append_checkpoint_preserves_the_parent_heads_active_plan() {
+        use crate::scope::{
+            ProjectionCheckpointPayload, decode_head, decode_projection_checkpoint_event,
+            scope_event_key, scope_head_key, sha256,
+        };
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let plan = Digest::new("a".repeat(64)).unwrap();
+        let parent = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            Some(plan.clone()),
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap();
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new("b".repeat(64)).unwrap(),
+            1_024,
+            1,
+            genesis.event_ref().digest().clone(),
+            Some(plan.clone()),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(&parent).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"committed\"")], SdkBody::empty()),
+        ]);
+        let observed_parent = read(&store, &scope).await.unwrap().unwrap();
+        let outcome = append_checkpoint(
+            &store,
+            ScopeHeadParent::existing(Box::new(observed_parent)),
+            &scope,
+            &payload,
+            "checkpoint-plan-op",
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ScopeHeadCommitOutcome::Committed(_)));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 3);
+        let event_bytes = requests[1].body().bytes().unwrap().to_vec();
+        let reference = ScopeEventRef::new(2, Digest::new(sha256(&event_bytes)).unwrap()).unwrap();
+        let certificate = decode_projection_checkpoint_event(
+            &event_bytes,
+            &scope_event_key(&scope, &reference),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(
+            certificate.payload().covered_active_plan_digest(),
+            Some(&plan)
+        );
+        let committed = decode_head(
+            requests[2].body().bytes().unwrap(),
+            &scope_head_key(&scope),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(committed.active_plan_digest(), Some(&plan));
+        assert_eq!(requests[2].headers().get("if-match"), Some("\"parent\""));
+
+        // A payload that drops the parent's plan is refused before any publication.
+        let unplanned = ProjectionCheckpointPayload::new(
+            Digest::new("b".repeat(64)).unwrap(),
+            1_024,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![]);
+        assert!(matches!(
+            append_checkpoint(
+                &store,
+                ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+                &scope,
+                &unplanned,
+                "checkpoint-plan-op-2",
+                &mut AttemptHistory::default(),
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
     #[tokio::test]
     async fn reconciliation_refuses_a_chain_that_breaks_the_epoch_ordering_rule() {
         let genesis = genesis();

@@ -1314,6 +1314,42 @@ mod tests {
             Err(WireError::InvalidValue)
         );
         assert_eq!(decode_pointer(&[], scope), Err(WireError::LimitExceeded));
+
+        // A row wider than one pack can hold is refused at construction.
+        assert_eq!(
+            PackEntry::new(1, MAX_PACK_EVENTS as u64 + 1, digest("wide")),
+            Err(WireError::InvalidValue)
+        );
+        assert!(PackEntry::new(1, MAX_PACK_EVENTS as u64, digest("widest")).is_ok());
+    }
+
+    #[test]
+    fn a_catalog_at_the_row_cap_encodes_and_decodes_under_the_byte_cap() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let digest = |seed: usize| Digest::new(sha256(&seed.to_le_bytes())).unwrap();
+        let entries: Vec<PackEntry> = (0..MAX_CATALOG_ROWS)
+            .map(|index| {
+                let start = index as u64 * 2 + 1;
+                PackEntry::new(start, start + 1, digest(index)).unwrap()
+            })
+            .collect();
+        let checkpoints: Vec<ScopeEventRef> = (0..MAX_CATALOG_ROWS)
+            .map(|index| ScopeEventRef::new(index as u64 + 1, digest(index)).unwrap())
+            .collect();
+        let (bytes, catalog_digest) = encode_catalog(scope, &entries, &checkpoints).unwrap();
+        assert!(bytes.len() <= MAX_CATALOG_BYTES);
+        let decoded = decode_catalog(&bytes, &catalog_digest, scope).unwrap();
+        assert_eq!(decoded.entries().len(), MAX_CATALOG_ROWS);
+        assert_eq!(decoded.checkpoints().len(), MAX_CATALOG_ROWS);
+
+        let mut over = entries.clone();
+        let start = MAX_CATALOG_ROWS as u64 * 2 + 1;
+        over.push(PackEntry::new(start, start + 1, digest(MAX_CATALOG_ROWS)).unwrap());
+        assert_eq!(
+            encode_catalog(scope, &over, &checkpoints),
+            Err(WireError::InvalidValue)
+        );
     }
 
     #[test]
@@ -1388,6 +1424,81 @@ mod tests {
         assert!(packed_events(&store, scope, 2, 4).await.is_none());
     }
 
+    #[tokio::test]
+    async fn packed_reads_truncate_above_last_and_refuse_over_budget_fetches() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let events = chain(&genesis, 4);
+        let pack = pack_of(&genesis, &events, 0, 3);
+        let entries = vec![PackEntry::new(1, 4, pack.digest().clone()).unwrap()];
+        let (catalog_bytes, catalog_digest) = encode_catalog(scope, &entries, &[]).unwrap();
+        let pointer = encode_pointer(scope, &catalog_digest).unwrap();
+        // Events above `last` inside the covering pack are skipped, not returned.
+        let (store, _) = replay_store(vec![
+            response(200, &[("etag", "\"pointer\"")], pointer),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+        ]);
+        let stored = packed_events(&store, scope, 2, 3).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].decoded.event_ref(), &events[1].0);
+        assert_eq!(stored[1].decoded.event_ref(), &events[2].0);
+
+        // Nine full-width rows answered with pack-object-sized bodies cross the 64 MiB
+        // budget inside the second concurrency window: the read is a miss, not an
+        // error, and the third window is never requested.
+        let digest = |seed: usize| Digest::new(sha256(&seed.to_le_bytes())).unwrap();
+        let wide: Vec<PackEntry> = (0..9_u64)
+            .map(|index| {
+                let start = index * MAX_PACK_EVENTS as u64 + 1;
+                PackEntry::new(
+                    start,
+                    start + MAX_PACK_EVENTS as u64 - 1,
+                    digest(index as usize),
+                )
+                .unwrap()
+            })
+            .collect();
+        let (catalog_bytes, catalog_digest) = encode_catalog(scope, &wide, &[]).unwrap();
+        let pointer = encode_pointer(scope, &catalog_digest).unwrap();
+        let mut responses = vec![
+            response(200, &[("etag", "\"pointer\"")], pointer),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+        ];
+        responses.extend((0..8).map(|_| {
+            response(
+                200,
+                &[("etag", "\"pack\"")],
+                vec![0_u8; MAX_PACK_OBJECT_BYTES],
+            )
+        }));
+        let (store, client) = replay_store(responses);
+        assert!(
+            packed_events(&store, scope, 1, 9 * MAX_PACK_EVENTS as u64)
+                .await
+                .is_none()
+        );
+        assert_eq!(client.actual_requests().count(), 10);
+
+        // An interval wider than one replay is refused before any request.
+        let (store, client) = replay_store(vec![]);
+        assert!(
+            packed_events_from_catalog(
+                &store,
+                scope,
+                &ReplayCatalog {
+                    entries: Vec::new(),
+                    checkpoints: Vec::new(),
+                },
+                2,
+                2 + crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS,
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
     #[test]
     fn segmentation_flushes_at_the_event_count_and_byte_boundaries() {
         let genesis = genesis();
@@ -1458,6 +1569,15 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), text);
         }
+        // The wrapper's display is identical for different inner variants, so no inner
+        // error text can ever reach a caller through it.
+        assert_eq!(
+            CheckpointPublishError::Append(ScopeAppendError::InvalidInput).to_string(),
+            CheckpointPublishError::Append(ScopeAppendError::Publication(
+                crate::sync::event::ScopeEventPublicationError::UnsupportedPayload
+            ))
+            .to_string()
+        );
     }
 
     #[tokio::test]
@@ -1613,30 +1733,47 @@ mod tests {
 
     #[tokio::test]
     async fn publication_creates_the_pointer_then_merges_and_survives_cas_loss() {
+        use crate::scope::PROJECTION_CHECKPOINT_PAYLOAD_TYPE;
+
         let genesis = genesis();
         let scope = genesis.identity();
         let events = chain(&genesis, 2);
+        // The second retained event must be recorded as a catalog checkpoint
+        // certificate.
         let retained: Vec<RetainedEvent> = events
             .iter()
             .enumerate()
             .map(|(index, (reference, bytes))| RetainedEvent {
                 reference: reference.clone(),
                 parent: (index > 0).then(|| events[index - 1].0.clone()),
-                payload_type: TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+                payload_type: if index == 1 {
+                    PROJECTION_CHECKPOINT_PAYLOAD_TYPE.into()
+                } else {
+                    TEST_SUCCESSOR_PAYLOAD_TYPE.into()
+                },
                 bytes: bytes.clone(),
             })
             .collect();
+        let cert_ref = events[1].0.clone();
         let pack = pack_of(&genesis, &events, 0, 1);
         let entry = PackEntry::new(1, 2, pack.digest().clone()).unwrap();
-        let (catalog_bytes, catalog_digest) = encode_catalog(scope, &[entry], &[]).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            scope,
+            std::slice::from_ref(&entry),
+            std::slice::from_ref(&cert_ref),
+        )
+        .unwrap();
         let pointer_bytes = encode_pointer(scope, &catalog_digest).unwrap();
 
-        // An absent pointer is created with a create-only PUT.
+        // An absent pointer is created with a create-only PUT. Two surplus scripted
+        // failures make any request beyond the expected four visible in the count.
         let (store, client) = replay_store(vec![
             response(200, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
         ]);
         publish_packs_after_replay(&store, scope, &retained).await;
         let requests: Vec<_> = client.actual_requests().collect();
@@ -1654,6 +1791,7 @@ mod tests {
         assert_eq!(requests[0].body().bytes(), Some(pack.bytes()));
         assert!(path(1).ends_with("/replay-index/current"));
         assert!(path(2).ends_with(&format!("/replay-index/{}", catalog_digest.as_str())));
+        assert_eq!(requests[2].headers().get("if-none-match"), Some("*"));
         assert_eq!(requests[2].body().bytes(), Some(catalog_bytes.as_slice()));
         assert!(path(3).ends_with("/replay-index/current"));
         assert_eq!(requests[3].headers().get("if-none-match"), Some("*"));
@@ -1665,14 +1803,24 @@ mod tests {
             response(200, &[], pack.bytes().to_vec()),
             response(200, &[("etag", "\"pointer\"")], pointer_bytes.clone()),
             response(200, &[("etag", "\"catalog\"")], catalog_bytes.clone()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
         ]);
         publish_packs_after_replay(&store, scope, &retained).await;
         assert_eq!(client.actual_requests().count(), 4);
 
-        // A pointer CAS loss is silent: publication simply stops.
+        // A pointer CAS loss is silent: publication simply stops. The merged catalog
+        // must keep the existing disjoint row and carry the certificate reference.
         let disjoint = PackEntry::new(100, 101, pack.digest().clone()).unwrap();
-        let (other_catalog, other_digest) = encode_catalog(scope, &[disjoint], &[]).unwrap();
+        let (other_catalog, other_digest) =
+            encode_catalog(scope, std::slice::from_ref(&disjoint), &[]).unwrap();
         let other_pointer = encode_pointer(scope, &other_digest).unwrap();
+        let (merged_bytes, _) = encode_catalog(
+            scope,
+            &[entry.clone(), disjoint.clone()],
+            std::slice::from_ref(&cert_ref),
+        )
+        .unwrap();
         let (store, client) = replay_store(vec![
             response(412, &[], SdkBody::empty()),
             response(200, &[], pack.bytes().to_vec()),
@@ -1680,10 +1828,14 @@ mod tests {
             response(200, &[("etag", "\"catalog\"")], other_catalog),
             response(200, &[], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
         ]);
         publish_packs_after_replay(&store, scope, &retained).await;
         let requests: Vec<_> = client.actual_requests().collect();
         assert_eq!(requests.len(), 6);
+        assert_eq!(requests[4].headers().get("if-none-match"), Some("*"));
+        assert_eq!(requests[4].body().bytes(), Some(merged_bytes.as_slice()));
         assert_eq!(requests[5].headers().get("if-match"), Some("\"pointer\""));
     }
 }

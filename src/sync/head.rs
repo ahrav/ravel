@@ -164,8 +164,8 @@ impl ScopeHeadTransition {
     /// # Errors
     ///
     /// Returns [`WireError::InvalidValue`] when the batch-internal chain or any candidate
-    /// binding fails, or another [`WireError`] when the candidate head cannot be canonically
-    /// encoded.
+    /// binding fails, plan payload decode errors verbatim, or another [`WireError`] when the
+    /// candidate head cannot be canonically encoded.
     fn new_batch(
         parent: ScopeHeadParent,
         candidate: ScopeHead,
@@ -633,9 +633,10 @@ pub(crate) async fn append_checkpoint(
 /// The batch is atomic at the head: every event object is published create-only before the
 /// single conditional CAS, so a reader that observes the committed head reaches all of the
 /// batch through one contiguous chain, and a failed or losing CAS leaves at worst inert
-/// immutable orphans. The whole batch-internal chain is validated before the first byte is
-/// published, so a doomed batch sends nothing, and the first publication failure stops the
-/// batch before the CAS. The candidate head carries the final event's operation identity, so
+/// immutable orphans. The whole batch-internal chain is proven before any request, so a
+/// chain-invalid batch sends nothing; plan-object proofs — the only pre-publication reads —
+/// run only after that proof; and the first publication failure stops the batch before the
+/// CAS. The candidate head carries the final event's operation identity, so
 /// lost-CAS resolution and reconciliation identify the batch exactly as a single append.
 ///
 /// Events are published sequentially, one create-only PUT at a time. The caller owns
@@ -646,8 +647,8 @@ pub(crate) async fn append_checkpoint(
 ///
 /// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent (genesis stays a one-event
 /// transition through [`append_root`]), an empty batch, any batch-internal chain violation, a
-/// projection-checkpoint member, a plan admission whose named plan object is not readable, or
-/// an invalid transition, and publication errors verbatim.
+/// projection-checkpoint member, a plan admission whose named plan object cannot be read and
+/// digest-checked, or an invalid transition, and publication errors verbatim.
 pub async fn append_batch(
     store: &S3Store,
     parent: ScopeHeadParent,
@@ -666,7 +667,7 @@ pub async fn append_batch(
         let key = scope_event_key(scope, encoded.event_ref());
         validate_registered(scope, envelope, encoded, &key)
             .map_err(ScopeAppendError::Publication)?;
-        // A checkpoint certificate presumes its covered snapshot object is already published, and a batch caller holds no snapshot bytes to publish (`append_checkpoint` does), so checkpoint members are refused before any request. commentlint: allow(JUDGE)
+        // A checkpoint certificate presumes its covered snapshot object is already published — the checkpoint pipeline publishes the snapshot before calling `append_checkpoint` — and a batch caller holds no snapshot bytes, so checkpoint members are refused before any request. commentlint: allow(JUDGE)
         if envelope.payload_type() == PROJECTION_CHECKPOINT_PAYLOAD_TYPE {
             return Err(ScopeAppendError::InvalidInput);
         }
@@ -3686,9 +3687,9 @@ mod tests {
         let tail = genesis.event_ref().clone();
 
         // A member past its slot whose own envelope still chains to a self-consistent parent.
-        // The refusal fires on the parent-reference rule: `EventEnvelope::new` makes a true gap
-        // that names its real predecessor unconstructible, so the in-loop sequence check is
-        // defense-in-depth behind it. commentlint: allow(JUDGE)
+        // `EventEnvelope::new` makes a true gap that names its real predecessor
+        // unconstructible, so a constructible gap carries a phantom parent and trips the
+        // sequence rule first, with the parent-reference rule behind it. commentlint: allow(JUDGE)
         let gap = {
             let (env2, enc2) = successor(&scope, &tail, 2, "gap-op-2");
             let phantom = ScopeEventRef::new(3, Digest::new("a".repeat(64)).unwrap()).unwrap();

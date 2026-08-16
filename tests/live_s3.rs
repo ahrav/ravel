@@ -125,6 +125,9 @@ fn genesis_for(campaign: CampaignId) -> RootGenesis {
     .expect("root genesis is deterministic")
 }
 
+/// Grant activations are the one registered payload a live batch can carry with no companion
+/// object: root opens sequence 1 only, plan admissions need a readable plan object, and
+/// checkpoint members are refused.
 fn grant_batch(
     scope: &ScopeIdentity,
     parent_head: &ScopeHead,

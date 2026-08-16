@@ -207,6 +207,16 @@ fn validate_registered(
             Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
         };
     }
+    if envelope.payload_type() == crate::scope::PROJECTION_CHECKPOINT_PAYLOAD_TYPE {
+        let checkpoint =
+            crate::scope::decode_projection_checkpoint_event(encoded.stored_bytes(), key, scope)
+                .map_err(ScopeEventPublicationError::Invalid)?;
+        return if checkpoint.envelope() == envelope {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
+    }
     #[cfg(test)]
     if envelope.payload_type() == crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE {
         let decoded = decode_scope_event::<Value>(encoded.stored_bytes(), key, scope, None)

@@ -486,6 +486,9 @@ pub(crate) enum ScopeProjectionPayload {
     GrantActivated {
         payload: GrantActivatedPayload,
     },
+    /// Records the certificate event and advances the cursor without touching plan,
+    /// grant, work, or budget state: the snapshot it names grants no authority.
+    CheckpointPublished,
     #[cfg(test)]
     TestSuccessor,
 }
@@ -619,6 +622,62 @@ pub(crate) fn scope_matches_head(
                 && operation == head.operation_id()
         }),
     )
+}
+
+/// Copies the live projection to an absent `destination` with `VACUUM INTO`, then
+/// sanitizes and validates the copy as a checkpoint snapshot.
+///
+/// The sanitize step clears state a genesis replay restores from non-log objects — the
+/// claims-restored flag, claim columns, and terminal evidence — while keeping the
+/// event-derived grant columns. Validation reuses the full open-time projection checks
+/// and rejects copies above the 64 MiB snapshot bound. A failed copy is removed.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::Conflict`] when the live projection does not match `head` or
+/// `destination` already exists, and [`ApplyError::DatabaseOperationFailed`] for a
+/// non-UTF-8 destination, SQLite failures, an over-bound copy, or a copy that fails
+/// validation.
+pub(crate) fn snapshot_to(
+    connection: &rusqlite::Connection,
+    head: &ScopeHead,
+    destination: &Path,
+) -> Result<(), ApplyError> {
+    if !scope_matches_head(connection, head)? {
+        return Err(ApplyError::Conflict);
+    }
+    let destination_str = destination
+        .to_str()
+        .ok_or(ApplyError::DatabaseOperationFailed)?;
+    if destination
+        .try_exists()
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    {
+        return Err(ApplyError::Conflict);
+    }
+    connection.execute("VACUUM INTO ?1", [destination_str])?;
+    let sanitized = sanitize_and_validate_snapshot(destination);
+    if sanitized.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    sanitized
+}
+
+fn sanitize_and_validate_snapshot(destination: &Path) -> Result<(), ApplyError> {
+    {
+        let copy = rusqlite::Connection::open(destination)?;
+        set_rollback_journal(&copy)?;
+        copy.execute_batch(
+            "BEGIN;\n             UPDATE scopes SET claims_restored = 0;\n             UPDATE admitted_work\n             SET claim_fence = NULL,\n                 claim_lease_until = NULL,\n                 terminal_result_digest = NULL;\n             COMMIT;",
+        )?;
+    }
+    let metadata =
+        std::fs::metadata(destination).map_err(|_| ApplyError::DatabaseOperationFailed)?;
+    if metadata.len() > crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64 {
+        return Err(ApplyError::DatabaseOperationFailed);
+    }
+    drop(open_existing(destination).map_err(|_| ApplyError::DatabaseOperationFailed)?);
+    Ok(())
 }
 
 /// Re-admitting a revision is idempotent only when its canonical dependency set — the sorted,

@@ -18,9 +18,11 @@ use crate::{
     domain::proposal::AdmissibleProposal,
     scope::{
         EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent, GrantActivatedPayload,
-        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PlanAdmittedEvent, ScopeAuthority, ScopeHead,
-        ScopeIdentity, decode_head, decode_plan_admitted_event, encode_grant_activated_event,
-        encode_head, encode_plan_admitted_event, plan_key, scope_event_key, scope_head_key,
+        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PROJECTION_CHECKPOINT_PAYLOAD_TYPE,
+        PlanAdmittedEvent, ProjectionCheckpointEvent, ProjectionCheckpointPayload, ScopeAuthority,
+        ScopeHead, ScopeIdentity, decode_head, decode_plan_admitted_event,
+        encode_grant_activated_event, encode_head, encode_plan_admitted_event,
+        encode_projection_checkpoint_event, plan_key, scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
 };
@@ -431,6 +433,74 @@ pub(crate) async fn append_grant_activated(
         envelope,
         reference,
     })
+}
+
+/// Publishes the checkpoint-certificate event and commits the head that appends it.
+///
+/// The snapshot object must already be published: a certificate that names an unreadable
+/// address must never win the head race. The candidate head keeps the parent's authority,
+/// epoch, and active plan, moving only the tail and operation identity.
+///
+/// # Errors
+///
+/// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent, a payload whose
+/// covered cursor or active plan disagrees with the fenced parent, an unrepresentable
+/// sequence, or an invalid binding, and publication errors verbatim.
+pub(crate) async fn append_checkpoint(
+    store: &S3Store,
+    parent: ScopeHeadParent,
+    scope: &ScopeIdentity,
+    payload: &ProjectionCheckpointPayload,
+    operation_id: &str,
+    event_history: &mut AttemptHistory,
+    head_history: &mut AttemptHistory,
+) -> Result<ScopeHeadCommitOutcome, ScopeAppendError> {
+    let ScopeHeadParent::Existing(observed) = &parent else {
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    if payload.covered_sequence() != observed.head().tail().sequence()
+        || payload.covered_tail_digest() != observed.head().tail().digest()
+        || payload.covered_active_plan_digest() != observed.head().active_plan_digest()
+    {
+        return Err(ScopeAppendError::InvalidInput);
+    }
+    let sequence = next_sequence(observed)?;
+    let event = ProjectionCheckpointEvent::new(
+        EventEnvelope::new(
+            scope.scope_id().clone(),
+            sequence,
+            Some(observed.head().tail().clone()),
+            observed.head().scope_epoch().get(),
+            operation_id.to_owned(),
+            PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+        )
+        .map_err(|_| ScopeAppendError::InvalidInput)?,
+        payload.clone(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let (authority, scope_epoch) = (
+        observed.head().authority().clone(),
+        observed.head().scope_epoch().get(),
+    );
+    let active_plan = observed.head().active_plan_digest().cloned();
+    let encoded = encode_projection_checkpoint_event(&event)
+        .map_err(ScopeEventPublicationError::Invalid)
+        .map_err(ScopeAppendError::Publication)?;
+    let publication = publish_encoded(store, scope, event.envelope(), encoded, event_history)
+        .await
+        .map_err(ScopeAppendError::Publication)?;
+    let candidate = ScopeHead::new(
+        scope.clone(),
+        authority,
+        scope_epoch,
+        publication.event_ref().clone(),
+        active_plan,
+        operation_id.to_owned(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let transition = ScopeHeadTransition::new(parent, candidate, publication)
+        .map_err(|_| ScopeAppendError::InvalidInput)?;
+    Ok(commit(store, transition, head_history).await)
 }
 
 /// The append path validates the next sequence before publishing event bytes, so a scope cannot

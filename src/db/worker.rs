@@ -115,6 +115,11 @@ enum Command {
     Drain {
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
+    Snapshot {
+        head: Box<ScopeHead>,
+        destination: PathBuf,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
     RecordClaim {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
@@ -562,6 +567,30 @@ impl DbHandle {
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
+    /// Copies the live projection to an absent `destination` as a sanitized, validated
+    /// checkpoint snapshot, after verifying it matches `head`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Conflict`] when the projection does not match `head` or the
+    /// destination exists, [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`] for copy, sanitize, bound, or validation
+    /// failures.
+    pub(crate) async fn snapshot_to(
+        &self,
+        head: &ScopeHead,
+        destination: PathBuf,
+    ) -> Result<(), ApplyError> {
+        let head = Box::new(head.clone());
+        self.enqueue(|respond| Command::Snapshot {
+            head,
+            destination,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
     /// # Errors
     ///
     /// Returns [`ApplyError::Conflict`] for an unknown, terminal, or fence-regressing
@@ -775,6 +804,13 @@ fn run(
             }
             Command::Drain { respond } => {
                 let _ = respond.send(Ok(()));
+            }
+            Command::Snapshot {
+                head,
+                destination,
+                respond,
+            } => {
+                let _ = respond.send(projections::snapshot_to(&connection, &head, &destination));
             }
             Command::RecordClaim {
                 scope,
@@ -1242,6 +1278,69 @@ mod tests {
         drop(handle);
         drop(other);
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_a_matching_head_and_sanitizes_the_copy() {
+        let live_path = path("snapshot-live");
+        let _ = fs::remove_file(&live_path);
+        let destination = path("snapshot-copy");
+        let _ = fs::remove_file(&destination);
+        let genesis = genesis();
+        let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
+        handle.apply(test_mutation()).await.unwrap();
+        // Populate restore-derived columns the sanitize step must clear.
+        handle.drain().await.unwrap();
+        {
+            let side = rusqlite::Connection::open(&live_path).unwrap();
+            side.execute("UPDATE scopes SET claims_restored = 1", [])
+                .unwrap();
+        }
+
+        // A head the projection does not match refuses before any copy.
+        let mismatched = crate::scope::ScopeHead::new(
+            genesis.identity().clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            crate::scope::ScopeEventRef::new(2, crate::scope::Digest::new("f".repeat(64)).unwrap())
+                .unwrap(),
+            None,
+            "elsewhere".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            handle.snapshot_to(&mismatched, destination.clone()).await,
+            Err(ApplyError::Conflict)
+        );
+        assert!(!destination.exists());
+
+        handle
+            .snapshot_to(genesis.head(), destination.clone())
+            .await
+            .unwrap();
+        let copy = rusqlite::Connection::open(&destination).unwrap();
+        let (claims_restored, sequence): (i64, i64) = copy
+            .query_row("SELECT claims_restored, sequence FROM scopes", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(claims_restored, 0);
+        assert_eq!(sequence, 1);
+        drop(copy);
+        // The copy passes the full open-time validation on its own.
+        drop(projections::open_existing(&destination).unwrap());
+
+        // The destination must be absent.
+        assert_eq!(
+            handle
+                .snapshot_to(genesis.head(), destination.clone())
+                .await,
+            Err(ApplyError::Conflict)
+        );
+
+        drop(handle);
+        fs::remove_file(live_path).unwrap();
+        fs::remove_file(destination).unwrap();
     }
 
     #[tokio::test]

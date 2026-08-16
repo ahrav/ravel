@@ -540,6 +540,14 @@ fn typed_payload(
                 },
             ))
         }
+        crate::scope::PROJECTION_CHECKPOINT_PAYLOAD_TYPE => {
+            let event = crate::scope::projection_checkpoint_from_decoded(prepared.decoded)
+                .map_err(ScopeReplayError::EventInvalid)?;
+            Ok((
+                event.envelope().clone(),
+                ScopeProjectionPayload::CheckpointPublished,
+            ))
+        }
         #[cfg(test)]
         crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE => Ok((
             prepared.decoded.envelope().clone(),

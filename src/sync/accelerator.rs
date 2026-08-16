@@ -8,26 +8,31 @@
 //! Immutable packs and catalogs publish create-only; only `replay-index/current` is
 //! CAS-replaced, and a CAS loser stops publishing without affecting replay.
 
-use std::{io::Cursor, num::NonZeroUsize};
+use std::{error::Error, fmt, io::Cursor, num::NonZeroUsize, path::Path};
 
 use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
+    db::{projections::ApplyError, worker::DbHandle},
     distributed::claims::bounded_map,
     scope::{
-        DecodedScopeEvent, Digest, MAX_COMPRESSED_BYTES, ScopeEventRef, ScopeIdentity,
-        decode_scope_event, scope_event_key,
+        DecodedScopeEvent, Digest, MAX_COMPRESSED_BYTES, ProjectionCheckpointPayload,
+        ScopeEventRef, ScopeIdentity, decode_scope_event, scope_event_key,
     },
     storage::s3::{AttemptHistory, ETag, GetOutcome, MutationOutcome, S3Store},
     sync::WireError,
 };
 
+use super::head::{self, ScopeAppendError, ScopeHeadCommitOutcome, ScopeHeadParent};
+
 /// Most events one pack may embed.
 pub const MAX_PACK_EVENTS: usize = 256;
 /// Largest concatenated event-byte section one pack may embed.
 pub const MAX_PACK_EVENT_BYTES: usize = 8 * 1024 * 1024;
+/// Largest checkpoint snapshot one certificate may name.
+pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 /// Read cap for one pack object: the event section plus bounded framing.
 const MAX_PACK_OBJECT_BYTES: usize = MAX_PACK_EVENT_BYTES + 64 * 1024;
 const MAX_POINTER_BYTES: usize = 4 * 1024;
@@ -888,6 +893,102 @@ pub(crate) async fn publish_packs_after_replay(
     };
 }
 
+/// Data-free failure category for explicit checkpoint publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointPublishError {
+    /// The parent is genesis or otherwise unusable as a fenced boundary.
+    InvalidInput,
+    /// The live projection does not match the supplied covered head.
+    ProjectionMismatch,
+    /// The snapshot copy, sanitize, bound, or validation step failed.
+    SnapshotFailed,
+    /// The immutable snapshot object could not be published.
+    SnapshotStorage,
+    /// The certificate event or head append failed.
+    Append(ScopeAppendError),
+}
+
+impl fmt::Display for CheckpointPublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "checkpoint input is invalid",
+            Self::ProjectionMismatch => "projection does not match the covered head",
+            Self::SnapshotFailed => "checkpoint snapshot failed",
+            Self::SnapshotStorage => "checkpoint snapshot publication failed",
+            Self::Append(_) => "checkpoint certificate append failed",
+        })
+    }
+}
+
+impl Error for CheckpointPublishError {}
+
+/// Explicitly publishes one certified checkpoint from a caller holding a fresh fenced
+/// parent.
+///
+/// The projection is copied through the worker with `VACUUM INTO` at `staging` (an
+/// absent path the caller owns), sanitized, validated, hashed, and published immutably;
+/// the certificate event then appends through the ordinary event and head-CAS path,
+/// preserving the parent head's active plan. If the head CAS loses, the snapshot and
+/// event may remain immutable orphans; they grant no authority.
+///
+/// # Errors
+///
+/// Returns a [`CheckpointPublishError`] category; no step mutates any existing object,
+/// so every failure leaves replay exactly as it was.
+pub async fn publish_checkpoint(
+    store: &S3Store,
+    handle: &DbHandle,
+    parent: ScopeHeadParent,
+    staging: &Path,
+    operation_id: &str,
+    histories: [&mut AttemptHistory; 3],
+) -> Result<ScopeHeadCommitOutcome, CheckpointPublishError> {
+    let [snapshot_history, event_history, head_history] = histories;
+    let ScopeHeadParent::Existing(observed) = &parent else {
+        return Err(CheckpointPublishError::InvalidInput);
+    };
+    let scope = observed.head().scope().clone();
+    let covered = observed.head().tail().clone();
+    let covered_plan = observed.head().active_plan_digest().cloned();
+    handle
+        .snapshot_to(observed.head(), staging.to_path_buf())
+        .await
+        .map_err(|error| match error {
+            ApplyError::Conflict => CheckpointPublishError::ProjectionMismatch,
+            _ => CheckpointPublishError::SnapshotFailed,
+        })?;
+    let bytes = std::fs::read(staging).map_err(|_| CheckpointPublishError::SnapshotFailed)?;
+    let length = bytes.len();
+    if length == 0 || length > MAX_SNAPSHOT_BYTES {
+        return Err(CheckpointPublishError::SnapshotFailed);
+    }
+    let digest = Digest::new(sha256(&bytes)).map_err(|_| CheckpointPublishError::SnapshotFailed)?;
+    let key = scope_checkpoint_key(&scope, covered.sequence(), &digest);
+    store
+        .publish_with_history(&key, bytes, digest.as_str(), snapshot_history)
+        .await
+        .map_err(|_| CheckpointPublishError::SnapshotStorage)?;
+    let payload = ProjectionCheckpointPayload::new(
+        digest,
+        length as u64,
+        covered.sequence(),
+        covered.digest().clone(),
+        covered_plan,
+    )
+    .map_err(|_| CheckpointPublishError::InvalidInput)?;
+    head::append_checkpoint(
+        store,
+        parent,
+        &scope,
+        &payload,
+        operation_id,
+        event_history,
+        head_history,
+    )
+    .await
+    .map_err(CheckpointPublishError::Append)
+}
+
 /// Segments retained events into pack builds honoring the flush limits.
 fn segment_packs(scope: &ScopeIdentity, events: &[RetainedEvent]) -> Option<Vec<EncodedPack>> {
     let mut packs = Vec::new();
@@ -1286,6 +1387,157 @@ mod tests {
         assert_eq!(packs.len(), 2);
         assert_eq!((packs[0].start(), packs[0].end()), (1, 2));
         assert_eq!((packs[1].start(), packs[1].end()), (3, 3));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_publication_snapshots_then_appends_through_the_head_cas() {
+        use crate::sync::head::read;
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let db_path = std::env::temp_dir().join(format!(
+            "ravel-accel-checkpoint-{}-live.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let staging = std::env::temp_dir().join(format!(
+            "ravel-accel-checkpoint-{}-staging.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&staging);
+        let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
+        let root = crate::scope::decode_root_event(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
+        )
+        .unwrap();
+        let mutation = crate::db::projections::ScopeProjectionEvent::new(
+            scope.clone(),
+            root.envelope().clone(),
+            genesis.event_ref().clone(),
+            crate::db::projections::ScopeProjectionPayload::RootGenesis {
+                objective_digest: root.payload().config_digest().clone(),
+            },
+            1,
+        )
+        .unwrap();
+        handle
+            .apply_suffix(vec![mutation], genesis.head())
+            .await
+            .unwrap();
+
+        // A genesis parent is refused before any snapshot work.
+        let mut histories = [
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+        ];
+        let [a, b, c] = &mut histories;
+        let (store, client) = replay_store(vec![]);
+        assert_eq!(
+            publish_checkpoint(
+                &store,
+                &handle,
+                ScopeHeadParent::Genesis,
+                &staging,
+                "checkpoint-op-1",
+                [a, b, c],
+            )
+            .await
+            .err(),
+            Some(CheckpointPublishError::InvalidInput)
+        );
+        assert_eq!(client.actual_requests().count(), 0);
+
+        let mut histories = [
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+        ];
+        let [a, b, c] = &mut histories;
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                genesis.head_bytes().to_vec(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"committed\"")], SdkBody::empty()),
+        ]);
+        let observed = read(&store, &scope).await.unwrap().unwrap();
+        let outcome = publish_checkpoint(
+            &store,
+            &handle,
+            ScopeHeadParent::existing(Box::new(observed)),
+            &staging,
+            "checkpoint-op-1",
+            [a, b, c],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ScopeHeadCommitOutcome::Committed(_)));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 4);
+        let path_of = |index: usize| {
+            requests[index]
+                .uri()
+                .parse::<http::Uri>()
+                .unwrap()
+                .path()
+                .to_owned()
+        };
+        let snapshot_bytes = std::fs::read(&staging).unwrap();
+        let snapshot_digest = sha256(&snapshot_bytes);
+        assert_eq!(
+            path_of(1),
+            format!(
+                "/{}",
+                scope_checkpoint_key(&scope, 1, &Digest::new(snapshot_digest.clone()).unwrap())
+            )
+        );
+        assert_eq!(requests[1].headers().get("if-none-match"), Some("*"));
+        assert_eq!(requests[1].body().bytes(), Some(snapshot_bytes.as_slice()));
+        assert!(path_of(2).contains("/events/0000000000000002-"));
+        assert_eq!(requests[2].headers().get("if-none-match"), Some("*"));
+        assert!(path_of(3).ends_with("/head"));
+        assert_eq!(requests[3].headers().get("if-match"), Some("\"parent\""));
+
+        // The published certificate replays as a registered event: cursor advances,
+        // nothing else changes.
+        let event_bytes = requests[2].body().bytes().unwrap().to_vec();
+        let reference = ScopeEventRef::new(2, Digest::new(sha256(&event_bytes)).unwrap()).unwrap();
+        let certificate = crate::scope::decode_projection_checkpoint_event(
+            &event_bytes,
+            &scope_event_key(&scope, &reference),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(certificate.payload().covered_sequence(), 1);
+        assert_eq!(
+            certificate.payload().snapshot_length(),
+            snapshot_bytes.len() as u64
+        );
+        let head_bytes = requests[3].body().bytes().unwrap().to_vec();
+        let (fold_store, _) = replay_store(vec![
+            response(200, &[("etag", "\"head\"")], head_bytes),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"event\"")], event_bytes),
+        ]);
+        assert!(matches!(
+            crate::sync::replay::refresh(&fold_store, &handle, &scope).await,
+            crate::sync::replay::ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(
+            handle.scope_cursor(&scope).await.unwrap(),
+            (2, Some(reference.digest().clone()))
+        );
+
+        drop(handle);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(staging);
     }
 
     #[tokio::test]

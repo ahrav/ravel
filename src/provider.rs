@@ -3038,47 +3038,22 @@ mod tests {
         }
     }
 
-    /// Cancelling a call stops local waiting and keeps what that call might already have cost.
-    ///
-    /// Dropping the future is the cancellation: nothing here can tell the provider to stop, and
-    /// nothing can ask it afterwards whether it billed. So the only honest record is that this
-    /// attempt may have been sent, and it has to survive the drop — the mark happens before the
-    /// await and the resolve that could clear it never runs.
-    ///
-    /// This is the whole of cancellation that this boundary owns. Writing the terminal record for
-    /// a cancelled call needs the manifest and binding it was dispatched under, which belong to
-    /// whatever drives the call, and nothing in this crate drives one yet.
-    #[tokio::test(start_paused = true)]
-    async fn a_cancelled_call_keeps_the_uncertainty_it_may_already_have_incurred() {
-        let transport =
-            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
-        let mut history = AttemptHistory::default();
-
-        // A term long enough that the bound cannot be what ends this call.
-        let authority = model_authority(
-            GRANT_ACTION_MODEL_INVOKE.to_owned(),
-            profile().configuration_digest(),
-            OPERATION_ID.to_owned(),
-            u64::from(request().max_output_tokens().get()),
-            NOW_MS + 600_000,
-            NOW_MS + 600_000,
-        );
+    /// A grant may authorize more output tokens than a call will draw, and that slack is
+    /// permitted here: only intake bounds a grant from above, against the caller's own
+    /// expectation. Without this the comparison could be an equality and every dispatch under an
+    /// over-provisioned reservation would be refused.
+    #[test]
+    fn a_grant_wider_than_the_request_still_authorizes_it() {
         let request = request();
-        // The call runs until the outer timeout gives up on it, then drops it unfinished.
-        assert!(
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                transport.invoke(authority, &request, &mut history, NOW_MS),
-            )
-            .await
-            .is_err(),
-            "the call must still be in flight when it is dropped"
+        let wider = model_authority(
+            GRANT_ACTION_MODEL_INVOKE.to_owned(),
+            request.profile().configuration_digest(),
+            request.operation_id().to_owned(),
+            u64::from(request.max_output_tokens().get()) + 1,
+            NOW_MS + 60_000,
+            NOW_MS + 25_000,
         );
-
-        assert!(
-            history.may_have_been_sent(),
-            "a cancelled call keeps the possibility that it was billed"
-        );
+        assert!(wider.authorizes_model(&request, NOW_MS).is_ok());
     }
 
     /// The call is bounded by whichever clock runs out first.

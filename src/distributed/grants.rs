@@ -252,10 +252,13 @@ impl EffectAuthority {
             return Err(GrantRejection::IdentityMismatch);
         }
         // One unit is one authorized output token: `limit_units` is what the reservation drew at
-        // activation, and `max_output_tokens` is what this call may draw against it. Refusing
-        // here is what keeps a scope's `reserved_budget_units` a bound rather than a hope, since
-        // that budget is checked against authorized units at issuance and nothing debits what a
-        // call actually reports.
+        // activation, and `max_output_tokens` is what this call may draw against it. One-sided on
+        // purpose — a grant authorizing more than this call needs is fine, and bounding a grant
+        // from above is intake's job against the caller's own expectation.
+        //
+        // This bounds one call against its own reservation. It does not make the scope's
+        // `reserved_budget_units` a spend bound: that budget is checked against authorized units
+        // at issuance, and nothing anywhere debits what a call actually reported.
         if u64::from(request.max_output_tokens().get()) > self.grant.limit_units.get() {
             return Err(GrantRejection::NarrowerThanRequest);
         }
@@ -281,12 +284,14 @@ pub(crate) mod test_support {
     use super::{Digest, EffectAuthority, EffectGrant, ScopeClaimIdentity, ScopeIdentity, WorkRef};
     use crate::{distributed::identity::WorkspaceId, domain::work::WorkId, scope::CampaignId};
 
-    /// An authority for `action` over `resource_scope`, under `operation_id`.
+    /// An authority for `action` over `resource_scope`, under `operation_id`, authorizing
+    /// `limit_units` output tokens.
     ///
-    /// `resource_scope` is a profile's configuration digest and `operation_id` is the request's,
-    /// because those are what the effect boundary compares against. `action` is a parameter so a
-    /// refusal case can name an action the boundary does not accept without rebuilding a grant
-    /// field by field.
+    /// Every value the effect boundary compares against is a parameter, so a refusal case can
+    /// vary exactly one of them: the resource scope is a profile's configuration digest, the
+    /// operation id is the request's, and `limit_units` is the output-token budget a request's
+    /// cap is checked against. `action` is a parameter too, so a case can name an action the
+    /// boundary does not accept without rebuilding a grant field by field.
     pub(crate) fn model_authority(
         action: String,
         resource_scope: String,

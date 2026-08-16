@@ -272,6 +272,17 @@ pub async fn open_projection(
             }
         }
     }
+    // Cleanup deletes the destination, so it cannot race installation: a contender that
+    // observed a rebuildable path could otherwise delete a projection another contender had
+    // already installed and opened, leaving that worker writing an unlinked inode while
+    // everyone else uses a new file at the same pathname. The gate covers the whole
+    // delete-install-open region.
+    let _install = INSTALL_GATE.lock().await;
+    // A contender may have finished while this one waited. Its projection is complete and at
+    // the pinned head before its pathname exists, so adopting it beats deleting it.
+    if let Ok(handle) = DbHandle::open_existing(path.to_path_buf()).await {
+        return Ok(handle);
+    }
     // Every path that reaches the checkpoint rung removes the destination and its sidecars
     // first. A stale `-journal`, `-wal`, or `-shm` left by a crash outlives a missing main
     // file, and SQLite would recover the freshly installed snapshot through it.
@@ -279,9 +290,8 @@ pub async fn open_projection(
     if let Some(handle) = install_checkpoint(store, scope, path).await {
         return Ok(handle);
     }
-    // A concurrent install may have committed the destination while this rung ran; its
-    // snapshot is complete and validated before the commit link appears, so adopting it is
-    // preferable to creating an empty projection over it.
+    // Another process may hold the pathname; the create-only link refuses to replace it, so
+    // the losing install is a rung miss rather than a takeover.
     if let Ok(handle) = DbHandle::open_existing(path.to_path_buf()).await {
         return Ok(handle);
     }
@@ -289,6 +299,15 @@ pub async fn open_projection(
         .await
         .map_err(|_| ScopeReplayError::DatabaseUnavailable)
 }
+
+/// Serializes destination cleanup, checkpoint installation, and the first open.
+///
+/// One process-wide gate rather than one per path: installation runs only on a cold open, so
+/// serializing two scopes that happen to open at once costs nothing measurable and needs no
+/// registry of live paths. Two *processes* opening one projection pathname stay outside this
+/// gate — a projection has one owning worker, and the create-only commit link is what keeps a
+/// second process from replacing a file this one already opened.
+static INSTALL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Installs the newest provable certified checkpoint at `destination`.
 ///
@@ -419,32 +438,37 @@ async fn install_candidate(
         STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let staging = std::path::PathBuf::from(staging);
-    let installed = {
+    let staged = {
         let scope = scope.clone();
-        let destination = destination.to_path_buf();
+        let staging = staging.clone();
         crate::db::worker::run_blocking(move || {
             if rebuild_files(&staging).is_err() {
                 return false;
             }
-            let installed = std::fs::write(&staging, &bytes).is_ok()
+            std::fs::write(&staging, &bytes).is_ok()
                 && staged_snapshot_valid(&staging, &scope, &certificate)
-                // The commit is a create-only link, not a rename: a rename would replace a
-                // destination another install already committed and opened, leaving that
-                // worker writing an unlinked inode while everyone else reads the
-                // replacement. Losing this link means someone else committed first.
-                && std::fs::hard_link(&staging, &destination).is_ok();
-            let _ = rebuild_files(&staging);
-            installed
         })
         .await
         .unwrap_or(false)
     };
-    if !installed {
+    if !staged {
+        discard(&staging).await;
         return None;
     }
-    let handle = DbHandle::open_existing(destination.to_path_buf())
-        .await
-        .ok()?;
+
+    // The suffix applies to the staging file, before the destination pathname exists. The
+    // snapshot was proven against the pinned head, so a failure here means the snapshot's own
+    // rows cannot carry it — a row the suffix depends on is missing or disagrees. Publishing
+    // first and repairing after would expose that state: a concurrent open could take the
+    // pathname and keep the rejected inode alive after this candidate unlinked it, replaying
+    // the same failing suffix forever. Nothing is published until it is at the pinned head.
+    let staged_handle = match DbHandle::open_existing(staging.clone()).await {
+        Ok(handle) => handle,
+        Err(_) => {
+            discard(&staging).await;
+            return None;
+        }
+    };
     let prepared = PreparedSuffix {
         observed: ObservedScopeHead::proven(
             observed.head().clone(),
@@ -455,18 +479,39 @@ async fn install_candidate(
         events,
         from_packs: true,
     };
-    // The suffix was proven against the pinned head, so a failure here means the snapshot's
-    // own rows cannot carry it — a row the suffix depends on is missing or disagrees. Keeping
-    // the install would wedge the node: the projection is structurally valid, so later opens
-    // never revisit the checkpoint rung, and every refresh replays the same suffix against
-    // the same rows and fails again. Discarding it lets the next candidate, or a genesis
-    // rebuild, run. A transient failure costs one repeated install.
-    if apply_suffix(&handle, scope, prepared).await.is_err() {
-        drop(handle);
-        rebuild_files(destination).ok()?;
+    let applied = apply_suffix(&staged_handle, scope, prepared).await.is_ok();
+    drop(staged_handle);
+    if !applied {
+        discard(&staging).await;
         return None;
     }
-    Some(handle)
+
+    let published = {
+        let staging = staging.clone();
+        let destination = destination.to_path_buf();
+        crate::db::worker::run_blocking(move || {
+            // The commit is a create-only link, not a rename: a rename would replace a
+            // destination another install already committed and opened, leaving that worker
+            // writing an unlinked inode while everyone else reads the replacement. Losing this
+            // link means someone else committed first.
+            std::fs::hard_link(&staging, &destination).is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    };
+    discard(&staging).await;
+    if !published {
+        return None;
+    }
+    DbHandle::open_existing(destination.to_path_buf())
+        .await
+        .ok()
+}
+
+/// Removes a staging database and its sidecars off the async runtime.
+async fn discard(staging: &Path) {
+    let staging = staging.to_path_buf();
+    let _ = crate::db::worker::run_blocking(move || rebuild_files(&staging)).await;
 }
 
 /// Validates the staged snapshot file: full open-time projection validation plus the

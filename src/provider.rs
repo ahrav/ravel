@@ -796,12 +796,13 @@ impl BedrockTransport {
         //
         // `Converse` is not a streaming operation, so its deserializer reads the whole body
         // inside the orchestrator's timeout scope: this bound covers serialization, transmit,
-        // body read, and deserialization rather than only time to headers. A call therefore
-        // cannot outlive the authority that permitted it.
+        // body read, and deserialization rather than only time to headers.
         //
-        // The override only ever tightens. It is not capped at `OPERATION_TIMEOUT` because that
-        // would change nothing: retries are disabled, so exactly one attempt runs under
-        // `ATTEMPT_TIMEOUT`, which is the lower of the two and survives this override.
+        // The term is not capped at `OPERATION_TIMEOUT`, so a long term does raise this
+        // operation's own timeout above the fixed policy. Capping it would change no outcome:
+        // retries are disabled, so exactly one attempt runs, and the client's `ATTEMPT_TIMEOUT`
+        // is the lower of the two and survives an override that sets only the operation
+        // timeout.
         let bounded = call
             .customize()
             .config_override(
@@ -837,9 +838,10 @@ fn configured(region: Region, builder: Builder) -> aws_sdk_bedrockruntime::Confi
         .operation_timeout(OPERATION_TIMEOUT)
         .operation_attempt_timeout(ATTEMPT_TIMEOUT)
         .build();
-    // Operation and attempt timeouts stop applying once response headers arrive, so a
-    // trickling body is bounded by stalled-stream protection instead. Setting every policy
-    // after the caller's builder keeps a supplied configuration from disabling it.
+    // A streaming response body is read after these timeouts stop applying, so stalled-stream
+    // protection is what bounds a trickling one. This client's only operation is not streaming,
+    // so its body read falls inside the timeouts. Setting every policy after the caller's
+    // builder keeps a supplied configuration from disabling it.
     builder
         .region(region)
         .retry_config(RetryConfig::disabled())
@@ -1554,15 +1556,7 @@ mod tests {
         // A frame the deserializer rejects yields no usage, but the call stays correlatable:
         // the request id comes off the raw response, not the decoded body.
         let (undecodable, _) = replay(vec![json(String::from("not json"))]);
-        let outcome = undecodable
-            .invoke(
-                authority(),
-                &request(),
-                &mut AttemptHistory::default(),
-                NOW_MS,
-            )
-            .await
-            .expect("the fixture authority permits the fixture request");
+        let outcome = invoke(&undecodable).await;
         let InvocationOutcome::MalformedResponse {
             reported_use,
             provider_request_id,
@@ -1751,15 +1745,7 @@ mod tests {
                  \"totalTokens\":900000}}}}"
             ))]);
 
-            let outcome = transport
-                .invoke(
-                    authority(),
-                    &request(),
-                    &mut AttemptHistory::default(),
-                    NOW_MS,
-                )
-                .await
-                .expect("the fixture authority permits the fixture request");
+            let outcome = invoke(&transport).await;
             let InvocationOutcome::Refused {
                 reason,
                 reported_use,
@@ -2187,9 +2173,9 @@ mod tests {
             .await
             .expect("the fixture authority permits the fixture request");
         transport
-            .invoke(authority(), &changed, &mut history, NOW_MS)
+            .invoke(authority_for(&changed), &changed, &mut history, NOW_MS)
             .await
-            .expect("the fixture authority permits the fixture request");
+            .expect("the authority names this request's profile and operation");
     }
 
     /// A construction failure proves this attempt sent nothing, never that the operation
@@ -2242,15 +2228,7 @@ mod tests {
             ("max_tokens", TerminalReason::CapReached),
         ] {
             let (transport, _) = replay(vec![json(converse_body(wire, Some((1, 1, 2)), "text"))]);
-            let outcome = transport
-                .invoke(
-                    authority(),
-                    &request(),
-                    &mut AttemptHistory::default(),
-                    NOW_MS,
-                )
-                .await
-                .expect("the fixture authority permits the fixture request");
+            let outcome = invoke(&transport).await;
             let InvocationOutcome::Completed { reason, .. } = outcome else {
                 panic!("expected a completion for {wire}, got {outcome:?}");
             };
@@ -2270,15 +2248,7 @@ mod tests {
             &"x".repeat(MAX_COMPLETION_BYTES),
         ))]);
         assert!(matches!(
-            at_bound
-                .invoke(
-                    authority(),
-                    &request(),
-                    &mut AttemptHistory::default(),
-                    NOW_MS
-                )
-                .await
-                .expect("the fixture authority permits the fixture request"),
+            invoke(&at_bound).await,
             InvocationOutcome::Completed { .. }
         ));
 
@@ -2289,15 +2259,7 @@ mod tests {
             &oversized,
         ))]);
 
-        let outcome = transport
-            .invoke(
-                authority(),
-                &request(),
-                &mut AttemptHistory::default(),
-                NOW_MS,
-            )
-            .await
-            .expect("the fixture authority permits the fixture request");
+        let outcome = invoke(&transport).await;
         assert!(
             matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
             "{outcome:?}"
@@ -2987,8 +2949,6 @@ mod tests {
     /// claiming dispatch uncertainty it never earned.
     #[tokio::test(start_paused = true)]
     async fn an_authority_that_does_not_permit_the_call_refuses_before_dispatch() {
-        use crate::distributed::grants::GrantRejection;
-
         let transport =
             BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
         let action = GRANT_ACTION_MODEL_INVOKE.to_owned();
@@ -3068,7 +3028,8 @@ mod tests {
     /// claim and be dispatching too; past the grant deadline, the call runs on budget reserved
     /// until that instant and no longer.
     ///
-    /// The third case is the fixed ceiling, which a longer term must not raise.
+    /// The third case is the client's attempt timeout, which a term longer than the fixed
+    /// policy must not raise: the override sets only the operation timeout.
     #[tokio::test(start_paused = true)]
     async fn the_call_is_bounded_by_the_shortest_of_lease_grant_and_fixed_policy() {
         let transport =
@@ -3087,12 +3048,11 @@ mod tests {
                 NOW_MS + 60_000,
                 30,
             ),
-            // A term far past the fixed policy. The override sets only the operation timeout,
-            // so the client's attempt timeout must survive the merge and bound this call: with
-            // retries disabled one attempt runs, and resolving inside 91 s proves `ATTEMPT_TIMEOUT`
-            // still applies where the term alone would have allowed 600 s.
+            // A term far past the fixed policy, which raises this operation's own timeout to
+            // 600 s. Resolving inside 91 s proves the client's `ATTEMPT_TIMEOUT` survived the
+            // override and bounded the single attempt retries are disabled down to.
             (
-                "the fixed policy outlives the override",
+                "the attempt timeout outlives the override",
                 NOW_MS + 900_000,
                 NOW_MS + 600_000,
                 91,

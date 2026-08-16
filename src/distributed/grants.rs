@@ -38,12 +38,10 @@ use crate::{
 pub const MAX_GRANT_BYTES: usize = 4 * 1024;
 
 const GRANT_RECORD: &str = "effect_grant";
-/// Action naming a model invocation, beside the validator that decides it can exist.
+/// The action a grant must name to authorize a model invocation.
 ///
-/// A `&str` rather than a one-variant enum: the comparison is an equality against the grant's
-/// own free-form action, so an enum with no exhaustive `match` anywhere would force nothing
-/// when a second action is added. `validate_key_segment` in [`EffectGrant::new`] is what makes
-/// this value legal, which is why it lives here rather than beside the transport that uses it.
+/// A `&str` rather than an enum because the comparison is an equality against the grant's own
+/// free-form action, which [`EffectGrant::new`] validates as one key segment.
 pub const GRANT_ACTION_MODEL_INVOKE: &str = "model_invoke";
 
 /// Bounded authority for one external operation under one claim generation.
@@ -191,35 +189,25 @@ pub enum GrantRejection {
 /// children can still build one, and the crate boundary contributes nothing because every
 /// caller is in-crate.
 ///
-/// It carries the lease's stop instant as well as the grant, because the lease is the shorter
-/// clock. A grant's deadline has no ceiling at issuance beyond not being already expired, while
-/// the authority that proved current ownership stops within [`STOP_MARGIN_MS`] of its own term.
-/// A call bounded only by the grant could outlive the lease, and a successor that legitimately
-/// took the claim could be dispatching at the same time.
+/// It carries the lease's stop instant as well as the grant, because either can run out first
+/// and nothing at issuance bounds the grant's deadline by the lease: issuance refuses only a
+/// grant already expired, while the authority that proved current ownership stops within
+/// [`STOP_MARGIN_MS`] of its own term. A call bounded only by the grant could outlive the lease,
+/// and a successor that legitimately took the claim could be dispatching at the same time.
 #[must_use]
 pub struct EffectAuthority {
     grant: EffectGrant,
-    grant_digest: Digest,
     /// Instant past which the proving authority must stop, derived from its lease term.
     authority_stop_unix_ms: u64,
 }
 
 impl EffectAuthority {
-    pub fn grant(&self) -> &EffectGrant {
-        &self.grant
-    }
-
-    /// Address of the grant object this authority read back, as the projection recorded it.
-    pub fn grant_digest(&self) -> &Digest {
-        &self.grant_digest
-    }
-
     /// Decides this authority against the request it would authorize, returning how long the
     /// call may run.
     ///
     /// The bound is the shorter of the grant's deadline and the proving lease's stop instant.
-    /// Both are retested here rather than trusted from intake: between intake and dispatch the
-    /// caller does an object-store round trip, a projection query, and a manifest publication.
+    /// Both are retested here rather than trusted from intake, because intake decided at its own
+    /// `now_ms` and either term can elapse before a call is dispatched.
     ///
     /// The request is the argument rather than an action and a scope, because the only source
     /// for those would be the caller handing the authority its own values back.
@@ -227,8 +215,9 @@ impl EffectAuthority {
     /// # Errors
     ///
     /// Returns [`GrantRejection::IdentityMismatch`] when the grant does not name a model
-    /// invocation of this request's profile, [`GrantRejection::Expired`] for a grant past its
-    /// deadline, and [`GrantRejection::StaleAuthority`] when the proving lease has stopped.
+    /// invocation of this request's profile and operation, [`GrantRejection::Expired`] for a
+    /// grant past its deadline, and [`GrantRejection::StaleAuthority`] when the proving lease
+    /// has stopped.
     pub fn authorizes_model(
         &self,
         request: &crate::provider::InvocationRequest,
@@ -236,9 +225,10 @@ impl EffectAuthority {
     ) -> Result<Duration, GrantRejection> {
         // The operation identity is what makes this authority specific to one call. Without it
         // a grant issued for one operation would authorize any request against the same
-        // profile, so a second dispatch under the same grant would be indistinguishable from
-        // the first — the replay AC4 names. `intake` pins the grant's own operation id against
-        // the caller's expectation; this pins it against the request actually being sent.
+        // profile, so the same operation could be paid for twice under one grant with nothing
+        // able to tell the second dispatch from the first. `intake` pins the grant's own
+        // operation id against the caller's expectation; this pins it against the request
+        // actually being sent.
         //
         // `limit_units` is deliberately not compared against the output-token cap. The grant's
         // units have no denomination anywhere in this crate, so treating them as tokens would
@@ -264,25 +254,12 @@ impl EffectAuthority {
 
 /// Mints an [`EffectAuthority`] without an object store or a projection.
 ///
-/// Construction is module-private on purpose, so a test in another module has no way to build
-/// one and no reason to want a second mint path. This is that one path, and it is the only
-/// place outside [`intake`] where the fields are assembled.
+/// The fields are private to this module, so a test elsewhere cannot assemble one. This is the
+/// only mint path outside [`intake`].
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{Digest, EffectAuthority, EffectGrant, ScopeClaimIdentity, ScopeIdentity, WorkRef};
     use crate::{distributed::identity::WorkspaceId, domain::work::WorkId, scope::CampaignId};
-
-    pub(crate) fn authority(
-        grant: EffectGrant,
-        grant_digest: Digest,
-        authority_stop_unix_ms: u64,
-    ) -> EffectAuthority {
-        EffectAuthority {
-            grant,
-            grant_digest,
-            authority_stop_unix_ms,
-        }
-    }
 
     /// An authority for `action` over `resource_scope`, under `operation_id`.
     ///
@@ -308,8 +285,8 @@ pub(crate) mod test_support {
             2,
         )
         .unwrap();
-        authority(
-            EffectGrant::new(
+        EffectAuthority {
+            grant: EffectGrant::new(
                 identity,
                 action,
                 resource_scope,
@@ -319,9 +296,8 @@ pub(crate) mod test_support {
                 operation_id,
             )
             .unwrap(),
-            Digest::new("ab".repeat(32)).unwrap(),
             authority_stop_unix_ms,
-        )
+        }
     }
 }
 
@@ -643,7 +619,6 @@ pub async fn intake(
                     if row.grant_digest().as_str() == format!("{:x}", Sha256::digest(&bytes)) {
                         GrantIntake::Accepted(Box::new(EffectAuthority {
                             grant,
-                            grant_digest: row.grant_digest().clone(),
                             authority_stop_unix_ms: authority
                                 .lease_until()
                                 .get()
@@ -1761,16 +1736,9 @@ mod tests {
         let GrantIntake::Accepted(accepted) = accepted else {
             panic!("expected acceptance");
         };
-        // The authority carries the grant it decided, and the digest the projection recorded
-        // rather than one recomputed from the bytes a second time.
-        assert_eq!(*accepted.grant(), grant);
-        assert_eq!(
-            accepted.grant_digest().as_str(),
-            format!("{:x}", Sha256::digest(encode_grant(&grant).unwrap()))
-        );
-        // The stop instant comes from the proving lease, not from the grant. Reading the private
-        // field is what this test is for: every other test hands the field a literal, so without
-        // this the whole lease-stop bound could be minted as `u64::MAX` unnoticed.
+        // Reading the private fields is what this test is for: every other test hands them
+        // literals, so without this the stop instant could be minted as `u64::MAX` unnoticed.
+        assert_eq!(accepted.grant, grant);
         assert_eq!(
             accepted.authority_stop_unix_ms,
             reader.lease_until().get() - STOP_MARGIN_MS

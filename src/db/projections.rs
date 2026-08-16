@@ -3253,9 +3253,10 @@ mod tests {
 
         // The superseded revision stays readable through the projection's own reader, beside the
         // plan that admitted it, so a stale result remains auditable after it stops scheduling.
-        // `continuable` above supplies the fence, so the four bindings an executable record must
-        // carry — scope, plan digest, work revision, authority fence — are each asserted here
-        // through a reader rather than through direct SQL.
+        // With the `continuable` assertion above for the fence, three of the four bindings an
+        // executable record carries — plan digest, work revision, authority fence — are asserted
+        // through a reader rather than through direct SQL. The scope binding is not: this database
+        // holds one scope, so dropping `scope_id` from `ADMITTED_WORK_REFS_SQL` would still pass.
         assert_eq!(
             admitted_work_refs(&connection, &scope).unwrap(),
             vec![

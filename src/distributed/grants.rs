@@ -566,7 +566,7 @@ pub fn encode_grant(grant: &EffectGrant) -> Result<Vec<u8>, WireError> {
 /// # Errors
 ///
 /// Returns [`WireError`] for malformed, noncanonical, oversized, or mismatched input.
-pub fn decode_grant(
+pub(crate) fn decode_grant(
     bytes: &[u8],
     expected_key: &str,
     expected_scope: &ScopeIdentity,

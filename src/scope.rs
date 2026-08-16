@@ -161,7 +161,10 @@ pub struct ScopeClaimIdentity {
 impl ScopeClaimIdentity {
     /// Creates a scoped claim identity with a nonzero claim fence.
     ///
-    /// Crate-private because it takes a [`WorkRef`], which no public constructor produces.
+    /// Crate-private because a claim identity is only ever built from a row the projection read,
+    /// and [`WorkRef`] has no public constructor. The row readers on
+    /// [`crate::db::worker::DbHandle`] do hand out a `WorkRef`, so the restriction is on who may
+    /// pair one with a plan digest and a fence, not on who may hold one.
     ///
     /// # Errors
     ///
@@ -1466,6 +1469,12 @@ mod codec_tests {
 
     use super::*;
 
+    /// Stored-byte address of the activation event
+    /// `grant_activated_events_round_trip_and_reject_corruption` builds. The zstd frame is part of
+    /// the preimage, so the `zstd-sys` lockfile pin is byte-affecting for this value.
+    const ACTIVATION_EVENT_DIGEST: &str =
+        "9a00fbfcbea187b4e842f2168ebca6fe2bd60518f7e2ada79e7b330fa06a8fd4";
+
     fn fixture() -> RootGenesis {
         root_genesis(
             &AdmittedCampaignConfig::new(
@@ -1483,6 +1492,13 @@ mod codec_tests {
             Value::Map(entries) => entries,
             _ => panic!("expected map"),
         }
+    }
+
+    fn field_mut<'a>(entries: &'a mut [(Value, Value)], name: &str) -> &'a mut Value {
+        entries
+            .iter_mut()
+            .find_map(|(key, value)| (key == &Value::Text(name.to_owned())).then_some(value))
+            .unwrap()
     }
 
     fn reordered(genesis: &RootGenesis, field: &str) -> Vec<u8> {
@@ -1562,6 +1578,14 @@ mod codec_tests {
 
         let encoded = encode_grant_activated_event(&event).unwrap();
         let key = scope_event_key(genesis.identity(), encoded.event_ref());
+        // `encode_grant_activated_event` and `grant_activated_from_decoded` map `work_id` and
+        // `work_revision` field by field, so an edit applied to both leaves the round-trip
+        // assertion below green while changing the address and key of every stored activation
+        // event. Only a fixed digest catches that.
+        assert_eq!(
+            encoded.event_ref().digest().as_str(),
+            ACTIVATION_EVENT_DIGEST
+        );
         assert_eq!(
             decode_grant_activated_event(encoded.stored_bytes(), &key, genesis.identity()).unwrap(),
             event
@@ -1592,23 +1616,60 @@ mod codec_tests {
             Err(WireError::InvalidValue)
         );
 
+        // Rewriting the payload and re-keying the result is the only way to reach the decoder's own
+        // rejections: the encoder cannot produce these bytes, and a stale key would be refused for
+        // its address before the payload was read.
+        fn repacked(
+            stored: &[u8],
+            scope: &ScopeIdentity,
+            mutate: impl FnOnce(&mut Value),
+        ) -> (Vec<u8>, String) {
+            let cbor = zstd::bulk::decompress(stored, MAX_DECOMPRESSED_BYTES).unwrap();
+            let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+            let payload = map(&mut value)
+                .iter_mut()
+                .find_map(|(key, value)| (key == &Value::Text("payload".into())).then_some(value))
+                .unwrap();
+            mutate(payload);
+            let mut rewritten = Vec::new();
+            into_writer(&value, &mut rewritten).unwrap();
+            let rewritten = compress(&rewritten).unwrap();
+            let reference =
+                ScopeEventRef::new(2, Digest::new(sha256(&rewritten)).unwrap()).unwrap();
+            (rewritten.clone(), scope_event_key(scope, &reference))
+        }
+
         // Unknown payload fields are rejected.
-        let cbor = zstd::bulk::decompress(encoded.stored_bytes(), MAX_DECOMPRESSED_BYTES).unwrap();
-        let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
-        let root = map(&mut value);
-        let nested = root
-            .iter_mut()
-            .find_map(|(key, value)| (key == &Value::Text("payload".into())).then_some(value))
-            .unwrap();
-        map(nested).push((Value::Text("extra".into()), Value::Integer(1.into())));
-        let mut extended = Vec::new();
-        into_writer(&value, &mut extended).unwrap();
-        let extended = compress(&extended).unwrap();
-        let extended_ref = ScopeEventRef::new(2, Digest::new(sha256(&extended)).unwrap()).unwrap();
-        let extended_key = scope_event_key(genesis.identity(), &extended_ref);
+        let (extended, extended_key) =
+            repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
+                map(payload).push((Value::Text("extra".into()), Value::Integer(1.into())));
+            });
         assert!(
             decode_grant_activated_event(&extended, &extended_key, genesis.identity()).is_err()
         );
+
+        // The decoder is where an activation naming unvalidated work has to fail: nothing between
+        // these bytes and the fold reconstructs the identity or re-checks the revision.
+        for (field, to) in [
+            ("work_id", Value::Text(String::new())),
+            ("work_id", Value::Text("work/17".into())),
+            ("work_id", Value::Text("w".repeat(129))),
+            ("work_revision", Value::Integer(0.into())),
+            (
+                "work_revision",
+                Value::Integer((MAX_STORED_INTEGER + 1).into()),
+            ),
+        ] {
+            let (bytes, bad_key) =
+                repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
+                    *field_mut(map(payload), field) = to.clone();
+                });
+            assert_eq!(
+                decode_grant_activated_event(&bytes, &bad_key, genesis.identity()),
+                Err(WireError::InvalidValue),
+                "{field} = {to:?}"
+            );
+        }
 
         // Every integer binding is bounded by the stored-integer range and must be nonzero.
         let work_id = || WorkId::new("work-17".into()).unwrap();

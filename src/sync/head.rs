@@ -648,8 +648,9 @@ pub(crate) async fn append_checkpoint(
 ///
 /// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent (genesis stays a one-event
 /// transition through [`append_root`]), an empty batch, any batch-internal chain violation, a
-/// projection-checkpoint member, a plan admission whose named plan object cannot be read and
-/// digest-checked, or an invalid transition, and publication errors verbatim.
+/// projection-checkpoint member, a grant-activation member, a plan admission whose named plan
+/// object cannot be read, digest-checked, and matched to this scope, or an invalid transition,
+/// and publication errors verbatim.
 pub async fn append_batch(
     store: &S3Store,
     parent: ScopeHeadParent,
@@ -672,6 +673,16 @@ pub async fn append_batch(
         if envelope.payload_type() == PROJECTION_CHECKPOINT_PAYLOAD_TYPE {
             return Err(ScopeAppendError::InvalidInput);
         }
+        // A grant activation is replayable only if the projection's admitted-work row folds it
+        // (matching work revision, claim fence, and attempt) — mutable projection state that
+        // `grants::issue` proves against its fenced projection before appending. No durable
+        // object witnesses that proof, so this preflight cannot re-derive it; an unfoldable
+        // activation that won the head CAS would poison every replay with
+        // `ApplyError::Conflict`. Grant members are therefore refused before any request:
+        // activations route through the issuance pipeline. commentlint: allow(JUDGE)
+        if envelope.payload_type() == GRANT_ACTIVATED_PAYLOAD_TYPE {
+            return Err(ScopeAppendError::InvalidInput);
+        }
     }
     let active_plan = {
         let views: Vec<BatchEventView<'_>> =
@@ -692,7 +703,13 @@ pub async fn append_batch(
             Ok(GetOutcome::Found { bytes, .. }) => bytes,
             Ok(GetOutcome::NotFound) | Err(_) => return Err(ScopeAppendError::InvalidInput),
         };
-        if decode_plan(&bytes, digest).is_err() {
+        // `plan_key` is workspace+campaign scoped, so a readable, digest-matching plan object can
+        // still belong to a sibling scope; mirror `append_plan_admitted`'s cross-scope refusal.
+        // Scope is the one admissibility axis the stored bytes leave unbound here: every object
+        // at `plan_key` passed `validate_proposal` at issuance, its bases name immutable applied
+        // history, and the batch fold re-proves the none-to-Some active-plan rule.
+        let proposal = decode_plan(&bytes, digest).map_err(|_| ScopeAppendError::InvalidInput)?;
+        if proposal.scope_id() != scope.scope_id() {
             return Err(ScopeAppendError::InvalidInput);
         }
     }
@@ -4118,6 +4135,122 @@ mod tests {
                 "no event PUT may precede the plan-object proof"
             );
         }
+    }
+
+    /// A readable, digest-matching plan object can still belong to a foreign scope:
+    /// `decode_plan` proves bytes-to-digest binding, not scope, and `plan_key` is not scoped by
+    /// `scope_id`. The preflight mirrors `append_plan_admitted`'s cross-scope refusal, and no
+    /// event PUT may precede it.
+    #[tokio::test]
+    async fn a_batch_plan_admission_naming_a_foreign_scopes_plan_is_refused() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let foreign = root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-b".into()).unwrap(),
+                CampaignId::new("campaign-b".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (foreign_admissible, _) = admissible_plan(&foreign);
+        let plan = foreign_admissible.plan_digest().clone();
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "foreign-plan-op-2");
+        let (env3, enc3) =
+            plan_admitted_pair(&scope, enc2.event_ref(), 3, "foreign-plan-op-3", plan);
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                foreign_admissible.stored_bytes().to_vec(),
+            ),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                vec![(env2, enc2), (env3, enc3)],
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 2, "parent read + plan read");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.headers().get("if-none-match").is_none()),
+            "no event PUT may precede the cross-scope refusal"
+        );
+    }
+
+    /// A grant activation folds only against projection state — admitted work with a matching
+    /// revision, claim fence, and attempt — that `grants::issue` proves before appending. No
+    /// durable object witnesses that proof, so batch preflight refuses grant members before any
+    /// request rather than let an unfoldable activation win the head CAS and poison replay.
+    #[tokio::test]
+    async fn a_batch_grant_activation_member_is_refused_before_any_request() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "grant-batch-op-2");
+        let (env3, enc3) = {
+            let payload = GrantActivatedPayload::new(
+                crate::domain::work::WorkId::new("work-a".into()).unwrap(),
+                1,
+                1,
+                Digest::new("d".repeat(64)).unwrap(),
+                1,
+                1,
+                60_000,
+            )
+            .unwrap();
+            let event = GrantActivatedEvent::new(
+                EventEnvelope::new(
+                    scope.scope_id().clone(),
+                    3,
+                    Some(enc2.event_ref().clone()),
+                    1,
+                    "grant-batch-op-3".into(),
+                    GRANT_ACTIVATED_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                payload,
+            )
+            .unwrap();
+            let encoded = encode_grant_activated_event(&event).unwrap();
+            (event.envelope().clone(), encoded)
+        };
+        let (store, client) = replay_store(vec![response(
+            200,
+            &[("etag", "\"parent\"")],
+            encode_head(genesis.head()).unwrap(),
+        )]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                vec![(env2, enc2), (env3, enc3)],
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert_eq!(
+            client.actual_requests().count(),
+            1,
+            "parent read only; the grant member is refused before any batch request"
+        );
     }
 
     /// Genesis stays a one-event transition at the constructor too, so no caller can widen the

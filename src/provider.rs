@@ -385,7 +385,9 @@ impl fmt::Debug for InvocationRequest {
 
 /// Provider-reported token use, copied out of the response as scalars.
 ///
-/// Reported use is evidence, not confirmed spend.
+/// Reported use is evidence, not confirmed spend. Its absence from an outcome means no usable
+/// report arrived: either the response carried no usage block, or the counts it carried
+/// contradicted the response and were refused rather than recorded.
 ///
 /// The cache counters are `None` when the response reports no cache activity, which is the
 /// expected shape here because this boundary sends no cache points. They are kept rather
@@ -440,7 +442,9 @@ impl ReportedUse {
     ///   read is folded into the total is not part of that definition, and demanding equality
     ///   would refuse a cached frame the provider reported correctly.
     /// - A request carries a non-empty prompt, which this boundary validates before dispatch,
-    ///   so some input was billed. Zero input is possible only when a cache read covers it.
+    ///   so some input was billed somewhere. Zero input is possible only when a cache counter
+    ///   accounts for it: a read when the prompt was already cached, a write when this call is
+    ///   the one populating the cache.
     ///
     /// The remaining count, generated tokens, cannot be judged from the usage block alone: a
     /// completion that stops on its first stop sequence legitimately generates none, while one
@@ -448,7 +452,9 @@ impl ReportedUse {
     /// text and the stop reason together.
     fn contradicts_the_response(self) -> bool {
         u64::from(self.total_tokens) < u64::from(self.input_tokens) + u64::from(self.output_tokens)
-            || (self.input_tokens == 0 && self.cache_read_input_tokens.unwrap_or(0) == 0)
+            || (self.input_tokens == 0
+                && self.cache_read_input_tokens.unwrap_or(0) == 0
+                && self.cache_write_input_tokens.unwrap_or(0) == 0)
     }
 }
 
@@ -719,7 +725,7 @@ impl BedrockTransport {
         #[cfg(not(debug_assertions))]
         history.bind(request.operation_id());
         let prior_unknown = history.mark_possible_send();
-        let outcome = classify(call.send().await, prior_unknown);
+        let outcome = classify(call.send().await, request.max_output_tokens, prior_unknown);
         // A verdict about this attempt is not a verdict about an earlier one. An invocation
         // has no remote state to reconcile, so nothing retires the possibility that a prior
         // attempt already reached the provider and was billed; the prior value therefore
@@ -757,6 +763,7 @@ fn configured(region: Region, builder: Builder) -> aws_sdk_bedrockruntime::Confi
 
 fn classify(
     result: Result<ConverseResponse, SdkError<ConverseError>>,
+    cap: NonZeroU32,
     prior_unknown: bool,
 ) -> InvocationOutcome {
     let response = match result {
@@ -765,27 +772,34 @@ fn classify(
     };
     let reason = terminal_reason(response.stop_reason());
     let provider_request_id = request_id(&response);
-    let reported_use = match response.usage() {
-        None => None,
-        // A frame whose own accounting will not read is a frame this boundary cannot read.
-        // Clamping a negative count to zero would be worse than losing it: zero is itself a
-        // claim that nothing was billed, and cost reconciliation would treat the fabricated
-        // claim as provider-reported fact.
-        Some(usage) => match token_use(usage) {
-            Some(reported) => Some(reported),
-            None => {
-                return InvocationOutcome::MalformedResponse {
-                    provider_request_id,
-                    reported_use: None,
-                };
-            }
-        },
-    };
+    // The provider cannot generate past the cap this request sent, so a larger count is one
+    // more thing the response contradicts. It is a bound and not an equality: reaching the cap
+    // ought to mean generating exactly it, but that is inference rather than a documented
+    // contract, and refusing a completion the account paid for on an inferred equality is the
+    // more expensive mistake.
+    let reported_use = response
+        .usage()
+        .and_then(token_use)
+        .filter(|reported| reported.output_tokens <= cap.get());
+    let accounting_unreadable = response.usage().is_some() && reported_use.is_none();
+    // A definite verdict does not rest on its accounting. The stop reason is separate evidence
+    // that the provider answered, `Refused` already permits an absent report, and discarding
+    // the verdict would also leave the attempt dispatch-uncertain over a cost gap, which is not
+    // the thing in doubt.
     if reason.precludes_completion() {
         return InvocationOutcome::Refused {
             reason,
             provider_request_id,
             reported_use,
+        };
+    }
+    // A completion is not separable from its accounting the same way: the generated count is
+    // checked against the text itself below, so a contradiction there is the frame disagreeing
+    // with its own answer rather than only losing a number.
+    if accounting_unreadable {
+        return InvocationOutcome::MalformedResponse {
+            provider_request_id,
+            reported_use: None,
         };
     }
     match completion_text(&response) {
@@ -1787,6 +1801,79 @@ mod tests {
             panic!("expected a completion, got {outcome:?}");
         };
         assert!(text.is_empty());
+    }
+
+    /// A definite verdict survives unreadable accounting. The stop reason is separate evidence
+    /// that the provider answered, so losing the counts costs the report and not the verdict,
+    /// and the attempt is not left dispatch-uncertain over a cost gap.
+    #[tokio::test]
+    async fn a_refusal_keeps_its_reason_when_the_accounting_will_not_read() {
+        let (transport, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[]}},"stopReason":"content_filtered","usage":{"inputTokens":-1,"outputTokens":0,"totalTokens":0}}"#,
+        ))]);
+        let mut history = AttemptHistory::default();
+
+        let outcome = transport.invoke(&request(), &mut history).await;
+        let InvocationOutcome::Refused {
+            reason,
+            reported_use,
+            provider_request_id,
+        } = &outcome
+        else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(*reason, TerminalReason::ContentFiltered);
+        assert_eq!(*reported_use, None);
+        assert_eq!(provider_request_id.as_deref(), Some(PROVIDER_REQUEST_ID));
+        assert!(!history.may_have_been_sent());
+    }
+
+    /// The cap bounds the generated count: the provider cannot generate past what the request
+    /// sent. A count at the cap is fine, one above it is not.
+    #[tokio::test]
+    async fn a_generated_count_above_the_request_cap_is_refused() {
+        let (transport, _) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((1, 513, 514)),
+            "answer",
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        assert!(
+            matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
+            "{outcome:?}"
+        );
+
+        let (at_cap, _) = replay(vec![json(converse_body(
+            "max_tokens",
+            Some((1, 512, 513)),
+            "answer",
+        ))]);
+        let outcome = invoke(&at_cap).await;
+        assert!(
+            matches!(outcome, InvocationOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// A cache write accounts for a zero input count the same way a read does: the first call
+    /// that populates the cache is billed for writing the prompt, not for reading it.
+    #[tokio::test]
+    async fn a_cache_write_makes_a_zero_input_count_credible() {
+        let (transport, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":0,"outputTokens":5,"totalTokens":5,"cacheWriteInputTokens":400}}"#,
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::Completed { reported_use, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        assert_eq!(
+            reported_use
+                .expect("usage block present")
+                .cache_write_input_tokens(),
+            Some(400)
+        );
     }
 
     /// The stop reason is evidence about generation too. Reaching the output cap requires

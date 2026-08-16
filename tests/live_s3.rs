@@ -26,9 +26,18 @@ use ravel::{
             AcquireOutcome, ReleaseOutcome, RenewOutcome, STOP_MARGIN_MS, acquire, release, renew,
         },
     },
+    domain::{
+        proposal::{
+            AdmissibleProposal, ObservationFact, PlanProposal, ProposalBasis, ProposalFacts,
+            TargetBounds, WorkSpec, validate_proposal,
+        },
+        work::WorkId,
+    },
     scope::{
-        AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeIdentity,
-        decode_head, decode_root_event, encode_head, root_genesis, scope_event_key, scope_head_key,
+        AdmittedCampaignConfig, CampaignId, EncodedScopeEvent, EventEnvelope, PlanAdmittedEvent,
+        PlanAdmittedPayload, RootGenesis, ScopeAuthority, ScopeHead, ScopeIdentity, decode_head,
+        decode_root_event, encode_head, encode_plan_admitted_event, plan_key, root_genesis,
+        scope_event_key, scope_head_key,
     },
     storage::s3::{GetOutcome, MutationOutcome, S3Store},
     sync::{
@@ -39,7 +48,7 @@ use ravel::{
         event::publish_root,
         head::{
             ObservedScopeHead, ScopeAppendError, ScopeHeadCommitOutcome, ScopeHeadParent,
-            append_root, read,
+            append_batch, append_root, read,
         },
         replay::{ScopeReadiness, open_projection, refresh},
     },
@@ -121,6 +130,66 @@ fn genesis_for(campaign: CampaignId) -> RootGenesis {
         .expect("admitted configuration is within bounds"),
     )
     .expect("root genesis is deterministic")
+}
+
+/// A plan admission is the one registered payload a live batch can carry: root opens sequence 1
+/// only, a checkpoint member presumes a snapshot object the batch caller does not hold, and a
+/// grant activation carries a projection-checked admissibility no batch caller can prove, so
+/// both are refused at preflight. The admission's companion plan object is published
+/// create-only before the batch, exactly as `append_plan_admitted` orders its writes.
+fn plan_admission_batch(
+    scope: &ScopeIdentity,
+    parent_head: &ScopeHead,
+    genesis: &RootGenesis,
+) -> (
+    AdmissibleProposal,
+    Vec<(EventEnvelope, EncodedScopeEvent)>,
+    Vec<String>,
+) {
+    let proposal = PlanProposal::new(
+        scope.scope_id().clone(),
+        genesis.config_digest().clone(),
+        None,
+        vec![ProposalBasis::Observation {
+            event: genesis.event_ref().clone(),
+        }],
+        vec![WorkSpec::new(
+            WorkId::new("live-batch-work".into()).expect("work id is valid"),
+            Vec::new(),
+            TargetBounds::new(1, 60_000).expect("target bounds are valid"),
+        )],
+        0,
+    );
+    let facts = [ObservationFact::new(
+        scope.scope_id().clone(),
+        genesis.event_ref().clone(),
+        "root_genesis".to_owned(),
+    )];
+    let admissible = validate_proposal(
+        &proposal,
+        &ProposalFacts::new(scope, genesis.config_digest(), None, 1, &facts),
+    )
+    .expect("the genesis-based proposal is admissible");
+    let event = PlanAdmittedEvent::new(
+        EventEnvelope::new(
+            scope.scope_id().clone(),
+            parent_head.tail().sequence() + 1,
+            Some(parent_head.tail().clone()),
+            parent_head.scope_epoch().get(),
+            "live-batch-plan-op".to_owned(),
+            "plan_admitted".to_owned(),
+        )
+        .expect("envelope is valid"),
+        PlanAdmittedPayload::new(admissible.plan_digest().clone()),
+    )
+    .expect("plan admission event is valid");
+    let encoded = encode_plan_admitted_event(&event).expect("plan admission encodes");
+    let expected_keys = vec![scope_event_key(scope, encoded.event_ref())];
+    (
+        admissible,
+        vec![(event.envelope().clone(), encoded)],
+        expected_keys,
+    )
 }
 
 async fn observed(store: &S3Store, scope: &ScopeIdentity) -> ObservedScopeHead {
@@ -433,6 +502,116 @@ async fn append_reports_publication_errors_with_exact_dispatch_evidence() {
     assert!(
         !event_history.may_have_been_sent(),
         "an absent bucket answers with a proven 404, which must not claim a possible send"
+    );
+}
+
+#[tokio::test]
+async fn a_batched_commit_adds_exactly_its_event_keys_and_one_head_advance() {
+    if !ready() {
+        return;
+    }
+    let config = aws_config::load_from_env().await;
+    let store = store(&config);
+    let genesis = genesis_for(run_campaign());
+    let scope = genesis.identity();
+    let root = decode_root_event(genesis.event_bytes(), genesis.event_key(), scope)
+        .expect("canonical fixture decodes");
+    assert!(matches!(
+        append_root(
+            &store,
+            ScopeHeadParent::Genesis,
+            scope,
+            &root,
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .expect("root append succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("current Unix time fits u64 milliseconds");
+    let instance = InstanceId::new("live-batch-controller".into()).expect("instance id is valid");
+    let AcquireOutcome::Acquired(authority) = acquire(&store, scope, &instance, now_ms)
+        .await
+        .expect("acquisition succeeds")
+    else {
+        panic!("expected acquisition");
+    };
+    let parent_head = authority.head().clone();
+    let Ok(parent) = authority.into_parent(now_ms) else {
+        panic!("authority is within its term");
+    };
+
+    let before = store
+        .list_keys(&scope_events_prefix(scope), None, 64)
+        .await
+        .expect("listing before the batch succeeds");
+
+    let (admissible, batch, mut expected_keys) =
+        plan_admission_batch(scope, &parent_head, &genesis);
+    let plan_object_key = plan_key(
+        scope.workspace_id(),
+        scope.campaign_id(),
+        admissible.plan_digest(),
+    );
+    assert!(
+        matches!(
+            store
+                .put_if_absent(
+                    &plan_object_key,
+                    admissible.stored_bytes().to_vec(),
+                    &mut AttemptHistory::default(),
+                )
+                .await,
+            MutationOutcome::Committed { .. }
+        ),
+        "the companion plan object publishes create-only before the batch"
+    );
+
+    assert!(matches!(
+        append_batch(&store, parent, scope, batch, &mut AttemptHistory::default(),)
+            .await
+            .expect("batch append succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+
+    let after = store
+        .list_keys(&scope_events_prefix(scope), None, 64)
+        .await
+        .expect("listing after the batch succeeds");
+    assert!(
+        before.iter().all(|key| after.contains(key)),
+        "no protocol path deletes objects"
+    );
+    let mut added: Vec<String> = after
+        .iter()
+        .filter(|key| !before.contains(*key))
+        .cloned()
+        .collect();
+    added.sort();
+    expected_keys.sort();
+    assert_eq!(
+        added, expected_keys,
+        "the LIST set difference must be exactly the batch's synthesized keys"
+    );
+
+    let final_head = observed(&store, scope).await;
+    assert_eq!(
+        final_head.head().tail().sequence(),
+        parent_head.tail().sequence() + 1
+    );
+    assert_eq!(final_head.head().operation_id(), "live-batch-plan-op");
+    assert_eq!(
+        final_head.head().active_plan_digest(),
+        Some(admissible.plan_digest()),
+        "the committed head activates exactly the batch's admitted digest"
     );
 }
 

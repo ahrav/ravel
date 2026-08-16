@@ -3644,6 +3644,9 @@ mod tests {
         let tail = genesis.event_ref().clone();
 
         // A member past its slot whose own envelope still chains to a self-consistent parent.
+        // The refusal fires on the parent-reference rule: `EventEnvelope::new` makes a true gap
+        // that names its real predecessor unconstructible, so the in-loop sequence check is
+        // defense-in-depth behind it. commentlint: allow(JUDGE)
         let gap = {
             let (env2, enc2) = successor(&scope, &tail, 2, "gap-op-2");
             let phantom = ScopeEventRef::new(3, Digest::new("a".repeat(64)).unwrap()).unwrap();
@@ -3684,22 +3687,112 @@ mod tests {
             vec![(env2, enc2), (env3, enc3)]
         };
 
+        // Chain-valid against the foreign parent, but every member names this scope.
+        let foreign = root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-b".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let cross_scope = successor_batch(&scope, foreign.event_ref(), 2, &["cross-scope-op"]);
+        let checkpoint_member = {
+            let payload = ProjectionCheckpointPayload::new(
+                Digest::new("b".repeat(64)).unwrap(),
+                1_024,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            )
+            .unwrap();
+            let event = ProjectionCheckpointEvent::new(
+                EventEnvelope::new(
+                    scope.scope_id().clone(),
+                    2,
+                    Some(tail.clone()),
+                    1,
+                    "checkpoint-member-op".into(),
+                    PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                payload,
+            )
+            .unwrap();
+            let encoded = encode_projection_checkpoint_event(&event).unwrap();
+            vec![(event.envelope().clone(), encoded)]
+        };
+        let boundary = ScopeEventRef::new(
+            MAX_SCOPE_REPLAY_EVENTS - 1,
+            Digest::new("d".repeat(64)).unwrap(),
+        )
+        .unwrap();
+        let high_parent = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            boundary.clone(),
+            None,
+            "parent-op".into(),
+        )
+        .unwrap();
+        // The ceiling breach sits on a non-first member, so the bound is proven inside the
+        // walk, not only at the seed.
+        let over = successor_batch(
+            &scope,
+            &boundary,
+            MAX_SCOPE_REPLAY_EVENTS,
+            &["ceiling-op-1", "ceiling-op-2"],
+        );
+
         let cases = vec![
-            ("a sequence gap", gap),
-            ("a wrong parent reference", wrong_parent),
-            ("a mixed writer epoch", mixed_epoch),
-            ("a duplicate operation id", duplicate_operation),
-            ("an operation id equal to the parent's", parent_operation),
-            ("a second plan admission", double_admission),
-            ("an empty batch", Vec::new()),
+            ("a sequence gap", genesis.head().clone(), gap),
+            (
+                "a wrong parent reference",
+                genesis.head().clone(),
+                wrong_parent,
+            ),
+            ("a mixed writer epoch", genesis.head().clone(), mixed_epoch),
+            (
+                "a duplicate operation id",
+                genesis.head().clone(),
+                duplicate_operation,
+            ),
+            (
+                "an operation id equal to the parent's",
+                genesis.head().clone(),
+                parent_operation,
+            ),
+            (
+                "a second plan admission",
+                genesis.head().clone(),
+                double_admission,
+            ),
+            ("an empty batch", genesis.head().clone(), Vec::new()),
+            (
+                "a final sequence past the replay ceiling",
+                high_parent,
+                over,
+            ),
+            (
+                "a member outside the parent head's scope",
+                foreign.head().clone(),
+                cross_scope,
+            ),
+            (
+                "a projection-checkpoint member",
+                genesis.head().clone(),
+                checkpoint_member,
+            ),
         ];
-        for (label, batch) in cases {
+        for (label, parent, batch) in cases {
             let (store, client) = replay_store(vec![]);
             assert!(
                 matches!(
                     append_batch(
                         &store,
-                        ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+                        ScopeHeadParent::existing(Box::new(observed(&parent).await)),
                         &scope,
                         batch,
                         &mut AttemptHistory::default(),
@@ -3716,42 +3809,9 @@ mod tests {
             );
         }
 
-        // A final sequence past the replay ceiling is refused even when the chain itself holds.
-        let boundary = ScopeEventRef::new(
-            MAX_SCOPE_REPLAY_EVENTS - 1,
-            Digest::new("d".repeat(64)).unwrap(),
-        )
-        .unwrap();
-        let high_parent = ScopeHead::new(
-            scope.clone(),
-            ScopeAuthority::Unowned,
-            1,
-            boundary.clone(),
-            None,
-            "parent-op".into(),
-        )
-        .unwrap();
-        let over = successor_batch(
-            &scope,
-            &boundary,
-            MAX_SCOPE_REPLAY_EVENTS,
-            &["ceiling-op-1", "ceiling-op-2"],
-        );
-        let (store, client) = replay_store(vec![]);
-        assert!(matches!(
-            append_batch(
-                &store,
-                ScopeHeadParent::existing(Box::new(observed(&high_parent).await)),
-                &scope,
-                over,
-                &mut AttemptHistory::default(),
-            )
-            .await,
-            Err(ScopeAppendError::InvalidInput)
-        ));
-        assert_eq!(client.actual_requests().count(), 0);
-
-        // Genesis has no fenced boundary to chain a batch from.
+        // `append_batch` refuses any genesis parent outright: the first head is created only
+        // through `append_root`. The constructor-level one-event genesis rule is proven
+        // separately by `a_multi_event_genesis_batch_is_refused`.
         let genesis_batch = successor_batch(&scope, &tail, 2, &["genesis-batch-op"]);
         let (store, client) = replay_store(vec![]);
         assert!(matches!(
@@ -3766,6 +3826,257 @@ mod tests {
             Err(ScopeAppendError::InvalidInput)
         ));
         assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    /// The preflight's per-member validation refuses a payload-invalid member before any
+    /// object is published, so members ahead of it never reach the bucket. The error class is
+    /// pinned: an unregistered member surfaces as a publication error, not `InvalidInput`.
+    #[tokio::test]
+    async fn batch_preflight_refuses_an_invalid_member_payload_before_any_request() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "payload-op-2");
+        let unregistered = {
+            let envelope = EventEnvelope::new(
+                scope.scope_id().clone(),
+                3,
+                Some(enc2.event_ref().clone()),
+                1,
+                "payload-op-3".into(),
+                "artifact".into(),
+            )
+            .unwrap();
+            let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+            (envelope, encoded)
+        };
+        let (env4, enc4) = successor(&scope, unregistered.1.event_ref(), 4, "payload-op-4");
+        let (store, client) = replay_store(vec![]);
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+                &scope,
+                vec![(env2, enc2), unregistered, (env4, enc4)],
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::Publication(
+                ScopeEventPublicationError::UnsupportedPayload
+            ))
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    /// The first publication failure stops the batch before the head CAS, so a partially
+    /// published batch can never become authoritative.
+    #[tokio::test]
+    async fn a_mid_batch_publication_failure_stops_before_the_head_cas() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let batch = successor_batch(
+            &scope,
+            genesis.event_ref(),
+            2,
+            &["stop-op-2", "stop-op-3", "stop-op-4"],
+        );
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                batch,
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::Publication(
+                ScopeEventPublicationError::Storage(_)
+            ))
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(
+            requests.len(),
+            3,
+            "parent read + first event PUT + terminally failed second PUT"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.headers().get("if-match").is_none()),
+            "the head CAS must never dispatch after a publication failure"
+        );
+    }
+
+    /// A batched plan admission is folded left-to-right: the digest a middle member admits
+    /// survives the trailing plain member and lands on the committed head's wire form.
+    #[tokio::test]
+    async fn a_batched_plan_admission_carries_its_digest_onto_the_committed_head() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (admissible, _) = admissible_plan(&genesis);
+        let plan = admissible.plan_digest().clone();
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "fold-op-2");
+        let (env3, enc3) =
+            plan_admitted_pair(&scope, enc2.event_ref(), 3, "fold-op-3", plan.clone());
+        let (env4, enc4) = successor(&scope, enc3.event_ref(), 4, "fold-op-4");
+        let tail_ref = enc4.event_ref().clone();
+        let batch = vec![(env2, enc2), (env3, enc3), (env4, enc4)];
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                admissible.stored_bytes().to_vec(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"committed\"")], SdkBody::empty()),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        let outcome = append_batch(
+            &store,
+            ScopeHeadParent::existing(Box::new(parent)),
+            &scope,
+            batch,
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .unwrap();
+        let ScopeHeadCommitOutcome::Committed(Some(committed)) = outcome else {
+            panic!("the admitting batch must commit with a witness");
+        };
+        assert_eq!(committed.head().active_plan_digest(), Some(&plan));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(
+            requests.len(),
+            6,
+            "parent read + plan read + 3 event PUTs + head CAS"
+        );
+        let plan_uri = requests[1].uri().parse::<http::Uri>().unwrap();
+        assert!(plan_uri.path().contains("/plans/"));
+        let committed_head = decode_head(
+            requests[5].body().bytes().unwrap(),
+            &scope_head_key(&scope),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(committed_head.active_plan_digest(), Some(&plan));
+        assert_eq!(committed_head.tail(), &tail_ref);
+    }
+
+    /// A candidate head that drops the batch's folded admission is refused at the constructor,
+    /// so the fold is authoritative for the candidate's plan digest.
+    #[tokio::test]
+    async fn a_candidate_dropping_the_batched_admission_is_refused() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (admissible, _) = admissible_plan(&genesis);
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "drop-op-2");
+        let (env3, enc3) = plan_admitted_pair(
+            &scope,
+            enc2.event_ref(),
+            3,
+            "drop-op-3",
+            admissible.plan_digest().clone(),
+        );
+        let (env4, enc4) = successor(&scope, enc3.event_ref(), 4, "drop-op-4");
+        let tail_ref = enc4.event_ref().clone();
+        let publications = vec![
+            published(&scope, &env2, enc2).await,
+            published(&scope, &env3, enc3).await,
+            published(&scope, &env4, enc4).await,
+        ];
+        let candidate = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            tail_ref,
+            None,
+            "drop-op-4".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ScopeHeadTransition::new_batch(
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+                candidate,
+                publications,
+            ),
+            Err(WireError::InvalidValue)
+        ));
+    }
+
+    /// A batched admission must name a readable, digest-matching plan object before the first
+    /// event PUT: an event that names an address must never win the head race while that
+    /// address is unreadable.
+    #[tokio::test]
+    async fn a_batch_plan_admission_requires_a_readable_plan_object() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let plan = Digest::new("c".repeat(64)).unwrap();
+        let build = |prefix: &str| {
+            let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, &format!("{prefix}-2"));
+            let (env3, enc3) = plan_admitted_pair(
+                &scope,
+                enc2.event_ref(),
+                3,
+                &format!("{prefix}-3"),
+                plan.clone(),
+            );
+            vec![(env2, enc2), (env3, enc3)]
+        };
+
+        // Missing object, and readable bytes that do not decode to the named digest.
+        let plan_responses = [
+            response(404, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"plan\"")], b"not-a-plan".to_vec()),
+        ];
+        for (batch, plan_response) in [build("unread-op"), build("mismatch-op")]
+            .into_iter()
+            .zip(plan_responses)
+        {
+            let (store, client) = replay_store(vec![
+                response(
+                    200,
+                    &[("etag", "\"parent\"")],
+                    encode_head(genesis.head()).unwrap(),
+                ),
+                plan_response,
+            ]);
+            let parent = read(&store, &scope).await.unwrap().unwrap();
+            assert!(matches!(
+                append_batch(
+                    &store,
+                    ScopeHeadParent::existing(Box::new(parent)),
+                    &scope,
+                    batch,
+                    &mut AttemptHistory::default(),
+                )
+                .await,
+                Err(ScopeAppendError::InvalidInput)
+            ));
+            let requests: Vec<_> = client.actual_requests().collect();
+            assert_eq!(requests.len(), 2, "parent read + failed plan read");
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.headers().get("if-none-match").is_none()),
+                "no event PUT may precede the plan-object proof"
+            );
+        }
     }
 
     /// Genesis stays a one-event transition at the constructor too, so no caller can widen the
@@ -3821,6 +4132,10 @@ mod tests {
             .iter()
             .map(|(_, encoded)| scope_event_key(&scope, encoded.event_ref()))
             .collect();
+        let bodies: Vec<Vec<u8>> = batch
+            .iter()
+            .map(|(_, encoded)| encoded.stored_bytes().to_vec())
+            .collect();
         let last_ref = batch.last().unwrap().1.event_ref().clone();
         let (store, client) = replay_store(vec![
             response(
@@ -3851,10 +4166,13 @@ mod tests {
         assert_eq!(committed.head().operation_id(), "batch-op-4");
         let requests: Vec<_> = client.actual_requests().collect();
         assert_eq!(requests.len(), 5);
-        for (request, key) in requests[1..4].iter().zip(&keys) {
+        for (request, (key, bytes)) in requests[1..4].iter().zip(keys.iter().zip(&bodies)) {
             let uri = request.uri().parse::<http::Uri>().unwrap();
             assert_eq!(uri.path(), format!("/{key}"));
             assert_eq!(request.headers().get("if-none-match").unwrap(), "*");
+            // The body is a separate argument from the key, so publication order is pinned
+            // by content, not just by address.
+            assert_eq!(request.body().bytes().unwrap(), bytes.as_slice());
         }
         let head_uri = requests[4].uri().parse::<http::Uri>().unwrap();
         assert!(head_uri.path().ends_with("/head"));
@@ -3868,10 +4186,11 @@ mod tests {
         assert_eq!(committed_head.tail(), &last_ref);
     }
 
-    /// Two overlapping batches race one parent: the CAS admits at most one, and authoritative
-    /// replay reaches exactly the winning batch's cursor.
+    /// Two overlapping batches race one parent. The store's conditional CAS adjudicates the
+    /// race itself; this pins the loser's behavior — a 412 must never surface as `Committed`
+    /// — and proves authoritative replay reaches exactly the winning batch's cursor.
     #[tokio::test]
-    async fn racing_batches_admit_at_most_one_winner_and_replay_reaches_it() {
+    async fn a_losing_batch_cas_never_reports_committed_and_replay_reaches_the_winner() {
         let genesis = genesis();
         let scope = genesis.identity().clone();
         let winner_batch = successor_batch(
@@ -3922,22 +4241,15 @@ mod tests {
         // final operation absent between the winner's tail and the shared parent boundary.
         let loser_batch =
             successor_batch(&scope, genesis.event_ref(), 2, &["lose-op-2", "lose-op-3"]);
-        let mut responses = vec![
-            response(
-                200,
-                &[("etag", "\"parent\"")],
-                encode_head(genesis.head()).unwrap(),
-            ),
-            response(200, &[], SdkBody::empty()),
-            response(200, &[], SdkBody::empty()),
-            response(412, &[], SdkBody::empty()),
+        let mut responses = lost_cas_prelude(encode_head(genesis.head()).unwrap(), 412);
+        responses.extend([
             response(
                 200,
                 &[("etag", "\"winner\"")],
                 encode_head(&winner_head).unwrap(),
             ),
             response(404, &[], SdkBody::empty()),
-        ];
+        ]);
         responses.extend(
             winner_events
                 .iter()
@@ -3958,7 +4270,11 @@ mod tests {
             .unwrap(),
             ScopeHeadCommitOutcome::ProvenNotCommitted
         ));
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(
+            client.actual_requests().count(),
+            9,
+            "parent read + 2 event PUTs + lost CAS + head reread + pointer miss + 3 winner reads"
+        );
 
         // Authoritative replay of the winning head folds the whole batch at its cursor.
         let path = std::env::temp_dir().join(format!(
@@ -4003,6 +4319,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The fixed opening of a lost-CAS scenario: parent read, both event PUTs, and the CAS
+    /// failure that hides the outcome. Scenario tails stay inline because their response
+    /// order is the reconciliation walk under test.
+    fn lost_cas_prelude(parent_bytes: Vec<u8>, failure: u16) -> Vec<http::Response<SdkBody>> {
+        vec![
+            response(200, &[("etag", "\"parent\"")], parent_bytes),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(failure, &[], SdkBody::empty()),
+        ]
+    }
+
     /// A lost batch CAS response reconciles by the batch's final operation identity: the exact
     /// candidate proves committed, a longer winning batch containing the complete candidate
     /// batch proves superseded, and a rival chain reaching the shared boundary without the
@@ -4025,15 +4353,8 @@ mod tests {
             "lost-op-3".into(),
         )
         .unwrap();
-        let (store, client) = replay_store(vec![
-            response(
-                200,
-                &[("etag", "\"parent\"")],
-                encode_head(genesis.head()).unwrap(),
-            ),
-            response(200, &[], SdkBody::empty()),
-            response(200, &[], SdkBody::empty()),
-            response(500, &[], SdkBody::empty()),
+        let mut responses = lost_cas_prelude(encode_head(genesis.head()).unwrap(), 500);
+        responses.extend([
             response(
                 200,
                 &[("etag", "\"candidate\"")],
@@ -4041,20 +4362,27 @@ mod tests {
             ),
             response(200, &[("etag", "\"event\"")], tail_bytes),
         ]);
+        let (store, client) = replay_store(responses);
         let parent = read(&store, &scope).await.unwrap().unwrap();
-        assert!(matches!(
-            append_batch(
-                &store,
-                ScopeHeadParent::existing(Box::new(parent)),
-                &scope,
-                batch,
-                &mut AttemptHistory::default(),
-            )
-            .await
-            .unwrap(),
-            ScopeHeadCommitOutcome::Committed(_)
-        ));
-        assert_eq!(client.actual_requests().count(), 6);
+        let outcome = append_batch(
+            &store,
+            ScopeHeadParent::existing(Box::new(parent)),
+            &scope,
+            batch,
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .unwrap();
+        let ScopeHeadCommitOutcome::Committed(Some(witness)) = outcome else {
+            panic!("the lost CAS must resolve to a committed head witness");
+        };
+        assert_eq!(witness.head().tail(), candidate.tail());
+        assert_eq!(witness.head().operation_id(), "lost-op-3");
+        assert_eq!(
+            client.actual_requests().count(),
+            6,
+            "parent read + 2 event PUTs + lost CAS + head reread + tail readback"
+        );
 
         // CommittedSuperseded: a longer winning batch carries our two members plus one more.
         let ours = successor_batch(
@@ -4077,15 +4405,8 @@ mod tests {
             "super-op-4".into(),
         )
         .unwrap();
-        let (store, client) = replay_store(vec![
-            response(
-                200,
-                &[("etag", "\"parent\"")],
-                encode_head(genesis.head()).unwrap(),
-            ),
-            response(200, &[], SdkBody::empty()),
-            response(200, &[], SdkBody::empty()),
-            response(500, &[], SdkBody::empty()),
+        let mut responses = lost_cas_prelude(encode_head(genesis.head()).unwrap(), 500);
+        responses.extend([
             response(
                 200,
                 &[("etag", "\"longer\"")],
@@ -4100,6 +4421,7 @@ mod tests {
             response(200, &[("etag", "\"e3\"")], our_events[1].1.clone()),
             response(200, &[("etag", "\"e2\"")], our_events[0].1.clone()),
         ]);
+        let (store, client) = replay_store(responses);
         let parent = read(&store, &scope).await.unwrap().unwrap();
         assert!(matches!(
             append_batch(
@@ -4113,7 +4435,11 @@ mod tests {
             .unwrap(),
             ScopeHeadCommitOutcome::CommittedSuperseded
         ));
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(
+            client.actual_requests().count(),
+            9,
+            "parent read + 2 event PUTs + lost CAS + head reread + pointer miss + 3 chain reads"
+        );
 
         // ProvenNotCommitted: a rival chain fills the boundary range without our final
         // operation.
@@ -4133,15 +4459,8 @@ mod tests {
             "rival-op-3".into(),
         )
         .unwrap();
-        let (store, client) = replay_store(vec![
-            response(
-                200,
-                &[("etag", "\"parent\"")],
-                encode_head(genesis.head()).unwrap(),
-            ),
-            response(200, &[], SdkBody::empty()),
-            response(200, &[], SdkBody::empty()),
-            response(412, &[], SdkBody::empty()),
+        let mut responses = lost_cas_prelude(encode_head(genesis.head()).unwrap(), 412);
+        responses.extend([
             response(
                 200,
                 &[("etag", "\"rival\"")],
@@ -4159,6 +4478,7 @@ mod tests {
                 rivals[0].1.stored_bytes().to_vec(),
             ),
         ]);
+        let (store, client) = replay_store(responses);
         let parent = read(&store, &scope).await.unwrap().unwrap();
         assert!(matches!(
             append_batch(
@@ -4172,6 +4492,10 @@ mod tests {
             .unwrap(),
             ScopeHeadCommitOutcome::ProvenNotCommitted
         ));
-        assert_eq!(client.actual_requests().count(), 8);
+        assert_eq!(
+            client.actual_requests().count(),
+            8,
+            "parent read + 2 event PUTs + lost CAS + head reread + pointer miss + 2 rival reads"
+        );
     }
 }

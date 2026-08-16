@@ -27,10 +27,10 @@ use ravel::{
     },
     domain::work::{WorkId, WorkRef},
     scope::{
-        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, GrantActivatedEvent,
-        GrantActivatedPayload, RootGenesis, ScopeAuthority, ScopeIdentity, decode_head,
-        decode_root_event, encode_grant_activated_event, encode_head, root_genesis,
-        scope_event_key, scope_head_key,
+        AdmittedCampaignConfig, CampaignId, Digest, EncodedScopeEvent, EventEnvelope,
+        GrantActivatedEvent, GrantActivatedPayload, RootGenesis, ScopeAuthority, ScopeHead,
+        ScopeIdentity, decode_head, decode_root_event, encode_grant_activated_event, encode_head,
+        root_genesis, scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
     sync::{
@@ -123,6 +123,51 @@ fn genesis_for(campaign: CampaignId) -> RootGenesis {
         .expect("admitted configuration is within bounds"),
     )
     .expect("root genesis is deterministic")
+}
+
+fn grant_batch(
+    scope: &ScopeIdentity,
+    parent_head: &ScopeHead,
+    now_ms: u64,
+    fills: &[&str],
+) -> (Vec<(EventEnvelope, EncodedScopeEvent)>, Vec<String>) {
+    let epoch = parent_head.scope_epoch().get();
+    let mut parent_ref = parent_head.tail().clone();
+    let mut batch = Vec::new();
+    let mut expected_keys = Vec::new();
+    for (index, fill) in fills.iter().enumerate() {
+        let sequence = parent_head.tail().sequence() + 1 + index as u64;
+        let payload = GrantActivatedPayload::new(
+            WorkRef::new(
+                WorkId::new(format!("live-batch-work-{index}")).expect("work id is valid"),
+                1,
+            ),
+            1,
+            Digest::new(fill.repeat(64)).expect("grant digest is valid"),
+            1,
+            1,
+            now_ms + 60_000,
+        )
+        .expect("grant payload is within bounds");
+        let event = GrantActivatedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent_ref.clone()),
+                epoch,
+                format!("live-batch-op-{index}"),
+                "grant_activated".to_owned(),
+            )
+            .expect("envelope is valid"),
+            payload,
+        )
+        .expect("grant event is valid");
+        let encoded = encode_grant_activated_event(&event).expect("grant event encodes");
+        parent_ref = encoded.event_ref().clone();
+        expected_keys.push(scope_event_key(scope, encoded.event_ref()));
+        batch.push((event.envelope().clone(), encoded));
+    }
+    (batch, expected_keys)
 }
 
 async fn observed(store: &S3Store, scope: &ScopeIdentity) -> ObservedScopeHead {
@@ -487,42 +532,7 @@ async fn a_batched_commit_adds_exactly_its_event_keys_and_one_head_advance() {
         .await
         .expect("listing before the batch succeeds");
 
-    let epoch = parent_head.scope_epoch().get();
-    let mut parent_ref = parent_head.tail().clone();
-    let mut batch = Vec::new();
-    let mut expected_keys = Vec::new();
-    for (index, fill) in ["a", "b", "c"].iter().enumerate() {
-        let sequence = parent_head.tail().sequence() + 1 + index as u64;
-        let payload = GrantActivatedPayload::new(
-            WorkRef::new(
-                WorkId::new(format!("live-batch-work-{index}")).expect("work id is valid"),
-                1,
-            ),
-            1,
-            Digest::new(fill.repeat(64)).expect("grant digest is valid"),
-            1,
-            1,
-            now_ms + 60_000,
-        )
-        .expect("grant payload is within bounds");
-        let event = GrantActivatedEvent::new(
-            EventEnvelope::new(
-                scope.scope_id().clone(),
-                sequence,
-                Some(parent_ref.clone()),
-                epoch,
-                format!("live-batch-op-{index}"),
-                "grant_activated".to_owned(),
-            )
-            .expect("envelope is valid"),
-            payload,
-        )
-        .expect("grant event is valid");
-        let encoded = encode_grant_activated_event(&event).expect("grant event encodes");
-        parent_ref = encoded.event_ref().clone();
-        expected_keys.push(scope_event_key(scope, encoded.event_ref()));
-        batch.push((event.envelope().clone(), encoded));
-    }
+    let (batch, mut expected_keys) = grant_batch(scope, &parent_head, now_ms, &["a", "b", "c"]);
 
     assert!(matches!(
         append_batch(&store, parent, scope, batch, &mut AttemptHistory::default(),)

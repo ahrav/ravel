@@ -2938,19 +2938,70 @@ mod tests {
         fs::remove_file(listed_path).unwrap();
     }
 
-    /// A batched suffix produces the same cursor and projection content through the serial
-    /// walk, LIST, and packs.
+    /// A batched suffix produces the same cursor and projection content through the serial walk, LIST, and packs; the replayed bytes are the exact PUT bodies and CAS head that `append_batch` published, making this the suite's one write-path-to-read-path link. commentlint: allow(JUDGE)
     #[tokio::test]
     async fn a_batched_suffix_replays_identically_through_every_rung() {
         let genesis = genesis();
         let scope = genesis.identity().clone();
-        let (events, head) = accel_chain(&genesis, 4);
+
+        let mut batch = Vec::new();
+        let mut parent_ref = genesis.event_ref().clone();
+        for sequence in 2..=4u64 {
+            let envelope = EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent_ref.clone()),
+                1,
+                format!("batched-suffix-op-{sequence}"),
+                TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+            )
+            .unwrap();
+            let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+            parent_ref = encoded.event_ref().clone();
+            batch.push((envelope, encoded));
+        }
+        let references: Vec<ScopeEventRef> = batch
+            .iter()
+            .map(|(_, encoded)| encoded.event_ref().clone())
+            .collect();
+        let (store, client) = replay_store(vec![
+            head_response(genesis.head_bytes().to_vec()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"committed\"")], SdkBody::empty()),
+        ]);
+        let parent = head::read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            head::append_batch(
+                &store,
+                head::ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                batch,
+                &mut crate::storage::s3::AttemptHistory::default(),
+            )
+            .await
+            .unwrap(),
+            head::ScopeHeadCommitOutcome::Committed(_)
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        let head_bytes = requests[4].body().bytes().unwrap().to_vec();
+        let head =
+            crate::scope::decode_head(&head_bytes, &crate::scope::scope_head_key(&scope), &scope)
+                .unwrap();
+        let mut events = vec![(genesis.event_ref().clone(), genesis.event_bytes().to_vec())];
+        events.extend(
+            references
+                .into_iter()
+                .zip(&requests[1..4])
+                .map(|(reference, request)| (reference, request.body().bytes().unwrap().to_vec())),
+        );
         let keys = event_keys(&scope, &events);
 
         let serial_path = path("batched-suffix-serial");
         let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
-            head_response(encode_head(&head).unwrap()),
+            head_response(head_bytes.clone()),
             accel_miss(),
             accel_miss(),
             event_response(events[3].1.clone()),
@@ -2984,7 +3035,7 @@ mod tests {
         let packed_path = path("batched-suffix-packed");
         let packed = DbHandle::spawn(packed_path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
-            head_response(encode_head(&head).unwrap()),
+            head_response(head_bytes),
             response(200, &[("etag", "\"pointer\"")], pointer_bytes),
             response(200, &[("etag", "\"catalog\"")], catalog_bytes),
             response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),

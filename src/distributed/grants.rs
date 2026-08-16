@@ -229,12 +229,12 @@ pub enum IssueOutcome {
 
 /// Publishes one grant, appends its durable activation event, and folds it locally.
 ///
-/// The flow is: catch-up check, guards dry-run, immutable object publish, pre-append
-/// operation-id probe, event append under the consumed authority, then a synchronous local
-/// apply of the same committed event. A validation refusal appends nothing and leaves any
-/// published object inert. A crash between publish and append leaves an inert object at a
-/// burned fence key; the identical retry reconciles the create-if-absent publish on identical
-/// bytes, and its probe skips the append once the event is applied.
+/// The flow is: catch-up check, activation probe, guards dry-run, immutable object publish, event
+/// append under the consumed authority, then a synchronous local apply of the same committed
+/// event. A validation refusal appends nothing and leaves any published object inert. A crash
+/// between publish and append leaves an inert object at a burned fence key; the identical retry
+/// reconciles the create-if-absent publish on identical bytes, and its probe reports the
+/// activation before any guard whose state moves between attempts.
 pub async fn issue(
     store: &S3Store,
     database: &DbHandle,
@@ -255,13 +255,24 @@ pub async fn issue(
     if grant.deadline_unix_ms.get() <= now_ms {
         return refused(IssueError::Expired, authority);
     }
+    // Every step shares one deadline `STOP_MARGIN_MS` short of term expiry, and the accounting
+    // starts here so a queued projection read cannot spend term the later steps still assume.
+    // `elapsed_ms` advances `now_ms` by time spent since `started`.
+    let started = tokio::time::Instant::now();
+    let deadline = started
+        + Duration::from_millis(
+            authority
+                .remaining_term_ms(now_ms)
+                .saturating_sub(STOP_MARGIN_MS),
+        );
     // The probe and the dry-run read the local projection, which may lag the durable log after
     // a crash between append and apply; issuing over that lag would re-append a committed
     // operation, so a projection behind the observed head refuses until the caller refreshes.
-    match database.scope_matches_head(authority.head()).await {
-        Ok(true) => {}
-        Ok(false) => return refused(IssueError::ProjectionBehind, authority),
+    match tokio::time::timeout_at(deadline, database.scope_matches_head(authority.head())).await {
         Err(_) => return refused(IssueError::Unresolved, authority),
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return refused(IssueError::ProjectionBehind, authority),
+        Ok(Err(_)) => return refused(IssueError::Unresolved, authority),
     }
     let scope = grant.identity.scope().clone();
     let activation = |digest: Digest| GrantActivation {
@@ -280,15 +291,22 @@ pub async fn issue(
     let Ok(grant_digest) = Digest::new(digest.clone()) else {
         return refused(IssueError::Refused, authority);
     };
-    // Every step shares one deadline `STOP_MARGIN_MS` short of term expiry.
-    // `elapsed_ms` advances `now_ms` by time spent since `started`.
-    let started = tokio::time::Instant::now();
-    let deadline = started
-        + Duration::from_millis(
-            authority
-                .remaining_term_ms(now_ms)
-                .saturating_sub(STOP_MARGIN_MS),
-        );
+    // The probe runs before the dry-run because an activation this grant already committed is a
+    // fact, while the lease and budget the dry-run reads can move between attempts.
+    match tokio::time::timeout_at(
+        deadline,
+        database.grant_activation_probe(&grant.identity, grant.operation_id(), &grant_digest),
+    )
+    .await
+    {
+        Err(_) => return refused(IssueError::Unresolved, authority),
+        Ok(Ok(GrantActivationProbe::Activated)) => return IssueOutcome::Issued(authority),
+        Ok(Ok(GrantActivationProbe::ForeignOperation)) => {
+            return refused(IssueError::Refused, authority);
+        }
+        Ok(Ok(GrantActivationProbe::Absent)) => {}
+        Ok(Err(_)) => return refused(IssueError::Unresolved, authority),
+    }
     // Guards run before the object exists, so a refused issuance publishes nothing.
     match tokio::time::timeout_at(
         deadline,
@@ -321,20 +339,6 @@ pub async fn issue(
             | PublicationError::StorageNotFound,
         )) => return refused(IssueError::Unresolved, authority),
         Ok(Err(_)) => return refused(IssueError::Refused, authority),
-    }
-    match tokio::time::timeout_at(
-        deadline,
-        database.grant_activation_probe(&grant.identity, grant.operation_id(), &grant_digest),
-    )
-    .await
-    {
-        Err(_) => return refused(IssueError::Unresolved, authority),
-        Ok(Ok(GrantActivationProbe::Activated)) => return IssueOutcome::Issued(authority),
-        Ok(Ok(GrantActivationProbe::ForeignOperation)) => {
-            return refused(IssueError::Refused, authority);
-        }
-        Ok(Ok(GrantActivationProbe::Absent)) => {}
-        Ok(Err(_)) => return refused(IssueError::Unresolved, authority),
     }
     let payload = match GrantActivatedPayload::new(
         grant.identity.work().clone(),
@@ -468,6 +472,11 @@ pub async fn intake(
     {
         Ok(continuable) => {
             let accepted_at_ms = now_ms.saturating_add(elapsed_ms(started));
+            // The queued query answered against the timestamp it was given; the term can have
+            // crossed its stop margin while it waited.
+            if authority.must_stop(accepted_at_ms) {
+                return GrantIntake::Rejected(GrantRejection::StaleAuthority);
+            }
             if grant.deadline_unix_ms.get() <= accepted_at_ms {
                 return GrantIntake::Rejected(GrantRejection::Expired);
             }
@@ -1261,7 +1270,6 @@ mod tests {
                 response(200, &[], SdkBody::empty()),
                 response(200, &[], SdkBody::empty()),
                 response(200, &[("etag", "\"appended\"")], SdkBody::empty()),
-                response(200, &[], SdkBody::empty()),
                 response(200, &[("etag", "\"renewed\"")], SdkBody::empty()),
             ],
             NOW_MS,
@@ -1270,9 +1278,9 @@ mod tests {
         let authority = issued(issue_once(&store, &handle, authority, &grant, NOW_MS).await);
         assert_eq!(client.actual_requests().count(), 5);
         assert_eq!(authority.head().tail().sequence(), 3);
-        // The retry's probe recognises the committed operation and appends nothing.
+        // The retry probe recognizes the committed activation before any object-store request.
         let authority = issued(issue_once(&store, &handle, authority, &grant, NOW_MS).await);
-        assert_eq!(client.actual_requests().count(), 6);
+        assert_eq!(client.actual_requests().count(), 5);
         // The refreshed authority still renews: its retained observation is the committed head.
         let outcome = crate::distributed::scope_controller::renew(&store, authority, NOW_MS + 100)
             .await
@@ -1283,11 +1291,11 @@ mod tests {
         assert_eq!(renewed.scope_epoch().get(), 3);
         let requests = client.actual_requests().collect::<Vec<_>>();
         assert_eq!(
-            requests[6].headers().get("if-match").unwrap(),
+            requests[5].headers().get("if-match").unwrap(),
             "\"appended\""
         );
         let renewed_head = decode_head(
-            requests[6].body().bytes().unwrap(),
+            requests[5].body().bytes().unwrap(),
             &scope_head_key(genesis().identity()),
             genesis().identity(),
         )

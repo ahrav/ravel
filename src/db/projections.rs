@@ -2747,6 +2747,23 @@ mod tests {
             ),
             Ok(GrantActivationProbe::Absent)
         );
+        // At the claim lease deadline, `grant_admissible` returns `ApplyError::Conflict`.
+        // `issue` probes first so a committed activation still reports as issued.
+        let activation = GrantActivation {
+            scope_epoch: epoch(1),
+            attempt: NonZeroU64::new(1).unwrap(),
+            units: NonZeroU64::new(1).unwrap(),
+            deadline_unix_ms: NonZeroU64::new(MAX_STORED_INTEGER).unwrap(),
+            digest: digest.clone(),
+        };
+        assert_eq!(
+            grant_admissible(&connection, &identity, &activation, 31_000),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(
+            grant_activation_probe(&connection, &identity, "grant-op-2", &digest),
+            Ok(GrantActivationProbe::Activated)
+        );
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

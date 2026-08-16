@@ -697,9 +697,7 @@ pub(crate) async fn packed_events_from_catalog(
     first: u64,
     last: u64,
 ) -> Option<Vec<StoredEvent>> {
-    if first == 0
-        || last < first
-        || last - first + 1 > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS
+    if first == 0 || last < first || last - first + 1 > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS
     {
         return None;
     }
@@ -975,6 +973,10 @@ pub async fn publish_checkpoint(
     let ScopeHeadParent::Existing(observed) = &parent else {
         return Err(CheckpointPublishError::InvalidInput);
     };
+    // An occupied staging path is a caller input error, not a projection mismatch.
+    if staging.try_exists().unwrap_or(true) {
+        return Err(CheckpointPublishError::InvalidInput);
+    }
     let scope = observed.head().scope().clone();
     let covered = observed.head().tail().clone();
     let covered_plan = observed.head().active_plan_digest().cloned();
@@ -985,26 +987,47 @@ pub async fn publish_checkpoint(
             ApplyError::Conflict => CheckpointPublishError::ProjectionMismatch,
             _ => CheckpointPublishError::SnapshotFailed,
         })?;
-    let bytes = std::fs::read(staging).map_err(|_| CheckpointPublishError::SnapshotFailed)?;
-    let length = bytes.len();
-    if length == 0 || length > MAX_SNAPSHOT_BYTES {
+    let staged = {
+        let staging = staging.to_path_buf();
+        crate::db::worker::run_blocking(move || {
+            let bytes = std::fs::read(&staging).ok()?;
+            if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_BYTES {
+                return None;
+            }
+            let digest = Digest::new(sha256(&bytes)).ok()?;
+            Some((bytes, digest))
+        })
+        .await
+        .flatten()
+    };
+    let Some((bytes, digest)) = staged else {
+        let _ = std::fs::remove_file(staging);
         return Err(CheckpointPublishError::SnapshotFailed);
-    }
-    let digest = Digest::new(sha256(&bytes)).map_err(|_| CheckpointPublishError::SnapshotFailed)?;
+    };
+    let length = bytes.len();
     let key = scope_checkpoint_key(&scope, covered.sequence(), &digest);
-    store
+    if store
         .publish_with_history(&key, bytes, digest.as_str(), snapshot_history)
         .await
-        .map_err(|_| CheckpointPublishError::SnapshotStorage)?;
-    let payload = ProjectionCheckpointPayload::new(
+        .is_err()
+    {
+        let _ = std::fs::remove_file(staging);
+        return Err(CheckpointPublishError::SnapshotStorage);
+    }
+    let payload = match ProjectionCheckpointPayload::new(
         digest,
         length as u64,
         covered.sequence(),
         covered.digest().clone(),
         covered_plan,
-    )
-    .map_err(|_| CheckpointPublishError::InvalidInput)?;
-    head::append_checkpoint(
+    ) {
+        Ok(payload) => payload,
+        Err(_) => {
+            let _ = std::fs::remove_file(staging);
+            return Err(CheckpointPublishError::InvalidInput);
+        }
+    };
+    match head::append_checkpoint(
         store,
         parent,
         &scope,
@@ -1014,7 +1037,13 @@ pub async fn publish_checkpoint(
         head_history,
     )
     .await
-    .map_err(CheckpointPublishError::Append)
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            let _ = std::fs::remove_file(staging);
+            Err(CheckpointPublishError::Append(error))
+        }
+    }
 }
 
 /// Segments retained events into pack builds honoring the flush limits.

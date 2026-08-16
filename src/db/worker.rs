@@ -667,6 +667,20 @@ impl DbHandle {
     }
 }
 
+/// `None` means the thread could not spawn or exited without responding.
+pub(crate) async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (respond, receive) = oneshot::channel();
+    thread::Builder::new()
+        .name("ravel-snapshot-io".into())
+        .spawn(move || {
+            let _ = respond.send(work());
+        })
+        .ok()?;
+    receive.await.ok()
+}
+
 fn run(
     path: PathBuf,
     mode: OpenMode,

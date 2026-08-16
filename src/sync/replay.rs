@@ -368,23 +368,34 @@ async fn install_candidate(
     }
 
     let mut staging = destination.as_os_str().to_owned();
-    staging.push(format!(".checkpoint-{}", std::process::id()));
+    // The process-local counter differentiates staging paths for overlapping installs.
+    static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    staging.push(format!(
+        ".checkpoint-{}-{}",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let staging = std::path::PathBuf::from(staging);
-    let _ = std::fs::remove_file(&staging);
-    if std::fs::write(&staging, &bytes).is_err() {
-        let _ = std::fs::remove_file(&staging);
-        return None;
-    }
-    if !staged_snapshot_valid(&staging, scope, &certificate, &covered) {
-        let _ = std::fs::remove_file(&staging);
-        return None;
-    }
-
-    // Before the rename the previous destination is untouched; after it, the installed
-    // snapshot is independently valid at its covered cursor, so an interruption before
-    // the suffix applies still leaves a valid replayable projection.
-    if std::fs::rename(&staging, destination).is_err() {
-        let _ = std::fs::remove_file(&staging);
+    // Before rename, the previous destination remains untouched.
+    let installed = {
+        let scope = scope.clone();
+        let destination = destination.to_path_buf();
+        crate::db::worker::run_blocking(move || {
+            if rebuild_files(&staging).is_err() {
+                return false;
+            }
+            let installed = std::fs::write(&staging, &bytes).is_ok()
+                && staged_snapshot_valid(&staging, &scope, &certificate)
+                && std::fs::rename(&staging, &destination).is_ok();
+            if !installed {
+                let _ = rebuild_files(&staging);
+            }
+            installed
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if !installed {
         return None;
     }
     let handle = DbHandle::open_existing(destination.to_path_buf())
@@ -412,8 +423,11 @@ fn staged_snapshot_valid(
     staging: &Path,
     scope: &ScopeIdentity,
     certificate: &crate::scope::ProjectionCheckpointEvent,
-    covered: &(u64, Option<Digest>),
 ) -> bool {
+    let covered = (
+        certificate.payload().covered_sequence(),
+        Some(certificate.payload().covered_tail_digest().clone()),
+    );
     let Ok(connection) = crate::db::projections::open_existing(staging) else {
         return false;
     };
@@ -423,7 +437,7 @@ fn staged_snapshot_valid(
     let Ok(active_plan) = crate::db::projections::scope_active_plan(&connection, scope) else {
         return false;
     };
-    cursor == *covered && active_plan.as_ref() == certificate.payload().covered_active_plan_digest()
+    cursor == covered && active_plan.as_ref() == certificate.payload().covered_active_plan_digest()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -3664,12 +3678,29 @@ mod tests {
         let destination = path("checkpoint-interrupted");
         let _ = fs::remove_file(&destination);
 
-        // Before the rename: only the staging sibling exists. A retried cold start
-        // replaces the stale staging file and installs normally.
         let mut staging = destination.as_os_str().to_owned();
-        staging.push(format!(".checkpoint-{}", process::id()));
+        staging.push(".checkpoint-9999999-0");
         let staging = PathBuf::from(staging);
         fs::write(&staging, b"stale-staging").unwrap();
+        let staging_siblings = || {
+            let name = destination
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let mut siblings: Vec<String> = fs::read_dir(destination.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.unwrap().file_name().to_str().unwrap().to_owned();
+                    entry
+                        .starts_with(&format!("{name}.checkpoint-"))
+                        .then_some(entry)
+                })
+                .collect();
+            siblings.sort();
+            siblings
+        };
         assert!(!destination.exists());
         let (store, _) = replay_store(vec![
             head_response(encode_head(&fixture.head).unwrap()),
@@ -3689,7 +3720,12 @@ mod tests {
         ]);
         let handle = open_projection(&store, &scope, &destination).await.unwrap();
         assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 3);
-        assert!(!staging.exists());
+        assert_eq!(
+            staging_siblings(),
+            vec![staging.file_name().unwrap().to_str().unwrap().to_owned()],
+            "the retried install must leave no staging sibling of its own"
+        );
+        fs::remove_file(&staging).unwrap();
         drop(handle);
         fs::remove_file(&destination).unwrap();
 

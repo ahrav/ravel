@@ -38,6 +38,13 @@ use crate::{
 pub const MAX_GRANT_BYTES: usize = 4 * 1024;
 
 const GRANT_RECORD: &str = "effect_grant";
+/// Action naming a model invocation, beside the validator that decides it can exist.
+///
+/// A `&str` rather than a one-variant enum: the comparison is an equality against the grant's
+/// own free-form action, so an enum with no exhaustive `match` anywhere would force nothing
+/// when a second action is added. `validate_key_segment` in [`EffectGrant::new`] is what makes
+/// this value legal, which is why it lives here rather than beside the transport that uses it.
+pub const GRANT_ACTION_MODEL_INVOKE: &str = "model_invoke";
 
 /// Bounded authority for one external operation under one claim generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,10 +182,142 @@ pub enum GrantRejection {
     Malformed,
 }
 
+/// Proof that a claim and a grant were both checked against durable state.
+///
+/// Only [`intake`] constructs this, the way only `publish` constructs
+/// [`crate::storage::artifacts::PublishedArtifact`]: the fields are private to this module, so
+/// rustc refuses construction from every other module in the crate, including the transports
+/// that require one. That is the whole guarantee and its whole extent — this module and its
+/// children can still build one, and the crate boundary contributes nothing because every
+/// caller is in-crate.
+///
+/// It carries the lease's stop instant as well as the grant, because the lease is the shorter
+/// clock. A grant's deadline has no ceiling at issuance beyond not being already expired, while
+/// the authority that proved current ownership stops within [`STOP_MARGIN_MS`] of its own term.
+/// A call bounded only by the grant could outlive the lease, and a successor that legitimately
+/// took the claim could be dispatching at the same time.
+#[must_use]
+pub struct EffectAuthority {
+    grant: EffectGrant,
+    grant_digest: Digest,
+    /// Instant past which the proving authority must stop, derived from its lease term.
+    authority_stop_unix_ms: u64,
+}
+
+impl EffectAuthority {
+    pub fn grant(&self) -> &EffectGrant {
+        &self.grant
+    }
+
+    /// Address of the grant object this authority read back, as the projection recorded it.
+    pub fn grant_digest(&self) -> &Digest {
+        &self.grant_digest
+    }
+
+    /// Decides this authority against the request it would authorize, returning how long the
+    /// call may run.
+    ///
+    /// The bound is the shorter of the grant's deadline and the proving lease's stop instant.
+    /// Both are retested here rather than trusted from intake: between intake and dispatch the
+    /// caller does an object-store round trip, a projection query, and a manifest publication.
+    ///
+    /// The request is the argument rather than an action and a scope, because the only source
+    /// for those would be the caller handing the authority its own values back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrantRejection::IdentityMismatch`] when the grant does not name a model
+    /// invocation of this request's profile, [`GrantRejection::Expired`] for a grant past its
+    /// deadline, and [`GrantRejection::StaleAuthority`] when the proving lease has stopped.
+    pub fn authorizes_model(
+        &self,
+        request: &crate::provider::InvocationRequest,
+        now_ms: u64,
+    ) -> Result<Duration, GrantRejection> {
+        if self.grant.action != GRANT_ACTION_MODEL_INVOKE
+            || self.grant.resource_scope != request.profile().configuration_digest()
+        {
+            return Err(GrantRejection::IdentityMismatch);
+        }
+        if self.authority_stop_unix_ms <= now_ms {
+            return Err(GrantRejection::StaleAuthority);
+        }
+        let deadline = self.grant.deadline_unix_ms.get();
+        if deadline <= now_ms {
+            return Err(GrantRejection::Expired);
+        }
+        Ok(Duration::from_millis(
+            deadline.min(self.authority_stop_unix_ms) - now_ms,
+        ))
+    }
+}
+
+/// Mints an [`EffectAuthority`] without an object store or a projection.
+///
+/// Construction is module-private on purpose, so a test in another module has no way to build
+/// one and no reason to want a second mint path. This is that one path, and it is the only
+/// place outside [`intake`] where the fields are assembled.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{
+        Digest, EffectAuthority, EffectGrant, GRANT_ACTION_MODEL_INVOKE, ScopeClaimIdentity,
+        ScopeIdentity, WorkRef,
+    };
+    use crate::{distributed::identity::WorkspaceId, domain::work::WorkId, scope::CampaignId};
+
+    pub(crate) fn authority(
+        grant: EffectGrant,
+        grant_digest: Digest,
+        authority_stop_unix_ms: u64,
+    ) -> EffectAuthority {
+        EffectAuthority {
+            grant,
+            grant_digest,
+            authority_stop_unix_ms,
+        }
+    }
+
+    /// An authority that permits a model invocation of `resource_scope`.
+    ///
+    /// `resource_scope` is a profile's configuration digest, which is what the effect boundary
+    /// compares against, so a caller passes the digest of the profile it means to invoke.
+    pub(crate) fn model_authority(
+        resource_scope: String,
+        deadline_unix_ms: u64,
+        authority_stop_unix_ms: u64,
+    ) -> EffectAuthority {
+        let identity = ScopeClaimIdentity::new(
+            ScopeIdentity::root(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-a".into()).unwrap(),
+            )
+            .unwrap(),
+            Digest::new("11".repeat(32)).unwrap(),
+            WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1),
+            2,
+        )
+        .unwrap();
+        authority(
+            EffectGrant::new(
+                identity,
+                GRANT_ACTION_MODEL_INVOKE.to_owned(),
+                resource_scope,
+                1,
+                1_000,
+                deadline_unix_ms,
+                "invoke-op-1".to_owned(),
+            )
+            .unwrap(),
+            Digest::new("ab".repeat(32)).unwrap(),
+            authority_stop_unix_ms,
+        )
+    }
+}
+
 /// Outcome of reading one grant back for use.
 #[must_use]
 pub enum GrantIntake {
-    Accepted(Box<EffectGrant>),
+    Accepted(Box<EffectAuthority>),
     Rejected(GrantRejection),
     /// Storage or projection transport failed; retry may succeed.
     Unavailable,
@@ -491,7 +630,14 @@ pub async fn intake(
                 }
                 Some(row) if row.claim_fence() == expected.identity.claim_fence() => {
                     if row.grant_digest().as_str() == format!("{:x}", Sha256::digest(&bytes)) {
-                        GrantIntake::Accepted(Box::new(grant))
+                        GrantIntake::Accepted(Box::new(EffectAuthority {
+                            grant,
+                            grant_digest: row.grant_digest().clone(),
+                            authority_stop_unix_ms: authority
+                                .lease_until()
+                                .get()
+                                .saturating_sub(STOP_MARGIN_MS),
+                        }))
                     } else {
                         GrantIntake::Rejected(GrantRejection::IdentityMismatch)
                     }
@@ -1604,7 +1750,13 @@ mod tests {
         let GrantIntake::Accepted(accepted) = accepted else {
             panic!("expected acceptance");
         };
-        assert_eq!(*accepted, grant);
+        // The authority carries the grant it decided, and the digest the projection recorded
+        // rather than one recomputed from the bytes a second time.
+        assert_eq!(*accepted.grant(), grant);
+        assert_eq!(
+            accepted.grant_digest().as_str(),
+            format!("{:x}", Sha256::digest(encode_grant(&grant).unwrap()))
+        );
 
         // A grant with matching bindings must equal the projection's recorded grant.
         assert!(matches!(

@@ -3,12 +3,20 @@ use ravel::{
     distributed::identity::{InstanceId, WorkspaceId},
     domain::validation::ValidationError,
     scope::{
-        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ScopeAuthority, ScopeEventRef,
-        ScopeHead, ScopeId, ScopeIdentity, artifact_key, decode_head, decode_root_event,
-        encode_head, encode_root_event, plan_key, root_genesis, root_scope_id, scope_event_key,
-        scope_head_key,
+        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ProjectionCheckpointEvent,
+        ProjectionCheckpointPayload, ScopeAuthority, ScopeEventRef, ScopeHead, ScopeId,
+        ScopeIdentity, artifact_key, decode_head, decode_projection_checkpoint_event,
+        decode_root_event, encode_head, encode_projection_checkpoint_event, encode_root_event,
+        plan_key, root_genesis, root_scope_id, scope_event_key, scope_head_key,
     },
-    sync::WireError,
+    sync::{
+        WireError,
+        accelerator::{
+            PackEntry, build_pack, decode_catalog, decode_pack, decode_pointer, encode_catalog,
+            encode_pointer, replay_catalog_key, replay_pack_key, replay_pointer_key,
+            scope_checkpoint_key,
+        },
+    },
 };
 use sha2::{Digest as _, Sha256};
 
@@ -20,6 +28,16 @@ const EVENT_BYTES: &[u8] = include_bytes!(
     "fixtures/wire/0000000000000001-0e180b9203c97f2961404817cef51750a24c0fe2e17e0e63e432ad46c9c12969.cbor.zst"
 );
 const HEAD_BYTES: &[u8] = include_bytes!("fixtures/wire/root-head.json");
+const CHECKPOINT_EVENT_DIGEST: &str =
+    "16e08c7f89bfd37c6cf7a00da297bf415188607163a1af5ed14ad790bbd75c5a";
+const CHECKPOINT_EVENT_BYTES: &[u8] = include_bytes!(
+    "fixtures/wire/0000000000000002-16e08c7f89bfd37c6cf7a00da297bf415188607163a1af5ed14ad790bbd75c5a.cbor.zst"
+);
+const PACK_BYTES: &[u8] = include_bytes!("fixtures/wire/replay-pack.cbor");
+const PACK_DIGEST: &str = "f71b6b152a49ec129f0179bd8571f87b3e7d516d61a985d05ac34644c40ab22e";
+const CATALOG_BYTES: &[u8] = include_bytes!("fixtures/wire/replay-catalog.cbor");
+const CATALOG_DIGEST: &str = "05854b59cbcca7978b625dce5afa73fac0cb4b595dcbf3e033c7cfe6e5358ab8";
+const POINTER_BYTES: &[u8] = include_bytes!("fixtures/wire/replay-pointer.cbor");
 const CONFIG_BYTES: &[u8] = br#"{"budget":7,"campaign":"campaign-a"}"#;
 
 const ENVELOPE_FIELDS: [&str; 6] = [
@@ -594,5 +612,177 @@ fn size_and_reference_boundaries_fail_closed() {
     assert_eq!(
         decode_root_event(EVENT_BYTES, "wrong", &scope()),
         Err(WireError::ReferenceMismatch)
+    );
+}
+
+#[test]
+fn checkpoint_event_fixture_is_deterministic_and_canonical() {
+    let genesis = root_genesis(&config(CONFIG_BYTES)).unwrap();
+    let snapshot = b"snapshot-fixture";
+    let payload = ProjectionCheckpointPayload::new(
+        Digest::new(sha256(snapshot)).unwrap(),
+        snapshot.len() as u64,
+        1,
+        genesis.event_ref().digest().clone(),
+        None,
+    )
+    .unwrap();
+    let event = ProjectionCheckpointEvent::new(
+        EventEnvelope::new(
+            scope().scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "checkpoint-op-1".into(),
+            "projection_checkpoint_published".into(),
+        )
+        .unwrap(),
+        payload,
+    )
+    .unwrap();
+    let encoded = encode_projection_checkpoint_event(&event).unwrap();
+    assert_eq!(encoded.stored_bytes(), CHECKPOINT_EVENT_BYTES);
+    assert_eq!(
+        encoded.event_ref().digest().as_str(),
+        CHECKPOINT_EVENT_DIGEST
+    );
+    assert_eq!(sha256(CHECKPOINT_EVENT_BYTES), CHECKPOINT_EVENT_DIGEST);
+
+    let key = scope_event_key(&scope(), encoded.event_ref());
+    let decoded =
+        decode_projection_checkpoint_event(CHECKPOINT_EVENT_BYTES, &key, &scope()).unwrap();
+    assert_eq!(decoded, event);
+    assert_eq!(decoded.payload().covered_sequence(), 1);
+    assert_eq!(decoded.payload().snapshot_length(), snapshot.len() as u64);
+    assert_eq!(decoded.payload().covered_active_plan_digest(), None);
+    assert_eq!(
+        encode_projection_checkpoint_event(&decoded)
+            .unwrap()
+            .stored_bytes(),
+        CHECKPOINT_EVENT_BYTES
+    );
+    assert_eq!(
+        scope_checkpoint_key(&scope(), 1, decoded.payload().snapshot_digest()),
+        format!(
+            "workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/checkpoints/0000000000000001-{}",
+            sha256(snapshot)
+        )
+    );
+
+    // The wire payload names its fields exactly and rejects strangers.
+    let cbor = zstd::bulk::decompress(CHECKPOINT_EVENT_BYTES, 1024 * 1024).unwrap();
+    let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+    let root = map_mut(&mut value);
+    let payload_fields = map_mut(field_mut(root, "payload"));
+    assert_eq!(
+        keys(payload_fields),
+        [
+            "version",
+            "snapshot_digest",
+            "snapshot_length",
+            "covered_sequence",
+            "covered_tail_digest",
+            "covered_active_plan_digest",
+        ]
+    );
+    payload_fields.push((Value::Text("extra".into()), Value::Null));
+    let mut extended = Vec::new();
+    ciborium::into_writer(&value, &mut extended).unwrap();
+    let extended = zstd::bulk::compress(&extended, 3).unwrap();
+    let extended_ref = ScopeEventRef::new(2, Digest::new(sha256(&extended)).unwrap()).unwrap();
+    let extended_key = scope_event_key(&scope(), &extended_ref);
+    assert_eq!(
+        decode_projection_checkpoint_event(&extended, &extended_key, &scope()),
+        Err(WireError::InvalidEncoding)
+    );
+}
+
+#[test]
+fn accelerator_fixtures_are_deterministic_and_reject_tampering() {
+    let genesis = root_genesis(&config(CONFIG_BYTES)).unwrap();
+    let scope = scope();
+
+    let pack = build_pack(&scope, None, 1, &[genesis.event_bytes()]).unwrap();
+    assert_eq!(pack.bytes(), PACK_BYTES);
+    assert_eq!(pack.digest().as_str(), PACK_DIGEST);
+    assert_eq!(sha256(PACK_BYTES), PACK_DIGEST);
+    assert_eq!(
+        replay_pack_key(&scope, 1, 1, pack.digest()),
+        format!(
+            "workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/replay-packs/0000000000000001-0000000000000001-{PACK_DIGEST}"
+        )
+    );
+    let decoded = decode_pack(PACK_BYTES, pack.digest(), &scope).unwrap();
+    assert_eq!(decoded.event_count(), 1);
+    assert_eq!(decoded.event_bytes(0), EVENT_BYTES);
+    assert_eq!(decoded.parent_event(), None);
+    assert_eq!(decoded.final_event().digest().as_str(), EVENT_DIGEST);
+    let mut tampered = PACK_BYTES.to_vec();
+    tampered[8] ^= 1;
+    assert_eq!(
+        decode_pack(&tampered, pack.digest(), &scope),
+        Err(WireError::ReferenceMismatch)
+    );
+
+    let certificate_ref =
+        ScopeEventRef::new(2, Digest::new(CHECKPOINT_EVENT_DIGEST.into()).unwrap()).unwrap();
+    let entry = PackEntry::new(1, 1, pack.digest().clone()).unwrap();
+    let (catalog_bytes, catalog_digest) = encode_catalog(
+        &scope,
+        std::slice::from_ref(&entry),
+        std::slice::from_ref(&certificate_ref),
+    )
+    .unwrap();
+    assert_eq!(catalog_bytes, CATALOG_BYTES);
+    assert_eq!(catalog_digest.as_str(), CATALOG_DIGEST);
+    assert_eq!(sha256(CATALOG_BYTES), CATALOG_DIGEST);
+    assert_eq!(
+        replay_catalog_key(&scope, &catalog_digest),
+        format!(
+            "workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/replay-index/{CATALOG_DIGEST}"
+        )
+    );
+    let catalog = decode_catalog(CATALOG_BYTES, &catalog_digest, &scope).unwrap();
+    assert_eq!(catalog.entries(), std::slice::from_ref(&entry));
+    assert_eq!(catalog.checkpoints(), &[certificate_ref]);
+
+    let pointer = encode_pointer(&scope, &catalog_digest).unwrap();
+    assert_eq!(pointer, POINTER_BYTES);
+    assert_eq!(
+        decode_pointer(POINTER_BYTES, &scope).unwrap(),
+        catalog_digest
+    );
+    assert_eq!(
+        replay_pointer_key(&scope),
+        format!(
+            "workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/replay-index/current"
+        )
+    );
+
+    // Wrong-scope readers refuse all three accelerator objects.
+    let foreign = ScopeIdentity::root(
+        WorkspaceId::new("workspace-b".into()).unwrap(),
+        CampaignId::new("campaign-a".into()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        decode_pack(
+            PACK_BYTES,
+            &Digest::new(PACK_DIGEST.into()).unwrap(),
+            &foreign
+        ),
+        Err(WireError::InvalidValue)
+    );
+    assert_eq!(
+        decode_catalog(
+            CATALOG_BYTES,
+            &Digest::new(CATALOG_DIGEST.into()).unwrap(),
+            &foreign
+        ),
+        Err(WireError::InvalidValue)
+    );
+    assert_eq!(
+        decode_pointer(POINTER_BYTES, &foreign),
+        Err(WireError::InvalidValue)
     );
 }

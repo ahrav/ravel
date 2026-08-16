@@ -39,7 +39,7 @@ const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Opaque S3 version token passed unchanged to `If-Match`.
 ///
 /// The type exposes no content-hash, ordering, parsing, or string-access API.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ETag(String);
 
 /// Result of a bounded full-object read.
@@ -90,6 +90,30 @@ pub enum MutationOutcome {
     /// Input exceeded the single-PUT limit before request construction.
     TooLarge,
 }
+
+/// Data-free failure category for a bounded paginated key listing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListError {
+    /// The listing names more keys than the caller's bound.
+    TooMany,
+    /// A truncated page without a fresh continuation token, a repeated token, or an
+    /// entry without a key.
+    Invalid,
+    /// Transport, timeout, or service failure.
+    Transport,
+}
+
+impl fmt::Display for ListError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooMany => "listing exceeds the key limit",
+            Self::Invalid => "listing response is invalid",
+            Self::Transport => "listing failed",
+        })
+    }
+}
+
+impl Error for ListError {}
 
 /// Data-free failure category for immutable publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +234,65 @@ impl S3Store {
             bytes.extend_from_slice(&chunk);
         }
         Ok(GetOutcome::Found { bytes, etag })
+    }
+
+    /// Lists at most `max_keys` object keys under `prefix`, following pagination.
+    ///
+    /// Listings are hints: callers must re-verify anything a key claims to name. The
+    /// request page size is bounded to one key beyond the caller's limit so an
+    /// over-populated prefix is detected without accumulating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListError::TooMany`] when the prefix holds more keys than `max_keys`,
+    /// [`ListError::Invalid`] for a truncated page without a fresh continuation token, a
+    /// repeated token, an entry without a key, or an endpoint that pages without
+    /// delivering keys, and [`ListError::Transport`] for every SDK or service failure.
+    pub async fn list_keys(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<String>, ListError> {
+        let mut keys: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        // The page allowance refuses an endpoint that keeps paging without progress.
+        let mut pages = max_keys.div_ceil(1_000) + 2;
+        loop {
+            pages = pages.checked_sub(1).ok_or(ListError::Invalid)?;
+            let remaining = max_keys.saturating_sub(keys.len());
+            let page = remaining.saturating_add(1).min(1_000) as i32;
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .max_keys(page);
+            // `StartAfter` is defined only for the first page; once a continuation token
+            // exists it carries the position, and some S3-compatible endpoints reject or
+            // mishandle a request that sends both.
+            if let Some(token) = &token {
+                request = request.continuation_token(token);
+            } else if let Some(start_after) = start_after {
+                request = request.start_after(start_after);
+            }
+            let output = request.send().await.map_err(|_| ListError::Transport)?;
+            for object in output.contents() {
+                let key = object.key().ok_or(ListError::Invalid)?;
+                if keys.len() == max_keys {
+                    return Err(ListError::TooMany);
+                }
+                keys.push(key.to_owned());
+            }
+            if output.is_truncated() != Some(true) {
+                return Ok(keys);
+            }
+            let next = output.next_continuation_token().ok_or(ListError::Invalid)?;
+            if token.as_deref() == Some(next) {
+                return Err(ListError::Invalid);
+            }
+            token = Some(next.to_owned());
+        }
     }
 
     /// Sends one create-only PUT and records possible dispatch before awaiting it.
@@ -472,6 +555,30 @@ pub(crate) mod test_support {
         builder.body(body.into()).expect("valid test response")
     }
 
+    /// Builds one scripted `ListObjectsV2` page naming `keys` in order.
+    pub(crate) fn list_response(
+        keys: &[&str],
+        truncated: bool,
+        next_token: Option<&str>,
+    ) -> http::Response<SdkBody> {
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>test-bucket</Name>",
+        );
+        for key in keys {
+            body.push_str(&format!("<Contents><Key>{key}</Key></Contents>"));
+        }
+        body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+        if let Some(token) = next_token {
+            body.push_str(&format!(
+                "<NextContinuationToken>{token}</NextContinuationToken>"
+            ));
+        }
+        body.push_str("</ListBucketResult>");
+        response(200, &[("content-type", "application/xml")], body)
+    }
+
     pub(crate) fn replay_store(
         responses: Vec<http::Response<SdkBody>>,
     ) -> (S3Store, StaticReplayClient) {
@@ -486,6 +593,30 @@ pub(crate) mod test_support {
             test_builder(client.clone()),
         );
         (store, client)
+    }
+
+    /// Routes responses by path and query so concurrent requests cannot consume
+    /// responses by fetch order.
+    pub(crate) fn keyed_store(
+        route: impl Fn(&str) -> http::Response<SdkBody> + Send + Sync + 'static,
+    ) -> (S3Store, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let client = aws_smithy_http_client::test_util::infallible_client_fn(move |request| {
+            let uri = request.uri();
+            let line = match uri.query() {
+                Some(query) => format!("{} {}?{query}", request.method(), uri.path()),
+                None => format!("{} {}", request.method(), uri.path()),
+            };
+            recorded.lock().unwrap().push(line);
+            route(uri.path_and_query().map_or("", |value| value.as_str()))
+        });
+        let store = S3Store::new(
+            "test-bucket",
+            Region::new("us-east-1"),
+            test_builder(client),
+        );
+        (store, requests)
     }
 }
 
@@ -503,7 +634,7 @@ mod tests {
     use bytes::Bytes;
     use http_body::{Body, Frame};
 
-    use super::test_support::{replay_store, response, test_builder};
+    use super::test_support::{list_response, replay_store, response, test_builder};
 
     const TEST_ETAG: &str = "\"opaque-token:part-7\"";
 
@@ -1037,6 +1168,127 @@ mod tests {
         assert_eq!(
             PublicationError::Unresolved.to_string(),
             "immutable publication is unresolved"
+        );
+        assert_eq!(
+            ListError::TooMany.to_string(),
+            "listing exceeds the key limit"
+        );
+        assert_eq!(
+            ListError::Invalid.to_string(),
+            "listing response is invalid"
+        );
+        assert_eq!(ListError::Transport.to_string(), "listing failed");
+    }
+
+    #[tokio::test]
+    async fn list_returns_zero_results_and_multi_page_keys_in_order() {
+        let (store, _) = replay_store(vec![list_response(&[], false, None)]);
+        assert_eq!(store.list_keys("events/", None, 8).await, Ok(Vec::new()));
+
+        let (store, client) = replay_store(vec![
+            list_response(&["events/a", "events/b"], true, Some("token-1")),
+            list_response(&["events/c"], false, None),
+        ]);
+        assert_eq!(
+            store.list_keys("events/", Some("events/0"), 8).await,
+            Ok(vec![
+                "events/a".to_owned(),
+                "events/b".to_owned(),
+                "events/c".to_owned(),
+            ])
+        );
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 2);
+        let first = requests[0].uri().parse::<http::Uri>().unwrap();
+        let query = first.query().unwrap();
+        assert!(query.contains("start-after=events%2F0"));
+        assert!(query.contains("prefix=events%2F"));
+        assert!(query.contains("max-keys=9"));
+        let second = requests[1].uri().parse::<http::Uri>().unwrap();
+        assert!(
+            second
+                .query()
+                .unwrap()
+                .contains("continuation-token=token-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_repeated_tokens_missing_tokens_and_over_limit_pages() {
+        let (store, _) = replay_store(vec![
+            list_response(&["events/a"], true, Some("token-1")),
+            list_response(&["events/b"], true, Some("token-1")),
+        ]);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Invalid)
+        );
+
+        let (store, _) = replay_store(vec![list_response(&["events/a"], true, None)]);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Invalid)
+        );
+
+        let (store, _) = replay_store(vec![list_response(&["events/a", "events/b"], false, None)]);
+        assert_eq!(
+            store.list_keys("events/", None, 1).await,
+            Err(ListError::TooMany)
+        );
+
+        // The bound applies across pages, not per page.
+        let (store, _) = replay_store(vec![
+            list_response(&["events/a", "events/b"], true, Some("token-1")),
+            list_response(&["events/c"], false, None),
+        ]);
+        assert_eq!(
+            store.list_keys("events/", None, 2).await,
+            Err(ListError::TooMany)
+        );
+
+        let (store, _) = replay_store(vec![response(500, &[], SdkBody::empty())]);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Transport)
+        );
+
+        let (store, _) = replay_store(vec![response(200, &[], b"not-xml".to_vec())]);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Transport)
+        );
+
+        // An entry without a key is a malformed listing.
+        let keyless = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>test-bucket</Name>\
+             <Contents><Size>1</Size></Contents>\
+             <IsTruncated>false</IsTruncated>\
+             </ListBucketResult>";
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("content-type", "application/xml")],
+            keyless.to_owned(),
+        )]);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Invalid)
+        );
+
+        // An endpoint that keeps paging fresh tokens without progress exhausts the page
+        // allowance instead of looping forever.
+        let mut endless = Vec::new();
+        for page in 0..16 {
+            endless.push(list_response(&[], true, Some(&format!("token-{page}"))));
+        }
+        let (store, client) = replay_store(endless);
+        assert_eq!(
+            store.list_keys("events/", None, 8).await,
+            Err(ListError::Invalid)
+        );
+        assert_eq!(
+            client.actual_requests().count(),
+            8_usize.div_ceil(1_000) + 2
         );
     }
 }

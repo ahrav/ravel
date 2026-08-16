@@ -32,11 +32,16 @@ use ravel::{
     },
     storage::s3::{GetOutcome, MutationOutcome, S3Store},
     sync::{
+        accelerator::{
+            decode_catalog, decode_pointer, publish_checkpoint, replay_catalog_key,
+            replay_pointer_key, scope_events_prefix,
+        },
         event::publish_root,
         head::{
             ObservedScopeHead, ScopeAppendError, ScopeHeadCommitOutcome, ScopeHeadParent,
             append_root, read,
         },
+        replay::{ScopeReadiness, open_projection, refresh},
     },
 };
 
@@ -49,6 +54,8 @@ const EXPECTED_REGION: &str = "us-east-1";
 // The library keeps these decode caps private, so the suite restates them.
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_HEAD_BYTES: usize = 4 * 1024;
+const MAX_POINTER_BYTES: usize = 4 * 1024;
+const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 
 const CONFIG_BYTES: &[u8] = br#"{"budget":7,"campaign":"live"}"#;
 
@@ -427,4 +434,258 @@ async fn append_reports_publication_errors_with_exact_dispatch_evidence() {
         !event_history.may_have_been_sent(),
         "an absent bucket answers with a proven 404, which must not claim a possible send"
     );
+}
+
+/// Opens a fresh projection under a per-run temporary path.
+async fn fresh_projection(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    label: &str,
+) -> (ravel::db::worker::DbHandle, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("ravel-live-{}-{label}.sqlite3", process::id()));
+    let _ = std::fs::remove_file(&path);
+    let handle = open_projection(store, scope, &path)
+        .await
+        .expect("projection opens");
+    (handle, path)
+}
+
+fn cursor_of(readiness: ScopeReadiness) -> (u64, ravel::scope::Digest) {
+    match readiness {
+        ScopeReadiness::Ready { local_cursor, .. } => local_cursor,
+        ScopeReadiness::NotReady(error) => panic!("replay must reach readiness: {error}"),
+    }
+}
+
+#[tokio::test]
+async fn list_assisted_replay_then_pack_reads_reach_the_same_cursor() {
+    if !ready() {
+        return;
+    }
+    let config = aws_config::load_from_env().await;
+    let store = store(&config);
+    let genesis = genesis_for(run_campaign());
+    let scope = genesis.identity();
+    let root = decode_root_event(genesis.event_bytes(), genesis.event_key(), scope)
+        .expect("canonical fixture decodes");
+    assert!(matches!(
+        append_root(
+            &store,
+            ScopeHeadParent::Genesis,
+            scope,
+            &root,
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .expect("root append succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+
+    // Real S3 LIST semantics: the events prefix names exactly the genesis key.
+    let listed = store
+        .list_keys(&scope_events_prefix(scope), None, 8)
+        .await
+        .expect("listing succeeds");
+    assert_eq!(listed, vec![scope_event_key(scope, genesis.event_ref())]);
+
+    // With no pointer yet, the first cold replay is LIST-assisted and then publishes
+    // packs, a catalog, and the pointer.
+    let (first, first_path) = fresh_projection(&store, scope, "list-first").await;
+    let first_cursor = cursor_of(refresh(&store, &first, scope).await);
+    assert_eq!(first_cursor.0, 1);
+    assert_eq!(&first_cursor.1, genesis.event_ref().digest());
+    drop(first);
+    let _ = std::fs::remove_file(&first_path);
+    match store
+        .get_object(&replay_pointer_key(scope), 4 * 1024)
+        .await
+        .expect("pointer read succeeds")
+    {
+        GetOutcome::Found { .. } => {}
+        GetOutcome::NotFound => panic!("the first replay must publish the pointer"),
+    }
+
+    // A second cold projection replays through the published packs to the same cursor.
+    let (second, second_path) = fresh_projection(&store, scope, "list-second").await;
+    let second_cursor = cursor_of(refresh(&store, &second, scope).await);
+    assert_eq!(second_cursor, first_cursor);
+    drop(second);
+    let _ = std::fs::remove_file(&second_path);
+}
+
+#[tokio::test]
+async fn contending_publishers_leave_replay_successful_and_one_valid_pointer() {
+    if !ready() {
+        return;
+    }
+    let config = aws_config::load_from_env().await;
+    let store_a = store(&config);
+    let store_b = store(&config);
+    let genesis = genesis_for(run_campaign());
+    let scope = genesis.identity();
+    let root = decode_root_event(genesis.event_bytes(), genesis.event_key(), scope)
+        .expect("canonical fixture decodes");
+    assert!(matches!(
+        append_root(
+            &store_a,
+            ScopeHeadParent::Genesis,
+            scope,
+            &root,
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .expect("root append succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+
+    // Two cold projections replay and publish concurrently; a pointer CAS loser stops
+    // publishing while both replays stay successful.
+    let (first, first_path) = fresh_projection(&store_a, scope, "contend-a").await;
+    let (second, second_path) = fresh_projection(&store_b, scope, "contend-b").await;
+    let (readiness_a, readiness_b) = tokio::join!(
+        refresh(&store_a, &first, scope),
+        refresh(&store_b, &second, scope),
+    );
+    let cursor_a = cursor_of(readiness_a);
+    let cursor_b = cursor_of(readiness_b);
+    assert_eq!(cursor_a, cursor_b);
+    drop((first, second));
+    let _ = std::fs::remove_file(&first_path);
+    let _ = std::fs::remove_file(&second_path);
+
+    // The surviving pointer names a decodable catalog whose rows cover the replayed
+    // range.
+    let pointer_bytes = match store_a
+        .get_object(&replay_pointer_key(scope), MAX_POINTER_BYTES)
+        .await
+        .expect("pointer read succeeds")
+    {
+        GetOutcome::Found { bytes, .. } => bytes,
+        GetOutcome::NotFound => panic!("a publisher must have won the pointer CAS"),
+    };
+    let catalog_digest = decode_pointer(&pointer_bytes, scope).expect("pointer decodes");
+    let catalog_bytes = match store_a
+        .get_object(
+            &replay_catalog_key(scope, &catalog_digest),
+            MAX_CATALOG_BYTES,
+        )
+        .await
+        .expect("catalog read succeeds")
+    {
+        GetOutcome::Found { bytes, .. } => bytes,
+        GetOutcome::NotFound => panic!("the surviving pointer must name a stored catalog"),
+    };
+    let catalog = decode_catalog(&catalog_bytes, &catalog_digest, scope).expect("catalog decodes");
+    assert!(
+        catalog
+            .entries()
+            .iter()
+            .any(|entry| entry.start() <= 1 && 1 <= entry.end()),
+        "the surviving catalog must cover the replayed range"
+    );
+
+    // Whichever pointer won, a third cold projection replays through it.
+    let (third, third_path) = fresh_projection(&store_a, scope, "contend-c").await;
+    assert_eq!(cursor_of(refresh(&store_a, &third, scope).await), cursor_a);
+    drop(third);
+    let _ = std::fs::remove_file(&third_path);
+}
+
+#[tokio::test]
+async fn a_checkpoint_certified_cold_start_reaches_the_pinned_head() {
+    if !ready() {
+        return;
+    }
+    let config = aws_config::load_from_env().await;
+    let store = store(&config);
+    let genesis = genesis_for(run_campaign());
+    let scope = genesis.identity();
+    let root = decode_root_event(genesis.event_bytes(), genesis.event_key(), scope)
+        .expect("canonical fixture decodes");
+    assert!(matches!(
+        append_root(
+            &store,
+            ScopeHeadParent::Genesis,
+            scope,
+            &root,
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .expect("root append succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+
+    // A live projection reaches the head, then a fenced controller certifies it.
+    let (live, live_path) = fresh_projection(&store, scope, "checkpoint-live").await;
+    assert_eq!(cursor_of(refresh(&store, &live, scope).await).0, 1);
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("current Unix time fits u64 milliseconds");
+    let instance = InstanceId::new("live-checkpoint-controller".into()).expect("id is valid");
+    let AcquireOutcome::Acquired(authority) = acquire(&store, scope, &instance, now_ms)
+        .await
+        .expect("acquisition succeeds")
+    else {
+        panic!("expected acquisition");
+    };
+    // Acquisition advanced the epoch, so the live projection re-reads the head before
+    // the snapshot comparison.
+    assert_eq!(cursor_of(refresh(&store, &live, scope).await).0, 1);
+    let Ok(parent) = authority.into_parent(now_ms) else {
+        panic!("authority is within its term");
+    };
+    let staging = std::env::temp_dir().join(format!(
+        "ravel-live-{}-checkpoint-staging.sqlite3",
+        process::id()
+    ));
+    let _ = std::fs::remove_file(&staging);
+    let mut histories = [
+        AttemptHistory::default(),
+        AttemptHistory::default(),
+        AttemptHistory::default(),
+    ];
+    let [snapshot_history, event_history, head_history] = &mut histories;
+    assert!(matches!(
+        publish_checkpoint(
+            &store,
+            &live,
+            parent,
+            &staging,
+            "live-checkpoint-op-1",
+            [snapshot_history, event_history, head_history],
+        )
+        .await
+        .expect("checkpoint publication succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+    let _ = std::fs::remove_file(&staging);
+
+    // Folding the certificate also publishes the pack and catalog naming it.
+    assert_eq!(cursor_of(refresh(&store, &live, scope).await).0, 2);
+    drop(live);
+    let _ = std::fs::remove_file(&live_path);
+
+    // A cold start now installs the certified snapshot and applies the packed suffix.
+    // Only an installed snapshot leaves the destination at the pinned head before any
+    // refresh; a rung miss would leave a fresh empty projection at cursor 0.
+    let (cold, cold_path) = fresh_projection(&store, scope, "checkpoint-cold").await;
+    let installed_cursor: (i64, String) = rusqlite::Connection::open(&cold_path)
+        .expect("the installed projection opens")
+        .query_row(
+            "SELECT sequence, tail_event_digest FROM scopes WHERE scope_id = ?1",
+            [scope.scope_id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the installed projection holds this scope's row");
+    assert_eq!(installed_cursor.0, 2);
+    assert_eq!(cursor_of(refresh(&store, &cold, scope).await).0, 2);
+    drop(cold);
+    let _ = std::fs::remove_file(&cold_path);
 }

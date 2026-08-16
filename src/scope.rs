@@ -25,6 +25,7 @@ use crate::{
 pub(crate) const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
 pub(crate) const PLAN_ADMITTED_PAYLOAD_TYPE: &str = "plan_admitted";
 pub(crate) const GRANT_ACTIVATED_PAYLOAD_TYPE: &str = "grant_activated";
+pub(crate) const PROJECTION_CHECKPOINT_PAYLOAD_TYPE: &str = "projection_checkpoint_published";
 #[cfg(test)]
 pub(crate) const TEST_SUCCESSOR_PAYLOAD_TYPE: &str = "test_successor";
 const ROOT_SCOPE_DOMAIN: &[u8] = b"ravel.scope.root\0";
@@ -488,6 +489,107 @@ impl GrantActivatedEvent {
     }
 }
 
+/// Payload of the event that certifies one published projection snapshot.
+///
+/// The snapshot key is derived from the covered sequence and snapshot digest; no key
+/// string is stored. Certification grants no authority: replay must still prove the
+/// certificate and its suffix against the pinned head before trusting the snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionCheckpointPayload {
+    snapshot_digest: Digest,
+    snapshot_length: u64,
+    covered_sequence: u64,
+    covered_tail_digest: Digest,
+    covered_active_plan_digest: Option<Digest>,
+}
+
+impl ProjectionCheckpointPayload {
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidValue`] for a zero or over-bound snapshot length or an
+    /// invalid covered sequence.
+    pub fn new(
+        snapshot_digest: Digest,
+        snapshot_length: u64,
+        covered_sequence: u64,
+        covered_tail_digest: Digest,
+        covered_active_plan_digest: Option<Digest>,
+    ) -> Result<Self, WireError> {
+        if snapshot_length == 0
+            || snapshot_length > crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64
+        {
+            return Err(WireError::InvalidValue);
+        }
+        validate_sequence(covered_sequence).map_err(|_| WireError::InvalidValue)?;
+        Ok(Self {
+            snapshot_digest,
+            snapshot_length,
+            covered_sequence,
+            covered_tail_digest,
+            covered_active_plan_digest,
+        })
+    }
+
+    pub fn snapshot_digest(&self) -> &Digest {
+        &self.snapshot_digest
+    }
+
+    pub fn snapshot_length(&self) -> u64 {
+        self.snapshot_length
+    }
+
+    pub fn covered_sequence(&self) -> u64 {
+        self.covered_sequence
+    }
+
+    pub fn covered_tail_digest(&self) -> &Digest {
+        &self.covered_tail_digest
+    }
+
+    pub fn covered_active_plan_digest(&self) -> Option<&Digest> {
+        self.covered_active_plan_digest.as_ref()
+    }
+}
+
+/// One validated checkpoint-certificate event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionCheckpointEvent {
+    envelope: EventEnvelope,
+    payload: ProjectionCheckpointPayload,
+}
+
+impl ProjectionCheckpointEvent {
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidValue`] unless the envelope carries the checkpoint
+    /// payload type above genesis and its parent equals the payload's covered cursor.
+    pub fn new(
+        envelope: EventEnvelope,
+        payload: ProjectionCheckpointPayload,
+    ) -> Result<Self, WireError> {
+        if envelope.payload_type() != PROJECTION_CHECKPOINT_PAYLOAD_TYPE || envelope.sequence() < 2
+        {
+            return Err(WireError::InvalidValue);
+        }
+        let parent_matches = envelope.parent_event().is_some_and(|parent| {
+            parent.sequence() == payload.covered_sequence()
+                && parent.digest() == payload.covered_tail_digest()
+        });
+        if !parent_matches {
+            return Err(WireError::InvalidValue);
+        }
+        Ok(Self { envelope, payload })
+    }
+
+    pub fn envelope(&self) -> &EventEnvelope {
+        &self.envelope
+    }
+
+    pub fn payload(&self) -> &ProjectionCheckpointPayload {
+        &self.payload
+    }
+}
+
 /// Controller authority encoded in one `ScopeHead`.
 ///
 /// `lease_until` is a Unix-epoch millisecond expiry. Construction and decoding require
@@ -890,6 +992,17 @@ struct WireGrantActivatedPayload {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct WireProjectionCheckpointPayload {
+    version: u64,
+    snapshot_digest: String,
+    snapshot_length: u64,
+    covered_sequence: u64,
+    covered_tail_digest: String,
+    covered_active_plan_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct WireRootGenesisPayload {
     campaign_id: String,
     parent_scope_id: Option<String>,
@@ -1109,6 +1222,90 @@ pub fn encode_grant_activated_event(
     )
 }
 
+/// Encodes one validated checkpoint-certificate event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for serialization, compression, or size-limit failures.
+pub fn encode_projection_checkpoint_event(
+    event: &ProjectionCheckpointEvent,
+) -> Result<EncodedScopeEvent, WireError> {
+    encode_scope_event(
+        event.envelope(),
+        &WireProjectionCheckpointPayload {
+            version: 1,
+            snapshot_digest: event.payload().snapshot_digest().as_str().to_owned(),
+            snapshot_length: event.payload().snapshot_length(),
+            covered_sequence: event.payload().covered_sequence(),
+            covered_tail_digest: event.payload().covered_tail_digest().as_str().to_owned(),
+            covered_active_plan_digest: event
+                .payload()
+                .covered_active_plan_digest()
+                .map(|digest| digest.as_str().to_owned()),
+        },
+    )
+}
+
+/// Converts one opaque decoded event into a checkpoint-certificate event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for a payload type other than the checkpoint type, noncanonical
+/// payload bytes, an unsupported version, or an invalid binding.
+pub(crate) fn projection_checkpoint_from_decoded(
+    decoded: DecodedScopeEvent<ciborium::Value>,
+) -> Result<ProjectionCheckpointEvent, WireError> {
+    if decoded.envelope.payload_type() != PROJECTION_CHECKPOINT_PAYLOAD_TYPE {
+        return Err(WireError::InvalidValue);
+    }
+    let mut original = Vec::new();
+    into_writer(&decoded.payload, &mut original).map_err(|_| WireError::InvalidEncoding)?;
+    let payload: WireProjectionCheckpointPayload = decoded
+        .payload
+        .deserialized()
+        .map_err(|_| WireError::InvalidEncoding)?;
+    let mut canonical = Vec::new();
+    into_writer(&payload, &mut canonical).map_err(|_| WireError::InvalidEncoding)?;
+    if original != canonical {
+        return Err(WireError::NonCanonical);
+    }
+    if payload.version != 1 {
+        return Err(WireError::InvalidValue);
+    }
+    let payload = ProjectionCheckpointPayload::new(
+        Digest::new(payload.snapshot_digest).map_err(|_| WireError::InvalidValue)?,
+        payload.snapshot_length,
+        payload.covered_sequence,
+        Digest::new(payload.covered_tail_digest).map_err(|_| WireError::InvalidValue)?,
+        payload
+            .covered_active_plan_digest
+            .map(Digest::new)
+            .transpose()
+            .map_err(|_| WireError::InvalidValue)?,
+    )?;
+    ProjectionCheckpointEvent::new(decoded.envelope, payload)
+}
+
+/// Decodes only the exact checkpoint-certificate event for `expected_scope` at
+/// `expected_key`.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for framing, size, canonicality, identity, or key failures.
+pub fn decode_projection_checkpoint_event(
+    stored_bytes: &[u8],
+    expected_key: &str,
+    expected_scope: &ScopeIdentity,
+) -> Result<ProjectionCheckpointEvent, WireError> {
+    let decoded = decode_scope_event::<ciborium::Value>(
+        stored_bytes,
+        expected_key,
+        expected_scope,
+        Some(PROJECTION_CHECKPOINT_PAYLOAD_TYPE),
+    )?;
+    projection_checkpoint_from_decoded(decoded)
+}
+
 /// Converts one opaque decoded event into a grant-activation event.
 ///
 /// # Errors
@@ -1242,6 +1439,7 @@ pub(crate) fn payload_type_registered(payload_type: &str) -> bool {
     if payload_type == ROOT_GENESIS_PAYLOAD_TYPE
         || payload_type == PLAN_ADMITTED_PAYLOAD_TYPE
         || payload_type == GRANT_ACTIVATED_PAYLOAD_TYPE
+        || payload_type == PROJECTION_CHECKPOINT_PAYLOAD_TYPE
     {
         return true;
     }
@@ -1458,7 +1656,7 @@ fn compress(cbor: &[u8]) -> Result<Vec<u8>, WireError> {
     zstd::bulk::compress(cbor, ZSTD_LEVEL).map_err(|_| WireError::InvalidEncoding)
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -1740,6 +1938,132 @@ mod codec_tests {
         assert_eq!(
             ScopeClaimIdentity::new(scope, digest, claim.work().clone(), 0),
             Err(ValidationError::InvalidFence)
+        );
+    }
+
+    #[test]
+    fn projection_checkpoint_events_round_trip_and_reject_broken_bindings() {
+        let genesis = fixture();
+        let snapshot_digest = Digest::new("ab".repeat(32)).unwrap();
+        let payload = ProjectionCheckpointPayload::new(
+            snapshot_digest.clone(),
+            8_192,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let event = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "checkpoint-op-1".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload.clone(),
+        )
+        .unwrap();
+
+        let encoded = encode_projection_checkpoint_event(&event).unwrap();
+        let key = scope_event_key(genesis.identity(), encoded.event_ref());
+        assert_eq!(
+            decode_projection_checkpoint_event(encoded.stored_bytes(), &key, genesis.identity())
+                .unwrap(),
+            event
+        );
+        // Genesis bytes are a registered event, but not this payload type.
+        assert_eq!(
+            decode_projection_checkpoint_event(
+                genesis.event_bytes(),
+                genesis.event_key(),
+                genesis.identity()
+            ),
+            Err(WireError::InvalidValue)
+        );
+
+        // The envelope parent must equal the payload's covered cursor.
+        let disagreeing = ProjectionCheckpointPayload::new(
+            snapshot_digest.clone(),
+            8_192,
+            1,
+            Digest::new("0".repeat(64)).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ProjectionCheckpointEvent::new(
+                EventEnvelope::new(
+                    genesis.identity().scope_id().clone(),
+                    2,
+                    Some(genesis.event_ref().clone()),
+                    1,
+                    "checkpoint-op-1".into(),
+                    PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                disagreeing,
+            ),
+            Err(WireError::InvalidValue)
+        );
+
+        // A zero or over-bound snapshot length never encodes.
+        assert_eq!(
+            ProjectionCheckpointPayload::new(
+                snapshot_digest.clone(),
+                0,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            ),
+            Err(WireError::InvalidValue)
+        );
+        assert_eq!(
+            ProjectionCheckpointPayload::new(
+                snapshot_digest.clone(),
+                crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64 + 1,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            ),
+            Err(WireError::InvalidValue)
+        );
+        // The bound itself is accepted.
+        assert!(
+            ProjectionCheckpointPayload::new(
+                snapshot_digest.clone(),
+                crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            )
+            .is_ok()
+        );
+
+        // A future payload version fails closed.
+        let cbor = zstd::bulk::decompress(encoded.stored_bytes(), MAX_DECOMPRESSED_BYTES).unwrap();
+        let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+        let root = map(&mut value);
+        let nested = root
+            .iter_mut()
+            .find_map(|(key, value)| (key == &Value::Text("payload".into())).then_some(value))
+            .unwrap();
+        for (key, field) in map(nested).iter_mut() {
+            if key == &Value::Text("version".into()) {
+                *field = Value::Integer(2.into());
+            }
+        }
+        let mut versioned = Vec::new();
+        into_writer(&value, &mut versioned).unwrap();
+        let versioned = compress(&versioned).unwrap();
+        let versioned_ref =
+            ScopeEventRef::new(2, Digest::new(sha256(&versioned)).unwrap()).unwrap();
+        let versioned_key = scope_event_key(genesis.identity(), &versioned_ref);
+        assert_eq!(
+            decode_projection_checkpoint_event(&versioned, &versioned_key, genesis.identity()),
+            Err(WireError::InvalidValue)
         );
     }
 

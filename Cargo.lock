@@ -1687,6 +1687,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-sdk-s3",
  "aws-sdk-sts",
+ "aws-smithy-http-client",
  "aws-smithy-runtime",
  "bytes",
  "ciborium",

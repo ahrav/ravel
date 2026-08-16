@@ -6,7 +6,12 @@
 //! cursor unchanged. A writer epoch may lag the head epoch but never exceeds it or its own child's.
 //! Replay limits are 4,096 unseen events and 64 MiB of stored event and plan bytes.
 
-use std::{collections::HashSet, error::Error, fmt, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+    path::Path,
+};
 
 use ciborium::Value;
 
@@ -27,6 +32,7 @@ use crate::{
 
 use super::{
     WireError,
+    accelerator::{self, RetainedEvent, StoredEvent},
     event::{ScopeEventReadError, payload_registered, read_opaque, root_domain_valid},
     head::{self, ObservedScopeHead, ScopeHeadReadError},
 };
@@ -39,6 +45,14 @@ const LIMITS: Limits = Limits {
 /// Unseen events one refresh may replay. A rebuild starts at cursor 0, so a committed head above
 /// this bound is unreachable from genesis; [`crate::sync::head`] refuses to append past it.
 pub(crate) const MAX_SCOPE_REPLAY_EVENTS: u64 = 4_096;
+
+/// Checkpoint candidates one cold open may prove.
+///
+/// A catalog retains thousands of certificates, and every candidate fetches and validates
+/// its own packed suffix before its snapshot GET can fail. Trying them all turns the
+/// fallback into a quadratic download; a genesis replay is the cheaper answer once the
+/// newest few candidates are unusable.
+const MAX_CHECKPOINT_CANDIDATES: usize = 4;
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -100,10 +114,14 @@ pub enum ScopeReadiness {
 pub(crate) struct PreparedSuffix {
     observed: ObservedScopeHead,
     events: Vec<Prepared>,
+    /// True when the pack rung supplied the whole suffix; republishing it adds nothing.
+    from_packs: bool,
 }
 
 struct Prepared {
     decoded: crate::scope::DecodedScopeEvent<Value>,
+    /// Exact stored compressed bytes, retained for opportunistic pack publication.
+    bytes: Vec<u8>,
     /// Present exactly for `plan_admitted` events: the decoded event and the verified plan object
     /// replay re-admits from.
     plan: Option<(crate::scope::PlanAdmittedEvent, PlanProposal)>,
@@ -124,26 +142,33 @@ pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) 
     // failure part-way through a rebuild leaves the cursor advanced but the flag down, and
     // gating on a blank cursor would skip the remaining restore forever.
     match prepare_suffix(store, scope, cursor).await {
-        Ok(prepared) => match apply_suffix(handle, scope, prepared).await {
-            Ok((local_cursor, observed_head)) => {
-                match handle.claims_restored(scope).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Err(error) = restore_claims(store, handle, scope).await {
-                            return ScopeReadiness::NotReady(error);
+        Ok(prepared) => {
+            match apply_suffix(handle, scope, prepared).await {
+                Ok((local_cursor, observed_head, retained)) => {
+                    // Publication is a best-effort hint: any failure inside it leaves the
+                    // just-committed replay result untouched.
+                    if let Some(retained) = retained {
+                        accelerator::publish_packs_after_replay(store, scope, &retained).await;
+                    }
+                    match handle.claims_restored(scope).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Err(error) = restore_claims(store, handle, scope).await {
+                                return ScopeReadiness::NotReady(error);
+                            }
+                        }
+                        Err(error) => {
+                            return ScopeReadiness::NotReady(ScopeReplayError::Apply(error));
                         }
                     }
-                    Err(error) => {
-                        return ScopeReadiness::NotReady(ScopeReplayError::Apply(error));
+                    ScopeReadiness::Ready {
+                        local_cursor,
+                        observed_head: Box::new(observed_head),
                     }
                 }
-                ScopeReadiness::Ready {
-                    local_cursor,
-                    observed_head: Box::new(observed_head),
-                }
+                Err(error) => ScopeReadiness::NotReady(error),
             }
-            Err(error) => ScopeReadiness::NotReady(error),
-        },
+        }
         Err(error) => ScopeReadiness::NotReady(error),
     }
 }
@@ -207,49 +232,374 @@ async fn restore_claims(
         .map_err(ScopeReplayError::Apply)
 }
 
-/// Replaces the file after deterministic local format or history validation failures.
-/// A foreign application id is a refusal, not a rebuild: it can belong to unrelated
-/// local data. Database-operation failures leave the existing file intact.
+/// Opens the scope projection at `path`, installing a certified checkpoint when the
+/// projection is missing or rebuildable.
+///
+/// A valid existing projection opens normally and is never replaced merely because a
+/// checkpoint exists. A missing or rebuildable projection first tries the checkpoint
+/// rung: prove a certified snapshot and its packed suffix against the pinned head, then
+/// install it with one atomic rename. Any checkpoint failure creates or rebuilds the
+/// empty projection as before; a later refresh replays through packs, LIST, then the
+/// serial walk from genesis. A foreign application id is a refusal, not a rebuild: it
+/// can belong to unrelated local data. Database-operation failures leave the existing
+/// file intact.
 ///
 /// # Errors
 ///
 /// Returns [`ScopeReplayError::DatabaseUnavailable`] for `:memory:` or `file:` URIs,
 /// file I/O failures, and SQLite operation failures.
-pub async fn open_projection(path: &Path) -> Result<DbHandle, ScopeReplayError> {
+pub async fn open_projection(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    path: &Path,
+) -> Result<DbHandle, ScopeReplayError> {
     if is_sqlite_uri(path) {
         return Err(ScopeReplayError::DatabaseUnavailable);
     }
+    match classify_destination(path).await? {
+        Destination::Opened(handle) => return Ok(handle),
+        Destination::Missing | Destination::Rebuildable => {}
+    }
+    // Cleanup deletes the destination, so it cannot race installation: a contender that
+    // observed a rebuildable path could otherwise delete a projection another contender had
+    // already installed and opened, leaving that worker writing an unlinked inode while
+    // everyone else uses a new file at the same pathname. The lock covers the whole
+    // recheck-delete-install-open region.
+    let _install = install_lock(path).await?;
+    // The classification runs again under the lock, in full: a contender may have finished
+    // while this one waited, and an unrelated database may have appeared at the pathname. The
+    // second case is still a refusal — treating every failed open as rebuildable here would
+    // unlink a foreign file this function promises never to touch.
+    match classify_destination(path).await? {
+        Destination::Opened(handle) => return Ok(handle),
+        Destination::Missing | Destination::Rebuildable => {}
+    }
+    // Every path that reaches the checkpoint rung removes the destination and its sidecars
+    // first. A stale `-journal`, `-wal`, or `-shm` left by a crash outlives a missing main
+    // file, and SQLite would recover the freshly installed snapshot through it.
+    rebuild_files(path)?;
+    if let Some(handle) = install_checkpoint(store, scope, path).await {
+        return Ok(handle);
+    }
+    DbHandle::spawn(path.to_path_buf())
+        .await
+        .map_err(|_| ScopeReplayError::DatabaseUnavailable)
+}
+
+/// What one destination pathname currently holds.
+enum Destination {
+    /// A valid projection, already open.
+    Opened(DbHandle),
+    /// Nothing at the pathname.
+    Missing,
+    /// This application's projection, damaged past repair, so replaceable.
+    Rebuildable,
+}
+
+/// Classifies a destination without modifying it.
+///
+/// A foreign application id is a refusal rather than a rebuild: the file can belong to
+/// unrelated local data, so the error leaves it in place. Damage this application owns —
+/// failed integrity check, unreadable schema, inconsistent history — is replaceable.
+///
+/// # Errors
+///
+/// Returns [`ScopeReplayError::DatabaseUnavailable`] for a file this function must not
+/// replace, and for I/O or SQLite failures that leave the pathname unclassified.
+async fn classify_destination(path: &Path) -> Result<Destination, ScopeReplayError> {
     if !path
         .try_exists()
         .map_err(|_| ScopeReplayError::DatabaseUnavailable)?
     {
-        return DbHandle::spawn(path.to_path_buf())
-            .await
-            .map_err(|_| ScopeReplayError::DatabaseUnavailable);
+        return Ok(Destination::Missing);
     }
     match DbHandle::open_existing(path.to_path_buf()).await {
-        Ok(handle) => Ok(handle),
+        Ok(handle) => Ok(Destination::Opened(handle)),
         Err(OpenExistingError::Validation(
             ValidateError::IntegrityCheckFailed
             | ValidateError::InvalidSchema
             | ValidateError::InvalidHistory,
-        )) => rebuild_projection(path).await,
+        )) => Ok(Destination::Rebuildable),
         Err(OpenExistingError::DatabaseOperationFailed | OpenExistingError::Validation(_)) => {
             Err(ScopeReplayError::DatabaseUnavailable)
         }
     }
 }
 
-async fn rebuild_projection(path: &Path) -> Result<DbHandle, ScopeReplayError> {
+/// Takes the exclusive install lock for one projection pathname.
+///
+/// The lock is a file lock, not a process-local mutex, because the region it guards begins by
+/// unlinking the destination: a process-local gate leaves a second process free to delete a
+/// projection this one already installed and opened, and the create-only commit link cannot
+/// help because the deletion happens first. The advisory lock is held by the open file
+/// description, so two tasks in one process contend on it exactly as two processes do.
+///
+/// The lock file sits beside the projection under its own suffix, so destination cleanup never
+/// removes it. It is deliberately never unlinked: the lock lives on the inode, so removing the
+/// pathname would let a later caller create and lock a different inode while a holder still
+/// believes it owns the region. The kernel releases the lock when the file closes, including on
+/// a crash.
+async fn install_lock(path: &Path) -> Result<std::fs::File, ScopeReplayError> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".install-lock");
+    let lock_path = std::path::PathBuf::from(lock_path);
+    crate::db::worker::run_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        file.lock().ok()?;
+        Some(file)
+    })
+    .await
+    .flatten()
+    .ok_or(ScopeReplayError::DatabaseUnavailable)
+}
+
+/// Installs the newest provable certified checkpoint at `destination`.
+///
+/// `None` is a rung miss: the empty projection is created as before and later refreshes
+/// replay from genesis. Every accelerator object consulted here is a hint; the pinned
+/// head and the exact `events/` ancestry are the only authority the install trusts.
+/// At most [`MAX_CHECKPOINT_CANDIDATES`] in-range candidates are proven, because each
+/// attempt fetches and validates its own suffix.
+async fn install_checkpoint(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    destination: &Path,
+) -> Option<DbHandle> {
+    let observed = head::read(store, scope).await.ok().flatten()?;
+    let accelerator::CurrentCatalog::Present(catalog, _) =
+        accelerator::read_current_catalog(store, scope).await
+    else {
+        return None;
+    };
+    let mut attempts = 0;
+    for certificate_ref in catalog.checkpoints().iter().rev() {
+        if certificate_ref.sequence() > observed.head().tail().sequence() {
+            continue;
+        }
+        if attempts == MAX_CHECKPOINT_CANDIDATES {
+            return None;
+        }
+        attempts += 1;
+        if let Some(handle) = install_candidate(
+            store,
+            scope,
+            destination,
+            &observed,
+            &catalog,
+            certificate_ref,
+        )
+        .await
+        {
+            return Some(handle);
+        }
+    }
+    None
+}
+
+/// Proves one checkpoint candidate against the pinned head, then installs its snapshot.
+///
+/// Proof precedes download: the certificate's covered cursor must reach the pinned tail
+/// through packed events and the common chain validator before the snapshot GET is
+/// issued at its certified byte length and checked against its certified digest. The
+/// create-only link from the staged sibling path to `destination` is the commit point:
+/// before it the previous destination is untouched; after it the snapshot is
+/// independently valid at its covered cursor, so interruption before the suffix applies
+/// still leaves a valid replayable projection. A suffix the installed rows cannot carry
+/// discards the destination again. `None` lets the caller try the next candidate.
+async fn install_candidate(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    destination: &Path,
+    observed: &ObservedScopeHead,
+    catalog: &accelerator::ReplayCatalog,
+    certificate_ref: &ScopeEventRef,
+) -> Option<DbHandle> {
+    // The certificate is read at its exact event key; its typed conversion requires the
+    // envelope parent and the payload's covered cursor to agree.
+    let (decoded, _) = read_opaque(store, scope, certificate_ref).await.ok()??;
+    let certificate = crate::scope::projection_checkpoint_from_decoded(decoded).ok()?;
+    let covered = (
+        certificate.payload().covered_sequence(),
+        Some(certificate.payload().covered_tail_digest().clone()),
+    );
+    // `precheck` bounds the covered-to-tail interval before any pack fetch.
+    precheck(&covered, observed.head().tail(), LIMITS).ok()?;
+
+    let stored = accelerator::packed_events_from_catalog(
+        store,
+        scope,
+        catalog,
+        certificate.envelope().sequence(),
+        observed.head().tail().sequence(),
+    )
+    .await?;
+    let events = prepare_chain(
+        store,
+        scope,
+        covered.clone(),
+        observed.head().tail().clone(),
+        observed.head().scope_epoch().get(),
+        observed.head().operation_id(),
+        LIMITS,
+        ChainEvents::prefetched(stored),
+    )
+    .await
+    .ok()?;
+    // `prepare_chain` re-derives the ancestry downward from the pinned tail and pushes it
+    // newest first, so the last element is the committed event at `covered_sequence + 1` —
+    // this certificate's own sequence, which `precheck` proved is at or below the tail.
+    // Requiring the two to name the same object is what makes the certificate authoritative
+    // instead of merely self-consistent at its content-addressed key: an event published by
+    // a head-CAS loser or a fenced writer is a valid object that the pinned head never
+    // commits, and its payload chooses the snapshot digest, cursor, and active plan that
+    // every later check here compares against.
+    if events.last()?.decoded.event_ref() != certificate_ref {
+        return None;
+    }
+
+    let length = usize::try_from(certificate.payload().snapshot_length()).ok()?;
+    let key = accelerator::scope_checkpoint_key(
+        scope,
+        certificate.payload().covered_sequence(),
+        certificate.payload().snapshot_digest(),
+    );
+    let bytes = match store.get_object(&key, length).await {
+        Ok(GetOutcome::Found { bytes, .. }) => bytes,
+        Ok(GetOutcome::NotFound) | Err(_) => return None,
+    };
+    if bytes.len() != length
+        || crate::scope::sha256(&bytes) != certificate.payload().snapshot_digest().as_str()
+    {
+        return None;
+    }
+
+    let mut staging = destination.as_os_str().to_owned();
+    // The process-local counter differentiates staging paths for overlapping installs.
+    static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    staging.push(format!(
+        ".checkpoint-{}-{}",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let staging = std::path::PathBuf::from(staging);
+    let staged = {
+        let scope = scope.clone();
+        let staging = staging.clone();
+        crate::db::worker::run_blocking(move || {
+            if rebuild_files(&staging).is_err() {
+                return false;
+            }
+            std::fs::write(&staging, &bytes).is_ok()
+                && staged_snapshot_valid(&staging, &scope, &certificate)
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if !staged {
+        discard(&staging).await;
+        return None;
+    }
+
+    // The suffix applies to the staging file, before the destination pathname exists. The
+    // snapshot was proven against the pinned head, so a failure here means the snapshot's own
+    // rows cannot carry it — a row the suffix depends on is missing or disagrees. Publishing
+    // first and repairing after would expose that state: a concurrent open could take the
+    // pathname and keep the rejected inode alive after this candidate unlinked it, replaying
+    // the same failing suffix forever. Nothing is published until it is at the pinned head.
+    let staged_handle = match DbHandle::open_existing(staging.clone()).await {
+        Ok(handle) => handle,
+        Err(_) => {
+            discard(&staging).await;
+            return None;
+        }
+    };
+    let prepared = PreparedSuffix {
+        observed: ObservedScopeHead::proven(
+            observed.head().clone(),
+            observed.canonical_bytes().to_vec(),
+            observed.etag().clone(),
+            observed.namespace().to_owned(),
+        ),
+        events,
+        from_packs: true,
+    };
+    let applied = apply_suffix(&staged_handle, scope, prepared).await.is_ok();
+    drop(staged_handle);
+    if !applied {
+        discard(&staging).await;
+        return None;
+    }
+
+    let published = {
+        let staging = staging.clone();
+        let destination = destination.to_path_buf();
+        crate::db::worker::run_blocking(move || {
+            // The commit is a create-only link, not a rename: a rename would replace a
+            // destination another install already committed and opened, leaving that worker
+            // writing an unlinked inode while everyone else reads the replacement. Losing this
+            // link means someone else committed first.
+            std::fs::hard_link(&staging, &destination).is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    };
+    discard(&staging).await;
+    if !published {
+        return None;
+    }
+    DbHandle::open_existing(destination.to_path_buf())
+        .await
+        .ok()
+}
+
+/// Removes a staging database and its sidecars off the async runtime.
+async fn discard(staging: &Path) {
+    let staging = staging.to_path_buf();
+    let _ = crate::db::worker::run_blocking(move || rebuild_files(&staging)).await;
+}
+
+/// Validates the staged snapshot file: full open-time projection validation plus the
+/// certified scope as the copy's only scope, its covered cursor, and its active plan.
+fn staged_snapshot_valid(
+    staging: &Path,
+    scope: &ScopeIdentity,
+    certificate: &crate::scope::ProjectionCheckpointEvent,
+) -> bool {
+    let covered = (
+        certificate.payload().covered_sequence(),
+        Some(certificate.payload().covered_tail_digest().clone()),
+    );
+    let Ok(connection) = crate::db::projections::open_existing(staging) else {
+        return false;
+    };
+    // The snapshot is a whole-file copy of the publisher's projection, which may host other
+    // scopes. Only this scope's rows are covered by the certificate, and the install has no
+    // ancestry to prove the rest against, so a copy naming any other scope is refused rather
+    // than installed with uncertified admission, grant, and budget rows in it.
+    if crate::db::projections::scope_count(&connection) != Ok(1) {
+        return false;
+    }
+    let Ok(cursor) = crate::db::projections::scope_cursor(&connection, scope) else {
+        return false;
+    };
+    let Ok(active_plan) = crate::db::projections::scope_active_plan(&connection, scope) else {
+        return false;
+    };
+    cursor == covered && active_plan.as_ref() == certificate.payload().covered_active_plan_digest()
+}
+
+fn rebuild_files(path: &Path) -> Result<(), ScopeReplayError> {
     for suffix in ["-journal", "-wal", "-shm"] {
         let mut sidecar = path.as_os_str().to_owned();
         sidecar.push(suffix);
         remove_if_exists(Path::new(&sidecar))?;
     }
-    remove_if_exists(path)?;
-    DbHandle::spawn(path.to_path_buf())
-        .await
-        .map_err(|_| ScopeReplayError::DatabaseUnavailable)
+    remove_if_exists(path)
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), ScopeReplayError> {
@@ -283,32 +633,194 @@ async fn prepare_suffix_with_limits(
             return Err(ScopeReplayError::HeadInvalid(error));
         }
     };
-    let events = prepare_chain(
-        store,
-        scope,
-        cursor,
-        observed.head().tail().clone(),
-        observed.head().scope_epoch().get(),
-        observed.head().operation_id(),
-        limits,
-    )
-    .await?;
-    Ok(PreparedSuffix { observed, events })
+    let tail = observed.head().tail().clone();
+    let scope_epoch = observed.head().scope_epoch().get();
+    let head_operation = observed.head().operation_id().to_owned();
+    let unseen = precheck(&cursor, &tail, limits)?;
+    if unseen == 0 {
+        return Ok(PreparedSuffix {
+            observed,
+            events: Vec::new(),
+            from_packs: false,
+        });
+    }
+    // The accelerator ladder: packed events, then LIST-assisted reads, then the serial
+    // walk. Every rung feeds the same chain validator; an accelerator failure of any kind
+    // falls through without changing the projection, and only the final serial rung
+    // surfaces errors.
+    let mut events = None;
+    let mut from_packs = false;
+    if let Some(stored) =
+        accelerator::packed_events(store, scope, cursor.0 + 1, tail.sequence()).await
+    {
+        events = prepare_chain(
+            store,
+            scope,
+            cursor.clone(),
+            tail.clone(),
+            scope_epoch,
+            &head_operation,
+            limits,
+            ChainEvents::prefetched(stored),
+        )
+        .await
+        .ok();
+        from_packs = events.is_some();
+    }
+    if events.is_none()
+        && let Some(stored) = listed_events(store, scope, cursor.0, &tail).await
+    {
+        events = prepare_chain(
+            store,
+            scope,
+            cursor.clone(),
+            tail.clone(),
+            scope_epoch,
+            &head_operation,
+            limits,
+            ChainEvents::prefetched(stored),
+        )
+        .await
+        .ok();
+    }
+    let events = match events {
+        Some(events) => events,
+        None => {
+            prepare_chain(
+                store,
+                scope,
+                cursor,
+                tail,
+                scope_epoch,
+                &head_operation,
+                limits,
+                ChainEvents::Serial,
+            )
+            .await?
+        }
+    };
+    Ok(PreparedSuffix {
+        observed,
+        events,
+        from_packs,
+    })
+}
+
+/// Cursor, tail, and limit checks that run once, ahead of the accelerator ladder.
+///
+/// Returns the unseen event count; zero means the suffix is empty.
+fn precheck(
+    cursor: &(u64, Option<Digest>),
+    tail: &ScopeEventRef,
+    limits: Limits,
+) -> Result<u64, ScopeReplayError> {
+    if tail.sequence() < cursor.0 {
+        return Err(ScopeReplayError::CursorAhead);
+    }
+    if tail.sequence() == cursor.0 {
+        return if cursor.1.as_ref() == Some(tail.digest()) {
+            Ok(0)
+        } else {
+            Err(ScopeReplayError::TailMismatch)
+        };
+    }
+    let unseen = tail.sequence() - cursor.0;
+    if unseen > limits.events {
+        return Err(ScopeReplayError::Overflow);
+    }
+    Ok(unseen)
+}
+
+/// LIST-assisted candidate discovery for the unseen range `(cursor, tail]`.
+///
+/// LIST is a hint, never a snapshot: candidates below the cursor or beyond the pinned
+/// tail are ignored, and any in-range gap, duplicate sequence, malformed key, missing
+/// object, or invalid event returns `None` so the caller falls through.
+async fn listed_events(
+    store: &S3Store,
+    scope: &ScopeIdentity,
+    cursor_sequence: u64,
+    tail: &ScopeEventRef,
+) -> Option<Vec<StoredEvent>> {
+    let unseen = tail.sequence().checked_sub(cursor_sequence)?;
+    let prefix = accelerator::scope_events_prefix(scope);
+    // Keys embed zero-padded 16-digit sequences, so lexicographic listing order is
+    // numeric. `.` sorts after `-`, so this boundary skips every key at the cursor
+    // sequence and none above it.
+    let start_after = (cursor_sequence > 0).then(|| format!("{prefix}{cursor_sequence:016}."));
+    // `MAX_SCOPE_REPLAY_EVENTS` covers the lifetime sequence ceiling, so keys beyond the
+    // pinned tail are ignored rather than causing failure.
+    let keys = store
+        .list_keys(
+            &prefix,
+            start_after.as_deref(),
+            MAX_SCOPE_REPLAY_EVENTS as usize,
+        )
+        .await
+        .ok()?;
+    let mut references: Vec<ScopeEventRef> = Vec::with_capacity(unseen as usize);
+    let mut next = cursor_sequence + 1;
+    for key in &keys {
+        if next == tail.sequence() + 1 {
+            break;
+        }
+        let reference = parse_event_key(key, &prefix)?;
+        if reference.sequence() > tail.sequence() {
+            // Beyond the pinned tail is not part of this replay; later keys only sort higher.
+            break;
+        }
+        if reference.sequence() != next {
+            // A duplicate sequence is an orphaned rival; a skipped one is a gap.
+            return None;
+        }
+        next += 1;
+        references.push(reference);
+    }
+    if next != tail.sequence() + 1 {
+        return None;
+    }
+    accelerator::fetch_events(store, scope, &references).await
+}
+
+/// Parses `{sequence:016}-{digest}.cbor.zst` after `prefix`; any deviation is a miss.
+fn parse_event_key(key: &str, prefix: &str) -> Option<ScopeEventRef> {
+    let name = key.strip_prefix(prefix)?;
+    let name = name.strip_suffix(".cbor.zst")?;
+    let (sequence, digest) = name.split_at_checked(16)?;
+    let digest = digest.strip_prefix('-')?;
+    if !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let sequence: u64 = sequence.parse().ok()?;
+    ScopeEventRef::new(sequence, Digest::new(digest.to_owned()).ok()?).ok()
 }
 
 /// Converts the prepared suffix, then applies its events through the worker.
+///
+/// The returned retained events are the verified suffix in chain order, kept for
+/// opportunistic pack publication after the commit; `None` when the suffix came from
+/// packs and republishing it would add nothing.
 pub(crate) async fn apply_suffix(
     handle: &DbHandle,
     scope: &ScopeIdentity,
     mut prepared: PreparedSuffix,
-) -> Result<((u64, Digest), ObservedScopeHead), ScopeReplayError> {
+) -> Result<((u64, Digest), ObservedScopeHead, Option<Vec<RetainedEvent>>), ScopeReplayError> {
     prepared.events.reverse();
     let scope_epoch = prepared.observed.head().scope_epoch().get();
+    let mut retained = (!prepared.from_packs).then(|| Vec::with_capacity(prepared.events.len()));
     let mutations = prepared
         .events
         .into_iter()
-        .map(|prepared| {
+        .map(|mut prepared| {
             let reference = prepared.decoded.event_ref().clone();
+            if let Some(retained) = retained.as_mut() {
+                retained.push(RetainedEvent {
+                    reference: reference.clone(),
+                    parent: prepared.decoded.envelope().parent_event().cloned(),
+                    payload_type: prepared.decoded.envelope().payload_type().to_owned(),
+                    bytes: std::mem::take(&mut prepared.bytes),
+                });
+            }
             let (envelope, payload) = typed_payload(prepared, scope)?;
             ScopeProjectionEvent::new(scope.clone(), envelope, reference, payload, scope_epoch)
                 .map_err(|_| ScopeReplayError::HistoryConflict)
@@ -327,7 +839,7 @@ pub(crate) async fn apply_suffix(
         prepared.observed.head().tail().sequence(),
         prepared.observed.head().tail().digest().clone(),
     );
-    Ok((local_cursor, prepared.observed))
+    Ok((local_cursor, prepared.observed, retained))
 }
 
 /// Converts one prepared event into the typed content its apply writes.
@@ -366,6 +878,14 @@ fn typed_payload(
                 },
             ))
         }
+        crate::scope::PROJECTION_CHECKPOINT_PAYLOAD_TYPE => {
+            let event = crate::scope::projection_checkpoint_from_decoded(prepared.decoded)
+                .map_err(ScopeReplayError::EventInvalid)?;
+            Ok((
+                event.envelope().clone(),
+                ScopeProjectionPayload::CheckpointPublished,
+            ))
+        }
         #[cfg(test)]
         crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE => Ok((
             prepared.decoded.envelope().clone(),
@@ -377,6 +897,38 @@ fn typed_payload(
     }
 }
 
+/// Where the chain validator draws each event from.
+///
+/// `Serial` reads newest-to-oldest through [`read_opaque`], preserving the final rung's
+/// behavior and error classification. `Prefetched` consumes accelerator-supplied events
+/// already re-verified against their synthesized keys; the validator still enforces every
+/// source-independent check on them.
+enum ChainEvents {
+    Serial,
+    Prefetched(HashMap<u64, StoredEvent>),
+}
+
+impl ChainEvents {
+    fn prefetched(events: Vec<StoredEvent>) -> Self {
+        Self::Prefetched(
+            events
+                .into_iter()
+                .map(|event| (event.decoded.event_ref().sequence(), event))
+                .collect(),
+        )
+    }
+}
+
+/// Source-independent chain validation and plan loading shared by every replay rung.
+///
+/// Enforces the exact tail named by the pinned head, newest-to-oldest parent continuity,
+/// the writer-epoch bounds, unique operation IDs, the head operation at hop zero, the
+/// exact cursor or genesis boundary, and the event and byte limits. Plan objects load
+/// serially and draw on the same byte budget regardless of the event source.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one internal call shape per rung"
+)]
 async fn prepare_chain(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -385,21 +937,9 @@ async fn prepare_chain(
     scope_epoch: u64,
     head_operation: &str,
     limits: Limits,
+    mut source: ChainEvents,
 ) -> Result<Vec<Prepared>, ScopeReplayError> {
-    if tail.sequence() < cursor.0 {
-        return Err(ScopeReplayError::CursorAhead);
-    }
-    if tail.sequence() == cursor.0 {
-        return if cursor.1.as_ref() == Some(tail.digest()) {
-            Ok(Vec::new())
-        } else {
-            Err(ScopeReplayError::TailMismatch)
-        };
-    }
-    let unseen = tail.sequence() - cursor.0;
-    if unseen > limits.events {
-        return Err(ScopeReplayError::Overflow);
-    }
+    let unseen = precheck(&cursor, &tail, limits)?;
 
     let mut current = tail;
     let mut total_bytes = 0;
@@ -408,13 +948,21 @@ async fn prepare_chain(
     let mut highest_epoch = scope_epoch;
     let mut prepared = Vec::with_capacity(unseen as usize);
     for hop in 0..unseen {
-        let (decoded, bytes) = match read_opaque(store, scope, &current).await {
-            Ok(Some(event)) => event,
-            Ok(None) => return Err(ScopeReplayError::EventMissing),
-            Err(ScopeEventReadError::Invalid(error)) => {
-                return Err(ScopeReplayError::EventInvalid(error));
+        let (decoded, bytes) = match &mut source {
+            ChainEvents::Serial => match read_opaque(store, scope, &current).await {
+                Ok(Some(event)) => event,
+                Ok(None) => return Err(ScopeReplayError::EventMissing),
+                Err(ScopeEventReadError::Invalid(error)) => {
+                    return Err(ScopeReplayError::EventInvalid(error));
+                }
+                Err(ScopeEventReadError::Storage(_)) => return Err(ScopeReplayError::EventStorage),
+            },
+            ChainEvents::Prefetched(events) => {
+                let stored = events
+                    .remove(&current.sequence())
+                    .ok_or(ScopeReplayError::EventMissing)?;
+                (stored.decoded, stored.bytes)
             }
-            Err(ScopeEventReadError::Storage(_)) => return Err(ScopeReplayError::EventStorage),
         };
         total_bytes = checked_total(total_bytes, bytes.len(), limits.bytes)?;
         if decoded.event_ref() != &current
@@ -477,7 +1025,11 @@ async fn prepare_chain(
         } else {
             None
         };
-        prepared.push(Prepared { decoded, plan });
+        prepared.push(Prepared {
+            decoded,
+            bytes,
+            plan,
+        });
     }
     Ok(prepared)
 }
@@ -514,11 +1066,14 @@ mod tests {
         db::{projections, worker::DbHandle},
         distributed::identity::{InstanceId, WorkspaceId},
         scope::{
-            AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ROOT_GENESIS_PAYLOAD_TYPE,
-            ScopeAuthority, ScopeEventRef, ScopeHead, TEST_SUCCESSOR_PAYLOAD_TYPE, encode_head,
-            encode_scope_event, root_genesis,
+            AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope,
+            PROJECTION_CHECKPOINT_PAYLOAD_TYPE, ProjectionCheckpointEvent,
+            ProjectionCheckpointPayload, ROOT_GENESIS_PAYLOAD_TYPE, ScopeAuthority, ScopeEventRef,
+            ScopeHead, TEST_SUCCESSOR_PAYLOAD_TYPE, encode_head,
+            encode_projection_checkpoint_event, encode_scope_event, root_genesis, sha256,
         },
-        storage::s3::test_support::{replay_store, response},
+        storage::s3::test_support::{keyed_store, list_response, replay_store, response},
+        sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer},
     };
 
     use super::*;
@@ -571,6 +1126,41 @@ mod tests {
             .unwrap();
     }
 
+    /// Dumps every table's rows (sorted) so two projections compare by content, not by
+    /// row counts.
+    fn projection_content(path: &Path) -> Vec<String> {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let tables: Vec<String> = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut dump = Vec::new();
+        for table in tables {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    let cells: Vec<String> = (0..columns)
+                        .map(|index| {
+                            format!("{:?}", row.get::<_, rusqlite::types::Value>(index).unwrap())
+                        })
+                        .collect();
+                    Ok(cells.join("|"))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows.sort();
+            dump.extend(rows.into_iter().map(|row| format!("{table}: {row}")));
+        }
+        dump
+    }
+
     /// Reads projection rows over a short-lived connection while the worker is idle.
     fn row_counts(path: &Path) -> (i64, i64) {
         rusqlite::Connection::open(path)
@@ -592,6 +1182,11 @@ mod tests {
         response(200, &[("etag", "\"event\"")], bytes)
     }
 
+    /// Returns 404 for an accelerator pointer read or LIST probe.
+    fn accel_miss() -> http::Response<SdkBody> {
+        response(404, &[], SdkBody::empty())
+    }
+
     #[tokio::test]
     async fn replay_is_idempotent_and_returns_the_observed_head_witness() {
         let genesis = genesis();
@@ -599,6 +1194,8 @@ mod tests {
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, client) = replay_store(vec![
             head_response(genesis.head_bytes().to_vec()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         match refresh(&store, &handle, genesis.identity()).await {
@@ -616,7 +1213,7 @@ mod tests {
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (1, Some(genesis.event_ref().digest().clone()))
         );
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         let before = row_counts(&path);
         let (store, client) = replay_store(vec![head_response(genesis.head_bytes().to_vec())]);
         assert!(matches!(
@@ -644,6 +1241,8 @@ mod tests {
         for _ in 0..2 {
             let (store, _) = replay_store(vec![
                 head_response(genesis.head_bytes().to_vec()),
+                accel_miss(),
+                accel_miss(),
                 event_response(genesis.event_bytes().to_vec()),
             ]);
             prepared.push(
@@ -655,11 +1254,11 @@ mod tests {
         let second = prepared.pop().unwrap();
         let first = prepared.pop().unwrap();
 
-        let (first_cursor, _) = apply_suffix(&handle, genesis.identity(), first)
+        let (first_cursor, _, _) = apply_suffix(&handle, genesis.identity(), first)
             .await
             .unwrap();
         let rows = row_counts(&path);
-        let (second_cursor, _) = apply_suffix(&other, genesis.identity(), second)
+        let (second_cursor, _, _) = apply_suffix(&other, genesis.identity(), second)
             .await
             .expect("a suffix the first caller committed is not a history conflict");
 
@@ -687,13 +1286,15 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         let prepared = prepare_suffix(&store, genesis.identity(), (0, None))
             .await
             .unwrap();
-        let (mixed_cursor, _) = apply_suffix(&other, genesis.identity(), prepared)
+        let (mixed_cursor, _, _) = apply_suffix(&other, genesis.identity(), prepared)
             .await
             .expect("an already-applied prefix continues into the unseen suffix");
 
@@ -714,6 +1315,8 @@ mod tests {
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(genesis.head_bytes().to_vec()),
+            accel_miss(),
+            accel_miss(),
             event_response(b"not-zstd".to_vec()),
         ]);
         assert!(matches!(
@@ -746,13 +1349,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::UnsupportedPayload)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -779,13 +1384,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&invalid_root_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(invalid_root.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::EventInvalid(WireError::InvalidValue))
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -802,13 +1409,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&mismatched_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -849,13 +1458,15 @@ mod tests {
         .unwrap();
         let (store, client) = replay_store(vec![
             head_response(encode_head(&unsubstantiated_plan_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
             refresh(&store, &handle, genesis.identity()).await,
             ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
         ));
-        assert_eq!(client.actual_requests().count(), 2);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (0, None)
@@ -899,8 +1510,9 @@ mod tests {
             .pragma_update(None, "application_id", 0x1234)
             .unwrap();
         drop(foreign);
+        let (offline, _) = replay_store(vec![]);
         assert!(matches!(
-            open_projection(&path).await,
+            open_projection(&offline, genesis.identity(), &path).await,
             Err(ScopeReplayError::DatabaseUnavailable)
         ));
         assert_eq!(
@@ -920,7 +1532,10 @@ mod tests {
         for sidecar in &sidecars {
             fs::write(sidecar, b"stale").unwrap();
         }
-        let rebuilt = open_projection(&path).await.unwrap();
+        let (offline, _) = replay_store(vec![]);
+        let rebuilt = open_projection(&offline, genesis.identity(), &path)
+            .await
+            .unwrap();
         // A rebuilt projection is empty and carries the neutral application id.
         assert_eq!(
             rebuilt.scope_cursor(genesis.identity()).await.unwrap(),
@@ -971,6 +1586,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
             event_response(genesis.event_bytes().to_vec()),
         ]);
@@ -989,9 +1606,14 @@ mod tests {
             .unwrap();
         drop(projections::open_existing(&path).unwrap());
 
-        let recovered = open_projection(&path).await.unwrap();
+        let (offline, _) = replay_store(vec![]);
+        let recovered = open_projection(&offline, genesis.identity(), &path)
+            .await
+            .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&successor_head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(successor.stored_bytes().to_vec()),
             event_response(genesis.event_bytes().to_vec()),
         ]);
@@ -1022,15 +1644,29 @@ mod tests {
                 .to_string()
                 .contains("malicious/internal/key")
         );
-        assert!(open_projection(Path::new(":memory:")).await.is_err());
+        let genesis = genesis();
+        let (offline, _) = replay_store(vec![]);
         assert!(
-            open_projection(Path::new("file:scope.sqlite3"))
+            open_projection(&offline, genesis.identity(), Path::new(":memory:"))
                 .await
                 .is_err()
         );
+        assert!(
+            open_projection(
+                &offline,
+                genesis.identity(),
+                Path::new("file:scope.sqlite3")
+            )
+            .await
+            .is_err()
+        );
         let non_utf8 = std::ffi::OsString::from_vec(b"file:scope.sqlite3?mode=memory\xff".to_vec());
         assert!(is_sqlite_uri(Path::new(&non_utf8)));
-        assert!(open_projection(Path::new(&non_utf8)).await.is_err());
+        assert!(
+            open_projection(&offline, genesis.identity(), Path::new(&non_utf8))
+                .await
+                .is_err()
+        );
     }
 
     /// Builds one canonical chain of `LIMITS.events` events: root genesis at sequence 1 and
@@ -1078,6 +1714,8 @@ mod tests {
         .unwrap();
         let mut responses = Vec::with_capacity(bytes.len() + 1);
         responses.push(head_response(encode_head(&head).unwrap()));
+        responses.push(accel_miss());
+        responses.push(accel_miss());
         responses.extend(bytes.into_iter().rev().map(event_response));
         let (store, _) = replay_store(responses);
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
@@ -1124,8 +1762,10 @@ mod tests {
             format!("benchmark-operation-{size}"),
         )
         .unwrap();
-        let mut responses = Vec::with_capacity(size + 1);
+        let mut responses = Vec::with_capacity(size + 3);
         responses.push(head_response(encode_head(&head).unwrap()));
+        responses.push(accel_miss());
+        responses.push(accel_miss());
         responses.extend(
             (0..size)
                 .rev()
@@ -1220,6 +1860,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&owned).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(genesis.event_bytes().to_vec()),
         ]);
         assert!(matches!(
@@ -1284,6 +1926,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(encoded.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
@@ -1336,6 +1980,8 @@ mod tests {
         .unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(second_encoded.stored_bytes().to_vec()),
             event_response(first_encoded.stored_bytes().to_vec()),
         ]);
@@ -1422,6 +2068,8 @@ mod tests {
         let responses = || {
             vec![
                 head_response(encode_head(&head).unwrap()),
+                accel_miss(),
+                accel_miss(),
                 event_response(encoded.stored_bytes().to_vec()),
                 response(
                     200,
@@ -1429,6 +2077,9 @@ mod tests {
                     admissible.stored_bytes().to_vec(),
                 ),
                 event_response(genesis.event_bytes().to_vec()),
+                // Publication reads the pointer, then attempts the pack write.
+                accel_miss(),
+                accel_miss(),
                 response(404, &[], Vec::new()),
                 response(404, &[], Vec::new()),
             ]
@@ -1552,6 +2203,8 @@ mod tests {
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(encode_head(&disagreeing).unwrap()),
+            accel_miss(),
+            accel_miss(),
             event_response(encoded.stored_bytes().to_vec()),
             response(
                 200,
@@ -1816,6 +2469,8 @@ mod tests {
         let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
         let (store, _) = replay_store(vec![
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -1823,6 +2478,9 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
+            accel_miss(),
             response(404, &[], Vec::new()),
             response(404, &[], Vec::new()),
         ]);
@@ -1942,6 +2600,8 @@ mod tests {
         let rebuilt = DbHandle::spawn(rebuild_path.clone()).await.unwrap();
         let (store, rebuild_client) = replay_store(vec![
             head_response(final_head.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(event_bytes(9)),
             event_response(event_bytes(6)),
             event_response(event_bytes(3)),
@@ -1952,6 +2612,9 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2032,6 +2695,8 @@ mod tests {
         // object sits at its fence key, and the rebuild must never request it.
         let (store, client) = replay_store(vec![
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -2039,6 +2704,9 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2079,7 +2747,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 6);
+        assert_eq!(client.actual_requests().count(), 10);
         assert!(
             client
                 .actual_requests()
@@ -2123,6 +2791,8 @@ mod tests {
             // First refresh: replay admits both works, work-a's claim restores at fence 2,
             // then work-b's claim GET returns 500, so claims_restored remains false.
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -2130,6 +2800,9 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2173,7 +2846,7 @@ mod tests {
             ScopeReadiness::Ready { .. }
         ));
         assert!(handle.claims_restored(&scope).await.unwrap());
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(client.actual_requests().count(), 13);
 
         handle.drain().await.unwrap();
         drop(handle);
@@ -2203,6 +2876,8 @@ mod tests {
         let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
         let (store, client) = replay_store(vec![
             head_response(fixture.head_bytes.clone()),
+            accel_miss(),
+            accel_miss(),
             event_response(fixture.admission_bytes.clone()),
             response(
                 200,
@@ -2210,6 +2885,9 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
+            accel_miss(),
             response(
                 200,
                 &[("etag", "\"claim-a\"")],
@@ -2231,7 +2909,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 6);
+        assert_eq!(client.actual_requests().count(), 10);
         assert!(handle.claims_restored(&scope).await.unwrap());
 
         handle.drain().await.unwrap();
@@ -2240,5 +2918,1748 @@ mod tests {
         assert_eq!(rows[0].claim_fence, None);
         assert_eq!(rows[0].claim_lease_until, None);
         fs::remove_file(db_path).unwrap();
+    }
+
+    /// Builds a canonical chain of `count` events: genesis plus test successors, beside the
+    /// unowned head naming the final event.
+    fn accel_chain(
+        genesis: &crate::scope::RootGenesis,
+        count: usize,
+    ) -> (Vec<(ScopeEventRef, Vec<u8>)>, ScopeHead) {
+        accel_chain_with(genesis, count, "accel-op")
+    }
+
+    fn accel_chain_with(
+        genesis: &crate::scope::RootGenesis,
+        count: usize,
+        operation_prefix: &str,
+    ) -> (Vec<(ScopeEventRef, Vec<u8>)>, ScopeHead) {
+        let mut events = Vec::with_capacity(count);
+        events.push((genesis.event_ref().clone(), genesis.event_bytes().to_vec()));
+        for sequence in 2..=count as u64 {
+            let parent = events[(sequence - 2) as usize].0.clone();
+            let envelope = EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                sequence,
+                Some(parent),
+                1,
+                format!("{operation_prefix}-{sequence}"),
+                TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+            )
+            .unwrap();
+            let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+            events.push((encoded.event_ref().clone(), encoded.stored_bytes().to_vec()));
+        }
+        let operation = if count == 1 {
+            genesis.head().operation_id().to_owned()
+        } else {
+            format!("{operation_prefix}-{count}")
+        };
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            events[count - 1].0.clone(),
+            None,
+            operation,
+        )
+        .unwrap();
+        (events, head)
+    }
+
+    fn event_keys(scope: &ScopeIdentity, events: &[(ScopeEventRef, Vec<u8>)]) -> Vec<String> {
+        events
+            .iter()
+            .map(|(reference, _)| crate::scope::scope_event_key(scope, reference))
+            .collect()
+    }
+
+    /// Builds a keyed route serving `head` plus the listed events, with a 404 pointer
+    /// and 500 for anything else, so concurrent fetch order cannot skew the script.
+    fn accel_route(
+        scope: &ScopeIdentity,
+        head: &ScopeHead,
+        events: &[(ScopeEventRef, Vec<u8>)],
+        listed: Vec<String>,
+    ) -> impl Fn(&str) -> http::Response<SdkBody> + Send + Sync + 'static {
+        let head_bytes = encode_head(head).unwrap();
+        let events: Vec<(String, Vec<u8>)> = events
+            .iter()
+            .map(|(reference, bytes)| {
+                (
+                    format!("/{}", crate::scope::scope_event_key(scope, reference)),
+                    bytes.clone(),
+                )
+            })
+            .collect();
+        move |uri: &str| {
+            let path = uri.split('?').next().unwrap();
+            if uri.contains("list-type=2") {
+                let refs: Vec<&str> = listed.iter().map(String::as_str).collect();
+                return list_response(&refs, false, None);
+            }
+            if path.ends_with("/head") {
+                return head_response(head_bytes.clone());
+            }
+            if path.ends_with("/replay-index/current") {
+                return accel_miss();
+            }
+            if let Some((_, bytes)) = events.iter().find(|(key, _)| path == key) {
+                return event_response(bytes.clone());
+            }
+            response(500, &[], SdkBody::empty())
+        }
+    }
+
+    /// The unseen-event limit is inclusive: a suffix exactly at the limit passes the
+    /// precheck and one past it overflows.
+    #[test]
+    fn precheck_accepts_an_unseen_span_exactly_at_the_event_limit() {
+        let digest = Digest::new("a".repeat(64)).unwrap();
+        let limits = Limits {
+            events: 3,
+            bytes: 64,
+        };
+        let tail = ScopeEventRef::new(3, digest.clone()).unwrap();
+        assert_eq!(precheck(&(0, None), &tail, limits), Ok(3));
+        let tail = ScopeEventRef::new(4, digest).unwrap();
+        assert_eq!(
+            precheck(&(0, None), &tail, limits),
+            Err(ScopeReplayError::Overflow)
+        );
+    }
+
+    /// The LIST rung replays exactly what the serial walk replays, at the same cursor.
+    #[tokio::test]
+    async fn list_replay_is_equivalent_to_the_serial_walk() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 2);
+        let keys = event_keys(&scope, &events);
+
+        let serial_path = path("list-equivalence-serial");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(events[1].1.clone()),
+            event_response(events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        drop(serial);
+
+        let listed_path = path("list-equivalence-listed");
+        let listed = DbHandle::spawn(listed_path.clone()).await.unwrap();
+        let (store, requests) = keyed_store(accel_route(&scope, &head, &events, keys.clone()));
+        match refresh(&store, &listed, &scope).await {
+            ScopeReadiness::Ready { local_cursor, .. } => {
+                assert_eq!(local_cursor.0, 2);
+                assert_eq!(local_cursor.1, *events[1].0.digest());
+            }
+            ScopeReadiness::NotReady(error) => panic!("LIST replay failed: {error}"),
+        }
+        assert_eq!(listed.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        assert_eq!(
+            projection_content(&listed_path),
+            projection_content(&serial_path)
+        );
+        // Head, pointer miss, LIST, one bounded GET per candidate, and publication's own
+        // pointer read plus its failed pack PUT; the keyed route records every request, so a
+        // surplus request would raise the count.
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 8);
+        assert!(recorded[0].contains("/head"));
+        assert!(recorded[1].contains("/replay-index/current"));
+        assert!(recorded[2].contains("list-type=2"));
+        // A cursor-0 replay lists from the start of the prefix: no start-after key.
+        assert!(!recorded[2].contains("start-after"));
+        let mut candidate_gets = vec![recorded[3].clone(), recorded[4].clone()];
+        candidate_gets.sort();
+        let candidate = |index: usize| {
+            format!(
+                "GET /{}?x-id=GetObject",
+                crate::scope::scope_event_key(&scope, &events[index].0)
+            )
+        };
+        assert_eq!(candidate_gets, vec![candidate(0), candidate(1)]);
+        // Publication reads the pointer, then its failed pack PUT and ambiguity probe end it.
+        assert!(recorded[5].starts_with("GET ") && recorded[5].contains("/replay-index/current"));
+        assert!(recorded[6].starts_with("PUT ") && recorded[6].contains("/replay-packs/"));
+        assert!(recorded[7].starts_with("GET ") && recorded[7].contains("/replay-packs/"));
+        drop(listed);
+        fs::remove_file(serial_path).unwrap();
+        fs::remove_file(listed_path).unwrap();
+    }
+
+    /// Anomalous listings fall back to the serial walk without changing the outcome, and a
+    /// candidate beyond the pinned tail is ignored rather than treated as an anomaly.
+    #[tokio::test]
+    async fn list_anomalies_fall_back_and_beyond_tail_candidates_are_ignored() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 4);
+        let keys = event_keys(&scope, &events);
+        let prefix = crate::sync::accelerator::scope_events_prefix(&scope);
+        let orphan_key = format!("{prefix}0000000000000002-{}.cbor.zst", "e".repeat(64));
+
+        // Each anomaly is detected while scanning keys, before any candidate fetch.
+        let listings = [
+            // An in-range gap: sequence 2 is missing from the listing.
+            vec![keys[0].clone(), keys[2].clone(), keys[3].clone()],
+            // An in-range orphan: a rival object at an expected sequence.
+            vec![
+                keys[0].clone(),
+                orphan_key.clone(),
+                keys[1].clone(),
+                keys[2].clone(),
+            ],
+            // A malformed key inside the range.
+            vec![
+                keys[0].clone(),
+                format!("{prefix}not-an-event"),
+                keys[2].clone(),
+            ],
+        ];
+        for listing in listings {
+            let key_refs: Vec<&str> = listing.iter().map(String::as_str).collect();
+            let path = path("list-fallback");
+            let handle = DbHandle::spawn(path.clone()).await.unwrap();
+            let (store, _) = replay_store(vec![
+                head_response(encode_head(&head).unwrap()),
+                accel_miss(),
+                list_response(&key_refs, false, None),
+                event_response(events[3].1.clone()),
+                event_response(events[2].1.clone()),
+                event_response(events[1].1.clone()),
+                event_response(events[0].1.clone()),
+            ]);
+            assert!(matches!(
+                refresh(&store, &handle, &scope).await,
+                ScopeReadiness::Ready { .. }
+            ));
+            assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 4);
+            drop(handle);
+            fs::remove_file(path).unwrap();
+        }
+
+        // A listed-but-missing object forces the serial fallback.
+        let (short_events, short_head) = accel_chain(&genesis, 2);
+        let short_keys = event_keys(&scope, &short_events);
+        let short_refs: Vec<&str> = short_keys.iter().map(String::as_str).collect();
+        let path_missing = path("list-missing-object");
+        let handle = DbHandle::spawn(path_missing.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&short_head).unwrap()),
+            accel_miss(),
+            list_response(&short_refs, false, None),
+            event_response(short_events[0].1.clone()),
+            response(404, &[], Vec::new()),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        drop(handle);
+        fs::remove_file(path_missing).unwrap();
+
+        // A listed candidate answered with foreign event bytes fails its synthesized-key
+        // check and forces the serial fallback.
+        let invalid_path = path("list-invalid-event");
+        let handle = DbHandle::spawn(invalid_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&short_head).unwrap()),
+            accel_miss(),
+            list_response(&short_refs, false, None),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[1].1.clone()),
+            event_response(short_events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        drop(handle);
+        fs::remove_file(invalid_path).unwrap();
+
+        // Candidates beyond the pinned tail are ignored: the head pins sequence 2 while the
+        // listing also names sequence 3.
+        let beyond_path = path("list-beyond-tail");
+        let handle = DbHandle::spawn(beyond_path.clone()).await.unwrap();
+        let (store, requests) = keyed_store(accel_route(
+            &scope,
+            &short_head,
+            &events[..2],
+            keys[..3].to_vec(),
+        ));
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 2);
+        // Head, pointer miss, LIST, two candidate GETs, and publication's own pointer read
+        // plus its failed PUT and ambiguity probe: the beyond-tail candidate is never fetched.
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 8);
+        assert!(recorded.iter().all(|line| !line.contains(&format!(
+            "/{}",
+            crate::scope::scope_event_key(&scope, &events[2].0)
+        ))));
+        drop(handle);
+        fs::remove_file(beyond_path).unwrap();
+    }
+
+    /// The pack rung replays exactly what the serial walk replays and re-verifies every
+    /// embedded event; corrupt, wrong-scope, range-mismatch, and tail-mismatch packs fall
+    /// through.
+    #[tokio::test]
+    async fn packed_replay_is_equivalent_and_bad_packs_fall_back() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 3);
+        let slices: Vec<&[u8]> = events.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        let pack = build_pack(&scope, None, 1, &slices).unwrap();
+        let entry = PackEntry::new(1, 3, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let serial_path = path("pack-equivalence-serial");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(events[2].1.clone()),
+            event_response(events[1].1.clone()),
+            event_response(events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        drop(serial);
+
+        let packed_path = path("pack-equivalence-packed");
+        let packed = DbHandle::spawn(packed_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes.clone()),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes.clone()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &packed, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(packed.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        assert_eq!(
+            projection_content(&packed_path),
+            projection_content(&serial_path)
+        );
+        // Head, pointer, catalog, and one pack: no per-event GET and no republication.
+        // The surplus scripted failures would record any extra request.
+        assert_eq!(client.actual_requests().count(), 4);
+        drop(packed);
+        fs::remove_file(packed_path).unwrap();
+
+        // A corrupt pack, a wrong-scope pack, a pack that mismatches its catalog range, and
+        // a pack whose final event misses the pinned tail all fall through to the serial
+        // walk without changing the outcome.
+        let foreign_config = AdmittedCampaignConfig::new(
+            WorkspaceId::new("workspace-b".into()).unwrap(),
+            CampaignId::new("campaign-b".into()).unwrap(),
+            b"admitted".to_vec(),
+        )
+        .unwrap();
+        let foreign_genesis = crate::scope::root_genesis(&foreign_config).unwrap();
+        let (foreign_events, _) = accel_chain(&foreign_genesis, 3);
+        let foreign_slices: Vec<&[u8]> = foreign_events
+            .iter()
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect();
+        let foreign_pack =
+            build_pack(foreign_genesis.identity(), None, 1, &foreign_slices).unwrap();
+        let short_slices: Vec<&[u8]> = slices[..2].to_vec();
+        let short_pack = build_pack(&scope, None, 1, &short_slices).unwrap();
+        let (alternate_events, _) = accel_chain_with(&genesis, 3, "rival-op");
+        let alternate_slices: Vec<&[u8]> = alternate_events
+            .iter()
+            .map(|(_, bytes)| bytes.as_slice())
+            .collect();
+        let alternate_pack = build_pack(&scope, None, 1, &alternate_slices).unwrap();
+        let mut corrupt = pack.bytes().to_vec();
+        corrupt[20] ^= 0xff;
+        let bad_packs = [
+            (pack.digest().clone(), corrupt),
+            (foreign_pack.digest().clone(), foreign_pack.bytes().to_vec()),
+            (short_pack.digest().clone(), short_pack.bytes().to_vec()),
+            (
+                alternate_pack.digest().clone(),
+                alternate_pack.bytes().to_vec(),
+            ),
+        ];
+        for (digest, bytes) in bad_packs {
+            let entry = PackEntry::new(1, 3, digest).unwrap();
+            let (bad_catalog, bad_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+            let bad_pointer = encode_pointer(&scope, &bad_digest).unwrap();
+            let fallback_path = path("pack-fallback");
+            let handle = DbHandle::spawn(fallback_path.clone()).await.unwrap();
+            let (store, _) = replay_store(vec![
+                head_response(encode_head(&head).unwrap()),
+                response(200, &[("etag", "\"pointer\"")], bad_pointer),
+                response(200, &[("etag", "\"catalog\"")], bad_catalog),
+                response(200, &[("etag", "\"pack\"")], bytes),
+                accel_miss(),
+                event_response(events[2].1.clone()),
+                event_response(events[1].1.clone()),
+                event_response(events[0].1.clone()),
+            ]);
+            assert!(matches!(
+                refresh(&store, &handle, &scope).await,
+                ScopeReadiness::Ready { .. }
+            ));
+            assert_eq!(handle.scope_cursor(&scope).await.unwrap(), serial_cursor);
+            drop(handle);
+            fs::remove_file(fallback_path).unwrap();
+        }
+        fs::remove_file(serial_path).unwrap();
+    }
+
+    /// For an N-event history served through packs, event-data GETs drop from N to
+    /// `ceil(N / 256)`; the fixed head/pointer/catalog requests are asserted separately.
+    #[tokio::test]
+    async fn packed_replay_reduces_event_data_requests_to_pack_count() {
+        const EVENTS: usize = 300;
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, EVENTS);
+        let mut entries = Vec::new();
+        let mut packs = Vec::new();
+        for group in (0..EVENTS).collect::<Vec<_>>().chunks(256) {
+            let start = group[0];
+            let end = group[group.len() - 1];
+            let parent = (start > 0).then(|| events[start - 1].0.clone());
+            let slices: Vec<&[u8]> = events[start..=end]
+                .iter()
+                .map(|(_, bytes)| bytes.as_slice())
+                .collect();
+            let pack = build_pack(&scope, parent.as_ref(), start as u64 + 1, &slices).unwrap();
+            entries.push(
+                PackEntry::new(start as u64 + 1, end as u64 + 1, pack.digest().clone()).unwrap(),
+            );
+            packs.push(pack);
+        }
+        assert_eq!(packs.len(), EVENTS.div_ceil(256));
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &entries, &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let path = path("pack-request-count");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let mut responses = vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+        ];
+        responses.extend(
+            packs
+                .iter()
+                .map(|pack| response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec())),
+        );
+        let (store, client) = replay_store(responses);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, EVENTS as u64);
+        let requests: Vec<String> = client
+            .actual_requests()
+            .map(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .to_owned()
+            })
+            .collect();
+        let event_gets = requests
+            .iter()
+            .filter(|path| path.contains("/events/"))
+            .count();
+        let pack_gets = requests
+            .iter()
+            .filter(|path| path.contains("/replay-packs/"))
+            .count();
+        assert_eq!(event_gets, 0);
+        assert_eq!(pack_gets, EVENTS.div_ceil(256));
+        assert_eq!(requests.len(), 1 + 2 + pack_gets);
+        drop(handle);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A LIST-served replay publishes packs, and a second cold projection then replays
+    /// through them: the acceptance path from serial cost to `ceil(N / 256)` GETs.
+    #[tokio::test]
+    async fn a_replay_publishes_packs_that_serve_the_next_cold_projection() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 2);
+        let keys = event_keys(&scope, &events);
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let slices: Vec<&[u8]> = events.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        let expected_pack = build_pack(&scope, None, 1, &slices).unwrap();
+        let entry = PackEntry::new(1, 2, expected_pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let first_path = path("publish-first");
+        let first = DbHandle::spawn(first_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            list_response(&key_refs, false, None),
+            event_response(events[0].1.clone()),
+            event_response(events[1].1.clone()),
+            // Publication: pointer probe, pack PUT, catalog PUT, pointer create.
+            response(404, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &first, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests[6].body().bytes(), Some(expected_pack.bytes()));
+        assert_eq!(requests[7].body().bytes(), Some(catalog_bytes.as_slice()));
+        assert_eq!(requests[8].body().bytes(), Some(pointer_bytes.as_slice()));
+        drop(first);
+        fs::remove_file(first_path).unwrap();
+
+        let second_path = path("publish-second");
+        let second = DbHandle::spawn(second_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], expected_pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &second, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(second.scope_cursor(&scope).await.unwrap().0, 2);
+        assert_eq!(client.actual_requests().count(), 4);
+        drop(second);
+        fs::remove_file(second_path).unwrap();
+    }
+
+    /// Shared checkpoint fixture: a live projection at genesis, its sanitized snapshot,
+    /// the certificate at sequence 2, one successor at sequence 3, and the accelerator
+    /// objects proving them.
+    struct CheckpointFixture {
+        scope: ScopeIdentity,
+        head: ScopeHead,
+        snapshot: Vec<u8>,
+        certificate_bytes: Vec<u8>,
+        successor_bytes: Vec<u8>,
+        successor_ref: ScopeEventRef,
+        pack: crate::sync::accelerator::EncodedPack,
+        catalog_bytes: Vec<u8>,
+        pointer_bytes: Vec<u8>,
+    }
+
+    async fn checkpoint_fixture(
+        genesis: &crate::scope::RootGenesis,
+        label: &str,
+    ) -> CheckpointFixture {
+        let scope = genesis.identity().clone();
+        let live_path = path(&format!("checkpoint-fixture-live-{label}"));
+        let snap_path = path(&format!("checkpoint-fixture-snap-{label}"));
+        let _ = fs::remove_file(&snap_path);
+        let live = DbHandle::spawn(live_path.clone()).await.unwrap();
+        live.apply(root_mutation(genesis)).await.unwrap();
+        live.snapshot_to(genesis.head(), snap_path.clone())
+            .await
+            .unwrap();
+        drop(live);
+        let snapshot = fs::read(&snap_path).unwrap();
+        fs::remove_file(&live_path).unwrap();
+        fs::remove_file(&snap_path).unwrap();
+        let snapshot_digest = Digest::new(sha256(&snapshot)).unwrap();
+
+        let payload = ProjectionCheckpointPayload::new(
+            snapshot_digest,
+            snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "checkpoint-op-1".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let certificate_encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let successor_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            3,
+            Some(certificate_encoded.event_ref().clone()),
+            1,
+            "post-checkpoint-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let successor = encode_scope_event(&successor_envelope, &Value::Null).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            successor.event_ref().clone(),
+            None,
+            "post-checkpoint-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[certificate_encoded.stored_bytes(), successor.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 3, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            &scope,
+            &[entry],
+            std::slice::from_ref(certificate_encoded.event_ref()),
+        )
+        .unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+        CheckpointFixture {
+            scope,
+            head,
+            snapshot,
+            certificate_bytes: certificate_encoded.stored_bytes().to_vec(),
+            successor_bytes: successor.stored_bytes().to_vec(),
+            successor_ref: successor.event_ref().clone(),
+            pack,
+            catalog_bytes,
+            pointer_bytes,
+        }
+    }
+
+    /// A cold start through a certified checkpoint reaches the same projection and cursor
+    /// as the serial walk from genesis, with one snapshot GET plus `ceil(suffix / 256)`
+    /// pack GETs beside the fixed head/pointer/catalog/certificate requests.
+    #[tokio::test]
+    async fn a_cold_start_installs_a_certified_checkpoint_and_matches_the_serial_walk() {
+        let genesis = genesis();
+        let fixture = checkpoint_fixture(&genesis, "cold-start").await;
+        let scope = fixture.scope.clone();
+
+        // The serial baseline replays the same chain from genesis.
+        let serial_path = path("checkpoint-serial-baseline");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&fixture.head).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(fixture.successor_bytes.clone()),
+            event_response(fixture.certificate_bytes.clone()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        drop(serial);
+
+        let cold_path = path("checkpoint-cold-install");
+        let _ = fs::remove_file(&cold_path);
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&fixture.head).unwrap()),
+            response(
+                200,
+                &[("etag", "\"pointer\"")],
+                fixture.pointer_bytes.clone(),
+            ),
+            response(
+                200,
+                &[("etag", "\"catalog\"")],
+                fixture.catalog_bytes.clone(),
+            ),
+            event_response(fixture.certificate_bytes.clone()),
+            response(200, &[("etag", "\"pack\"")], fixture.pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+        ]);
+        let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        assert_eq!(
+            handle.scope_cursor(&scope).await.unwrap(),
+            (3, Some(fixture.successor_ref.digest().clone()))
+        );
+        assert_eq!(row_counts(&cold_path), row_counts(&serial_path));
+        let requests: Vec<String> = client
+            .actual_requests()
+            .map(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|path| path.contains("/checkpoints/"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|path| path.contains("/replay-packs/"))
+                .count(),
+            1
+        );
+        // The one event GET is the certificate read at its exact key.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|path| path.contains("/events/"))
+                .count(),
+            1
+        );
+
+        // A valid existing projection opens normally with no store request at all.
+        drop(handle);
+        let (offline, offline_client) = replay_store(vec![]);
+        let reopened = open_projection(&offline, &scope, &cold_path).await.unwrap();
+        assert_eq!(reopened.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        assert_eq!(offline_client.actual_requests().count(), 0);
+        drop(reopened);
+        fs::remove_file(serial_path).unwrap();
+        fs::remove_file(cold_path).unwrap();
+    }
+
+    /// Builds the six-response script certifying `snapshot` at covered sequence 1
+    /// through a certificate at sequence 2 under `operation`.
+    fn certified_responses(
+        genesis: &crate::scope::RootGenesis,
+        snapshot: Vec<u8>,
+        active_plan: Option<Digest>,
+        operation: &str,
+    ) -> Vec<http::Response<SdkBody>> {
+        let scope = genesis.identity().clone();
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&snapshot)).unwrap(),
+            snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            active_plan.clone(),
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                operation.into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            active_plan,
+            operation.into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
+        let (catalog, digest) =
+            encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref())).unwrap();
+        let pointer = encode_pointer(&scope, &digest).unwrap();
+        vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer),
+            response(200, &[("etag", "\"catalog\"")], catalog),
+            event_response(encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], snapshot),
+        ]
+    }
+
+    /// Uncertified, wrong-digest, invalid-SQLite, wrong-plan, wrong-scope, wrong-cursor,
+    /// and off-chain-certificate checkpoints all fall through to the empty projection.
+    #[tokio::test]
+    async fn bad_checkpoints_fall_through_to_an_empty_projection() {
+        let genesis = genesis();
+        let fixture = checkpoint_fixture(&genesis, "fallback").await;
+        let scope = fixture.scope.clone();
+
+        // Uncertified: the catalog names packs but no checkpoint certificate.
+        let entry = PackEntry::new(2, 3, fixture.pack.digest().clone()).unwrap();
+        let (bare_catalog, bare_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let bare_pointer = encode_pointer(&scope, &bare_digest).unwrap();
+        let uncertified = vec![
+            head_response(encode_head(&fixture.head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], bare_pointer),
+            response(200, &[("etag", "\"catalog\"")], bare_catalog),
+        ];
+
+        // Wrong digest: the snapshot object does not hash to the certified digest.
+        let mut corrupt_snapshot = fixture.snapshot.clone();
+        let last = corrupt_snapshot.len() - 1;
+        corrupt_snapshot[last] ^= 0xff;
+        let wrong_digest = vec![
+            head_response(encode_head(&fixture.head).unwrap()),
+            response(
+                200,
+                &[("etag", "\"pointer\"")],
+                fixture.pointer_bytes.clone(),
+            ),
+            response(
+                200,
+                &[("etag", "\"catalog\"")],
+                fixture.catalog_bytes.clone(),
+            ),
+            event_response(fixture.certificate_bytes.clone()),
+            response(200, &[("etag", "\"pack\"")], fixture.pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], corrupt_snapshot),
+        ];
+
+        // Invalid SQLite: the certified length and digest match arbitrary junk.
+        let junk = certified_responses(
+            &genesis,
+            b"not-a-sqlite-database".repeat(64),
+            None,
+            "junk-checkpoint-op",
+        );
+
+        // Wrong plan: the certificate claims an active plan the snapshot does not hold.
+        let wrong_plan = certified_responses(
+            &genesis,
+            fixture.snapshot.clone(),
+            Some(Digest::new("a".repeat(64)).unwrap()),
+            "planned-checkpoint-op",
+        );
+
+        // Wrong scope: the snapshot is a valid projection of a foreign scope, so the
+        // certified scope binding refuses it before installation.
+        let foreign_genesis = root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-b".into()).unwrap(),
+                CampaignId::new("campaign-b".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let foreign_live = path("checkpoint-foreign-live");
+        let foreign_snap = path("checkpoint-foreign-snap");
+        let _ = fs::remove_file(&foreign_snap);
+        let live = DbHandle::spawn(foreign_live.clone()).await.unwrap();
+        live.apply(root_mutation(&foreign_genesis)).await.unwrap();
+        live.snapshot_to(foreign_genesis.head(), foreign_snap.clone())
+            .await
+            .unwrap();
+        drop(live);
+        let foreign_snapshot = fs::read(&foreign_snap).unwrap();
+        fs::remove_file(&foreign_live).unwrap();
+        fs::remove_file(&foreign_snap).unwrap();
+        let wrong_scope =
+            certified_responses(&genesis, foreign_snapshot, None, "foreign-checkpoint-op");
+
+        // Wrong cursor: the snapshot is a valid projection of this scope, two events
+        // deep, while the certificate covers cursor 1.
+        let two_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "two-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let two_encoded = encode_scope_event(&two_envelope, &Value::Null).unwrap();
+        let two_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            two_encoded.event_ref().clone(),
+            None,
+            "two-op".into(),
+        )
+        .unwrap();
+        let two_live = path("checkpoint-two-live");
+        let two_snap = path("checkpoint-two-snap");
+        let _ = fs::remove_file(&two_snap);
+        let live = DbHandle::spawn(two_live.clone()).await.unwrap();
+        live.apply(root_mutation(&genesis)).await.unwrap();
+        live.apply(
+            ScopeProjectionEvent::new(
+                scope.clone(),
+                two_envelope,
+                two_encoded.event_ref().clone(),
+                ScopeProjectionPayload::TestSuccessor,
+                1,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        live.snapshot_to(&two_head, two_snap.clone()).await.unwrap();
+        drop(live);
+        let two_snapshot = fs::read(&two_snap).unwrap();
+        fs::remove_file(&two_live).unwrap();
+        fs::remove_file(&two_snap).unwrap();
+        let wrong_cursor = certified_responses(&genesis, two_snapshot, None, "wrong-cursor-op");
+
+        // Off-chain certificate: a valid checkpoint event at a sequence the pinned head's
+        // ancestry commits to a different object. A head-CAS loser or a fenced writer leaves
+        // exactly this — an event whose key is fresh, whose parent is genuine, and whose
+        // payload names a snapshot of its own choosing. The chain walk proves the ancestry
+        // but must refuse the certificate that is not part of it.
+        let committed_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "committed-rival-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let committed = encode_scope_event(&committed_envelope, &Value::Null).unwrap();
+        let committed_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            committed.event_ref().clone(),
+            None,
+            "committed-rival-op".into(),
+        )
+        .unwrap();
+        let orphan = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "orphan-checkpoint-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            ProjectionCheckpointPayload::new(
+                Digest::new(sha256(&fixture.snapshot)).unwrap(),
+                fixture.snapshot.len() as u64,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let orphan_encoded = encode_projection_checkpoint_event(&orphan).unwrap();
+        assert_ne!(orphan_encoded.event_ref(), committed.event_ref());
+        let committed_pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[committed.stored_bytes()],
+        )
+        .unwrap();
+        let committed_entry = PackEntry::new(2, 2, committed_pack.digest().clone()).unwrap();
+        let (orphan_catalog, orphan_catalog_digest) = encode_catalog(
+            &scope,
+            &[committed_entry],
+            std::slice::from_ref(orphan_encoded.event_ref()),
+        )
+        .unwrap();
+        let off_chain_certificate = vec![
+            head_response(encode_head(&committed_head).unwrap()),
+            response(
+                200,
+                &[("etag", "\"pointer\"")],
+                encode_pointer(&scope, &orphan_catalog_digest).unwrap(),
+            ),
+            response(200, &[("etag", "\"catalog\"")], orphan_catalog),
+            event_response(orphan_encoded.stored_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"pack\"")],
+                committed_pack.bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+        ];
+
+        for responses in [
+            uncertified,
+            wrong_digest,
+            junk,
+            wrong_plan,
+            wrong_scope,
+            wrong_cursor,
+            off_chain_certificate,
+        ] {
+            let cold_path = path("checkpoint-fallback");
+            let _ = fs::remove_file(&cold_path);
+            let (store, _) = replay_store(responses);
+            let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+            assert_eq!(handle.scope_cursor(&scope).await.unwrap(), (0, None));
+            assert_eq!(
+                row_counts(&cold_path),
+                (0, 0),
+                "a refused checkpoint must leave a fresh empty projection"
+            );
+            let leaked = fs::read_dir(cold_path.parent().unwrap())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .starts_with(&format!(
+                            "{}.checkpoint-",
+                            cold_path.file_name().unwrap().to_str().unwrap()
+                        ))
+                })
+                .count();
+            assert_eq!(leaked, 0, "a refused install must remove its staging file");
+            drop(handle);
+            fs::remove_file(cold_path).unwrap();
+        }
+    }
+
+    /// A snapshot whose bytes match the certified length but not the certified digest
+    /// falls through without installation.
+    #[tokio::test]
+    async fn a_snapshot_matching_length_but_not_digest_falls_through() {
+        let genesis = genesis();
+        let fixture = checkpoint_fixture(&genesis, "digest-split").await;
+        let scope = fixture.scope.clone();
+        // The certificate names the exact snapshot length with a digest of other bytes.
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(b"different-bytes")).unwrap(),
+            fixture.snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "digest-split-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            None,
+            "digest-split-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
+        let (catalog, digest) =
+            encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref())).unwrap();
+        let pointer = encode_pointer(&scope, &digest).unwrap();
+        let cold_path = path("checkpoint-digest-split");
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer),
+            response(200, &[("etag", "\"catalog\"")], catalog),
+            event_response(encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+        ]);
+        let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap(), (0, None));
+        drop(handle);
+        fs::remove_file(cold_path).unwrap();
+    }
+
+    /// Candidates are attempted newest first; a failing newer candidate falls to an
+    /// older one, and a candidate beyond the pinned tail is skipped without a read.
+    #[tokio::test]
+    async fn checkpoint_candidates_try_newest_first_and_fall_to_older_ones() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+
+        let live_path = path("candidates-live");
+        let snap_path = path("candidates-snap");
+        let _ = fs::remove_file(&snap_path);
+        let live = DbHandle::spawn(live_path.clone()).await.unwrap();
+        live.apply(root_mutation(&genesis)).await.unwrap();
+        live.snapshot_to(genesis.head(), snap_path.clone())
+            .await
+            .unwrap();
+        drop(live);
+        let old_snapshot = fs::read(&snap_path).unwrap();
+        fs::remove_file(&live_path).unwrap();
+        fs::remove_file(&snap_path).unwrap();
+
+        let old_payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&old_snapshot)).unwrap(),
+            old_snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let old_certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "old-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            old_payload,
+        )
+        .unwrap();
+        let old_encoded = encode_projection_checkpoint_event(&old_certificate).unwrap();
+        let mid_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            3,
+            Some(old_encoded.event_ref().clone()),
+            1,
+            "mid-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let mid = encode_scope_event(&mid_envelope, &Value::Null).unwrap();
+        // The newer certificate is fully certified but its snapshot object is missing.
+        let new_payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(b"missing-snapshot")).unwrap(),
+            1_024,
+            3,
+            mid.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let new_certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                4,
+                Some(mid.event_ref().clone()),
+                1,
+                "new-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            new_payload,
+        )
+        .unwrap();
+        let new_encoded = encode_projection_checkpoint_event(&new_certificate).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            new_encoded.event_ref().clone(),
+            None,
+            "new-cert-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[
+                old_encoded.stored_bytes(),
+                mid.stored_bytes(),
+                new_encoded.stored_bytes(),
+            ],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 4, pack.digest().clone()).unwrap();
+        let beyond = ScopeEventRef::new(99, Digest::new("9".repeat(64)).unwrap()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            &scope,
+            &[entry],
+            &[
+                old_encoded.event_ref().clone(),
+                new_encoded.event_ref().clone(),
+                beyond,
+            ],
+        )
+        .unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let cold_path = path("candidates-cold");
+        let _ = fs::remove_file(&cold_path);
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            event_response(new_encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(404, &[], SdkBody::empty()),
+            event_response(old_encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], old_snapshot),
+        ]);
+        let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+        assert_eq!(
+            handle.scope_cursor(&scope).await.unwrap(),
+            (4, Some(new_encoded.event_ref().digest().clone()))
+        );
+        let requests: Vec<String> = client
+            .actual_requests()
+            .map(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(requests.len(), 9);
+        // Newest first: the sequence-4 certificate and its snapshot are attempted
+        // before the sequence-2 certificate.
+        assert!(requests[3].contains("/events/0000000000000004-"));
+        assert!(requests[5].contains("/checkpoints/0000000000000003-"));
+        assert!(requests[6].contains("/events/0000000000000002-"));
+        assert!(requests[8].contains("/checkpoints/0000000000000001-"));
+        // The beyond-tail candidate is never read.
+        assert!(
+            requests
+                .iter()
+                .all(|path| !path.contains("0000000000000099"))
+        );
+        drop(handle);
+        fs::remove_file(cold_path).unwrap();
+    }
+
+    /// A warm refresh lists strictly after the cursor sequence: the boundary key ends
+    /// with `.`, which sorts between the cursor key and every later sequence.
+    #[tokio::test]
+    async fn a_warm_list_refresh_starts_after_the_cursor_boundary() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 3);
+        let keys = event_keys(&scope, &events);
+        let db_path = path("list-warm-cursor");
+        let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(genesis.head_bytes().to_vec()),
+            accel_miss(),
+            accel_miss(),
+            event_response(events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 1);
+
+        let (store, requests) =
+            keyed_store(accel_route(&scope, &head, &events[1..], keys[1..].to_vec()));
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 3);
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 8);
+        assert!(recorded[2].contains("list-type=2"));
+        assert!(
+            recorded[2].contains("start-after=") && recorded[2].contains("0000000000000001."),
+            "the listing must start after every key at the cursor sequence: {}",
+            recorded[2]
+        );
+        drop(handle);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// A checkpointed cold start over a suffix wider than one pack performs one
+    /// snapshot GET plus `ceil(suffix / 256)` pack GETs.
+    #[tokio::test]
+    async fn a_checkpoint_cold_start_reads_the_suffix_in_pack_sized_requests() {
+        const COUNT: usize = 302;
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+
+        let live_path = path("ratio-live");
+        let snap_path = path("ratio-snap");
+        let _ = fs::remove_file(&snap_path);
+        let live = DbHandle::spawn(live_path.clone()).await.unwrap();
+        live.apply(root_mutation(&genesis)).await.unwrap();
+        live.snapshot_to(genesis.head(), snap_path.clone())
+            .await
+            .unwrap();
+        drop(live);
+        let snapshot = fs::read(&snap_path).unwrap();
+        fs::remove_file(&live_path).unwrap();
+        fs::remove_file(&snap_path).unwrap();
+
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&snapshot)).unwrap(),
+            snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "ratio-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let cert_encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let mut suffix: Vec<(ScopeEventRef, Vec<u8>)> = vec![(
+            cert_encoded.event_ref().clone(),
+            cert_encoded.stored_bytes().to_vec(),
+        )];
+        for sequence in 3..=COUNT as u64 {
+            let parent = suffix.last().unwrap().0.clone();
+            let envelope = EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent),
+                1,
+                format!("ratio-op-{sequence}"),
+                TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+            )
+            .unwrap();
+            let encoded = encode_scope_event(&envelope, &Value::Null).unwrap();
+            suffix.push((encoded.event_ref().clone(), encoded.stored_bytes().to_vec()));
+        }
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            suffix.last().unwrap().0.clone(),
+            None,
+            format!("ratio-op-{COUNT}"),
+        )
+        .unwrap();
+        let mut entries = Vec::new();
+        let mut packs = Vec::new();
+        let mut parent = genesis.event_ref().clone();
+        let mut start = 2_u64;
+        for group in suffix.chunks(256) {
+            let slices: Vec<&[u8]> = group.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+            let pack = build_pack(&scope, Some(&parent), start, &slices).unwrap();
+            entries.push(
+                PackEntry::new(start, start + group.len() as u64 - 1, pack.digest().clone())
+                    .unwrap(),
+            );
+            parent = group.last().unwrap().0.clone();
+            start += group.len() as u64;
+            packs.push(pack);
+        }
+        let suffix_len = COUNT - 1;
+        assert_eq!(packs.len(), suffix_len.div_ceil(256));
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            &scope,
+            &entries,
+            std::slice::from_ref(cert_encoded.event_ref()),
+        )
+        .unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        let cold_path = path("ratio-cold");
+        let _ = fs::remove_file(&cold_path);
+        let mut responses = vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            event_response(cert_encoded.stored_bytes().to_vec()),
+        ];
+        responses.extend(
+            packs
+                .iter()
+                .map(|pack| response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec())),
+        );
+        responses.push(response(200, &[("etag", "\"snapshot\"")], snapshot));
+        let (store, client) = replay_store(responses);
+        let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, COUNT as u64);
+        let requests: Vec<String> = client
+            .actual_requests()
+            .map(|request| {
+                request
+                    .uri()
+                    .parse::<http::Uri>()
+                    .unwrap()
+                    .path()
+                    .to_owned()
+            })
+            .collect();
+        let count_of = |segment: &str| {
+            requests
+                .iter()
+                .filter(|path| path.contains(segment))
+                .count()
+        };
+        assert_eq!(count_of("/checkpoints/"), 1);
+        assert_eq!(count_of("/replay-packs/"), suffix_len.div_ceil(256));
+        assert_eq!(count_of("/events/"), 1);
+        assert_eq!(requests.len(), 3 + 1 + suffix_len.div_ceil(256) + 1);
+        drop(handle);
+        fs::remove_file(cold_path).unwrap();
+    }
+
+    /// A checkpoint cold start over a plan-, work-, and grant-bearing history matches
+    /// the serial walk row for row.
+    #[tokio::test]
+    async fn a_checkpoint_cold_start_reproduces_plan_and_grant_state() {
+        use crate::domain::work::WorkId;
+        use crate::scope::{GrantActivatedEvent, GrantActivatedPayload};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let genesis = genesis();
+        let fixture = admitted_fixture(&genesis, NOW);
+        let scope = fixture.scope.clone();
+        let plan = fixture.plan_digest.clone();
+        let admission_ref =
+            ScopeEventRef::new(2, Digest::new(sha256(&fixture.admission_bytes)).unwrap()).unwrap();
+        let grant_event = GrantActivatedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                3,
+                Some(admission_ref.clone()),
+                1,
+                "grant-op-3".into(),
+                GRANT_ACTIVATED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            GrantActivatedPayload::new(
+                WorkId::new("work-a".into()).unwrap(),
+                1,
+                2,
+                Digest::new("d".repeat(64)).unwrap(),
+                1,
+                5,
+                NOW + 20_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let grant_encoded = crate::scope::encode_grant_activated_event(&grant_event).unwrap();
+        let head3 = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            grant_encoded.event_ref().clone(),
+            Some(plan.clone()),
+            "grant-op-3".into(),
+        )
+        .unwrap();
+
+        // The live projection replays the grant-bearing chain and is snapshotted.
+        let live_path = path("grant-checkpoint-live");
+        let snap_path = path("grant-checkpoint-snap");
+        let _ = fs::remove_file(&snap_path);
+        let live = DbHandle::spawn(live_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head3).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(grant_encoded.stored_bytes().to_vec()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            // Publication's pointer read fails, which ends it before any write.
+            response(500, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &live, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        live.snapshot_to(&head3, snap_path.clone()).await.unwrap();
+        drop(live);
+        let snapshot = fs::read(&snap_path).unwrap();
+        fs::remove_file(&live_path).unwrap();
+        fs::remove_file(&snap_path).unwrap();
+
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(&snapshot)).unwrap(),
+            snapshot.len() as u64,
+            3,
+            grant_encoded.event_ref().digest().clone(),
+            Some(plan.clone()),
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                4,
+                Some(grant_encoded.event_ref().clone()),
+                1,
+                "grant-cert-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let cert_encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let head4 = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            cert_encoded.event_ref().clone(),
+            Some(plan.clone()),
+            "grant-cert-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(grant_encoded.event_ref()),
+            4,
+            &[cert_encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(4, 4, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(
+            &scope,
+            &[entry],
+            std::slice::from_ref(cert_encoded.event_ref()),
+        )
+        .unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+
+        // The serial baseline replays the whole chain from genesis.
+        let serial_path = path("grant-checkpoint-serial");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head4).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(cert_encoded.stored_bytes().to_vec()),
+            event_response(grant_encoded.stored_bytes().to_vec()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            // Publication's pointer read fails, which ends it before any write.
+            response(500, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        serial.drain().await.unwrap();
+        drop(serial);
+
+        // The cold start installs the snapshot, applies the packed suffix, and restores
+        // claims on its first refresh.
+        let cold_path = path("grant-checkpoint-cold");
+        let _ = fs::remove_file(&cold_path);
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head4).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            event_response(cert_encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], snapshot),
+        ]);
+        let cold = open_projection(&store, &scope, &cold_path).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head4).unwrap()),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &cold, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(cold.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        cold.drain().await.unwrap();
+        drop(cold);
+
+        // The fixture genuinely carries plan, work, and grant state.
+        let rows = scheduling_rows(&cold_path);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].granted_units, Some(5));
+        assert_eq!(rows[0].plan_digest, plan.as_str());
+        assert_eq!(
+            projection_content(&cold_path),
+            projection_content(&serial_path)
+        );
+        fs::remove_file(serial_path).unwrap();
+        fs::remove_file(cold_path).unwrap();
+    }
+
+    /// Interruption immediately before the rename leaves the destination untouched;
+    /// interruption immediately after it leaves an independently valid projection at the
+    /// covered cursor that the next refresh completes.
+    #[tokio::test]
+    async fn an_interrupted_installation_leaves_a_usable_destination() {
+        let genesis = genesis();
+        let fixture = checkpoint_fixture(&genesis, "interrupted").await;
+        let scope = fixture.scope.clone();
+        let destination = path("checkpoint-interrupted");
+        let _ = fs::remove_file(&destination);
+
+        let mut staging = destination.as_os_str().to_owned();
+        staging.push(".checkpoint-9999999-0");
+        let staging = PathBuf::from(staging);
+        fs::write(&staging, b"stale-staging").unwrap();
+        let staging_siblings = || {
+            let name = destination
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let mut siblings: Vec<String> = fs::read_dir(destination.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.unwrap().file_name().to_str().unwrap().to_owned();
+                    entry
+                        .starts_with(&format!("{name}.checkpoint-"))
+                        .then_some(entry)
+                })
+                .collect();
+            siblings.sort();
+            siblings
+        };
+        assert!(!destination.exists());
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&fixture.head).unwrap()),
+            response(
+                200,
+                &[("etag", "\"pointer\"")],
+                fixture.pointer_bytes.clone(),
+            ),
+            response(
+                200,
+                &[("etag", "\"catalog\"")],
+                fixture.catalog_bytes.clone(),
+            ),
+            event_response(fixture.certificate_bytes.clone()),
+            response(200, &[("etag", "\"pack\"")], fixture.pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+        ]);
+        let handle = open_projection(&store, &scope, &destination).await.unwrap();
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 3);
+        assert_eq!(
+            staging_siblings(),
+            vec![staging.file_name().unwrap().to_str().unwrap().to_owned()],
+            "the retried install must leave no staging sibling of its own"
+        );
+        fs::remove_file(&staging).unwrap();
+        drop(handle);
+        fs::remove_file(&destination).unwrap();
+
+        // After the rename: the destination holds the validated snapshot at its covered
+        // cursor. It opens as a valid existing projection and refresh replays the
+        // suffix.
+        fs::write(&destination, &fixture.snapshot).unwrap();
+        let (offline, _) = replay_store(vec![]);
+        let handle = open_projection(&offline, &scope, &destination)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.scope_cursor(&scope).await.unwrap(),
+            (1, Some(genesis.event_ref().digest().clone()))
+        );
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&fixture.head).unwrap()),
+            response(
+                200,
+                &[("etag", "\"pointer\"")],
+                fixture.pointer_bytes.clone(),
+            ),
+            response(
+                200,
+                &[("etag", "\"catalog\"")],
+                fixture.catalog_bytes.clone(),
+            ),
+            response(200, &[("etag", "\"pack\"")], fixture.pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(
+            handle.scope_cursor(&scope).await.unwrap(),
+            (3, Some(fixture.successor_ref.digest().clone()))
+        );
+        drop(handle);
+        fs::remove_file(destination).unwrap();
     }
 }

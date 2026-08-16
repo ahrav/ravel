@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    domain::{proposal::MAX_STORED_INTEGER, work::WorkId},
-    provider::{InvocationRequest, ModelProvider, ReportedUse},
+    domain::{validation::bounded_stored, work::WorkId},
+    provider::{InvocationRequest, MAX_IDENTIFIER_BYTES, ModelProvider, ReportedUse},
     scope::{Digest, ScopeId},
 };
 
@@ -65,8 +65,6 @@ impl fmt::Display for RecordError {
 }
 
 impl Error for RecordError {}
-
-const MAX_IDENTIFIER_BYTES: usize = 256;
 
 /// How one invocation ended, in the vocabulary durable history uses.
 ///
@@ -199,9 +197,7 @@ fn identifier(value: &str) -> Result<(), RecordError> {
 }
 
 fn bounded(value: u64) -> Result<NonZeroU64, RecordError> {
-    NonZeroU64::new(value)
-        .filter(|value| value.get() <= MAX_STORED_INTEGER)
-        .ok_or(RecordError::OutOfRange)
+    bounded_stored(value).ok_or(RecordError::OutOfRange)
 }
 
 /// The authority one invocation ran under, shared by its manifest and its trace.
@@ -244,24 +240,12 @@ impl InvocationBinding {
         })
     }
 
-    pub fn scope_id(&self) -> &ScopeId {
-        &self.scope_id
-    }
-
-    pub fn plan_digest(&self) -> &Digest {
-        &self.plan_digest
-    }
-
     pub fn work_id(&self) -> &WorkId {
         &self.work_id
     }
 
     pub fn work_revision(&self) -> NonZeroU64 {
         self.work_revision
-    }
-
-    pub fn claim_fence(&self) -> NonZeroU64 {
-        self.claim_fence
     }
 
     pub fn grant_digest(&self) -> &Digest {
@@ -372,18 +356,6 @@ impl InvocationManifest {
         })
     }
 
-    pub fn binding(&self) -> &InvocationBinding {
-        &self.binding
-    }
-
-    pub fn request_digest(&self) -> &Digest {
-        &self.request_digest
-    }
-
-    pub fn operation_id(&self) -> &str {
-        &self.operation_id
-    }
-
     /// The exact bytes to publish, and the address they hash to.
     ///
     /// # Errors
@@ -439,25 +411,13 @@ impl InvocationTrace {
         })
     }
 
-    pub fn binding(&self) -> &InvocationBinding {
-        &self.binding
-    }
-
     /// The manifest this trace terminates, so a reader needs no external index to pair them.
-    pub fn manifest_digest(&self) -> &Digest {
-        &self.manifest_digest
-    }
-
     pub fn outcome(&self) -> TerminalOutcome {
         self.outcome
     }
 
     pub fn reported_use(&self) -> Option<ReportedUse> {
         self.reported_use
-    }
-
-    pub fn output(&self) -> Option<&BoundedText> {
-        self.output.as_ref()
     }
 
     /// The exact bytes to publish, and the address they hash to.
@@ -744,6 +704,8 @@ impl WireTrace {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+
+    use crate::domain::validation::MAX_STORED_INTEGER;
 
     use super::*;
     use crate::provider::ModelProfile;

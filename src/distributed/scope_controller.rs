@@ -211,14 +211,12 @@ pub(crate) async fn append_grant_activated(
     now_ms: u64,
 ) -> GrantAppend {
     let instance = authority.instance.clone();
-    let scope = authority.head().scope().clone();
     let Ok(parent) = authority.into_parent(now_ms) else {
         return GrantAppend::Stopped;
     };
     let Ok(append) = head::append_grant_activated(
         store,
         parent,
-        &scope,
         payload,
         operation_id,
         event_history,

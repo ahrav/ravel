@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    domain::work::WorkId,
+    domain::{
+        validation::{MAX_STORED_INTEGER, bounded_stored},
+        work::WorkId,
+    },
     scope::{Digest, ROOT_GENESIS_PAYLOAD_TYPE, ScopeEventRef, ScopeId, ScopeIdentity},
 };
 
@@ -39,7 +42,6 @@ const PLAN_PROPOSAL_DOMAIN: &[u8] = b"ravel.plan.proposal\0";
 const CBOR_RECURSION_LIMIT: usize = 16;
 
 /// Highest value the durable integer columns and 16-digit key encodings accept.
-pub const MAX_STORED_INTEGER: u64 = 9_999_999_999_999_999;
 /// Cap on the CBOR body of one plan object.
 pub const MAX_PLAN_CANONICAL_BYTES: usize = 1024 * 1024;
 /// Cap on one stored plan object: the domain prefix plus the CBOR body.
@@ -118,11 +120,7 @@ impl TargetBounds {
     ///
     /// Returns [`ProposalError::BoundOutOfRange`] outside `1..=MAX_STORED_INTEGER`.
     pub fn new(max_attempts: u64, deadline_unix_ms: u64) -> Result<Self, ProposalError> {
-        let bounded = |value: u64| {
-            NonZeroU64::new(value)
-                .filter(|value| value.get() <= MAX_STORED_INTEGER)
-                .ok_or(ProposalError::BoundOutOfRange)
-        };
+        let bounded = |value: u64| bounded_stored(value).ok_or(ProposalError::BoundOutOfRange);
         Ok(Self {
             max_attempts: bounded(max_attempts)?,
             deadline_unix_ms: bounded(deadline_unix_ms)?,

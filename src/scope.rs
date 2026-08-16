@@ -16,8 +16,9 @@ use crate::{
     distributed::identity::{InstanceId, WorkspaceId},
     domain::{
         artifact::ArtifactRef,
-        proposal::MAX_STORED_INTEGER,
-        validation::{ValidationError, is_digest, validate_key_segment, validate_sequence},
+        validation::{
+            ValidationError, bounded_stored, is_digest, validate_key_segment, validate_sequence,
+        },
         work::{WorkId, WorkRef},
     },
     sync::WireError,
@@ -421,11 +422,7 @@ impl GrantActivatedPayload {
         units: u64,
         deadline_unix_ms: u64,
     ) -> Result<Self, ValidationError> {
-        let bounded = |value: u64| {
-            NonZeroU64::new(value)
-                .filter(|value| value.get() <= MAX_STORED_INTEGER)
-                .ok_or(ValidationError::OutOfRange)
-        };
+        let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
         Ok(Self {
             work_id,
             work_revision: bounded(work_revision)?,
@@ -581,11 +578,7 @@ impl ArtifactReferencePayload {
         grant_digest: Digest,
         attempt: u64,
     ) -> Result<Self, ValidationError> {
-        let bounded = |value: u64| {
-            NonZeroU64::new(value)
-                .filter(|value| value.get() <= MAX_STORED_INTEGER)
-                .ok_or(ValidationError::OutOfRange)
-        };
+        let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
         bounded(artifact.size())?;
         bounded(artifact.creation_time_unix_ms())?;
         Ok(Self {
@@ -1748,6 +1741,8 @@ fn sha256(bytes: &[u8]) -> String {
 mod codec_tests {
     use ciborium::Value;
 
+    use crate::domain::validation::MAX_STORED_INTEGER;
+
     use crate::distributed::identity::WorkspaceId;
 
     use super::*;
@@ -1964,7 +1959,7 @@ mod codec_tests {
         // Every integer binding is bounded by the stored-integer range and must be nonzero.
         let work_id = || WorkId::new("work-17".into()).unwrap();
         let digest = || Digest::new("ab".repeat(32)).unwrap();
-        let max = crate::domain::proposal::MAX_STORED_INTEGER;
+        let max = MAX_STORED_INTEGER;
         assert!(GrantActivatedPayload::new(work_id(), max, max, digest(), max, max, max).is_ok());
         for (revision, fence, attempt, units, deadline) in [
             (0, 1, 1, 1, 1),
@@ -2136,7 +2131,7 @@ mod codec_tests {
     fn artifact_reference_integer_bindings_are_bounded_and_nonzero() {
         use crate::domain::work::WorkId;
 
-        let max = crate::domain::proposal::MAX_STORED_INTEGER;
+        let max = MAX_STORED_INTEGER;
         let build = |size: u64, creation: u64, revision: u64, attempt: u64| {
             ArtifactReferencePayload::new(
                 ArtifactKind::InvocationManifest,

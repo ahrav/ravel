@@ -24,10 +24,10 @@ use rusqlite::{OpenFlags, OptionalExtension, params};
 use crate::{
     domain::{
         proposal::{
-            INITIAL_WORK_REVISION, MAX_STORED_INTEGER, ObservationFact, PlanProposal,
-            ProposalFacts, TargetBounds, validate_proposal,
+            INITIAL_WORK_REVISION, ObservationFact, PlanProposal, ProposalFacts, TargetBounds,
+            validate_proposal,
         },
-        validation::ValidationError,
+        validation::{MAX_STORED_INTEGER, ValidationError},
         work::{WorkId, WorkRef},
     },
     scope::{

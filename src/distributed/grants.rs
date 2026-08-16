@@ -26,8 +26,7 @@ use crate::{
     dispatch::AttemptHistory,
     distributed::scope_controller::{self, ControllerAuthority, GrantAppend, STOP_MARGIN_MS},
     domain::{
-        proposal::MAX_STORED_INTEGER,
-        validation::{ValidationError, validate_key_segment},
+        validation::{ValidationError, bounded_stored, validate_key_segment},
         work::WorkRef,
     },
     scope::{Digest, GrantActivatedPayload, ScopeClaimIdentity, ScopeIdentity, scope_grant_key},
@@ -70,11 +69,7 @@ impl EffectGrant {
         validate_key_segment(&action)?;
         validate_key_segment(&resource_scope)?;
         validate_key_segment(&operation_id)?;
-        let bounded = |value: u64| {
-            NonZeroU64::new(value)
-                .filter(|value| value.get() <= MAX_STORED_INTEGER)
-                .ok_or(ValidationError::OutOfRange)
-        };
+        let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
         bounded(identity.work().revision())?;
         bounded(identity.claim_fence().get())?;
         Ok(Self {
@@ -148,11 +143,7 @@ impl ExpectedGrant {
         validate_key_segment(&action)?;
         validate_key_segment(&resource_scope)?;
         validate_key_segment(&operation_id)?;
-        let bounded = |value: u64| {
-            NonZeroU64::new(value)
-                .filter(|value| value.get() <= MAX_STORED_INTEGER)
-                .ok_or(ValidationError::OutOfRange)
-        };
+        let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
         Ok(Self {
             identity,
             action,
@@ -614,6 +605,8 @@ pub(crate) fn decode_grant(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+
+    use crate::domain::validation::MAX_STORED_INTEGER;
 
     use aws_sdk_s3::primitives::SdkBody;
 

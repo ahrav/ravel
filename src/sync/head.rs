@@ -20,11 +20,11 @@ use crate::{
     invocation::InvocationBinding,
     scope::{
         ARTIFACT_REFERENCE_PAYLOAD_TYPE, ArtifactKind, ArtifactReferenceEvent,
-        ArtifactReferencePayload, EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent,
-        GrantActivatedPayload, MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PlanAdmittedEvent,
-        ScopeAuthority, ScopeHead, ScopeIdentity, decode_head, decode_plan_admitted_event,
-        encode_artifact_reference_event, encode_grant_activated_event, encode_head,
-        encode_plan_admitted_event, plan_key, scope_event_key, scope_head_key,
+        ArtifactReferencePayload, EncodedScopeEvent, EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE,
+        GrantActivatedEvent, GrantActivatedPayload, MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE,
+        PlanAdmittedEvent, ScopeAuthority, ScopeHead, ScopeIdentity, decode_head,
+        decode_plan_admitted_event, encode_artifact_reference_event, encode_grant_activated_event,
+        encode_head, encode_plan_admitted_event, plan_key, scope_event_key, scope_head_key,
     },
     storage::{
         artifacts::PublishedArtifact,
@@ -369,12 +369,89 @@ pub(crate) struct ScopeEventAppend {
     pub(crate) reference: crate::scope::ScopeEventRef,
 }
 
+/// Binds one envelope to the head it succeeds.
+///
+/// Every binding is read out of the fenced parent rather than taken as an argument, so a caller
+/// cannot hand over a scope, sequence, or epoch that contradicts the head it is appending to.
+///
+/// # Errors
+///
+/// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent, an unrepresentable operation
+/// identity, or a sequence past what one refresh replays.
+fn succeeding_envelope(
+    parent: &ScopeHeadParent,
+    operation_id: &str,
+    payload_type: &str,
+) -> Result<EventEnvelope, ScopeAppendError> {
+    let ScopeHeadParent::Existing(observed) = parent else {
+        // A successor always fences against an owned head, so there is a parent to bind to.
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    EventEnvelope::new(
+        observed.head().scope().scope_id().clone(),
+        next_sequence(observed)?,
+        Some(observed.head().tail().clone()),
+        observed.head().scope_epoch().get(),
+        operation_id.to_owned(),
+        payload_type.to_owned(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)
+}
+
+/// Publishes one event that succeeds a fenced parent and commits the head that appends it.
+///
+/// The candidate head keeps the parent's authority, epoch, and active plan, moving only the tail
+/// and operation identity. That invariant lives here rather than at each append so a new event
+/// type cannot quietly move a column the parent owns. `append_plan_admitted` is the one append
+/// that does not route through this, because admission is exactly the case where the candidate's
+/// active plan is *not* the parent's.
+///
+/// # Errors
+///
+/// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent or an invalid head or
+/// transition, and publication errors verbatim.
+async fn publish_succeeding_event(
+    store: &S3Store,
+    parent: ScopeHeadParent,
+    envelope: &EventEnvelope,
+    encoded: EncodedScopeEvent,
+    event_history: &mut AttemptHistory,
+    head_history: &mut AttemptHistory,
+) -> Result<ScopeEventAppend, ScopeAppendError> {
+    let ScopeHeadParent::Existing(observed) = &parent else {
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    let scope = observed.head().scope().clone();
+    let authority = observed.head().authority().clone();
+    let scope_epoch = observed.head().scope_epoch().get();
+    let active_plan = observed.head().active_plan_digest().cloned();
+    let publication = publish_encoded(store, &scope, envelope, encoded, event_history)
+        .await
+        .map_err(ScopeAppendError::Publication)?;
+    let candidate = ScopeHead::new(
+        scope,
+        authority,
+        scope_epoch,
+        publication.event_ref().clone(),
+        active_plan,
+        envelope.operation_id().to_owned(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let reference = publication.event_ref().clone();
+    let transition = ScopeHeadTransition::new(parent, candidate, publication)
+        .map_err(|_| ScopeAppendError::InvalidInput)?;
+    Ok(ScopeEventAppend {
+        outcome: commit(store, transition, head_history).await,
+        envelope: envelope.clone(),
+        reference,
+    })
+}
+
 /// Publishes the grant-activation event and commits the head that appends it.
 ///
 /// The grant object itself is already published by the issuer; this appends only the durable
-/// activation fact. The candidate head keeps the parent's authority, epoch, and active plan,
-/// moving only the tail and operation identity. Each activation permanently spends one of the
-/// 4,096 lifetime replay events; replay's `Overflow` bound is the check.
+/// activation fact. Each activation permanently spends one of the 4,096 lifetime replay events;
+/// replay's `Overflow` bound is the check.
 ///
 /// # Errors
 ///
@@ -384,59 +461,28 @@ pub(crate) struct ScopeEventAppend {
 pub(crate) async fn append_grant_activated(
     store: &S3Store,
     parent: ScopeHeadParent,
-    scope: &ScopeIdentity,
     payload: &GrantActivatedPayload,
     operation_id: &str,
     event_history: &mut AttemptHistory,
     head_history: &mut AttemptHistory,
 ) -> Result<ScopeEventAppend, ScopeAppendError> {
-    let ScopeHeadParent::Existing(observed) = &parent else {
-        // Activation always succeeds an owned head, so there is a parent to fence against.
-        return Err(ScopeAppendError::InvalidInput);
-    };
-    let sequence = next_sequence(observed)?;
     let event = GrantActivatedEvent::new(
-        EventEnvelope::new(
-            scope.scope_id().clone(),
-            sequence,
-            Some(observed.head().tail().clone()),
-            observed.head().scope_epoch().get(),
-            operation_id.to_owned(),
-            GRANT_ACTIVATED_PAYLOAD_TYPE.to_owned(),
-        )
-        .map_err(|_| ScopeAppendError::InvalidInput)?,
+        succeeding_envelope(&parent, operation_id, GRANT_ACTIVATED_PAYLOAD_TYPE)?,
         payload.clone(),
     )
     .map_err(|_| ScopeAppendError::InvalidInput)?;
-    let (authority, scope_epoch) = (
-        observed.head().authority().clone(),
-        observed.head().scope_epoch().get(),
-    );
-    let active_plan = observed.head().active_plan_digest().cloned();
     let encoded = encode_grant_activated_event(&event)
         .map_err(ScopeEventPublicationError::Invalid)
         .map_err(ScopeAppendError::Publication)?;
-    let publication = publish_encoded(store, scope, event.envelope(), encoded, event_history)
-        .await
-        .map_err(ScopeAppendError::Publication)?;
-    let candidate = ScopeHead::new(
-        scope.clone(),
-        authority,
-        scope_epoch,
-        publication.event_ref().clone(),
-        active_plan,
-        operation_id.to_owned(),
+    publish_succeeding_event(
+        store,
+        parent,
+        event.envelope(),
+        encoded,
+        event_history,
+        head_history,
     )
-    .map_err(|_| ScopeAppendError::InvalidInput)?;
-    let envelope = event.envelope().clone();
-    let reference = publication.event_ref().clone();
-    let transition = ScopeHeadTransition::new(parent, candidate, publication)
-        .map_err(|_| ScopeAppendError::InvalidInput)?;
-    Ok(ScopeEventAppend {
-        outcome: commit(store, transition, head_history).await,
-        envelope,
-        reference,
-    })
+    .await
 }
 
 /// What one artifact-reference append admits.
@@ -500,15 +546,6 @@ pub(crate) async fn append_artifact_reference(
         // same fact permanently contradict each other with no way to tell which is right.
         return Err(ScopeAppendError::InvalidInput);
     }
-    let ScopeHeadParent::Existing(observed) = &parent else {
-        // An artifact always succeeds an owned head, so there is a parent to fence against.
-        return Err(ScopeAppendError::InvalidInput);
-    };
-    // The fenced parent already names the scope this append writes to, so taking it separately
-    // would let a caller pass two scopes that disagree.
-    let scope = observed.head().scope().clone();
-    let scope = &scope;
-    let sequence = next_sequence(observed)?;
     let payload = ArtifactReferencePayload::new(
         kind,
         witness.artifact_ref().clone(),
@@ -519,47 +556,22 @@ pub(crate) async fn append_artifact_reference(
     )
     .map_err(|_| ScopeAppendError::InvalidInput)?;
     let event = ArtifactReferenceEvent::new(
-        EventEnvelope::new(
-            scope.scope_id().clone(),
-            sequence,
-            Some(observed.head().tail().clone()),
-            observed.head().scope_epoch().get(),
-            operation_id.to_owned(),
-            ARTIFACT_REFERENCE_PAYLOAD_TYPE.to_owned(),
-        )
-        .map_err(|_| ScopeAppendError::InvalidInput)?,
+        succeeding_envelope(&parent, operation_id, ARTIFACT_REFERENCE_PAYLOAD_TYPE)?,
         payload,
     )
     .map_err(|_| ScopeAppendError::InvalidInput)?;
-    let (authority, scope_epoch) = (
-        observed.head().authority().clone(),
-        observed.head().scope_epoch().get(),
-    );
-    let active_plan = observed.head().active_plan_digest().cloned();
     let encoded = encode_artifact_reference_event(&event)
         .map_err(ScopeEventPublicationError::Invalid)
         .map_err(ScopeAppendError::Publication)?;
-    let publication = publish_encoded(store, scope, event.envelope(), encoded, event_history)
-        .await
-        .map_err(ScopeAppendError::Publication)?;
-    let candidate = ScopeHead::new(
-        scope.clone(),
-        authority,
-        scope_epoch,
-        publication.event_ref().clone(),
-        active_plan,
-        operation_id.to_owned(),
+    publish_succeeding_event(
+        store,
+        parent,
+        event.envelope(),
+        encoded,
+        event_history,
+        head_history,
     )
-    .map_err(|_| ScopeAppendError::InvalidInput)?;
-    let envelope = event.envelope().clone();
-    let reference = publication.event_ref().clone();
-    let transition = ScopeHeadTransition::new(parent, candidate, publication)
-        .map_err(|_| ScopeAppendError::InvalidInput)?;
-    Ok(ScopeEventAppend {
-        outcome: commit(store, transition, head_history).await,
-        envelope,
-        reference,
-    })
+    .await
 }
 
 /// The append path validates the next sequence before publishing event bytes, so a scope cannot

@@ -118,6 +118,9 @@ impl TerminalOutcome {
 /// Storing the address rather than the text is what lets a trace stay small while still
 /// attesting to output no one wants in durable history. `retained` is cut at a character
 /// boundary, so a multi-byte character is dropped whole rather than split.
+///
+/// The prefix is verbatim output bounded in size, never sanitized: this type cannot know
+/// which bytes are sensitive, so any redaction must happen before the text reaches it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundedText {
     retained: String,
@@ -301,6 +304,7 @@ pub struct InvocationManifest {
     binding: InvocationBinding,
     provider: ModelProvider,
     model_id: String,
+    configuration_id: String,
     configuration_digest: Digest,
     request_digest: Digest,
     max_output_tokens: NonZeroU64,
@@ -332,6 +336,7 @@ impl InvocationManifest {
             binding,
             profile.provider(),
             profile.model_id().to_owned(),
+            profile.configuration_id().to_owned(),
             Digest::new(profile.configuration_digest())
                 .map_err(|_| RecordError::InvalidEncoding)?,
             Digest::new(request.request_digest()).map_err(|_| RecordError::InvalidEncoding)?,
@@ -355,6 +360,7 @@ impl InvocationManifest {
         binding: InvocationBinding,
         provider: ModelProvider,
         model_id: String,
+        configuration_id: String,
         configuration_digest: Digest,
         request_digest: Digest,
         max_output_tokens: u64,
@@ -362,6 +368,7 @@ impl InvocationManifest {
         operation_id: String,
     ) -> Result<Self, RecordError> {
         identifier(&model_id)?;
+        identifier(&configuration_id)?;
         identifier(&operation_id)?;
         // A live request's cap is a `NonZeroU32` already checked against the profile ceiling,
         // so this bound bites only on decode — where the wire form could otherwise claim a
@@ -373,6 +380,7 @@ impl InvocationManifest {
             binding,
             provider,
             model_id,
+            configuration_id,
             configuration_digest,
             request_digest,
             max_output_tokens: bounded(max_output_tokens)?,
@@ -580,6 +588,10 @@ struct WireManifest {
     binding: WireBinding,
     provider: String,
     model_id: String,
+    /// The fixed configuration's identifier travels beside its digest: the digest absorbs it
+    /// but cannot be reversed, and there is deliberately no profile registry to look it up in,
+    /// so a reader auditing which configuration ran would otherwise have no way to recover it.
+    configuration_id: String,
     configuration_digest: String,
     request_digest: String,
     max_output_tokens: u64,
@@ -654,6 +666,7 @@ impl From<&InvocationManifest> for WireManifest {
             binding: WireBinding::from(&manifest.binding),
             provider: manifest.provider.as_str().to_owned(),
             model_id: manifest.model_id.clone(),
+            configuration_id: manifest.configuration_id.clone(),
             configuration_digest: manifest.configuration_digest.as_str().to_owned(),
             request_digest: manifest.request_digest.as_str().to_owned(),
             max_output_tokens: manifest.max_output_tokens.get(),
@@ -674,6 +687,7 @@ impl WireManifest {
             self.binding.into_domain()?,
             provider,
             self.model_id,
+            self.configuration_id,
             digest(self.configuration_digest)?,
             digest(self.request_digest)?,
             self.max_output_tokens,
@@ -723,15 +737,27 @@ impl WireTrace {
             Digest::new(self.manifest_digest).map_err(|_| RecordError::InvalidEncoding)?,
             TerminalOutcome::parse(&self.outcome).ok_or(RecordError::InvalidEncoding)?,
             self.provider_request_id,
-            self.reported_use.map(|wire| {
-                ReportedUse::from_reported(
-                    wire.input_tokens,
-                    wire.output_tokens,
-                    wire.total_tokens,
-                    wire.cache_read_input_tokens,
-                    wire.cache_write_input_tokens,
-                )
-            }),
+            self.reported_use
+                .map(|wire| {
+                    // The provider boundary refuses a total below input plus output before a
+                    // trace is ever built, so bytes claiming one were produced by no live
+                    // transport path and must not decode into provider evidence. All-zero
+                    // usage stays representable: a provider that reports zeros has said
+                    // something, and these bytes are the only record that it did.
+                    if u64::from(wire.total_tokens)
+                        < u64::from(wire.input_tokens) + u64::from(wire.output_tokens)
+                    {
+                        return Err(RecordError::InvalidEncoding);
+                    }
+                    Ok(ReportedUse::from_reported(
+                        wire.input_tokens,
+                        wire.output_tokens,
+                        wire.total_tokens,
+                        wire.cache_read_input_tokens,
+                        wire.cache_write_input_tokens,
+                    ))
+                })
+                .transpose()?,
             self.output.map(text).transpose()?,
             self.diagnostic.map(text).transpose()?,
         )
@@ -815,7 +841,7 @@ mod tests {
     /// kind has been published; after that a reader holding the old address would be asking for
     /// bytes that no longer describe what it stored, and the change needs a new artifact kind.
     const MANIFEST_FIXTURE_ADDRESS: &str =
-        "8319488b439971f49d174ae6ee3b1efe45788cef4bf4fb32821b1c1c55ab8465";
+        "1cf4aaa7237cc6266726a072f8942349e9def2b428da0c8785d741501a85e246";
     /// Address of the fixture trace's stored bytes. See [`MANIFEST_FIXTURE_ADDRESS`].
     const TRACE_FIXTURE_ADDRESS: &str =
         "ff48ae03199ff49ace58df7c401f14c6cc7ed3fa302d5576a5849de873a12159";
@@ -988,6 +1014,7 @@ mod tests {
                 binding(),
                 ModelProvider::Bedrock,
                 model_id,
+                "profile-a".into(),
                 digest(0x33),
                 digest(0x44),
                 512,
@@ -1133,6 +1160,7 @@ mod tests {
                 binding(),
                 ModelProvider::Bedrock,
                 "anthropic.claude-fixture-v1:0".into(),
+                "profile-a".into(),
                 digest(0x33),
                 digest(0x44),
                 cap,
@@ -1146,5 +1174,26 @@ mod tests {
             build(u64::from(MAX_OUTPUT_TOKEN_CEILING) + 1),
             Err(RecordError::OutOfRange)
         );
+    }
+
+    /// The provider boundary refuses an arithmetically impossible total before a trace
+    /// exists, so canonical bytes claiming one were produced by no live transport path and
+    /// the rebuild refuses them rather than presenting them as provider evidence. All-zero
+    /// usage is not in that category: zeros are a fact a provider can report.
+    #[test]
+    fn decoding_refuses_reported_use_the_provider_boundary_would_have_dropped() {
+        let bounded = |reported: ReportedUse| {
+            let record = trace(Some(reported), None);
+            let (stored, address) = record.stored_bytes().unwrap();
+            decode_trace(&stored, &address)
+        };
+
+        // A total below input plus output is arithmetically impossible.
+        assert_eq!(
+            bounded(ReportedUse::from_reported(10, 5, 1, None, None)),
+            Err(RecordError::InvalidEncoding)
+        );
+        // The counted fixture round-trips, so the gate refuses only the impossible shape.
+        assert!(bounded(ReportedUse::from_reported(11, 7, 18, Some(4), None)).is_ok());
     }
 }

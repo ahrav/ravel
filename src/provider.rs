@@ -206,6 +206,11 @@ impl ModelProfile {
         &self.model_id
     }
 
+    /// The fixed configuration this profile was registered under.
+    pub fn configuration_id(&self) -> &str {
+        &self.configuration_id
+    }
+
     /// Address of this exact configuration, over every field that reaches the provider.
     pub fn configuration_digest(&self) -> String {
         let mut hasher = Sha256::new();

@@ -427,6 +427,15 @@ impl ReportedUse {
     pub fn cache_write_input_tokens(self) -> Option<u32> {
         self.cache_write_input_tokens
     }
+
+    /// Whether every category this type carries is zero or absent.
+    fn reports_nothing(self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.total_tokens == 0
+            && self.cache_read_input_tokens.unwrap_or(0) == 0
+            && self.cache_write_input_tokens.unwrap_or(0) == 0
+    }
 }
 
 /// Why the provider stopped generating, in this crate's own vocabulary.
@@ -488,11 +497,11 @@ impl TerminalReason {
 pub enum InvocationOutcome {
     /// The provider returned a completion.
     ///
-    /// `reported_use` is `None` only if a response carries no usage block at all. The
-    /// current deserializer does not produce that: `usage` is a required member of the
-    /// `Converse` output, so an omitted block deserializes to zero counts instead. A
-    /// consumer therefore cannot read zeros as proof that no tokens were billed, and the
-    /// `None` arm stays because the outcome has to remain total if that changes.
+    /// A completion always carries usage. `usage` is a required member of the `Converse`
+    /// output, so an omitted block deserializes to zero counts rather than to nothing, and a
+    /// frame reporting no use at all is refused as unreadable instead of being returned as a
+    /// completion whose zeros a consumer could mistake for a provider claim. The `None` arm
+    /// stays because the outcome has to remain total if the deserializer changes.
     Completed {
         text: String,
         reason: TerminalReason,
@@ -832,13 +841,20 @@ fn token_use(usage: &TokenUsage) -> Option<ReportedUse> {
         None => Some(None),
         Some(count) => u32::try_from(count).ok().map(Some),
     };
-    Some(ReportedUse {
+    let reported = ReportedUse {
         input_tokens: u32::try_from(usage.input_tokens()).ok()?,
         output_tokens: u32::try_from(usage.output_tokens()).ok()?,
         total_tokens: u32::try_from(usage.total_tokens()).ok()?,
         cache_read_input_tokens: optional(usage.cache_read_input_tokens())?,
         cache_write_input_tokens: optional(usage.cache_write_input_tokens())?,
-    })
+    };
+    // A response the provider produced consumed something, so a report of no use at all is
+    // not a report. `usage` is a required member of the output, so an omitted block
+    // deserializes to zeros rather than to nothing, and those zeros cannot be told apart from
+    // a genuine claim that nothing was billed. Refusing the shape keeps the fabricated claim
+    // out of cost reconciliation, on the same terms a negative count is refused. A fully
+    // cached prompt still reports its cache counters, so it is unaffected.
+    (!reported.reports_nothing()).then_some(reported)
 }
 
 fn request_id(response: &ConverseResponse) -> Option<String> {
@@ -1132,26 +1148,24 @@ mod tests {
         }
     }
 
-    /// An omitted usage block reports zeros rather than nothing, because `usage` is a
-    /// required member of the `Converse` output. Zeros are therefore not evidence that no
-    /// tokens were billed, and this pins that so a consumer is not written against the
-    /// weaker assumption.
+    /// An omitted usage block is refused rather than reported as zeros. `usage` is a required
+    /// member of the `Converse` output, so omitting it deserializes to zero counts, and a
+    /// consumer cannot tell those from a provider claim that nothing was billed. The frame is
+    /// unreadable for the same reason a negative count makes one unreadable.
     #[tokio::test]
-    async fn an_omitted_usage_block_reports_zeros_rather_than_absence() {
+    async fn an_omitted_usage_block_makes_the_frame_malformed() {
         let (transport, _) = replay(vec![json(converse_body("end_turn", None, "answer"))]);
 
-        let InvocationOutcome::Completed { reported_use, .. } = invoke(&transport).await else {
-            panic!("expected a completion");
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::MalformedResponse {
+            reported_use,
+            provider_request_id,
+        } = &outcome
+        else {
+            panic!("expected an unreadable frame, got {outcome:?}");
         };
-        let reported = reported_use.expect("a required usage member is always populated");
-        assert_eq!(
-            (
-                reported.input_tokens(),
-                reported.output_tokens(),
-                reported.total_tokens()
-            ),
-            (0, 0, 0)
-        );
+        assert_eq!(*reported_use, None);
+        assert_eq!(provider_request_id.as_deref(), Some(PROVIDER_REQUEST_ID));
     }
 
     /// With retries disabled a throttled attempt is dispatched exactly once, so the caller

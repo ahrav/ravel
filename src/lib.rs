@@ -20,6 +20,8 @@ pub mod domain {
 
 pub mod distributed;
 
+pub mod provider;
+
 pub mod storage {
     pub mod artifacts;
     pub mod s3;

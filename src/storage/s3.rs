@@ -124,35 +124,36 @@ pub(crate) enum VerificationOutcome {
     Transport,
 }
 
-/// Dispatch history for one logical publication across all resubmissions.
+/// Dispatch history for one logical operation across all resubmissions.
 ///
 /// Replacing this value between attempts discards evidence that an earlier
 /// request may have been sent.
 ///
-/// One history belongs to exactly one object key. Carrying a history across two
-/// logical publications leaks the first one's dispatch uncertainty into the
+/// One history belongs to exactly one operation identity — an object key here, a
+/// provider operation id in [`crate::provider`]. Carrying a history across two
+/// logical operations leaks the first one's dispatch uncertainty into the
 /// second, which can only over-report ambiguity (`AmbiguousConflict` where a
 /// definitive `Conflict`/`PreconditionFailed` held) and never under-report it.
-/// Debug builds assert the single-key binding.
+/// Debug builds assert the single-identity binding.
 #[derive(Default)]
 pub struct AttemptHistory {
-    may_have_been_sent: bool,
+    pub(crate) may_have_been_sent: bool,
     #[cfg(debug_assertions)]
-    key: Option<String>,
+    identity: Option<String>,
 }
 
 impl AttemptHistory {
-    fn bind(&mut self, key: &str) {
+    pub(crate) fn bind(&mut self, identity: &str) {
         #[cfg(debug_assertions)]
-        match &self.key {
+        match &self.identity {
             Some(bound) => debug_assert_eq!(
-                bound, key,
-                "an AttemptHistory covers one object key; reusing it across \
-                 publications leaks dispatch uncertainty"
+                bound, identity,
+                "an AttemptHistory covers one operation identity; reusing it across \
+                 operations leaks dispatch uncertainty"
             ),
-            None => self.key = Some(key.to_owned()),
+            None => self.identity = Some(identity.to_owned()),
         }
-        let _ = key;
+        let _ = identity;
     }
 }
 
@@ -1080,8 +1081,8 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "one object key")]
-    fn one_history_cannot_span_two_keys() {
+    #[should_panic(expected = "one operation identity")]
+    fn one_history_cannot_span_two_operation_identities() {
         let mut history = AttemptHistory::default();
         history.bind("campaigns/c/head.json");
         history.bind("campaigns/other/head.json");

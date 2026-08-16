@@ -2862,6 +2862,38 @@ mod tests {
         );
         assert!(before != snapshot(&connection), "the event row is recorded");
 
+        // A second scope in the same database, holding work and a grant that this scope never
+        // released. Both halves of the predicate are scoped, and without another scope's rows
+        // to confuse them a predicate missing its `scope_id` would resolve exactly the same.
+        let elsewhere = tests::scope("workspace-a", "campaign-b");
+        apply_scope_event(&mut connection, &mutation(&elsewhere, 1, DIGEST_1, None)).unwrap();
+        seed_active_plan(&connection, &elsewhere, 1);
+        // The other scope holds the same work the activation fixture names, so its grant can
+        // activate there, plus a work id this scope has never heard of.
+        admit(&mut connection, &elsewhere, &target, &[], epoch(1)).unwrap();
+        record_claim(&connection, &elsewhere, &target, fence, fence, 1).unwrap();
+        admit(
+            &mut connection,
+            &elsewhere,
+            &work("work-b", 1),
+            &[],
+            epoch(1),
+        )
+        .unwrap();
+        let foreign_grant = grant_digest(fence.get(), 2);
+        apply_scope_event(
+            &mut connection,
+            &grant_activation_event(
+                &elsewhere,
+                2,
+                DIGEST_1,
+                &event_digest(0xb2),
+                "grant-op-2",
+                activation_payload(2, 1, &foreign_grant),
+            ),
+        )
+        .unwrap();
+
         // A revision this scope never admitted is refused, and so is a grant no activation
         // event in this scope recorded. Both leave the cursor where it was.
         for (label, payload) in [
@@ -2876,6 +2908,14 @@ mod tests {
             (
                 "grant no activation recorded",
                 artifact_reference_payload("work-a", 1, DIGEST_1),
+            ),
+            (
+                "work admitted only in another scope",
+                artifact_reference_payload("work-b", 1, grant.as_str()),
+            ),
+            (
+                "grant activated in another scope",
+                artifact_reference_payload("work-a", 1, foreign_grant.as_str()),
             ),
         ] {
             assert_eq!(

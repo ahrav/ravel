@@ -509,6 +509,20 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
+    /// The media type a blob of this kind must carry.
+    ///
+    /// The kind and the media type are two records of the same fact, one in the event and one
+    /// in the blob's metadata. They are pinned to each other here so a reader that trusts
+    /// either one is trusting the same claim; a vendor type rather than a generic CBOR type
+    /// because a reader that decodes a trace as a manifest gets a decode error, not a
+    /// mismatch it can report.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::InvocationManifest => "application/vnd.ravel.invocation-manifest+cbor",
+            Self::InvocationTrace => "application/vnd.ravel.invocation-trace+cbor",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvocationManifest => "invocation_manifest",

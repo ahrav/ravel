@@ -305,6 +305,14 @@ impl InvocationRequest {
         })
     }
 
+    pub fn profile(&self) -> &ModelProfile {
+        &self.profile
+    }
+
+    pub fn max_output_tokens(&self) -> NonZeroU32 {
+        self.max_output_tokens
+    }
+
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }

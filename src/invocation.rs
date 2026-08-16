@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     domain::{proposal::MAX_STORED_INTEGER, work::WorkId},
-    provider::{ModelProfile, ModelProvider, ReportedUse},
+    provider::{InvocationRequest, ModelProvider, ReportedUse},
     scope::{Digest, ScopeId},
 };
 
@@ -129,6 +129,37 @@ pub struct BoundedText {
 }
 
 impl BoundedText {
+    /// Rebuilds a bounded text from durable bytes, enforcing what [`Self::new`] guarantees.
+    ///
+    /// Decoding is a trust boundary, so the invariant has to be checked here rather than
+    /// assumed: bytes reaching this point were not produced by `new`. Without the check a
+    /// record could retain text past the bound the type exists to impose, address it with a
+    /// value that is not a digest, and report a length shorter than what it holds — which
+    /// would make `truncated` report the opposite of the truth.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::InvalidEncoding`] when the retained prefix exceeds
+    /// [`MAX_RETAINED_TEXT_BYTES`], the address is not a digest, or the claimed full length is
+    /// shorter than the prefix retained from it.
+    fn rebuilt(
+        retained: String,
+        full_bytes: u64,
+        full_digest: String,
+    ) -> Result<Self, RecordError> {
+        if retained.len() > MAX_RETAINED_TEXT_BYTES
+            || !crate::domain::validation::is_digest(&full_digest)
+            || full_bytes < retained.len() as u64
+        {
+            return Err(RecordError::InvalidEncoding);
+        }
+        Ok(Self {
+            retained,
+            full_bytes,
+            full_digest,
+        })
+    }
+
     /// Retains at most [`MAX_RETAINED_TEXT_BYTES`] of `text` and addresses all of it.
     pub fn new(text: &str) -> Self {
         let mut cut = MAX_RETAINED_TEXT_BYTES.min(text.len());
@@ -243,6 +274,21 @@ impl InvocationBinding {
     pub fn attempt(&self) -> NonZeroU64 {
         self.attempt
     }
+
+    /// The per-producer metadata string a blob drawn under this binding must carry.
+    ///
+    /// Blobs are content addressed, so two attempts that produce identical bytes land on one
+    /// key and are told apart only by this string. Minting it here rather than at each call
+    /// site is what lets admission check that the blob it is admitting was drawn by the
+    /// attempt the event names: a free-form string chosen by the publisher could not be
+    /// checked against anything.
+    ///
+    /// The attempt alone, not the work id: the identity bound is capped at 128 bytes and a
+    /// work id may use all of it, and the event payload beside the blob already carries the
+    /// work id and revision that the fold checks against admitted work.
+    pub fn producer_attempt(&self) -> String {
+        format!("attempt-{}", self.attempt)
+    }
 }
 
 /// The immutable starting record of one model invocation.
@@ -267,29 +313,36 @@ impl InvocationManifest {
     ///
     /// Returns [`RecordError`] for an empty or oversized identifier, or a cap or deadline
     /// outside the durable range.
+    /// Records what one request will run under, taken from that request.
+    ///
+    /// The request is the argument rather than its parts because its digest already covers the
+    /// profile, the prompt, the cap, and the operation id. Accepting those separately would let
+    /// a manifest record a limit, an operation, or a profile the digest beside them was never
+    /// computed over, and nothing downstream could ever catch it: replay sees the manifest
+    /// alone and cannot recompute a digest over a request it does not have.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::OutOfRange`] for a deadline outside the durable range, or
+    /// [`RecordError::InvalidEncoding`] for a profile whose configuration digest is malformed.
+    /// The identifier and cap bounds cannot fail here: the request already holds them.
     pub fn new(
         binding: InvocationBinding,
-        profile: &ModelProfile,
-        request_digest: Digest,
-        max_output_tokens: u64,
+        request: &InvocationRequest,
         deadline_unix_ms: u64,
-        operation_id: String,
     ) -> Result<Self, RecordError> {
-        let model_id = profile.model_id().to_owned();
-        let configuration_digest = Digest::new(profile.configuration_digest())
-            .map_err(|_| RecordError::InvalidEncoding)?;
-        identifier(&model_id)?;
-        identifier(&operation_id)?;
-        Ok(Self {
+        let profile = request.profile();
+        Self::from_parts(
             binding,
-            provider: profile.provider(),
-            model_id,
-            configuration_digest,
-            request_digest,
-            max_output_tokens: bounded(max_output_tokens)?,
-            deadline_unix_ms: bounded(deadline_unix_ms)?,
-            operation_id,
-        })
+            profile.provider(),
+            profile.model_id().to_owned(),
+            Digest::new(profile.configuration_digest())
+                .map_err(|_| RecordError::InvalidEncoding)?,
+            Digest::new(request.request_digest()).map_err(|_| RecordError::InvalidEncoding)?,
+            u64::from(request.max_output_tokens().get()),
+            deadline_unix_ms,
+            request.operation_id().to_owned(),
+        )
     }
 
     /// Rebuilds a manifest from durable bytes, where no profile value is available.
@@ -668,10 +721,8 @@ impl From<&InvocationTrace> for WireTrace {
 
 impl WireTrace {
     fn into_domain(self) -> Result<InvocationTrace, RecordError> {
-        let text = |wire: WireBoundedText| BoundedText {
-            retained: wire.retained,
-            full_bytes: wire.full_bytes,
-            full_digest: wire.full_digest,
+        let text = |wire: WireBoundedText| {
+            BoundedText::rebuilt(wire.retained, wire.full_bytes, wire.full_digest)
         };
         InvocationTrace::new(
             self.binding.into_domain()?,
@@ -687,15 +738,18 @@ impl WireTrace {
                     wire.cache_write_input_tokens,
                 )
             }),
-            self.output.map(text),
-            self.diagnostic.map(text),
+            self.output.map(text).transpose()?,
+            self.diagnostic.map(text).transpose()?,
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
+    use crate::provider::ModelProfile;
 
     fn digest(seed: u8) -> Digest {
         Digest::new(format!("{seed:02x}").repeat(32)).unwrap()
@@ -727,16 +781,19 @@ mod tests {
         .unwrap()
     }
 
-    fn manifest() -> InvocationManifest {
-        InvocationManifest::new(
-            binding(),
-            &profile(),
-            digest(0x44),
-            512,
-            1_700_000_060_000,
+    fn request() -> InvocationRequest {
+        InvocationRequest::new(
+            profile(),
+            "system".into(),
+            "prompt".into(),
+            NonZeroU32::new(512).unwrap(),
             "invoke-op-1".into(),
         )
         .unwrap()
+    }
+
+    fn manifest() -> InvocationManifest {
+        InvocationManifest::new(binding(), &request(), 1_700_000_060_000).unwrap()
     }
 
     fn trace(reported_use: Option<ReportedUse>, output: Option<BoundedText>) -> InvocationTrace {
@@ -752,11 +809,26 @@ mod tests {
         .unwrap()
     }
 
+    /// Address of the fixture manifest's stored bytes.
+    ///
+    /// Pinned because every other assertion in this file is satisfied by any encoding that
+    /// round-trips: swapping two adjacent same-typed wire fields, renaming a key, or changing
+    /// an integer's width all leave `decode(encode(x)) == x` true while moving these bytes.
+    /// The address is what a published artifact is named by, so once one exists no such change
+    /// is compatible. A failure here is not a wrong digest to update — it is a wire change,
+    /// and it needs a new artifact kind rather than a new constant.
+    const MANIFEST_FIXTURE_ADDRESS: &str =
+        "8319488b439971f49d174ae6ee3b1efe45788cef4bf4fb32821b1c1c55ab8465";
+    /// Address of the fixture trace's stored bytes. See [`MANIFEST_FIXTURE_ADDRESS`].
+    const TRACE_FIXTURE_ADDRESS: &str =
+        "8bd3140a4f610d890f8bd49a38aead0ad72c533ab803d7db7ea9af7aa881707b";
+
     #[test]
     fn a_manifest_round_trips_and_addresses_its_own_bytes() {
         let manifest = manifest();
         let (stored, address) = manifest.stored_bytes().unwrap();
 
+        assert_eq!(address, MANIFEST_FIXTURE_ADDRESS);
         assert!(stored.starts_with(MANIFEST_DOMAIN));
         // The address is the plain digest of the stored bytes, so publication verifies it
         // with the same integrity check it applies to any blob.
@@ -794,6 +866,7 @@ mod tests {
             Some(BoundedText::new("rayleigh scattering")),
         );
         let (stored, address) = counted.stored_bytes().unwrap();
+        assert_eq!(address, TRACE_FIXTURE_ADDRESS);
         assert_eq!(decode_trace(&stored, &address).unwrap(), counted);
 
         // Absent reported use and reported use of zero are different facts, and the bytes keep
@@ -906,28 +979,40 @@ mod tests {
             );
         }
 
-        let build = |operation_id: String, cap: u64, deadline: u64| {
-            InvocationManifest::new(
+        assert_eq!(
+            InvocationManifest::new(binding(), &request(), max + 1),
+            Err(RecordError::OutOfRange)
+        );
+        assert!(InvocationManifest::new(binding(), &request(), max).is_ok());
+        // Decode is the only path that can present an out-of-bound identifier, because a
+        // request refuses one before a manifest can be built from it.
+        let decoded = |model_id: String, operation_id: String| {
+            InvocationManifest::from_parts(
                 binding(),
-                &profile(),
+                ModelProvider::Bedrock,
+                model_id,
+                digest(0x33),
                 digest(0x44),
-                cap,
-                deadline,
+                512,
+                1,
                 operation_id,
             )
         };
         assert_eq!(
-            build(String::new(), 1, 1),
+            decoded(String::new(), "op".into()),
             Err(RecordError::EmptyIdentifier)
         );
         assert_eq!(
-            build(long.clone(), 1, 1),
+            decoded("model".into(), long.clone()),
             Err(RecordError::IdentifierTooLong)
         );
-        assert_eq!(build("op".into(), 0, 1), Err(RecordError::OutOfRange));
-        assert_eq!(build("op".into(), 1, max + 1), Err(RecordError::OutOfRange));
-        // The identifier bound holds at exactly the limit.
-        assert!(build("o".repeat(MAX_IDENTIFIER_BYTES), max, max).is_ok());
+        assert!(
+            decoded(
+                "m".repeat(MAX_IDENTIFIER_BYTES),
+                "o".repeat(MAX_IDENTIFIER_BYTES)
+            )
+            .is_ok()
+        );
 
         assert_eq!(
             InvocationTrace::new(
@@ -977,5 +1062,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(oversized.stored_bytes(), Err(RecordError::RecordTooLarge));
+    }
+
+    /// Decoding rebuilds bounded text rather than trusting it, because bytes arriving from
+    /// storage were not necessarily produced by this crate.
+    #[test]
+    fn decoding_refuses_bounded_text_that_breaks_its_own_bound() {
+        let bounded = |text: BoundedText| {
+            let record = InvocationTrace::new(
+                binding(),
+                digest(0x55),
+                TerminalOutcome::Success,
+                None,
+                None,
+                Some(text),
+                None,
+            )
+            .unwrap();
+            let (stored, address) = record.stored_bytes().unwrap();
+            decode_trace(&stored, &address)
+        };
+
+        // Retaining past the bound: the type exists to cap what durable history holds.
+        assert_eq!(
+            bounded(BoundedText {
+                retained: "z".repeat(MAX_RETAINED_TEXT_BYTES + 1),
+                full_bytes: (MAX_RETAINED_TEXT_BYTES + 1) as u64,
+                full_digest: digest(0x66).as_str().to_owned(),
+            }),
+            Err(RecordError::InvalidEncoding)
+        );
+        // An address that is not a digest cannot name the full text anywhere.
+        assert_eq!(
+            bounded(BoundedText {
+                retained: "zz".into(),
+                full_bytes: 2,
+                full_digest: "not-a-digest".into(),
+            }),
+            Err(RecordError::InvalidEncoding)
+        );
+        // A full length below what is retained would make `truncated` report the opposite of
+        // the truth: the prefix cannot be longer than the text it was cut from.
+        assert_eq!(
+            bounded(BoundedText {
+                retained: "zz".into(),
+                full_bytes: 1,
+                full_digest: digest(0x66).as_str().to_owned(),
+            }),
+            Err(RecordError::InvalidEncoding)
+        );
+        // Exactly at the bound, with the full text retained, is the boundary case that holds.
+        let at_bound = BoundedText::new(&"z".repeat(MAX_RETAINED_TEXT_BYTES));
+        assert!(!at_bound.truncated());
+        assert!(bounded(at_bound).is_ok());
     }
 }

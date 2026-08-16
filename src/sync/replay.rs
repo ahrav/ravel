@@ -1448,6 +1448,205 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// The bytes a real append writes are the bytes a rebuild reads, all the way to admission.
+    ///
+    /// Every other artifact assertion stops short of this: the append path checks what it wrote
+    /// without a projection, the fold checks a hand-built payload without bytes, and the suffix
+    /// test above reaches the fold only to be refused. A resolving reference exercises the whole
+    /// chain — publication encoding, the walk back through history, the conversion arm, and the
+    /// resolving branch of the predicate — and it is the only case where a disagreement between
+    /// any two of them shows up as a failure rather than as the refusal that was expected anyway.
+    #[tokio::test]
+    async fn a_published_artifact_reference_replays_into_an_admitted_projection() {
+        use crate::{
+            domain::{
+                artifact::ArtifactRef,
+                proposal::{
+                    PlanProposal, ProposalBasis, ProposalFacts, TargetBounds, WorkSpec,
+                    validate_proposal,
+                },
+                work::WorkId,
+            },
+            scope::{
+                ARTIFACT_REFERENCE_PAYLOAD_TYPE, ArtifactKind, ArtifactReferenceEvent,
+                ArtifactReferencePayload, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent,
+                GrantActivatedPayload, PlanAdmittedEvent, PlanAdmittedPayload,
+                encode_artifact_reference_event, encode_grant_activated_event,
+                encode_plan_admitted_event,
+            },
+        };
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let work = WorkId::new("work-a".into()).unwrap();
+        let proposal = PlanProposal::new(
+            scope.scope_id().clone(),
+            genesis.config_digest().clone(),
+            None,
+            vec![ProposalBasis::Observation {
+                event: genesis.event_ref().clone(),
+            }],
+            vec![WorkSpec::new(
+                work.clone(),
+                Vec::new(),
+                TargetBounds::new(2, 60_000).unwrap(),
+            )],
+            11,
+        );
+        let facts = [crate::domain::proposal::ObservationFact::new(
+            scope.scope_id().clone(),
+            genesis.event_ref().clone(),
+            ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        let admissible = validate_proposal(
+            &proposal,
+            &ProposalFacts::new(&scope, &genesis.config_digest().clone(), None, 1, &facts),
+        )
+        .unwrap();
+
+        let envelope = |sequence: u64, parent: &ScopeEventRef, operation: &str, kind: &str| {
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent.clone()),
+                1,
+                operation.into(),
+                kind.to_owned(),
+            )
+            .unwrap()
+        };
+        let admitted = encode_plan_admitted_event(
+            &PlanAdmittedEvent::new(
+                envelope(
+                    2,
+                    genesis.event_ref(),
+                    "admit-plan-1",
+                    crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE,
+                ),
+                PlanAdmittedPayload::new(admissible.plan_digest().clone()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        // The grant this reference will name, activated against the revision the plan admitted.
+        let grant = Digest::new("ab".repeat(32)).unwrap();
+        let activated = encode_grant_activated_event(
+            &GrantActivatedEvent::new(
+                envelope(
+                    3,
+                    admitted.event_ref(),
+                    "activate-grant-1",
+                    GRANT_ACTIVATED_PAYLOAD_TYPE,
+                ),
+                GrantActivatedPayload::new(
+                    work.clone(),
+                    1,
+                    2,
+                    grant.clone(),
+                    1,
+                    1,
+                    1_700_000_900_000,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let kind = ArtifactKind::InvocationTrace;
+        let reference = encode_artifact_reference_event(
+            &ArtifactReferenceEvent::new(
+                envelope(
+                    4,
+                    activated.event_ref(),
+                    "artifact-op-4",
+                    ARTIFACT_REFERENCE_PAYLOAD_TYPE,
+                ),
+                ArtifactReferencePayload::new(
+                    kind,
+                    ArtifactRef::new(
+                        "cd".repeat(32),
+                        4_096,
+                        kind.media_type().into(),
+                        "attempt-1".into(),
+                        1_700_000_123_456,
+                        None,
+                    )
+                    .unwrap(),
+                    work.clone(),
+                    1,
+                    grant.clone(),
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            reference.event_ref().clone(),
+            Some(admissible.plan_digest().clone()),
+            "artifact-op-4".into(),
+        )
+        .unwrap();
+        // Newest first: the walk back from the head reaches the plan object when it decodes the
+        // admission event, and stops at genesis.
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            event_response(reference.stored_bytes().to_vec()),
+            event_response(activated.stored_bytes().to_vec()),
+            event_response(admitted.stored_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                admissible.stored_bytes().to_vec(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            // The claim and grant objects a restore reads back after the suffix commits.
+            response(404, &[], Vec::new()),
+            response(404, &[], Vec::new()),
+        ]);
+
+        let path = path("artifact-replay-admitted");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let readiness = refresh(&store, &handle, &scope).await;
+        assert!(
+            matches!(readiness, ScopeReadiness::Ready { .. }),
+            "{:?}",
+            match &readiness {
+                ScopeReadiness::Ready { .. } => None,
+                ScopeReadiness::NotReady(error) => Some(error),
+            },
+        );
+        // The whole suffix committed, so the reference resolved rather than rolling it back.
+        assert_eq!(
+            handle.scope_cursor(&scope).await.unwrap(),
+            (4, Some(reference.event_ref().digest().clone()))
+        );
+        drop(handle);
+
+        // The reference is durable at its own address and resolves the same way on a rebuild
+        // from an empty projection, which is the case a fold over rewritten columns would fail.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT payload_type FROM applied_scope_events WHERE sequence = 4",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            ARTIFACT_REFERENCE_PAYLOAD_TYPE
+        );
+        drop(connection);
+        fs::remove_file(&path).unwrap();
+    }
+
     /// A deleted projection is rebuilt from durable history alone: genesis, the admission event,
     /// and the plan object reproduce the same plan, work, dependencies, bounds, and reservation.
     #[tokio::test]

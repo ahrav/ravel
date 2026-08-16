@@ -489,7 +489,13 @@ pub(crate) async fn append_artifact_reference(
         binding,
         operation_id,
     } = admission;
-    if witness.namespace() != store.namespace() {
+    if witness.namespace() != store.namespace()
+        || witness.artifact_ref().media_type() != kind.media_type()
+        || witness.artifact_ref().producer_attempt() != binding.producer_attempt()
+    {
+        // The payload restates the blob's kind and attempt in event bytes that can never be
+        // rewritten, so a witness that disagrees with either would make the two records of the
+        // same fact permanently contradict each other with no way to tell which is right.
         return Err(ScopeAppendError::InvalidInput);
     }
     let ScopeHeadParent::Existing(observed) = &parent else {
@@ -890,12 +896,129 @@ mod tests {
         )
     }
 
-    /// A witness minted against one store and an append aimed at another.
+    /// The whole admitting path, from a witness to a committed head.
     ///
-    /// An artifact's key is its digest, and that key is identical in every bucket, so a
-    /// witness proves bytes exist only in the namespace it was minted against.
+    /// Every other assertion about this path is a refusal, and a refusal is reached before the
+    /// payload is built: without this test the payload could name any field of the binding and
+    /// nothing would notice. The binding therefore uses a distinct revision, fence and attempt,
+    /// so reading the wrong one is a different number rather than the same one.
     #[tokio::test]
-    async fn an_artifact_witness_from_another_namespace_is_refused_before_any_dispatch() {
+    async fn an_admitted_artifact_carries_the_binding_it_was_drawn_under() {
+        use crate::{
+            domain::work::WorkId,
+            invocation::InvocationBinding,
+            scope::{ArtifactKind, ScopeId, decode_artifact_reference_event, scope_event_key},
+            storage::artifacts::publish,
+        };
+
+        let genesis = genesis();
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+
+        let grant_digest = Digest::new("ab".repeat(32)).unwrap();
+        let binding = InvocationBinding::new(
+            ScopeId::new(genesis.identity().scope_id().as_str().to_owned()).unwrap(),
+            Digest::new("11".repeat(32)).unwrap(),
+            WorkId::new("work-a".into()).unwrap(),
+            7,
+            3,
+            grant_digest.clone(),
+            2,
+        )
+        .unwrap();
+        let body = b"a manifest body".to_vec();
+        let witness = publish(
+            &store,
+            body.clone(),
+            ArtifactKind::InvocationManifest.media_type().to_owned(),
+            binding.producer_attempt(),
+            1_700_000_123_456,
+            None,
+        )
+        .await
+        .unwrap();
+        let parent = ScopeHeadParent::existing(Box::new(
+            read(&store, genesis.identity()).await.unwrap().unwrap(),
+        ));
+
+        let append = append_artifact_reference(
+            &store,
+            parent,
+            ArtifactAdmission {
+                kind: ArtifactKind::InvocationManifest,
+                witness: &witness,
+                binding: &binding,
+                operation_id: "artifact-op-1",
+            },
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            append.outcome,
+            ScopeHeadCommitOutcome::Committed(_)
+        ));
+
+        // The envelope succeeds the fenced parent under the same authority epoch.
+        assert_eq!(append.envelope.sequence(), 2);
+        assert_eq!(append.envelope.parent_event(), Some(genesis.event_ref()));
+        assert_eq!(append.envelope.writer_epoch(), genesis.head().scope_epoch());
+        assert_eq!(append.envelope.operation_id(), "artifact-op-1");
+
+        // The bytes that were written decode to the payload the binding names, field by field.
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        let event_bytes = requests[2].body().bytes().unwrap().to_vec();
+        let event = decode_artifact_reference_event(
+            &event_bytes,
+            &scope_event_key(genesis.identity(), &append.reference),
+            genesis.identity(),
+        )
+        .unwrap();
+        let payload = event.payload();
+        assert_eq!(payload.kind(), ArtifactKind::InvocationManifest);
+        assert_eq!(payload.work_id(), binding.work_id());
+        assert_eq!(payload.work_revision(), binding.work_revision());
+        assert_eq!(payload.attempt(), binding.attempt());
+        assert_eq!(payload.grant_digest(), &grant_digest);
+        assert_eq!(payload.artifact(), witness.artifact_ref());
+        assert_eq!(payload.artifact().size(), body.len() as u64);
+
+        // The blob went to its digest key before the event that names it.
+        let artifact_uri = requests[0].uri().parse::<http::Uri>().unwrap();
+        assert!(
+            artifact_uri
+                .path()
+                .ends_with(witness.artifact_ref().digest())
+        );
+    }
+
+    /// A witness that describes something other than what the event would claim.
+    ///
+    /// The three axes are one guard because they share a consequence. A witness proves bytes
+    /// exist only in the namespace it was minted against, and a namespace is one constructed
+    /// store rather than a bucket name. The kind and the attempt are each recorded twice — once
+    /// in the blob's metadata and once in event bytes that can never be rewritten — so a
+    /// witness disagreeing with either leaves two permanent records of one fact contradicting
+    /// each other with no way to tell which is right.
+    ///
+    /// Each case differs from the committing case by exactly one field and gets a store that
+    /// would carry the append through, so the request count is what proves the refusal: an
+    /// accepted witness goes on to write the event and the head. Only the namespace case uses a
+    /// second store, because every constructed store has its own namespace by design — which is
+    /// also why the other two must publish against the store they are admitted into, or the
+    /// namespace check would refuse them first and prove nothing about kind or attempt.
+    #[tokio::test]
+    async fn an_artifact_witness_that_disagrees_with_the_event_is_refused_before_any_dispatch() {
         use crate::{
             domain::work::WorkId,
             invocation::InvocationBinding,
@@ -904,50 +1027,69 @@ mod tests {
         };
 
         let genesis = genesis();
-        let head = ScopeHead::new(
-            genesis.identity().clone(),
-            ScopeAuthority::Unowned,
-            1,
-            genesis.event_ref().clone(),
-            None,
-            "genesis".into(),
-        )
-        .unwrap();
-        let parent = ScopeHeadParent::existing(Box::new(observed(&head).await));
-
-        // The witness comes from a store that is not the one the append writes to.
-        let (elsewhere, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
-        let witness = publish(
-            &elsewhere,
-            b"a manifest body".to_vec(),
-            "application/vnd.ravel.invocation-manifest+cbor".into(),
-            "attempt-1".into(),
-            1_700_000_123_456,
-            None,
-        )
-        .await
-        .unwrap();
-
         let binding = InvocationBinding::new(
             ScopeId::new(genesis.identity().scope_id().as_str().to_owned()).unwrap(),
             Digest::new("11".repeat(32)).unwrap(),
             WorkId::new("work-a".into()).unwrap(),
-            1,
-            1,
+            7,
+            3,
             Digest::new("ab".repeat(32)).unwrap(),
-            1,
+            2,
         )
         .unwrap();
+        let kind = ArtifactKind::InvocationManifest;
 
-        // A store that would panic on any request, so the refusal is proven to precede
-        // dispatch rather than merely to precede a response.
-        let (target, client) = replay_store(vec![]);
-        assert!(matches!(
-            append_artifact_reference(
+        for (case, elsewhere, media_type, producer_attempt) in [
+            (
+                "another namespace",
+                true,
+                kind.media_type(),
+                binding.producer_attempt(),
+            ),
+            (
+                "the other kind's media type",
+                false,
+                ArtifactKind::InvocationTrace.media_type(),
+                binding.producer_attempt(),
+            ),
+            (
+                "another attempt",
+                false,
+                kind.media_type(),
+                "attempt-1".to_owned(),
+            ),
+        ] {
+            // Enough responses to commit, so nothing but the mismatch can end the append.
+            let (target, client) = replay_store(vec![
+                response(
+                    200,
+                    &[("etag", "\"parent\"")],
+                    encode_head(genesis.head()).unwrap(),
+                ),
+                response(200, &[], SdkBody::empty()),
+                response(200, &[], SdkBody::empty()),
+                response(200, &[], SdkBody::empty()),
+            ]);
+            let parent = ScopeHeadParent::existing(Box::new(
+                read(&target, genesis.identity()).await.unwrap().unwrap(),
+            ));
+            let (other, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+            let witness = publish(
+                if elsewhere { &other } else { &target },
+                b"a manifest body".to_vec(),
+                media_type.to_owned(),
+                producer_attempt,
+                1_700_000_123_456,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let refused = append_artifact_reference(
                 &target,
                 parent,
                 ArtifactAdmission {
-                    kind: ArtifactKind::InvocationManifest,
+                    kind,
                     witness: &witness,
                     binding: &binding,
                     operation_id: "artifact-op-2",
@@ -955,10 +1097,19 @@ mod tests {
                 &mut AttemptHistory::default(),
                 &mut AttemptHistory::default(),
             )
-            .await,
-            Err(ScopeAppendError::InvalidInput)
-        ));
-        assert_eq!(client.actual_requests().count(), 0);
+            .await;
+            assert!(
+                matches!(refused, Err(ScopeAppendError::InvalidInput)),
+                "{case}"
+            );
+            // The parent read and the blob, and nothing after: neither the event nor the head
+            // was written. The namespace case published its blob to the other store.
+            assert_eq!(
+                client.actual_requests().count(),
+                if elsewhere { 1 } else { 2 },
+                "{case}"
+            );
+        }
     }
 
     async fn observed(head: &ScopeHead) -> ObservedScopeHead {

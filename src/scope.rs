@@ -1470,8 +1470,9 @@ mod codec_tests {
     use super::*;
 
     /// Stored-byte address of the activation event
-    /// `grant_activated_events_round_trip_and_reject_corruption` builds. The zstd frame is part of
-    /// the preimage, so the `zstd-sys` lockfile pin is byte-affecting for this value.
+    /// `grant_activated_events_round_trip_and_reject_corruption` builds. The preimage is the
+    /// compressed CBOR, so both the `ciborium` and `zstd-sys` lockfile pins are byte-affecting for
+    /// this value.
     const ACTIVATION_EVENT_DIGEST: &str =
         "9a00fbfcbea187b4e842f2168ebca6fe2bd60518f7e2ada79e7b330fa06a8fd4";
 

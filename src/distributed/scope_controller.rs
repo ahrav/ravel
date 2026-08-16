@@ -20,9 +20,15 @@ use std::num::NonZeroU64;
 
 use crate::{
     distributed::identity::InstanceId,
-    scope::{ScopeAuthority, ScopeHead, ScopeIdentity, encode_head, scope_head_key},
+    scope::{
+        EventEnvelope, GrantActivatedPayload, ScopeAuthority, ScopeEventRef, ScopeHead,
+        ScopeIdentity, encode_head, scope_head_key,
+    },
     storage::s3::{AttemptHistory, MutationOutcome, S3Store},
-    sync::head::{self as head, ObservedScopeHead, ScopeHeadParent, ScopeHeadReadError},
+    sync::head::{
+        self as head, ObservedScopeHead, ScopeHeadCommitOutcome, ScopeHeadParent,
+        ScopeHeadReadError,
+    },
 };
 
 /// Lease term granted by one acquisition or renewal, in milliseconds.
@@ -164,6 +170,97 @@ pub enum ReleaseOutcome {
     /// The head already moved on; ownership is no longer this instance's to relinquish.
     Superseded,
     Unresolved,
+}
+
+/// Result of appending one grant-activation event under consumed authority.
+///
+/// The append keeps the epoch: an event commits under the authority that observed its parent
+/// head, so only the tail and operation identity move.
+#[must_use]
+pub(crate) enum GrantAppend {
+    /// The event is the committed head tail; the returned authority observed that head, so the
+    /// caller can keep issuing and renewing from it.
+    Committed {
+        authority: Box<ControllerAuthority>,
+        envelope: EventEnvelope,
+        reference: ScopeEventRef,
+    },
+    /// Another controller moved the head past this authority. The event may still have
+    /// committed durably; replay folds it and the operation-id probe recognises it on retry.
+    Superseded,
+    /// The lease term reached its stop margin before any write was authorized.
+    Stopped,
+    /// No proven conclusion; the caller refreshes and relies on the operation-id probe.
+    Unresolved,
+}
+
+/// Appends one `grant_activated` event through the single non-clonable authority value.
+///
+/// Consuming the authority serializes issuance: no rival dry-run can interleave between this
+/// append and the next, because the next issuance needs the returned value. A committed append
+/// rebuilds the authority from the committed head observation, keeping the instance and the
+/// pinned lease term.
+pub(crate) async fn append_grant_activated(
+    store: &S3Store,
+    authority: ControllerAuthority,
+    payload: &GrantActivatedPayload,
+    operation_id: &str,
+    event_history: &mut AttemptHistory,
+    head_history: &mut AttemptHistory,
+    now_ms: u64,
+) -> GrantAppend {
+    let instance = authority.instance.clone();
+    let scope = authority.head().scope().clone();
+    let Ok(parent) = authority.into_parent(now_ms) else {
+        return GrantAppend::Stopped;
+    };
+    let Ok(append) = head::append_grant_activated(
+        store,
+        parent,
+        &scope,
+        payload,
+        operation_id,
+        event_history,
+        head_history,
+    )
+    .await
+    else {
+        return GrantAppend::Unresolved;
+    };
+    let mut outcome = append.outcome;
+    // `RetryIdentically` carries a refreshed parent ETag or a proven-unsent request, so the
+    // identical retry is safe; the bound keeps a flapping store from pinning the issuer here.
+    for _ in 0..2 {
+        let ScopeHeadCommitOutcome::RetryIdentically(transition) = outcome else {
+            break;
+        };
+        outcome = head::commit(store, transition, head_history).await;
+    }
+    match outcome {
+        ScopeHeadCommitOutcome::Committed(Some(observed)) => {
+            if observed.head().tail() != &append.reference {
+                return GrantAppend::Unresolved;
+            }
+            match proven_authority(observed, instance) {
+                Ok(authority) => GrantAppend::Committed {
+                    authority: Box::new(authority),
+                    envelope: append.envelope,
+                    reference: append.reference,
+                },
+                // The event is the committed tail, but the head is owned elsewhere now, so no
+                // refreshed authority exists to return.
+                Err(_) => GrantAppend::Superseded,
+            }
+        }
+        // A commit without a witness cannot chain the next conditional write, so the caller
+        // refreshes; the probe then reports the issuance as already committed.
+        ScopeHeadCommitOutcome::Committed(None) => GrantAppend::Unresolved,
+        ScopeHeadCommitOutcome::CommittedSuperseded
+        | ScopeHeadCommitOutcome::ProvenNotCommitted => GrantAppend::Superseded,
+        ScopeHeadCommitOutcome::RetryIdentically(_) | ScopeHeadCommitOutcome::Unresolved(_) => {
+            GrantAppend::Unresolved
+        }
+    }
 }
 
 /// Acquires or resumes authority from a freshly read head.

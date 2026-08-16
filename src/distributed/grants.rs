@@ -171,7 +171,17 @@ pub enum GrantRejection {
     /// `IdentityMismatch` covers a grant whose binding differs from the expected binding.
     IdentityMismatch,
     Expired,
+    /// The grant authorizes more than the caller asked for, refused at intake so an over-wide
+    /// grant cannot be taken up at all.
     WiderThanRequested,
+    /// The grant authorizes fewer output tokens than the request would draw.
+    ///
+    /// The opposite direction from [`Self::WiderThanRequested`], and refused at a different
+    /// boundary: intake bounds the grant from above by what the caller expected, while an effect
+    /// bounds the request from above by what the grant authorized. A request that could draw
+    /// past its reservation is refused rather than truncated, because a truncated completion is
+    /// a different answer than the one the work asked for.
+    NarrowerThanRequest,
     /// The projection does not continue, or no longer continues, the caller's claim generation.
     Revoked,
     /// The caller's authority is stopped or the projection outran its epoch; nothing it decides
@@ -220,9 +230,10 @@ impl EffectAuthority {
     /// # Errors
     ///
     /// Returns [`GrantRejection::IdentityMismatch`] when the grant does not name a model
-    /// invocation of this request's profile and operation, [`GrantRejection::Expired`] for a
-    /// grant past its deadline, and [`GrantRejection::StaleAuthority`] when the proving lease
-    /// has stopped.
+    /// invocation of this request's profile and operation,
+    /// [`GrantRejection::NarrowerThanRequest`] when the request could draw more output tokens
+    /// than the grant authorized, [`GrantRejection::Expired`] for a grant past its deadline, and
+    /// [`GrantRejection::StaleAuthority`] when the proving lease has stopped.
     pub fn authorizes_model(
         &self,
         request: &crate::provider::InvocationRequest,
@@ -234,15 +245,19 @@ impl EffectAuthority {
         // able to tell the second dispatch from the first. `intake` pins the grant's own
         // operation id against the caller's expectation; this pins it against the request
         // actually being sent.
-        //
-        // `limit_units` is deliberately not compared against the output-token cap. The grant's
-        // units have no denomination anywhere in this crate, so treating them as tokens would
-        // invent a contract rather than enforce one.
         if self.grant.action != GRANT_ACTION_MODEL_INVOKE
             || self.grant.resource_scope != request.profile().configuration_digest()
             || self.grant.operation_id != request.operation_id()
         {
             return Err(GrantRejection::IdentityMismatch);
+        }
+        // One unit is one authorized output token: `limit_units` is what the reservation drew at
+        // activation, and `max_output_tokens` is what this call may draw against it. Refusing
+        // here is what keeps a scope's `reserved_budget_units` a bound rather than a hope, since
+        // that budget is checked against authorized units at issuance and nothing debits what a
+        // call actually reports.
+        if u64::from(request.max_output_tokens().get()) > self.grant.limit_units.get() {
+            return Err(GrantRejection::NarrowerThanRequest);
         }
         if self.authority_stop_unix_ms <= now_ms {
             return Err(GrantRejection::StaleAuthority);
@@ -276,6 +291,7 @@ pub(crate) mod test_support {
         action: String,
         resource_scope: String,
         operation_id: String,
+        limit_units: u64,
         deadline_unix_ms: u64,
         authority_stop_unix_ms: u64,
     ) -> EffectAuthority {
@@ -296,7 +312,7 @@ pub(crate) mod test_support {
                 action,
                 resource_scope,
                 1,
-                1_000,
+                limit_units,
                 deadline_unix_ms,
                 operation_id,
             )

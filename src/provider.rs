@@ -35,7 +35,7 @@ use aws_sdk_bedrockruntime::{
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::storage::s3::AttemptHistory;
+use crate::dispatch::AttemptHistory;
 
 /// Whole-operation bound, including every byte of the completion.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -389,6 +389,13 @@ pub enum TerminalReason {
     GuardrailIntervened,
     /// The provider reported its own output as malformed.
     ModelOutputMalformed,
+    /// The model stopped to request a tool.
+    ///
+    /// This boundary offers none, so the request it answers is not the request this crate
+    /// made. It is named rather than swept into [`Self::Unrecognized`] because it is a
+    /// definite stop the SDK models, and because a tool-use stop can arrive with leading
+    /// text that is not a whole answer.
+    ToolUseRequested,
     /// A stop reason this crate does not model, which a provider may add at any time.
     Unrecognized,
 }
@@ -408,6 +415,7 @@ impl TerminalReason {
                 | Self::GuardrailIntervened
                 | Self::ContextWindowExceeded
                 | Self::ModelOutputMalformed
+                | Self::ToolUseRequested
         )
     }
 }
@@ -446,6 +454,14 @@ pub enum InvocationOutcome {
     RateLimited { provider_request_id: Option<String> },
     /// The provider rejected the request as invalid. Retrying it unchanged cannot succeed.
     Rejected { provider_request_id: Option<String> },
+    /// The provider refused the request for authorization reasons, having done no model work.
+    ///
+    /// Separate from [`Self::Rejected`] because the request is not invalid: credential
+    /// rotation and IAM policy propagation both deny an otherwise valid request until that
+    /// state settles, so retrying it unchanged after a delay can succeed. Separate from
+    /// [`Self::RateLimited`] because nothing about the provider's load changes the answer,
+    /// and separate from [`Self::Unknown`] because no model work was done or billed.
+    Unauthorized { provider_request_id: Option<String> },
     /// A bound elapsed locally or the provider reported its own timeout. Whether the
     /// provider completed the work is unknown.
     ///
@@ -524,6 +540,9 @@ impl fmt::Debug for InvocationOutcome {
             Self::Rejected {
                 provider_request_id,
             } => correlated(formatter, "Rejected", provider_request_id),
+            Self::Unauthorized {
+                provider_request_id,
+            } => correlated(formatter, "Unauthorized", provider_request_id),
             Self::TimedOut {
                 provider_request_id,
             } => correlated(formatter, "TimedOut", provider_request_id),
@@ -567,6 +586,12 @@ impl BedrockTransport {
         request: &InvocationRequest,
         history: &mut AttemptHistory,
     ) -> InvocationOutcome {
+        // Dispatching to Bedrock is a decision about the request's provider, so this site
+        // names it: a second `ModelProvider` variant cannot compile until the decision is
+        // made here, rather than being sent to Bedrock under another provider's identity.
+        match request.profile.provider {
+            ModelProvider::Bedrock => {}
+        }
         let message = match Message::builder()
             .role(ConversationRole::User)
             .content(ContentBlock::Text(request.prompt.clone()))
@@ -683,6 +708,12 @@ fn completion_text(response: &ConverseResponse) -> Option<String> {
     let ResponseBody::Message(message) = response.output()? else {
         return None;
     };
+    // A completion is what the assistant said. Any other role is this crate's own request
+    // echoed back or a frame built for a different conversation, and promoting its text
+    // would let request content return as model output.
+    if *message.role() != ConversationRole::Assistant {
+        return None;
+    }
     let mut text = String::new();
     for block in message.content() {
         if let ContentBlock::Text(chunk) = block {
@@ -729,6 +760,7 @@ fn terminal_reason(reason: &StopReason) -> TerminalReason {
         StopReason::MalformedModelOutput | StopReason::MalformedToolUse => {
             TerminalReason::ModelOutputMalformed
         }
+        StopReason::ToolUse => TerminalReason::ToolUseRequested,
         _ => TerminalReason::Unrecognized,
     }
 }
@@ -758,39 +790,42 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
             provider_request_id,
             reported_use: None,
         },
-        SdkError::ServiceError(service) => match service.err() {
-            ConverseError::ThrottlingException(_)
-            | ConverseError::ServiceUnavailableException(_)
-            | ConverseError::ModelNotReadyException(_) => InvocationOutcome::RateLimited {
-                provider_request_id,
-            },
-            ConverseError::ModelTimeoutException(_) => InvocationOutcome::TimedOut {
-                provider_request_id,
-            },
-            ConverseError::ValidationException(_)
-            | ConverseError::AccessDeniedException(_)
-            | ConverseError::ResourceNotFoundException(_) => InvocationOutcome::Rejected {
-                provider_request_id,
-            },
-            // `InternalServerException` and `ModelErrorException` say the provider failed,
-            // not that it did no work, so neither is a definite refusal.
-            ConverseError::InternalServerException(_) | ConverseError::ModelErrorException(_) => {
-                InvocationOutcome::Unknown {
+        SdkError::ServiceError(service) => {
+            match service.err() {
+                ConverseError::ThrottlingException(_)
+                | ConverseError::ServiceUnavailableException(_)
+                | ConverseError::ModelNotReadyException(_) => InvocationOutcome::RateLimited {
                     provider_request_id,
-                }
+                },
+                ConverseError::ModelTimeoutException(_) => InvocationOutcome::TimedOut {
+                    provider_request_id,
+                },
+                ConverseError::ValidationException(_)
+                | ConverseError::ResourceNotFoundException(_) => InvocationOutcome::Rejected {
+                    provider_request_id,
+                },
+                ConverseError::AccessDeniedException(_) => InvocationOutcome::Unauthorized {
+                    provider_request_id,
+                },
+                // `InternalServerException` and `ModelErrorException` say the provider failed,
+                // not that it did no work, so neither is a definite refusal.
+                ConverseError::InternalServerException(_)
+                | ConverseError::ModelErrorException(_) => InvocationOutcome::Unknown {
+                    provider_request_id,
+                },
+                // An unmodelled error on a success status is a frame this boundary could not
+                // read — a body-deserialization failure arrives here, not as `ResponseError`.
+                // On a failure status it is a service condition this crate does not model, and
+                // an unnamed condition says nothing about whether the provider did work.
+                _ if service.raw().status().is_success() => InvocationOutcome::MalformedResponse {
+                    provider_request_id,
+                    reported_use: None,
+                },
+                _ => InvocationOutcome::Unknown {
+                    provider_request_id,
+                },
             }
-            // An unmodelled error on a success status is a frame this boundary could not
-            // read — a body-deserialization failure arrives here, not as `ResponseError`.
-            // On a failure status it is a service condition this crate does not model, and
-            // an unnamed condition says nothing about whether the provider did work.
-            _ if service.raw().status().is_success() => InvocationOutcome::MalformedResponse {
-                provider_request_id,
-                reported_use: None,
-            },
-            _ => InvocationOutcome::Unknown {
-                provider_request_id,
-            },
-        },
+        }
         _ => InvocationOutcome::Unknown {
             provider_request_id,
         },
@@ -1392,6 +1427,7 @@ mod tests {
             // Sharing an arm with the reason above is what makes this a definite verdict
             // rather than a completion, so its own wire string has to be exercised.
             ("malformed_tool_use", TerminalReason::ModelOutputMalformed),
+            ("tool_use", TerminalReason::ToolUseRequested),
         ] {
             let (transport, _) = replay(vec![json(format!(
                 "{{\"output\":{{\"message\":{{\"role\":\"assistant\",\"content\":[]}}}},\
@@ -1419,6 +1455,87 @@ mod tests {
                     .input_tokens(),
                 900_000
             );
+        }
+    }
+
+    /// A tool-use stop is not a completion even when text came with it. This boundary offers
+    /// no tools, so such a frame answers a request it did not make, and the text before the
+    /// tool call is a fragment rather than a whole answer.
+    #[tokio::test]
+    async fn a_tool_use_stop_with_text_is_refused_rather_than_completed() {
+        let (transport, _) = replay(vec![json(converse_body(
+            "tool_use",
+            Some((1, 1, 2)),
+            "let me look that up",
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::Refused { reason, .. } = &outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(*reason, TerminalReason::ToolUseRequested);
+    }
+
+    /// Only the assistant's own message is a completion. A frame carrying the user role is
+    /// this crate's request echoed back, and promoting its text would return request content
+    /// as model output.
+    #[tokio::test]
+    async fn a_non_assistant_response_message_is_not_a_completion() {
+        let (transport, _) = replay(vec![json(String::from(
+            "{\"output\":{\"message\":{\"role\":\"user\",\
+             \"content\":[{\"text\":\"why is the sky blue\"}]}},\
+             \"stopReason\":\"end_turn\"}",
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        assert!(
+            matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// An authorization refusal is not an invalid request. Credential rotation and IAM policy
+    /// propagation both deny a request that succeeds once that state settles, so it stays
+    /// separable from the rejections that repeating unchanged can never resolve.
+    #[tokio::test]
+    async fn an_access_denial_is_separable_from_an_invalid_request() {
+        for (error_type, expected) in [
+            (
+                "AccessDeniedException",
+                InvocationOutcome::Unauthorized {
+                    provider_request_id: Some(PROVIDER_REQUEST_ID.to_owned()),
+                },
+            ),
+            (
+                "ValidationException",
+                InvocationOutcome::Rejected {
+                    provider_request_id: Some(PROVIDER_REQUEST_ID.to_owned()),
+                },
+            ),
+            (
+                "ResourceNotFoundException",
+                InvocationOutcome::Rejected {
+                    provider_request_id: Some(PROVIDER_REQUEST_ID.to_owned()),
+                },
+            ),
+        ] {
+            let (transport, _) = replay(vec![response(
+                403,
+                &[
+                    ("x-amzn-errortype", error_type),
+                    ("x-amzn-requestid", PROVIDER_REQUEST_ID),
+                ],
+                SdkBody::from("{\"message\":\"denied\"}"),
+            )]);
+            let mut history = AttemptHistory::default();
+
+            assert_eq!(
+                transport.invoke(&request(), &mut history).await,
+                expected,
+                "{error_type}"
+            );
+            // Neither answer involved model work, so neither leaves dispatch uncertainty.
+            assert!(!history.may_have_been_sent(), "{error_type}");
         }
     }
 

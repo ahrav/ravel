@@ -18,6 +18,8 @@ pub mod domain {
     pub mod work;
 }
 
+pub mod dispatch;
+
 pub mod distributed;
 
 pub mod provider;

@@ -428,6 +428,18 @@ impl ReportedUse {
         self.cache_write_input_tokens
     }
 
+    /// Whether the total is below the counts it is documented to include.
+    ///
+    /// The provider defines `total_tokens` as the total of input and generated tokens, so a
+    /// smaller total is a count the response did not actually report: an omitted scalar
+    /// deserializes to zero the same way an omitted block does. This is a lower bound rather
+    /// than an equality because whether a cached read is folded into the total is not part of
+    /// that definition, and demanding equality would refuse a frame whose total legitimately
+    /// counts more than these two fields.
+    fn understates_its_total(self) -> bool {
+        u64::from(self.total_tokens) < u64::from(self.input_tokens) + u64::from(self.output_tokens)
+    }
+
     /// Whether every category this type carries is zero or absent.
     fn reports_nothing(self) -> bool {
         self.input_tokens == 0
@@ -854,7 +866,7 @@ fn token_use(usage: &TokenUsage) -> Option<ReportedUse> {
     // a genuine claim that nothing was billed. Refusing the shape keeps the fabricated claim
     // out of cost reconciliation, on the same terms a negative count is refused. A fully
     // cached prompt still reports its cache counters, so it is unaffected.
-    (!reported.reports_nothing()).then_some(reported)
+    (!reported.reports_nothing() && !reported.understates_its_total()).then_some(reported)
 }
 
 fn request_id(response: &ConverseResponse) -> Option<String> {
@@ -1719,6 +1731,39 @@ mod tests {
         let reported = reported_use.expect("usage block present");
         assert_eq!(reported.cache_read_input_tokens(), None);
         assert_eq!(reported.cache_write_input_tokens(), None);
+    }
+
+    /// An omitted scalar inside a present usage block is refused for the same reason an
+    /// omitted block is. A total below the input and generated counts it is defined to include
+    /// is a number the response did not report, and returning it would hand cost
+    /// reconciliation a fabricated zero total beside two real counts.
+    #[tokio::test]
+    async fn a_usage_block_missing_its_total_makes_the_frame_malformed() {
+        let (transport, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":5}}"#,
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::MalformedResponse { reported_use, .. } = &outcome else {
+            panic!("expected an unreadable frame, got {outcome:?}");
+        };
+        assert_eq!(*reported_use, None);
+
+        // A total above that sum is accepted: the definition does not say whether a cached
+        // read is counted in it, so a larger total is not evidence of a missing count.
+        let (cached, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":502,"cacheReadInputTokens":500}}"#,
+        ))]);
+        let outcome = invoke(&cached).await;
+        let InvocationOutcome::Completed { reported_use, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        assert_eq!(
+            reported_use
+                .expect("usage block present")
+                .cache_read_input_tokens(),
+            Some(500)
+        );
     }
 
     /// A negative cache counter is refused on the same terms as a negative aggregate: the

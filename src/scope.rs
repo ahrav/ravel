@@ -161,10 +161,12 @@ pub struct ScopeClaimIdentity {
 impl ScopeClaimIdentity {
     /// Creates a scoped claim identity with a nonzero claim fence.
     ///
+    /// Crate-private because it takes a [`WorkRef`], which no public constructor produces.
+    ///
     /// # Errors
     ///
     /// Returns [`ValidationError::InvalidFence`] when `claim_fence` is zero.
-    pub fn new(
+    pub(crate) fn new(
         scope: ScopeIdentity,
         plan_digest: Digest,
         work: WorkRef,
@@ -379,9 +381,15 @@ impl PlanAdmittedEvent {
 ///
 /// It carries every fact the projection's grant columns store, so a rebuild folds the event
 /// without reading the grant object back.
+///
+/// The work identity and its revision are held separately rather than as a [`WorkRef`]: this
+/// payload is reachable by decoding untrusted bytes, and a `WorkRef` asserts that some admission
+/// produced the revision it names. The fold resolves these two fields against the
+/// `admitted_work` row and refuses a revision no admission produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantActivatedPayload {
-    work: WorkRef,
+    work_id: WorkId,
+    work_revision: NonZeroU64,
     claim_fence: NonZeroU64,
     grant_digest: Digest,
     attempt: NonZeroU64,
@@ -395,7 +403,8 @@ impl GrantActivatedPayload {
     /// Returns [`ValidationError::OutOfRange`] when the revision, fence, attempt, units, or
     /// deadline is zero or exceeds the stored-integer range.
     pub fn new(
-        work: WorkRef,
+        work_id: WorkId,
+        work_revision: u64,
         claim_fence: u64,
         grant_digest: Digest,
         attempt: u64,
@@ -407,9 +416,9 @@ impl GrantActivatedPayload {
                 .filter(|value| value.get() <= MAX_STORED_INTEGER)
                 .ok_or(ValidationError::OutOfRange)
         };
-        bounded(work.revision())?;
         Ok(Self {
-            work,
+            work_id,
+            work_revision: bounded(work_revision)?,
             claim_fence: bounded(claim_fence)?,
             grant_digest,
             attempt: bounded(attempt)?,
@@ -418,8 +427,12 @@ impl GrantActivatedPayload {
         })
     }
 
-    pub fn work(&self) -> &WorkRef {
-        &self.work
+    pub fn work_id(&self) -> &WorkId {
+        &self.work_id
+    }
+
+    pub fn work_revision(&self) -> NonZeroU64 {
+        self.work_revision
     }
 
     pub fn claim_fence(&self) -> NonZeroU64 {
@@ -698,7 +711,7 @@ pub fn scope_event_key(scope: &ScopeIdentity, event: &ScopeEventRef) -> String {
 ///
 /// Plan lineage and claim fence are bindings inside the record, not part of its location, so a
 /// reader that has not yet seen the record can still address it.
-pub fn scope_claim_key(scope: &ScopeIdentity, work: &WorkRef) -> String {
+pub(crate) fn scope_claim_key(scope: &ScopeIdentity, work: &WorkRef) -> String {
     format!(
         "workspace/{}/campaigns/{}/scopes/{}/claims/{}/{}",
         scope.workspace_id().as_str(),
@@ -714,7 +727,11 @@ pub fn scope_claim_key(scope: &ScopeIdentity, work: &WorkRef) -> String {
 /// Unlike [`scope_claim_key`], the fence is part of the location: create-only publication then
 /// yields one immutable object per claim generation, and a reader must already know its fence
 /// to address a grant.
-pub fn scope_grant_key(scope: &ScopeIdentity, work: &WorkRef, claim_fence: NonZeroU64) -> String {
+pub(crate) fn scope_grant_key(
+    scope: &ScopeIdentity,
+    work: &WorkRef,
+    claim_fence: NonZeroU64,
+) -> String {
     format!(
         "workspace/{}/campaigns/{}/scopes/{}/grants/{}/{}/{}",
         scope.workspace_id().as_str(),
@@ -1077,8 +1094,8 @@ pub fn encode_grant_activated_event(
     encode_scope_event(
         event.envelope(),
         &WireGrantActivatedPayload {
-            work_id: event.payload().work().id().as_str().to_owned(),
-            work_revision: event.payload().work().revision(),
+            work_id: event.payload().work_id().as_str().to_owned(),
+            work_revision: event.payload().work_revision().get(),
             claim_fence: event.payload().claim_fence().get(),
             grant_digest: event.payload().grant_digest().as_str().to_owned(),
             attempt: event.payload().attempt().get(),
@@ -1111,12 +1128,9 @@ pub(crate) fn grant_activated_from_decoded(
     if original != canonical {
         return Err(WireError::NonCanonical);
     }
-    let work = WorkRef::new(
+    let payload = GrantActivatedPayload::new(
         WorkId::new(payload.work_id).map_err(|_| WireError::InvalidValue)?,
         payload.work_revision,
-    );
-    let payload = GrantActivatedPayload::new(
-        work,
         payload.claim_fence,
         Digest::new(payload.grant_digest).map_err(|_| WireError::InvalidValue)?,
         payload.attempt,
@@ -1519,11 +1533,12 @@ mod codec_tests {
 
     #[test]
     fn grant_activated_events_round_trip_and_reject_corruption() {
-        use crate::domain::work::{WorkId, WorkRef};
+        use crate::domain::work::WorkId;
 
         let genesis = fixture();
         let payload = GrantActivatedPayload::new(
-            WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1),
+            WorkId::new("work-17".into()).unwrap(),
+            1,
             2,
             Digest::new("ab".repeat(32)).unwrap(),
             1,
@@ -1596,35 +1611,73 @@ mod codec_tests {
         );
 
         // Every integer binding is bounded by the stored-integer range and must be nonzero.
-        let work = || WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
+        let work_id = || WorkId::new("work-17".into()).unwrap();
         let digest = || Digest::new("ab".repeat(32)).unwrap();
         let max = crate::domain::proposal::MAX_STORED_INTEGER;
-        assert!(GrantActivatedPayload::new(work(), max, digest(), max, max, max).is_ok());
-        for (fence, attempt, units, deadline) in [
-            (0, 1, 1, 1),
-            (1, 0, 1, 1),
-            (1, 1, 0, 1),
-            (1, 1, 1, 0),
-            (max + 1, 1, 1, 1),
-            (1, max + 1, 1, 1),
-            (1, 1, max + 1, 1),
-            (1, 1, 1, max + 1),
+        assert!(GrantActivatedPayload::new(work_id(), max, max, digest(), max, max, max).is_ok());
+        for (revision, fence, attempt, units, deadline) in [
+            (0, 1, 1, 1, 1),
+            (1, 0, 1, 1, 1),
+            (1, 1, 0, 1, 1),
+            (1, 1, 1, 0, 1),
+            (1, 1, 1, 1, 0),
+            (max + 1, 1, 1, 1, 1),
+            (1, max + 1, 1, 1, 1),
+            (1, 1, max + 1, 1, 1),
+            (1, 1, 1, max + 1, 1),
+            (1, 1, 1, 1, max + 1),
         ] {
             assert_eq!(
-                GrantActivatedPayload::new(work(), fence, digest(), attempt, units, deadline),
+                GrantActivatedPayload::new(
+                    work_id(),
+                    revision,
+                    fence,
+                    digest(),
+                    attempt,
+                    units,
+                    deadline
+                ),
                 Err(crate::domain::validation::ValidationError::OutOfRange)
             );
         }
+    }
+
+    /// `WorkRef` construction is crate-private, so the claim and grant key axes can only be
+    /// exercised from inside the crate. The scope address itself is pinned by
+    /// `root_genesis_fixture_is_deterministic_and_canonical`, so this derives it from the fixture
+    /// rather than repeating the literal.
+    #[test]
+    fn claim_and_grant_keys_cover_the_exact_identity_axis() {
+        use crate::domain::work::{WorkId, WorkRef};
+
+        let scope = fixture().identity().clone();
+        let digest = Digest::new("0".repeat(64)).unwrap();
+        let claim = ScopeClaimIdentity::new(
+            scope.clone(),
+            digest.clone(),
+            WorkRef::new(WorkId::new("work-17".into()).unwrap(), 4),
+            9,
+        )
+        .unwrap();
+        let prefix = format!(
+            "workspace/workspace-a/campaigns/campaign-a/scopes/{}",
+            scope.scope_id().as_str()
+        );
+
         assert_eq!(
-            GrantActivatedPayload::new(
-                WorkRef::new(WorkId::new("work-17".into()).unwrap(), 0),
-                1,
-                digest(),
-                1,
-                1,
-                1
-            ),
-            Err(crate::domain::validation::ValidationError::OutOfRange)
+            scope_claim_key(claim.scope(), claim.work()),
+            format!("{prefix}/claims/work-17/4")
+        );
+        // The fence is part of the grant location and not of the claim location.
+        assert_eq!(
+            scope_grant_key(claim.scope(), claim.work(), claim.claim_fence()),
+            format!("{prefix}/grants/work-17/4/9")
+        );
+        assert_eq!(claim.plan_digest(), &digest);
+        assert_eq!(claim.claim_fence().get(), 9);
+        assert_eq!(
+            ScopeClaimIdentity::new(scope, digest, claim.work().clone(), 0),
+            Err(ValidationError::InvalidFence)
         );
     }
 

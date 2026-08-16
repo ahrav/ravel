@@ -23,7 +23,14 @@ impl WorkId {
     }
 }
 
-/// Shape-validated work identity paired with a caller-supplied revision.
+/// One work identity paired with the revision an admission bound it at.
+///
+/// Construction is crate-private, and in production only two places call it: the
+/// admission that inserts an `admitted_work` row, and the queries that read those
+/// rows back. Nothing decoded from wire bytes can produce one, so a reference
+/// reaching an authority decision names a revision some plan admitted. Test
+/// fixtures call the same constructor with values they choose, which is why it is
+/// not named for the row it usually comes from.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkRef {
     id: WorkId,
@@ -31,7 +38,7 @@ pub struct WorkRef {
 }
 
 impl WorkRef {
-    pub fn new(id: WorkId, revision: u64) -> Self {
+    pub(crate) fn new(id: WorkId, revision: u64) -> Self {
         Self { id, revision }
     }
 

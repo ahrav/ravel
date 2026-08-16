@@ -343,7 +343,8 @@ pub async fn issue(
         Ok(Err(_)) => return refused(IssueError::Refused, authority),
     }
     let payload = match GrantActivatedPayload::new(
-        grant.identity.work().clone(),
+        grant.identity.work().id().clone(),
+        grant.identity.work().revision(),
         grant.identity.claim_fence().get(),
         grant_digest,
         grant.attempt.get(),

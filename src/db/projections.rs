@@ -1406,8 +1406,8 @@ fn apply_scope_event_in_transaction(
             FOLD_GRANT_SQL,
             params![
                 scope_id,
-                payload.work().id().as_str(),
-                stored_u64(payload.work().revision())?,
+                payload.work_id().as_str(),
+                stored_u64(payload.work_revision().get())?,
                 stored_u64(payload.claim_fence().get())?,
                 payload.grant_digest().as_str(),
                 stored_u64(payload.attempt().get())?,
@@ -2675,7 +2675,8 @@ mod tests {
 
         // Revision 2 of work-a was never admitted, so the fold updates zero rows.
         let payload = GrantActivatedPayload::new(
-            work("work-a", 2),
+            WorkId::new("work-a".into()).unwrap(),
+            2,
             2,
             Digest::new(DIGEST_3.into()).unwrap(),
             1,
@@ -2722,6 +2723,82 @@ mod tests {
         fs::remove_file(db_path).unwrap();
     }
 
+    /// `apply_scope_event_in_transaction` derives `grant_digest` from a match on the typed payload,
+    /// so neither violation is reachable through the writer and both rows are inserted directly.
+    /// `validate_schema` compares a live file's DDL against the `SCHEMA` constant, which moves with
+    /// any edit to that constant, so the constraint's effect is what pins it.
+    #[test]
+    fn grant_attribution_on_an_applied_event_is_a_biconditional() {
+        let (db_path, connection, scope) = genesis_scope("grant-attribution");
+        let insert = |sequence: i64,
+                      digest: &str,
+                      parent: &str,
+                      operation: &str,
+                      payload_type: &str,
+                      grant: Option<&str>| {
+            connection.execute(
+                "INSERT INTO applied_scope_events \
+                 (scope_id, sequence, digest, parent_digest, operation_id, writer_epoch, \
+                  payload_type, grant_digest) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)",
+                params![
+                    scope.scope_id().as_str(),
+                    sequence,
+                    digest,
+                    parent,
+                    operation,
+                    payload_type,
+                    grant,
+                ],
+            )
+        };
+        let refused = |result: rusqlite::Result<usize>| {
+            result.unwrap_err().sqlite_error_code()
+                == Some(rusqlite::ErrorCode::ConstraintViolation)
+        };
+
+        // An activation cannot enter history without naming the grant it activated, and no other
+        // payload type may claim a grant it did not activate.
+        assert!(refused(insert(
+            2,
+            DIGEST_2,
+            DIGEST_1,
+            "attribution-missing",
+            crate::scope::GRANT_ACTIVATED_PAYLOAD_TYPE,
+            None
+        )));
+        assert!(refused(insert(
+            2,
+            DIGEST_2,
+            DIGEST_1,
+            "attribution-foreign",
+            crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE,
+            Some(DIGEST_3)
+        )));
+
+        insert(
+            2,
+            DIGEST_2,
+            DIGEST_1,
+            "attribution-activated",
+            crate::scope::GRANT_ACTIVATED_PAYLOAD_TYPE,
+            Some(DIGEST_3),
+        )
+        .unwrap();
+        insert(
+            3,
+            DIGEST_3,
+            DIGEST_2,
+            "attribution-admitted",
+            crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE,
+            None,
+        )
+        .unwrap();
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
     #[test]
     fn a_grant_activation_event_folds_exactly_once() {
         let (db_path, mut connection, scope) = admitted_scope("grant-fold-once");
@@ -2735,7 +2812,8 @@ mod tests {
                            attempt: u64,
                            units: u64| {
             let payload = GrantActivatedPayload::new(
-                target,
+                target.id().clone(),
+                target.revision(),
                 fence,
                 Digest::new(DIGEST_3.into()).unwrap(),
                 attempt,
@@ -2852,7 +2930,8 @@ mod tests {
                 ScopeEventRef::new(sequence, Digest::new(reference.into()).unwrap()).unwrap(),
                 ScopeProjectionPayload::GrantActivated {
                     payload: GrantActivatedPayload::new(
-                        target.clone(),
+                        target.id().clone(),
+                        target.revision(),
                         fence,
                         grant.clone(),
                         attempt,
@@ -3171,6 +3250,20 @@ mod tests {
         // the plan binding is the only arm still withholding it.
         assert_eq!(claimable(&connection, &scope, 31_000), vec!["work-a@2"]);
         assert!(continuable(&connection, &scope, 1, 1_000).is_empty());
+
+        // The superseded revision stays readable through the projection's own reader, beside the
+        // plan that admitted it, so a stale result remains auditable after it stops scheduling.
+        // `continuable` above supplies the fence, so the four bindings an executable record must
+        // carry — scope, plan digest, work revision, authority fence — are each asserted here
+        // through a reader rather than through direct SQL.
+        assert_eq!(
+            admitted_work_refs(&connection, &scope).unwrap(),
+            vec![
+                (superseded.clone(), plan(ADMITTING_PLAN_DIGEST)),
+                (current.clone(), plan(DIGEST_3)),
+                (closed.clone(), plan(ADMITTING_PLAN_DIGEST)),
+            ]
+        );
 
         // Supersession withdraws scheduling and rewrites no recorded evidence.
         assert_eq!(

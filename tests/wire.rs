@@ -1,15 +1,12 @@
 use ciborium::Value;
 use ravel::{
     distributed::identity::{InstanceId, WorkspaceId},
-    domain::{
-        validation::ValidationError,
-        work::{WorkId, WorkRef},
-    },
+    domain::validation::ValidationError,
     scope::{
-        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ScopeAuthority,
-        ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeId, ScopeIdentity, artifact_key,
-        decode_head, decode_root_event, encode_head, encode_root_event, plan_key, root_genesis,
-        root_scope_id, scope_claim_key, scope_event_key, scope_grant_key, scope_head_key,
+        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, ScopeAuthority, ScopeEventRef,
+        ScopeHead, ScopeId, ScopeIdentity, artifact_key, decode_head, decode_root_event,
+        encode_head, encode_root_event, plan_key, root_genesis, root_scope_id, scope_event_key,
+        scope_head_key,
     },
     sync::WireError,
 };
@@ -197,13 +194,6 @@ fn config_bytes_change_payload_but_not_root_scope_identity() {
 fn scope_keys_cover_the_exact_identity_axis() {
     let scope = scope();
     let digest = Digest::new("0".repeat(64)).unwrap();
-    let claim = ScopeClaimIdentity::new(
-        scope.clone(),
-        digest.clone(),
-        WorkRef::new(WorkId::new("work-17".into()).unwrap(), 4),
-        9,
-    )
-    .unwrap();
     let event = ScopeEventRef::new(2, digest.clone()).unwrap();
 
     assert_eq!(scope_head_key(&scope), full_head_key());
@@ -214,16 +204,6 @@ fn scope_keys_cover_the_exact_identity_axis() {
             digest.as_str()
         )
     );
-    assert_eq!(
-        scope_claim_key(claim.scope(), claim.work()),
-        format!("workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/claims/work-17/4")
-    );
-    assert_eq!(
-        scope_grant_key(claim.scope(), claim.work(), claim.claim_fence()),
-        format!("workspace/workspace-a/campaigns/campaign-a/scopes/{SCOPE_ID}/grants/work-17/4/9")
-    );
-    assert_eq!(claim.plan_digest(), &digest);
-    assert_eq!(claim.claim_fence().get(), 9);
     assert_eq!(
         plan_key(&workspace(), &campaign(), &digest),
         format!(
@@ -237,10 +217,6 @@ fn scope_keys_cover_the_exact_identity_axis() {
             "workspace/workspace-a/campaigns/campaign-a/artifacts/{}",
             digest.as_str()
         )
-    );
-    assert_eq!(
-        ScopeClaimIdentity::new(scope, digest, claim.work().clone(), 0),
-        Err(ValidationError::InvalidFence)
     );
 }
 

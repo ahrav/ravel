@@ -219,9 +219,10 @@ pub enum IssueOutcome {
         error: IssueError,
         authority: ControllerAuthority,
     },
-    /// The event committed durably but the synchronous fold did not commit under the observed
-    /// head (the projection may lag it or already be past it); the caller refreshes the
-    /// projection, and the catch-up precondition blocks further issuance until then.
+    /// The event committed durably but the synchronous fold is not proven committed under the
+    /// observed head: the projection may lag it, be past it, or the response was lost. The
+    /// caller refreshes the projection, and the catch-up precondition blocks further issuance
+    /// until then.
     CommittedProjectionBehind(ControllerAuthority),
     /// The authority was consumed without a proven issuance; the caller reacquires, refreshes,
     /// and retries, and the operation-id probe keeps the retry from appending a duplicate.

@@ -112,8 +112,9 @@ struct Prepared {
 /// Replays the unseen suffix through the projection-owning worker.
 ///
 /// Remote reads and validation complete before the first projection write; the worker applies
-/// the whole suffix and the observed-head comparison in one transaction. Any failure rolls back
-/// the entire suffix and leaves the cursor unchanged.
+/// the whole suffix and the observed-head comparison in one transaction, so any failure inside
+/// that transaction rolls back the entire suffix and leaves the cursor unchanged. The claim
+/// restore that follows the commit reads remote objects and can still refuse readiness.
 pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) -> ScopeReadiness {
     let cursor = match handle.scope_cursor(scope).await {
         Ok(cursor) => cursor,

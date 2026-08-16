@@ -1245,7 +1245,8 @@ The sync engine:
 2. Traverses that scope's immutable parent chain without treating `LIST` as a
    publication snapshot.
 3. Validates payload type, scope binding, sequence, parent digest, `writer_epoch`,
-   operation identity, and canonical bytes before apply.
+   operation identity, and canonical bytes before apply; cross-history duplicate
+   detection completes inside the apply transaction.
 4. Applies the whole validated suffix and the head comparison in one transaction; the
    cursor advances only when the committed state matches the observed `ScopeHead`.
 5. Reports readiness only when the verified cursor matches the freshly read

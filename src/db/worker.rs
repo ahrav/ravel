@@ -43,7 +43,7 @@ fn command_channel() -> (SyncSender<Command>, Receiver<Command>) {
 
 enum Command {
     /// Direct event application has no production command: `ApplySuffix` is the production
-    /// projection writer.
+    /// event writer.
     #[cfg(test)]
     Apply {
         mutation: Box<ScopeProjectionEvent>,
@@ -299,8 +299,9 @@ impl DbHandle {
     /// Dropping the returned future does not revoke a command that was already accepted;
     /// the suffix still applies, and only the response is discarded. A lost response does not
     /// indicate whether the accepted suffix committed. An accepted command retains its whole
-    /// suffix (up to 64 MiB) in the queue until the worker processes it. Any apply error or
-    /// head mismatch rolls back the whole suffix and leaves the cursor unchanged.
+    /// decoded suffix (from up to 64 MiB of stored bytes) in the queue until the worker
+    /// processes it. Any apply error or head mismatch rolls back the whole suffix and leaves
+    /// the cursor unchanged.
     ///
     /// # Errors
     ///

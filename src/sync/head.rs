@@ -2492,9 +2492,17 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut checker = ReconcileChecker::new(&transition, &current, boundary);
+        let mut checker = ReconcileChecker::new(&transition, &current, boundary.clone());
         assert!(matches!(
             checker.check(1, &displaced, &decoded_candidate, &candidate_bytes),
+            ReconcileStep::Concluded(ReconcileVerdict::Unresolved)
+        ));
+
+        // A candidate-operation event whose bytes alone disagree concludes unresolved
+        // even when its reference and envelope both match.
+        let mut checker = ReconcileChecker::new(&transition, &current, boundary);
+        assert!(matches!(
+            checker.check(1, &candidate_ref, &decoded_candidate, b"tampered"),
             ReconcileStep::Concluded(ReconcileVerdict::Unresolved)
         ));
     }

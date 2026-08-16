@@ -1775,9 +1775,12 @@ mod tests {
         assert_eq!(stored.len(), max);
         assert_eq!(stored[max - 1].decoded.event_ref(), &events[max - 1].0);
 
-        // One event wider than a replay, an inverted interval, and a zero start are
-        // all refused before any request.
-        let (store, client) = replay_store(vec![]);
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
         assert!(
             packed_events_from_catalog(&store, scope, &catalog, 1, max as u64 + 1)
                 .await

@@ -1972,6 +1972,28 @@ mod tests {
             Err(ApplyError::DatabaseOperationFailed)
         );
         fs::remove_file(db_path).unwrap();
+
+        // The byte cap is exclusive: a snapshot whose file length equals
+        // `MAX_SNAPSHOT_BYTES` validates. Incremental vacuum trims the bloated file
+        // page by page onto the cap.
+        let db_path = path("cap-snapshot");
+        drop(create(&db_path).unwrap());
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA auto_vacuum = INCREMENTAL;\n                 VACUUM;\n                 CREATE TABLE ballast (payload BLOB);\n                 INSERT INTO ballast VALUES (zeroblob(67300000));\n                 DROP TABLE ballast;",
+            )
+            .unwrap();
+        let target = crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64;
+        while fs::metadata(&db_path).unwrap().len() > target {
+            connection
+                .execute_batch("PRAGMA incremental_vacuum(1)")
+                .unwrap();
+        }
+        drop(connection);
+        assert_eq!(fs::metadata(&db_path).unwrap().len(), target);
+        assert_eq!(sanitize_and_validate_snapshot(&db_path), Ok(()));
+        fs::remove_file(db_path).unwrap();
     }
 
     #[test]

@@ -275,9 +275,9 @@ pub async fn open_projection(
     // Cleanup deletes the destination, so it cannot race installation: a contender that
     // observed a rebuildable path could otherwise delete a projection another contender had
     // already installed and opened, leaving that worker writing an unlinked inode while
-    // everyone else uses a new file at the same pathname. The gate covers the whole
-    // delete-install-open region.
-    let _install = INSTALL_GATE.lock().await;
+    // everyone else uses a new file at the same pathname. The lock covers the whole
+    // recheck-delete-install-open region.
+    let _install = install_lock(path).await?;
     // A contender may have finished while this one waited. Its projection is complete and at
     // the pinned head before its pathname exists, so adopting it beats deleting it.
     if let Ok(handle) = DbHandle::open_existing(path.to_path_buf()).await {
@@ -290,24 +290,42 @@ pub async fn open_projection(
     if let Some(handle) = install_checkpoint(store, scope, path).await {
         return Ok(handle);
     }
-    // Another process may hold the pathname; the create-only link refuses to replace it, so
-    // the losing install is a rung miss rather than a takeover.
-    if let Ok(handle) = DbHandle::open_existing(path.to_path_buf()).await {
-        return Ok(handle);
-    }
     DbHandle::spawn(path.to_path_buf())
         .await
         .map_err(|_| ScopeReplayError::DatabaseUnavailable)
 }
 
-/// Serializes destination cleanup, checkpoint installation, and the first open.
+/// Takes the exclusive install lock for one projection pathname.
 ///
-/// One process-wide gate rather than one per path: installation runs only on a cold open, so
-/// serializing two scopes that happen to open at once costs nothing measurable and needs no
-/// registry of live paths. Two *processes* opening one projection pathname stay outside this
-/// gate — a projection has one owning worker, and the create-only commit link is what keeps a
-/// second process from replacing a file this one already opened.
-static INSTALL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The lock is a file lock, not a process-local mutex, because the region it guards begins by
+/// unlinking the destination: a process-local gate leaves a second process free to delete a
+/// projection this one already installed and opened, and the create-only commit link cannot
+/// help because the deletion happens first. The advisory lock is held by the open file
+/// description, so two tasks in one process contend on it exactly as two processes do.
+///
+/// The lock file sits beside the projection under its own suffix, so destination cleanup never
+/// removes it. It is deliberately never unlinked: the lock lives on the inode, so removing the
+/// pathname would let a later caller create and lock a different inode while a holder still
+/// believes it owns the region. The kernel releases the lock when the file closes, including on
+/// a crash.
+async fn install_lock(path: &Path) -> Result<std::fs::File, ScopeReplayError> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".install-lock");
+    let lock_path = std::path::PathBuf::from(lock_path);
+    crate::db::worker::run_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        file.lock().ok()?;
+        Some(file)
+    })
+    .await
+    .flatten()
+    .ok_or(ScopeReplayError::DatabaseUnavailable)
+}
 
 /// Installs the newest provable certified checkpoint at `destination`.
 ///

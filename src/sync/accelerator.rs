@@ -58,6 +58,12 @@ const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 const MAX_CATALOG_ROWS: usize = crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS as usize;
 /// Accumulated bytes one accelerator read may fetch; matches the replay byte budget. commentlint: allow(JUDGE)
 const MAX_FETCH_BYTES: usize = 64 * 1024 * 1024;
+/// Packs one replay may publish.
+///
+/// Publication is awaited on the readiness path, so the batch is bounded rather than sized to
+/// the replay: a full-limit replay would otherwise issue sixteen sequential object writes
+/// before its scope could report ready.
+const MAX_PUBLISHED_PACKS_PER_REPLAY: usize = 4;
 const CBOR_RECURSION_LIMIT: usize = 16;
 const FORMAT_VERSION: u64 = 1;
 /// Fixed remote-read concurrency, matching the repository's bounded-read policy.
@@ -835,6 +841,13 @@ pub(crate) struct RetainedEvent {
 /// `events` are the verified suffix in chain order. Any storage failure, malformed
 /// existing accelerator state, or pointer CAS loss stops publication silently: the replay
 /// that produced these events already succeeded and its result must not change.
+///
+/// At most [`MAX_PUBLISHED_PACKS_PER_REPLAY`] packs are written, from the lowest sequences up.
+/// A caller awaits this before it can report readiness, and a full-limit replay segments into
+/// sixteen packs whose PUTs each carry the store's operation timeout, so an unbounded batch
+/// lets slow or write-denied storage hold a correctly rebuilt scope unready. Sequences past the
+/// bound stay unpacked until a later replay covers them, which costs event reads, never
+/// correctness.
 pub(crate) async fn publish_packs_after_replay(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -846,7 +859,8 @@ pub(crate) async fn publish_packs_after_replay(
     let Some(packs) = segment_packs(scope, events) else {
         return;
     };
-    for pack in &packs {
+    let packs = &packs[..packs.len().min(MAX_PUBLISHED_PACKS_PER_REPLAY)];
+    for pack in packs {
         if store
             .publish_immutable(
                 &pack.key(scope),
@@ -869,7 +883,7 @@ pub(crate) async fn publish_packs_after_replay(
         None => (Vec::new(), Vec::new()),
     };
     let mut changed = false;
-    for pack in &packs {
+    for pack in packs {
         let Ok(entry) = PackEntry::new(pack.start(), pack.end(), pack.digest().clone()) else {
             return;
         };

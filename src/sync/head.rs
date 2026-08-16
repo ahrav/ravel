@@ -26,7 +26,7 @@ use crate::{
         encode_plan_admitted_event, encode_projection_checkpoint_event, plan_key, scope_event_key,
         scope_head_key,
     },
-    storage::s3::{ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+    storage::s3::{ETag, GetError, GetOutcome, MutationOutcome, PublicationError, S3Store},
 };
 
 use super::{
@@ -649,8 +649,9 @@ pub(crate) async fn append_checkpoint(
 /// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent (genesis stays a one-event
 /// transition through [`append_root`]), an empty batch, any batch-internal chain violation, a
 /// projection-checkpoint member, a grant-activation member, a plan admission whose named plan
-/// object cannot be read, digest-checked, and matched to this scope, or an invalid transition,
-/// and publication errors verbatim.
+/// object is missing, over-limit, fails its digest check, or names a foreign scope, or an
+/// invalid transition; a transport failure reading the plan object and publication errors
+/// surface verbatim as [`ScopeAppendError::Publication`].
 pub async fn append_batch(
     store: &S3Store,
     parent: ScopeHeadParent,
@@ -701,7 +702,19 @@ pub async fn append_batch(
         let key = plan_key(scope.workspace_id(), scope.campaign_id(), digest);
         let bytes = match store.get_object(&key, MAX_PLAN_STORED_BYTES).await {
             Ok(GetOutcome::Found { bytes, .. }) => bytes,
-            Ok(GetOutcome::NotFound) | Err(_) => return Err(ScopeAppendError::InvalidInput),
+            // A missing or over-limit object can never satisfy the admission that names it.
+            Ok(GetOutcome::NotFound) | Err(GetError::TooLarge) => {
+                return Err(ScopeAppendError::InvalidInput);
+            }
+            // A transport or response anomaly proves nothing about the batch: it surfaces as
+            // the retryable storage failure it is, so a valid batch stays distinguishable from
+            // malformed input during an outage. `Unresolved` is the storage layer's word for
+            // "the attempt proved nothing".
+            Err(GetError::Transport | GetError::MissingETag) => {
+                return Err(ScopeAppendError::Publication(
+                    ScopeEventPublicationError::Storage(PublicationError::Unresolved),
+                ));
+            }
         };
         // `plan_key` is workspace+campaign scoped, so a readable, digest-matching plan object can
         // still belong to a sibling scope; mirror `append_plan_admitted`'s cross-scope refusal.
@@ -4190,6 +4203,45 @@ mod tests {
                 .iter()
                 .all(|request| request.headers().get("if-none-match").is_none()),
             "no event PUT may precede the cross-scope refusal"
+        );
+    }
+
+    /// A transient failure reading the companion plan proves nothing about the batch, so it
+    /// surfaces as a retryable storage error rather than `InvalidInput`: a valid batch must
+    /// stay distinguishable from malformed input during an outage.
+    #[tokio::test]
+    async fn a_batch_plan_preflight_surfaces_transport_failures_as_storage_errors() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let plan = Digest::new("c".repeat(64)).unwrap();
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "transport-op-2");
+        let (env3, enc3) = plan_admitted_pair(&scope, enc2.event_ref(), 3, "transport-op-3", plan);
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                vec![(env2, enc2), (env3, enc3)],
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::Publication(
+                ScopeEventPublicationError::Storage(_)
+            ))
+        ));
+        assert_eq!(
+            client.actual_requests().count(),
+            2,
+            "parent read + failed plan read; no event PUT follows a transport failure"
         );
     }
 

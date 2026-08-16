@@ -137,7 +137,8 @@ impl ScopeHeadTransition {
     ///
     /// # Errors
     ///
-    /// Returns [`WireError::InvalidValue`] when any of those bindings fails, or another
+    /// Returns [`WireError::InvalidValue`] when any of those bindings fails, when the event's
+    /// sequence is above [`crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS`], or another
     /// [`WireError`] when the candidate head cannot be canonically encoded.
     pub fn new(
         parent: ScopeHeadParent,
@@ -145,6 +146,9 @@ impl ScopeHeadTransition {
         event: ResolvedScopeEventPublication,
     ) -> Result<Self, WireError> {
         let envelope = event.envelope();
+        if envelope.sequence() > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS {
+            return Err(WireError::InvalidValue);
+        }
         if candidate.scope() != event.scope()
             || candidate.tail() != event.event_ref()
             || candidate.operation_id() != envelope.operation_id()
@@ -298,12 +302,7 @@ pub async fn append_plan_admitted(
         return Err(ScopeAppendError::InvalidInput);
     }
     // Every envelope binding is derived from the fenced parent, so a caller cannot contradict it.
-    let sequence = observed
-        .head()
-        .tail()
-        .sequence()
-        .checked_add(1)
-        .ok_or(ScopeAppendError::InvalidInput)?;
+    let sequence = next_sequence(observed)?;
     let event = PlanAdmittedEvent::new(
         EventEnvelope::new(
             scope.scope_id().clone(),
@@ -388,12 +387,7 @@ pub(crate) async fn append_grant_activated(
         // Activation always succeeds an owned head, so there is a parent to fence against.
         return Err(ScopeAppendError::InvalidInput);
     };
-    let sequence = observed
-        .head()
-        .tail()
-        .sequence()
-        .checked_add(1)
-        .ok_or(ScopeAppendError::InvalidInput)?;
+    let sequence = next_sequence(observed)?;
     let event = GrantActivatedEvent::new(
         EventEnvelope::new(
             scope.scope_id().clone(),
@@ -436,6 +430,21 @@ pub(crate) async fn append_grant_activated(
         envelope,
         reference,
     })
+}
+
+/// The append path validates the next sequence before publishing event bytes, so a scope cannot
+/// commit a head past what one refresh replays.
+fn next_sequence(observed: &ObservedScopeHead) -> Result<u64, ScopeAppendError> {
+    let sequence = observed
+        .head()
+        .tail()
+        .sequence()
+        .checked_add(1)
+        .ok_or(ScopeAppendError::InvalidInput)?;
+    if sequence > crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS {
+        return Err(ScopeAppendError::InvalidInput);
+    }
+    Ok(sequence)
 }
 
 /// Publishes immutable event bytes before validating or mutating the head.
@@ -2419,5 +2428,62 @@ mod tests {
             ),
             Err(WireError::InvalidValue)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_successor_past_the_replay_ceiling_is_refused() {
+        use crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS;
+
+        let genesis = genesis();
+        let parent_at = |sequence: u64| {
+            ScopeHead::new(
+                genesis.identity().clone(),
+                ScopeAuthority::Unowned,
+                1,
+                ScopeEventRef::new(sequence, Digest::new("d".repeat(64)).unwrap()).unwrap(),
+                None,
+                "parent-op".into(),
+            )
+            .unwrap()
+        };
+        let at_ceiling = parent_at(MAX_SCOPE_REPLAY_EVENTS - 1);
+        let over_ceiling = parent_at(MAX_SCOPE_REPLAY_EVENTS);
+
+        assert_eq!(
+            next_sequence(&observed(&at_ceiling).await),
+            Ok(MAX_SCOPE_REPLAY_EVENTS)
+        );
+        assert_eq!(
+            next_sequence(&observed(&over_ceiling).await),
+            Err(ScopeAppendError::InvalidInput)
+        );
+
+        for (parent, sequence, accepted) in [
+            (&at_ceiling, MAX_SCOPE_REPLAY_EVENTS, true),
+            (&over_ceiling, MAX_SCOPE_REPLAY_EVENTS + 1, false),
+        ] {
+            let operation = format!("ceiling-op-{sequence}");
+            let (envelope, encoded) =
+                successor(genesis.identity(), parent.tail(), sequence, &operation);
+            let publication = published(genesis.identity(), &envelope, encoded).await;
+            let candidate = ScopeHead::new(
+                genesis.identity().clone(),
+                ScopeAuthority::Unowned,
+                1,
+                publication.event_ref().clone(),
+                None,
+                operation,
+            )
+            .unwrap();
+            let transition = ScopeHeadTransition::new(
+                ScopeHeadParent::existing(Box::new(observed(parent).await)),
+                candidate,
+                publication,
+            );
+            assert_eq!(transition.is_ok(), accepted);
+            if !accepted {
+                assert!(matches!(transition, Err(WireError::InvalidValue)));
+            }
+        }
     }
 }

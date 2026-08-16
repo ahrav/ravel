@@ -57,10 +57,15 @@ const EVENT_AT_SEQUENCE_SQL: &str =
     "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
 const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
-/// `issue()`'s pre-append probe: an operation id already applied means this issuance committed
-/// on an earlier attempt, so the retry must not append a duplicate event.
-const OPERATION_RECORDED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
-     WHERE scope_id = ?1 AND operation_id = ?2)";
+/// `issue()`'s pre-append probe. Operation ids are caller-supplied and share one namespace with
+/// every other event type, so mere existence proves nothing about this grant: the second column
+/// proves the activation itself folded, by the fence and content digest only these bytes carry.
+/// An id recorded without those bindings belongs to another event, and appending under it would
+/// bury a duplicate operation id in the chain.
+const GRANT_ACTIVATION_PROBE_SQL: &str = "SELECT \
+     EXISTS(SELECT 1 FROM applied_scope_events WHERE scope_id = ?1 AND operation_id = ?2), \
+     EXISTS(SELECT 1 FROM admitted_work WHERE scope_id = ?1 AND work_id = ?3 \
+       AND work_revision = ?4 AND grant_fence = ?5 AND grant_digest = ?6)";
 const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
 const SCOPE_UPDATE_SQL: &str = "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2, \
@@ -85,8 +90,11 @@ const ADMITTED_REVISION_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM admitted
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3)";
 /// Enumerates the rows a rebuild's claim reader must consult; replayed admissions are the only
 /// source of work identity, so no object listing exists anywhere in the read path.
-const ADMITTED_WORK_REFS_SQL: &str = "SELECT work_id, work_revision FROM admitted_work \
-     WHERE scope_id = ?1 ORDER BY work_id, work_revision";
+///
+/// The admitting plan travels with each row because a claim object is only evidence for the plan
+/// it names, and the claim key holds no plan segment.
+const ADMITTED_WORK_REFS_SQL: &str = "SELECT work_id, work_revision, plan_digest \
+     FROM admitted_work WHERE scope_id = ?1 ORDER BY work_id, work_revision";
 const PROJECTED_SCOPE_EPOCH_SQL: &str = "SELECT scope_epoch FROM scopes WHERE scope_id = ?1";
 const CLAIMS_RESTORED_SQL: &str = "SELECT claims_restored FROM scopes WHERE scope_id = ?1";
 const MARK_CLAIMS_RESTORED_SQL: &str = "UPDATE scopes SET claims_restored = 1 WHERE scope_id = ?1";
@@ -94,8 +102,12 @@ const OBJECTIVE_SQL: &str = "SELECT objective_digest FROM scopes WHERE scope_id 
 const OBSERVATION_FACT_SQL: &str =
     "SELECT digest, payload_type FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
 /// Only admission sets the pair, and only from no plan: rowcount 0 is a second plan.
+///
+/// Admission is also the only source of admitted rows, so it reopens the claim restore: rows this
+/// plan just inserted were never consulted by an earlier restore, and their claim objects would
+/// otherwise stay unread for the life of the projection.
 const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
-     SET active_plan_digest = ?2, reserved_budget_units = ?3 \
+     SET active_plan_digest = ?2, reserved_budget_units = ?3, claims_restored = 0 \
      WHERE scope_id = ?1 AND active_plan_digest IS NULL";
 /// A grant is bound to the exact claim fence it was issued for, so a reclaimed work revision
 /// cannot continue under a grant minted for the fence it superseded. Admissibility also requires
@@ -1165,42 +1177,83 @@ fn work_refs(rows: Vec<(String, i64)>) -> Result<Vec<WorkRef>, ApplyError> {
         .collect()
 }
 
-/// Lists every admitted `(work, revision)` row of one scope.
+/// Lists every admitted `(work, revision)` row of one scope beside the plan that admitted it.
 ///
 /// # Errors
 ///
 /// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a stored row cannot be
-/// converted back into a validated work reference.
+/// converted back into a validated work reference or digest.
 pub(crate) fn admitted_work_refs(
     connection: &rusqlite::Connection,
     scope: &ScopeIdentity,
-) -> Result<Vec<WorkRef>, ApplyError> {
+) -> Result<Vec<(WorkRef, Digest)>, ApplyError> {
     let mut statement = connection.prepare(ADMITTED_WORK_REFS_SQL)?;
     let rows = statement
         .query_map([scope.scope_id().as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    work_refs(rows)
+    rows.into_iter()
+        .map(|(work_id, revision, plan_digest)| {
+            Ok((
+                WorkRef::new(
+                    WorkId::new(work_id).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                    u64::try_from(revision).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+                ),
+                Digest::new(plan_digest).map_err(|_| ApplyError::DatabaseOperationFailed)?,
+            ))
+        })
+        .collect()
 }
 
-/// Reports whether one scope already applied an event under `operation_id`.
+/// What one scope already applied under `operation_id`, as it bears on appending this activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantActivationProbe {
+    /// Neither the operation id nor this activation's bindings are recorded: the append is the
+    /// first for both.
+    Absent,
+    /// This exact grant's activation already folded, so an earlier attempt committed it and a
+    /// retry must not append again.
+    Activated,
+    /// The operation id is recorded by some other event. Appending under it would bury a
+    /// duplicate operation id in the chain, so the issuance is refused instead.
+    ForeignOperation,
+}
+
+/// Reports whether appending `operation_id` would repeat this grant's activation, collide with an
+/// unrelated event, or be the first append for both.
 ///
 /// # Errors
 ///
 /// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
-pub(crate) fn scope_operation_recorded(
+pub(crate) fn grant_activation_probe(
     connection: &rusqlite::Connection,
-    scope: &ScopeIdentity,
+    identity: &ScopeClaimIdentity,
     operation_id: &str,
-) -> Result<bool, ApplyError> {
-    connection
-        .query_row(
-            OPERATION_RECORDED_SQL,
-            params![scope.scope_id().as_str(), operation_id],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
+    grant_digest: &Digest,
+) -> Result<GrantActivationProbe, ApplyError> {
+    let (operation_recorded, activation_folded): (bool, bool) = connection.query_row(
+        GRANT_ACTIVATION_PROBE_SQL,
+        params![
+            identity.scope().scope_id().as_str(),
+            operation_id,
+            identity.work().id().as_str(),
+            stored_u64(identity.work().revision())?,
+            stored_u64(identity.claim_fence().get())?,
+            grant_digest.as_str(),
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(match (activation_folded, operation_recorded) {
+        // The digest covers the operation id, so folded bindings can only be this activation's.
+        (true, _) => GrantActivationProbe::Activated,
+        (false, true) => GrantActivationProbe::ForeignOperation,
+        (false, false) => GrantActivationProbe::Absent,
+    })
 }
 
 fn stored_u64(value: u64) -> Result<i64, ApplyError> {
@@ -1985,8 +2038,10 @@ mod tests {
             query_plan(&connection, MARK_CLAIMS_RESTORED_SQL, &[&scope_id]),
             query_plan(
                 &connection,
-                OPERATION_RECORDED_SQL,
-                &[&scope_id, &operation],
+                GRANT_ACTIVATION_PROBE_SQL,
+                &[
+                    &scope_id, &operation, &work_id, &revision, &sequence, &digest,
+                ],
             ),
             query_plan(
                 &connection,
@@ -2639,6 +2694,59 @@ mod tests {
             Err(ApplyError::Conflict)
         );
         assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 3);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn a_grant_activation_probe_separates_its_own_activation_from_a_foreign_operation() {
+        let (db_path, mut connection, scope) = admitted_scope("grant-activation-probe");
+        let target = work("work-a", 1);
+        let fence = NonZeroU64::new(2).unwrap();
+        admit(&mut connection, &scope, &target, &[], epoch(1)).unwrap();
+        let identity = ScopeClaimIdentity::new(
+            scope.clone(),
+            plan(ADMITTING_PLAN_DIGEST),
+            target.clone(),
+            fence.get(),
+        )
+        .unwrap();
+        let digest = grant_digest(fence.get(), 1);
+
+        assert_eq!(
+            grant_activation_probe(&connection, &identity, "grant-op-2", &digest),
+            Ok(GrantActivationProbe::Absent)
+        );
+        // Genesis already applied its own operation id, and this grant never folded.
+        assert_eq!(
+            grant_activation_probe(&connection, &identity, &operation(&scope, 1), &digest),
+            Ok(GrantActivationProbe::ForeignOperation)
+        );
+
+        record_claim(
+            &connection,
+            &scope,
+            &target,
+            fence,
+            NonZeroU64::new(31_000).unwrap(),
+            1_000,
+        )
+        .unwrap();
+        grant_at(&connection, &scope, &target, fence, 1, 1).unwrap();
+        assert_eq!(
+            grant_activation_probe(&connection, &identity, "grant-op-2", &digest),
+            Ok(GrantActivationProbe::Activated)
+        );
+        assert_eq!(
+            grant_activation_probe(
+                &connection,
+                &identity,
+                "grant-op-2",
+                &grant_digest(fence.get(), 2)
+            ),
+            Ok(GrantActivationProbe::Absent)
+        );
 
         drop(connection);
         fs::remove_file(db_path).unwrap();
@@ -4042,6 +4150,24 @@ mod tests {
             apply_scope_event(&mut connection, &event),
             Ok(ApplyOutcome::AlreadyApplied)
         );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn admission_reopens_the_claim_restore() {
+        let (db_path, mut connection, scope) = genesis_scope("admission-reopens-restore");
+        let proposal = plan_proposal(&scope, &zero_objective(), 10_000);
+        let (event, _) = admission_event(&scope, &proposal, "admit-plan-1");
+
+        mark_claims_restored(&connection, &scope).unwrap();
+        assert!(claims_restored(&connection, &scope).unwrap());
+        assert_eq!(
+            apply_scope_event(&mut connection, &event),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert!(!claims_restored(&connection, &scope).unwrap());
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

@@ -33,9 +33,13 @@ use super::{
 };
 
 const LIMITS: Limits = Limits {
-    events: 4_096,
+    events: MAX_SCOPE_REPLAY_EVENTS,
     bytes: 64 * 1024 * 1024,
 };
+
+/// Unseen events one refresh may replay. A rebuild starts at cursor 0, so a committed head above
+/// this bound is unreachable from genesis; [`crate::sync::head`] refuses to append past it.
+pub(crate) const MAX_SCOPE_REPLAY_EVENTS: u64 = 4_096;
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -147,6 +151,8 @@ pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) 
 ///
 /// An absent object restores nothing.
 /// A `Sealed` claim is skipped because terminal evidence has no representation in the projection.
+/// A claim naming a plan other than the row's admitting plan is skipped: the key carries no plan
+/// segment, so the object's own binding is the only evidence of which plan it attests.
 async fn restore_claims(
     store: &S3Store,
     handle: &DbHandle,
@@ -156,7 +162,7 @@ async fn restore_claims(
         .admitted_work_refs(scope)
         .await
         .map_err(ScopeReplayError::Apply)?;
-    for work in works {
+    for (work, plan_digest) in works {
         let key = scope_claim_key(scope, &work);
         let bytes = match store.get_object(&key, MAX_CLAIM_BYTES).await {
             Ok(GetOutcome::Found { bytes, .. }) => bytes,
@@ -168,6 +174,9 @@ async fn restore_claims(
         };
         let claim =
             decode_claim(&bytes, &key, scope, &work).map_err(ScopeReplayError::ClaimInvalid)?;
+        if claim.identity().plan_digest() != &plan_digest {
+            continue;
+        }
         match claim.state() {
             ScopeClaimState::Active { lease_until } => {
                 // A fresh row records under the fence-free arm, so the takeover clock is never
@@ -189,7 +198,8 @@ async fn restore_claims(
     // Each restored row commits in its own worker transaction, so this final flag-set is the
     // restore's commit point: a crash anywhere earlier leaves the flag down and the next
     // refresh re-runs the reader, which RECORD_CLAIM_SQL's fresh-row and monotonic arms make
-    // idempotent. A restore over zero admitted rows still commits here.
+    // idempotent. A restore over zero admitted rows still commits here; admission clears the flag
+    // again for the rows it inserts.
     handle
         .mark_claims_restored(scope)
         .await
@@ -1569,13 +1579,24 @@ mod tests {
         state: crate::distributed::claims::ScopeClaimState,
         operation: &str,
     ) -> Vec<u8> {
+        claim_object_for_plan(fixture, &fixture.plan_digest, work, fence, state, operation)
+    }
+
+    fn claim_object_for_plan(
+        fixture: &AdmittedFixture,
+        plan_digest: &Digest,
+        work: &crate::domain::work::WorkRef,
+        fence: u64,
+        state: crate::distributed::claims::ScopeClaimState,
+        operation: &str,
+    ) -> Vec<u8> {
         use crate::distributed::claims::{ScopeClaim, encode_claim};
         use crate::distributed::identity::ActorId;
         encode_claim(
             &ScopeClaim::new(
                 crate::scope::ScopeClaimIdentity::new(
                     fixture.scope.clone(),
-                    fixture.plan_digest.clone(),
+                    plan_digest.clone(),
                     work.clone(),
                     fence,
                 )
@@ -2079,6 +2100,64 @@ mod tests {
         // The skipped row retains the fence and lease recorded by the partial restore.
         assert_eq!(rows[0].claim_fence, Some(2));
         assert_eq!(rows[0].claim_lease_until, Some((NOW + 10_000) as i64));
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// A claim object naming a plan other than the row's admitting plan restores nothing, and the
+    /// restore still completes.
+    #[tokio::test]
+    async fn a_claim_naming_another_plan_restores_nothing() {
+        use crate::distributed::claims::ScopeClaimState;
+        use crate::domain::work::{WorkId, WorkRef};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let genesis = genesis();
+        let fixture = admitted_fixture(&genesis, NOW);
+        let scope = fixture.scope.clone();
+        let work_a = WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1);
+        let foreign_plan = Digest::new("f".repeat(64)).unwrap();
+        let fence = |value: u64| std::num::NonZeroU64::new(value).unwrap();
+
+        let db_path = path("foreign-plan-claim");
+        let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(fixture.head_bytes.clone()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"claim-a\"")],
+                claim_object_for_plan(
+                    &fixture,
+                    &foreign_plan,
+                    &work_a,
+                    2,
+                    ScopeClaimState::Active {
+                        lease_until: fence(NOW + 10_000),
+                    },
+                    "claim-a-2",
+                ),
+            ),
+            response(404, &[], Vec::new()),
+        ]);
+
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(client.actual_requests().count(), 6);
+        assert!(handle.claims_restored(&scope).await.unwrap());
+
+        handle.drain().await.unwrap();
+        drop(handle);
+        let rows = scheduling_rows(&db_path);
+        assert_eq!(rows[0].claim_fence, None);
+        assert_eq!(rows[0].claim_lease_until, None);
         fs::remove_file(db_path).unwrap();
     }
 }

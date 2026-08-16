@@ -17,7 +17,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     db::{
-        projections::{ApplyError, GrantActivation, ScopeProjectionEvent, ScopeProjectionPayload},
+        projections::{
+            ApplyError, GrantActivation, GrantActivationProbe, ScopeProjectionEvent,
+            ScopeProjectionPayload,
+        },
         worker::DbHandle,
     },
     distributed::scope_controller::{self, ControllerAuthority, GrantAppend, STOP_MARGIN_MS},
@@ -319,17 +322,18 @@ pub async fn issue(
         )) => return refused(IssueError::Unresolved, authority),
         Ok(Err(_)) => return refused(IssueError::Refused, authority),
     }
-    // A probe hit means an earlier attempt committed and applied this operation; appending
-    // again would bury a duplicate operation id in the chain and poison every future replay.
     match tokio::time::timeout_at(
         deadline,
-        database.scope_operation_recorded(&scope, grant.operation_id()),
+        database.grant_activation_probe(&grant.identity, grant.operation_id(), &grant_digest),
     )
     .await
     {
         Err(_) => return refused(IssueError::Unresolved, authority),
-        Ok(Ok(true)) => return IssueOutcome::Issued(authority),
-        Ok(Ok(false)) => {}
+        Ok(Ok(GrantActivationProbe::Activated)) => return IssueOutcome::Issued(authority),
+        Ok(Ok(GrantActivationProbe::ForeignOperation)) => {
+            return refused(IssueError::Refused, authority);
+        }
+        Ok(Ok(GrantActivationProbe::Absent)) => {}
         Ok(Err(_)) => return refused(IssueError::Unresolved, authority),
     }
     let payload = match GrantActivatedPayload::new(

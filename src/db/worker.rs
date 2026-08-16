@@ -82,14 +82,15 @@ enum Command {
         now_ms: u64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
-    OperationRecorded {
-        scope: Box<ScopeIdentity>,
+    GrantActivationProbe {
+        identity: Box<ScopeClaimIdentity>,
         operation_id: String,
-        respond: oneshot::Sender<Result<bool, ApplyError>>,
+        grant_digest: Digest,
+        respond: oneshot::Sender<Result<projections::GrantActivationProbe, ApplyError>>,
     },
     AdmittedWorkRefs {
         scope: Box<ScopeIdentity>,
-        respond: oneshot::Sender<Result<Vec<WorkRef>, ApplyError>>,
+        respond: oneshot::Sender<Result<Vec<(WorkRef, Digest)>, ApplyError>>,
     },
     ClaimsRestored {
         scope: Box<ScopeIdentity>,
@@ -425,29 +426,33 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Reports whether `operation_id` was already applied for `scope`.
+    /// Reports whether appending `operation_id` would repeat this grant's activation, collide
+    /// with an unrelated event already applied under that id, or be the first append for both.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
-    pub(crate) async fn scope_operation_recorded(
+    pub(crate) async fn grant_activation_probe(
         &self,
-        scope: &ScopeIdentity,
+        identity: &ScopeClaimIdentity,
         operation_id: &str,
-    ) -> Result<bool, ApplyError> {
-        let scope = Box::new(scope.clone());
+        grant_digest: &Digest,
+    ) -> Result<projections::GrantActivationProbe, ApplyError> {
+        let identity = Box::new(identity.clone());
         let operation_id = operation_id.to_owned();
-        self.enqueue(|respond| Command::OperationRecorded {
-            scope,
+        let grant_digest = grant_digest.clone();
+        self.enqueue(|respond| Command::GrantActivationProbe {
+            identity,
             operation_id,
+            grant_digest,
             respond,
         })?
         .await
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Lists every admitted `(work, revision)` row of one scope.
+    /// Lists every admitted `(work, revision)` row of one scope beside the plan that admitted it.
     ///
     /// # Errors
     ///
@@ -456,7 +461,7 @@ impl DbHandle {
     pub(crate) async fn admitted_work_refs(
         &self,
         scope: &ScopeIdentity,
-    ) -> Result<Vec<WorkRef>, ApplyError> {
+    ) -> Result<Vec<(WorkRef, Digest)>, ApplyError> {
         let scope = Box::new(scope.clone());
         self.enqueue(|respond| Command::AdmittedWorkRefs { scope, respond })?
             .await
@@ -500,16 +505,18 @@ impl DbHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::StaleAuthority`] when `authority` must stop at `now_ms` or the
-    /// projection already advanced past its epoch, [`ApplyError::Full`],
-    /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
+    /// Returns [`ApplyError::StaleAuthority`] when `authority` must stop at `now_ms`, proves
+    /// ownership of another scope than `scope`, or the projection already advanced past its epoch,
+    /// [`ApplyError::Full`], [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
     pub async fn continuable_work(
         &self,
         scope: &ScopeIdentity,
         authority: &ControllerAuthority,
         now_ms: u64,
     ) -> Result<Vec<ContinuableWork>, ApplyError> {
-        if authority.must_stop(now_ms) {
+        // Only the head that proved this authority bounds it: without this, an authority for one
+        // scope would lend its epoch to a query about any other scope in the same store.
+        if authority.must_stop(now_ms) || authority.head().scope() != scope {
             return Err(ApplyError::StaleAuthority);
         }
         let scope = Box::new(scope.clone());
@@ -711,15 +718,17 @@ fn run(
                     now_ms,
                 ));
             }
-            Command::OperationRecorded {
-                scope,
+            Command::GrantActivationProbe {
+                identity,
                 operation_id,
+                grant_digest,
                 respond,
             } => {
-                let _ = respond.send(projections::scope_operation_recorded(
+                let _ = respond.send(projections::grant_activation_probe(
                     &connection,
-                    &scope,
+                    &identity,
                     &operation_id,
+                    &grant_digest,
                 ));
             }
             Command::AdmittedWorkRefs { scope, respond } => {
@@ -1017,7 +1026,7 @@ mod tests {
             handle.record_grant(&identity, activation(), 1).await,
             handle.grant_admissible(&identity, activation(), 1).await,
             handle
-                .scope_operation_recorded(scope, "operation")
+                .grant_activation_probe(&identity, "operation", genesis.config_digest())
                 .await
                 .map(|_| ()),
             handle.admitted_work_refs(scope).await.map(|_| ()),
@@ -1028,6 +1037,34 @@ mod tests {
                 .map(|_| ()),
             handle.drain().await,
         ]
+    }
+
+    #[tokio::test]
+    async fn continuable_work_refuses_an_authority_proving_another_scope() {
+        let path = path("foreign-authority");
+        let _ = fs::remove_file(&path);
+        let genesis = genesis();
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+        let authority = test_authority(&genesis).await;
+        let other = ScopeIdentity::root(
+            WorkspaceId::new("workspace-b".into()).unwrap(),
+            CampaignId::new("campaign-b".into()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            handle.continuable_work(&other, &authority, 1).await,
+            Err(ApplyError::StaleAuthority)
+        );
+        assert_eq!(
+            handle
+                .continuable_work(genesis.identity(), &authority, 1)
+                .await,
+            Ok(Vec::new())
+        );
+
+        drop(handle);
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(target_os = "linux")]

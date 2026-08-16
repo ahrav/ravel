@@ -148,8 +148,8 @@ pub(crate) struct Diagnostics {
     pub(crate) worker_thread: thread::ThreadId,
     pub(crate) apply_thread: Option<thread::ThreadId>,
     pub(crate) journal_mode: String,
-    /// `apply_count` includes worker-thread event attempts, including attempts rolled back with
-    /// their suffix.
+    /// `apply_count` counts the events of each executed command, including events rolled back
+    /// with their suffix.
     pub(crate) apply_count: usize,
     /// `suffix_count` is the number of `ApplySuffix` commands executed, each one transaction.
     pub(crate) suffix_count: usize,

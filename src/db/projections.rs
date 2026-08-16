@@ -2204,13 +2204,23 @@ mod tests {
         );
         assert_eq!(snapshot(&connection), before);
 
-        // A divergent digest at an already-applied sequence conflicts through the suffix path
-        // rather than skipping as `AlreadyApplied`.
+        // A divergent digest at an already-applied sequence enters the suffix conflict path
+        // instead of returning `AlreadyApplied`. `current_head` matches the projection state,
+        // so the divergent digest reaches the suffix conflict check.
+        let current_head = ScopeHead::new(
+            scope.clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            genesis.reference.clone(),
+            None,
+            genesis.envelope.operation_id().to_owned(),
+        )
+        .unwrap();
         assert_eq!(
             apply_scope_suffix(
                 &mut connection,
                 &[mutation(&scope, 1, DIGEST_2, None)],
-                &head
+                &current_head
             ),
             Err(ApplyError::Conflict)
         );

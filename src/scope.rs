@@ -546,8 +546,8 @@ impl ArtifactKind {
 /// The claim fence is deliberately absent — the grant the digest names is itself fenced, so
 /// carrying the fence again would record the same fact twice in bytes that cannot change.
 ///
-/// Everything an acceptance criterion asks the record to bind beyond that lives in the
-/// published artifact body, not here: this payload rides in an event bounded at 256 KiB
+/// Anything more the record must bind lives in the published artifact body, not here: this
+/// payload rides in an event bounded at 256 KiB
 /// compressed, while a prompt or completion is bounded at 1 MiB on its own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactReferencePayload {
@@ -1993,9 +1993,9 @@ mod codec_tests {
         }
     }
 
-    /// Pairwise-distinct values for every field the wire layout could transpose: the two
-    /// adjacent identity strings and the two adjacent bounded integers. A swapped pair would
-    /// otherwise round-trip and pass canonicality unnoticed.
+    /// Pairwise-distinct values for every field a transposition could reach: six same-typed
+    /// strings and four same-typed integers, any two of which the wire layout could swap. A
+    /// swapped pair would otherwise round-trip and pass canonicality unnoticed.
     fn artifact_reference() -> ArtifactReferencePayload {
         use crate::domain::work::WorkId;
 

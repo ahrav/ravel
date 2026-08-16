@@ -2858,7 +2858,7 @@ mod tests {
         assert_eq!(
             stored_plan_digest(&connection, &scope, &target),
             ADMITTING_PLAN_DIGEST,
-            "the fold writes no work columns"
+            "the work row's columns stay where the admission left them"
         );
         assert!(before != snapshot(&connection), "the event row is recorded");
 

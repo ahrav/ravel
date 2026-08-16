@@ -361,9 +361,9 @@ pub async fn append_plan_admitted(
     Ok(commit(store, transition, head_history).await)
 }
 
-/// Bindings of one published grant-activation event, returned beside the commit outcome so the
-/// issuer can fold the same event into its local projection.
-pub(crate) struct GrantActivatedAppend {
+/// Bindings of one published scope event, returned beside the commit outcome so the appender
+/// can fold the same event into its local projection without reading it back.
+pub(crate) struct ScopeEventAppend {
     pub(crate) outcome: ScopeHeadCommitOutcome,
     pub(crate) envelope: EventEnvelope,
     pub(crate) reference: crate::scope::ScopeEventRef,
@@ -389,7 +389,7 @@ pub(crate) async fn append_grant_activated(
     operation_id: &str,
     event_history: &mut AttemptHistory,
     head_history: &mut AttemptHistory,
-) -> Result<GrantActivatedAppend, ScopeAppendError> {
+) -> Result<ScopeEventAppend, ScopeAppendError> {
     let ScopeHeadParent::Existing(observed) = &parent else {
         // Activation always succeeds an owned head, so there is a parent to fence against.
         return Err(ScopeAppendError::InvalidInput);
@@ -432,7 +432,7 @@ pub(crate) async fn append_grant_activated(
     let reference = publication.event_ref().clone();
     let transition = ScopeHeadTransition::new(parent, candidate, publication)
         .map_err(|_| ScopeAppendError::InvalidInput)?;
-    Ok(GrantActivatedAppend {
+    Ok(ScopeEventAppend {
         outcome: commit(store, transition, head_history).await,
         envelope,
         reference,
@@ -465,15 +465,17 @@ pub(crate) struct ArtifactAdmission<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`ScopeAppendError::InvalidInput`] for a witness from another namespace, a missing
-/// parent head, an out-of-range binding, or a sequence past what one refresh replays, and
-/// [`ScopeAppendError::Publication`] when event bytes cannot be published.
+/// Returns [`ScopeAppendError::InvalidInput`] for a witness whose namespace, media type, or
+/// producer attempt disagrees with what the event would claim, an operation id the envelope or
+/// the head refuses, a missing parent head, an out-of-range binding, or a sequence past what
+/// one refresh replays, and [`ScopeAppendError::Publication`] when event bytes cannot be
+/// published.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the artifact-recording caller lands with the task that owns invocation \
-                  orchestration; `expect` flags this attribute for removal once it exists"
+        reason = "only tests call this; `expect` (not `allow`) flags this attribute for \
+                  removal if a non-test caller is added"
     )
 )]
 pub(crate) async fn append_artifact_reference(
@@ -482,7 +484,7 @@ pub(crate) async fn append_artifact_reference(
     admission: ArtifactAdmission<'_>,
     event_history: &mut AttemptHistory,
     head_history: &mut AttemptHistory,
-) -> Result<GrantActivatedAppend, ScopeAppendError> {
+) -> Result<ScopeEventAppend, ScopeAppendError> {
     let ArtifactAdmission {
         kind,
         witness,
@@ -553,7 +555,7 @@ pub(crate) async fn append_artifact_reference(
     let reference = publication.event_ref().clone();
     let transition = ScopeHeadTransition::new(parent, candidate, publication)
         .map_err(|_| ScopeAppendError::InvalidInput)?;
-    Ok(GrantActivatedAppend {
+    Ok(ScopeEventAppend {
         outcome: commit(store, transition, head_history).await,
         envelope,
         reference,

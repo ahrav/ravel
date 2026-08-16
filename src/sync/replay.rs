@@ -1630,8 +1630,9 @@ mod tests {
         );
         drop(handle);
 
-        // The reference is durable at its own address and resolves the same way on a rebuild
-        // from an empty projection, which is the case a fold over rewritten columns would fail.
+        // The reference's own row survived the transaction under its payload type. That it
+        // resolved at all is the rebuild evidence: the projection above was spawned empty, which
+        // is the case a fold over rewritten columns would fail.
         let connection = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(
             connection

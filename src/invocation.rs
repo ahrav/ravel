@@ -10,7 +10,8 @@
 //! any blob, and a decoder re-encodes what it read and refuses bytes that do not reproduce
 //! themselves — so publication and replay cannot disagree about what a record says.
 //!
-//! Neither record carries prompt or completion text. A manifest names the request by digest,
+//! Neither record carries the prompt, and neither carries a completion in full. A manifest
+//! names the request by digest,
 //! and a trace retains a bounded prefix of the output beside that output's full length and
 //! address. Text a caller must not find in durable history is therefore absent by
 //! construction rather than by redaction after the fact.
@@ -38,11 +39,6 @@ pub const MAX_RECORD_CANONICAL_BYTES: usize = 64 * 1024;
 /// The full output is addressed rather than stored, so this bounds the record without
 /// bounding what the record can attest to.
 pub const MAX_RETAINED_TEXT_BYTES: usize = 4 * 1024;
-
-/// Media type of a published manifest object.
-pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.ravel.invocation-manifest+cbor";
-/// Media type of a published trace object.
-pub const TRACE_MEDIA_TYPE: &str = "application/vnd.ravel.invocation-trace+cbor";
 
 /// Static category for a record this module refuses to build or read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,7 +125,8 @@ pub struct BoundedText {
 }
 
 impl BoundedText {
-    /// Rebuilds a bounded text from durable bytes, enforcing what [`Self::new`] guarantees.
+    /// Rebuilds a bounded text from durable bytes, enforcing every invariant [`Self::new`]
+    /// guarantees that bytes alone can prove.
     ///
     /// Decoding is a trust boundary, so the invariant has to be checked here rather than
     /// assumed: bytes reaching this point were not produced by `new`. Without the check a
@@ -309,10 +306,6 @@ pub struct InvocationManifest {
 }
 
 impl InvocationManifest {
-    /// # Errors
-    ///
-    /// Returns [`RecordError`] for an empty or oversized identifier, or a cap or deadline
-    /// outside the durable range.
     /// Records what one request will run under, taken from that request.
     ///
     /// The request is the argument rather than its parts because its digest already covers the
@@ -323,9 +316,9 @@ impl InvocationManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`RecordError::OutOfRange`] for a deadline outside the durable range, or
-    /// [`RecordError::InvalidEncoding`] for a profile whose configuration digest is malformed.
-    /// The identifier and cap bounds cannot fail here: the request already holds them.
+    /// Returns [`RecordError::OutOfRange`] for a deadline outside the durable range. Nothing
+    /// else here can fail: the request's identifiers are already bounded, its cap is a
+    /// `NonZeroU32` below the durable ceiling, and both digests it hands over are hash output.
     pub fn new(
         binding: InvocationBinding,
         request: &InvocationRequest,
@@ -345,10 +338,12 @@ impl InvocationManifest {
         )
     }
 
-    /// Rebuilds a manifest from durable bytes, where no profile value is available.
+    /// Builds a manifest from the fields the wire form holds, one per parameter.
     ///
-    /// The wire form carries the profile's identity rather than the profile, so a reader
-    /// recovers what the invocation ran under without the transport's types.
+    /// The wire form carries the profile's identity rather than the profile, so a decoder
+    /// recovers what an invocation ran under with no [`ModelProfile`] to hand. Construction
+    /// from a live request routes through here as well, which is what keeps a decoded manifest
+    /// and a fresh one subject to the same bounds.
     #[expect(
         clippy::too_many_arguments,
         reason = "one parameter per wire field, so the rebuild cannot silently drop one"
@@ -493,8 +488,10 @@ fn encode<T: Serialize>(domain: &[u8], wire: &T) -> Result<(Vec<u8>, String), Re
 ///
 /// # Errors
 ///
-/// Returns [`RecordError::InvalidEncoding`] for a missing prefix, malformed CBOR, trailing
-/// bytes, an unrepresentable field, or bytes that do not re-encode identically, and
+/// Returns [`RecordError::RecordTooLarge`] for stored bytes past the domain prefix plus
+/// [`MAX_RECORD_CANONICAL_BYTES`], refused before any decoding,
+/// [`RecordError::InvalidEncoding`] for a missing prefix, malformed CBOR, trailing bytes, an
+/// unrepresentable field, or bytes that do not re-encode identically, and
 /// [`RecordError::DigestMismatch`] when the bytes address a different record.
 pub fn decode_manifest(
     stored_bytes: &[u8],
@@ -812,8 +809,8 @@ mod tests {
     /// Address of the fixture manifest's stored bytes.
     ///
     /// Pinned because every other assertion in this file is satisfied by any encoding that
-    /// round-trips: swapping two adjacent same-typed wire fields, renaming a key, or changing
-    /// an integer's width all leave `decode(encode(x)) == x` true while moving these bytes.
+    /// round-trips: swapping two same-typed wire fields, renaming a key, or encoding an
+    /// integer as text all leave `decode(encode(x)) == x` true while moving these bytes.
     /// The address is what a published artifact is named by, so once one exists no such change
     /// is compatible. A failure here is not a wrong digest to update — it is a wire change,
     /// and it needs a new artifact kind rather than a new constant.
@@ -952,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn every_record_rejection_fails_before_any_publication() {
+    fn every_binding_and_identifier_rejection_fails_before_any_publication() {
         let long = "m".repeat(MAX_IDENTIFIER_BYTES + 1);
         let max = MAX_STORED_INTEGER;
 

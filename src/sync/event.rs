@@ -171,7 +171,7 @@ pub(crate) fn root_payload_valid(
         || crate::scope::root_event_from_decoded(decoded.clone(), scope).is_ok()
 }
 
-fn validate_registered(
+pub(super) fn validate_registered(
     scope: &ScopeIdentity,
     envelope: &EventEnvelope,
     encoded: &EncodedScopeEvent,
@@ -213,6 +213,16 @@ fn validate_registered(
             crate::scope::decode_artifact_reference_event(encoded.stored_bytes(), key, scope)
                 .map_err(ScopeEventPublicationError::Invalid)?;
         return if reference.envelope() == envelope {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
+    }
+    if envelope.payload_type() == crate::scope::PROJECTION_CHECKPOINT_PAYLOAD_TYPE {
+        let checkpoint =
+            crate::scope::decode_projection_checkpoint_event(encoded.stored_bytes(), key, scope)
+                .map_err(ScopeEventPublicationError::Invalid)?;
+        return if checkpoint.envelope() == envelope {
             Ok(())
         } else {
             Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))

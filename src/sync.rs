@@ -1,5 +1,6 @@
 use std::{error::Error, fmt};
 
+pub mod accelerator;
 pub mod event;
 pub mod head;
 pub mod replay;

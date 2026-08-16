@@ -41,6 +41,10 @@ tokio = { version = "=1.53.1", default-features = false, features = ["sync"] }
 zstd = { version = "=0.13.3", default-features = false }
 
 [dev-dependencies]
+# Concurrent-fetch tests key scripted responses by request URI instead of arrival order.
+aws-smithy-http-client = { version = "=1.2.0", default-features = false, features = [
+  "test-util",
+] }
 aws-config = { version = "=1.10.1", default-features = false, features = [
   "behavior-version-latest",
   "credentials-process",

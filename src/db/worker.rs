@@ -115,6 +115,11 @@ enum Command {
     Drain {
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
+    Snapshot {
+        head: Box<ScopeHead>,
+        destination: PathBuf,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
     RecordClaim {
         scope: Box<ScopeIdentity>,
         work: WorkRef,
@@ -562,6 +567,30 @@ impl DbHandle {
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
+    /// Copies the live projection to an absent `destination` as a sanitized, validated
+    /// checkpoint snapshot, after verifying it matches `head`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Conflict`] when the projection does not match `head` or the
+    /// destination exists, [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`] for copy, sanitize, bound, or validation
+    /// failures.
+    pub(crate) async fn snapshot_to(
+        &self,
+        head: &ScopeHead,
+        destination: PathBuf,
+    ) -> Result<(), ApplyError> {
+        let head = Box::new(head.clone());
+        self.enqueue(|respond| Command::Snapshot {
+            head,
+            destination,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
     /// # Errors
     ///
     /// Returns [`ApplyError::Conflict`] for an unknown, terminal, or fence-regressing
@@ -636,6 +665,20 @@ impl DbHandle {
         .await
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
+}
+
+/// `None` means the thread could not spawn or exited without responding.
+pub(crate) async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (respond, receive) = oneshot::channel();
+    thread::Builder::new()
+        .name("ravel-snapshot-io".into())
+        .spawn(move || {
+            let _ = respond.send(work());
+        })
+        .ok()?;
+    receive.await.ok()
 }
 
 fn run(
@@ -776,6 +819,13 @@ fn run(
             Command::Drain { respond } => {
                 let _ = respond.send(Ok(()));
             }
+            Command::Snapshot {
+                head,
+                destination,
+                respond,
+            } => {
+                let _ = respond.send(projections::snapshot_to(&connection, &head, &destination));
+            }
             Command::RecordClaim {
                 scope,
                 work,
@@ -885,7 +935,10 @@ mod tests {
     }
 
     fn test_mutation() -> ScopeProjectionEvent {
-        let genesis = genesis();
+        mutation_for(&genesis())
+    }
+
+    fn mutation_for(genesis: &RootGenesis) -> ScopeProjectionEvent {
         let root = crate::scope::decode_root_event(
             genesis.event_bytes(),
             genesis.event_key(),
@@ -1242,6 +1295,184 @@ mod tests {
         drop(handle);
         drop(other);
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_a_matching_head_and_sanitizes_the_copy() {
+        let live_path = path("snapshot-live");
+        let _ = fs::remove_file(&live_path);
+        let destination = path("snapshot-copy");
+        let _ = fs::remove_file(&destination);
+        let genesis = genesis();
+        let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
+        handle.apply(test_mutation()).await.unwrap();
+        // Populate restore-derived columns the sanitize step must clear, beside the
+        // event-derived grant columns it must keep.
+        let plan_digest = Digest::new("c".repeat(64)).unwrap();
+        let work = WorkRef::new(
+            crate::domain::work::WorkId::new("work-a".into()).unwrap(),
+            1,
+        );
+        handle
+            .admit_work(
+                genesis.identity(),
+                work.clone(),
+                Vec::new(),
+                plan_digest,
+                NonZeroU64::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        handle
+            .record_claim(
+                genesis.identity(),
+                work,
+                NonZeroU64::new(2).unwrap(),
+                NonZeroU64::new(10_000).unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        handle.drain().await.unwrap();
+        {
+            let side = rusqlite::Connection::open(&live_path).unwrap();
+            side.execute("UPDATE scopes SET claims_restored = 1", [])
+                .unwrap();
+            side.execute(
+                "UPDATE admitted_work SET grant_fence = 2, grant_digest = ?1, \
+                 granted_attempt = 1, granted_units = 5, grant_deadline_unix_ms = 9_000, \
+                 terminal_result_digest = ?2",
+                rusqlite::params!["d".repeat(64), "e".repeat(64)],
+            )
+            .unwrap();
+        }
+
+        // A head the projection does not match refuses before any copy.
+        let mismatched = crate::scope::ScopeHead::new(
+            genesis.identity().clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            crate::scope::ScopeEventRef::new(2, crate::scope::Digest::new("f".repeat(64)).unwrap())
+                .unwrap(),
+            None,
+            "elsewhere".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            handle.snapshot_to(&mismatched, destination.clone()).await,
+            Err(ApplyError::Conflict)
+        );
+        assert!(!destination.exists());
+
+        handle
+            .snapshot_to(genesis.head(), destination.clone())
+            .await
+            .unwrap();
+        let copy = rusqlite::Connection::open(&destination).unwrap();
+        let (claims_restored, sequence): (i64, i64) = copy
+            .query_row("SELECT claims_restored, sequence FROM scopes", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(claims_restored, 0);
+        assert_eq!(sequence, 1);
+        // Claim and terminal columns clear; the grant columns survive untouched.
+        let row: Vec<Option<String>> = copy
+            .query_row(
+                "SELECT CAST(claim_fence AS TEXT), CAST(claim_lease_until AS TEXT), \
+                 terminal_result_digest, CAST(grant_fence AS TEXT), grant_digest, \
+                 CAST(granted_attempt AS TEXT), CAST(granted_units AS TEXT), \
+                 CAST(grant_deadline_unix_ms AS TEXT) \
+                 FROM admitted_work",
+                [],
+                |row| (0..8).map(|index| row.get(index)).collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            vec![
+                None,
+                None,
+                None,
+                Some("2".to_owned()),
+                Some("d".repeat(64)),
+                Some("1".to_owned()),
+                Some("5".to_owned()),
+                Some("9000".to_owned()),
+            ]
+        );
+        drop(copy);
+        // The copy passes the full open-time validation on its own.
+        drop(projections::open_existing(&destination).unwrap());
+
+        // The destination must be absent.
+        assert_eq!(
+            handle
+                .snapshot_to(genesis.head(), destination.clone())
+                .await,
+            Err(ApplyError::Conflict)
+        );
+
+        drop(handle);
+        fs::remove_file(live_path).unwrap();
+        fs::remove_file(destination).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_only_the_certified_scope() {
+        let live_path = path("snapshot-multi-scope-live");
+        let _ = fs::remove_file(&live_path);
+        let destination = path("snapshot-multi-scope-copy");
+        let _ = fs::remove_file(&destination);
+        let genesis = genesis();
+        let other = root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-b".into()).unwrap(),
+                CampaignId::new("campaign-b".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
+        handle.apply(test_mutation()).await.unwrap();
+        handle.apply(mutation_for(&other)).await.unwrap();
+
+        handle
+            .snapshot_to(genesis.head(), destination.clone())
+            .await
+            .unwrap();
+
+        // `VACUUM INTO` copies the whole projection, but only the certified scope is covered
+        // by the certificate the snapshot is published under, so the other scope's rows —
+        // which an installer has no ancestry to prove — must not travel with it.
+        let copy = rusqlite::Connection::open(&destination).unwrap();
+        let scopes: Vec<String> = copy
+            .prepare("SELECT scope_id FROM scopes")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            scopes,
+            vec![genesis.identity().scope_id().as_str().to_owned()]
+        );
+        let events: i64 = copy
+            .query_row(
+                "SELECT COUNT(*) FROM applied_scope_events WHERE scope_id = ?1",
+                [other.identity().scope_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "cascade must clear the dropped scope's events");
+        drop(copy);
+        // The pruned copy still passes the full open-time validation on its own.
+        drop(projections::open_existing(&destination).unwrap());
+
+        drop(handle);
+        fs::remove_file(live_path).unwrap();
+        fs::remove_file(destination).unwrap();
     }
 
     #[tokio::test]

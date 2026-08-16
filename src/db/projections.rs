@@ -3252,13 +3252,11 @@ mod tests {
         assert_eq!(claimable(&connection, &scope, 31_000), vec!["work-a@2"]);
         assert!(continuable(&connection, &scope, 1, 1_000).is_empty());
 
-        // The superseded revision stays readable through the projection's own reader, beside the
-        // plan that admitted it, so a stale result remains auditable after it stops scheduling.
-        // With the first `continuable` assertion in this test for the fence, three of the four
-        // bindings an executable record carries — plan digest, work revision, authority fence —
-        // are asserted through a reader rather than through direct SQL. The scope binding is not:
-        // this database holds one scope, so the `scope_id` filter in `ADMITTED_WORK_REFS_SQL`
-        // narrows nothing here.
+        // A stale result stays auditable: the superseded revision is still readable through a
+        // reader, beside the plan that admitted it, after it stops scheduling. Every other
+        // assertion on that row below goes through direct SQL. The scope binding is the one
+        // executable binding no reader assertion here covers, because this database holds one
+        // scope and so the `scope_id` filter in `ADMITTED_WORK_REFS_SQL` narrows nothing.
         assert_eq!(
             admitted_work_refs(&connection, &scope).unwrap(),
             vec![

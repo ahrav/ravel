@@ -1496,13 +1496,6 @@ mod codec_tests {
         }
     }
 
-    fn field_mut<'a>(entries: &'a mut [(Value, Value)], name: &str) -> &'a mut Value {
-        entries
-            .iter_mut()
-            .find_map(|(key, value)| (key == &Value::Text(name.to_owned())).then_some(value))
-            .unwrap()
-    }
-
     fn reordered(genesis: &RootGenesis, field: &str) -> Vec<u8> {
         let cbor = zstd::bulk::decompress(genesis.event_bytes(), MAX_DECOMPRESSED_BYTES).unwrap();
         let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
@@ -1664,7 +1657,13 @@ mod codec_tests {
         ] {
             let (bytes, bad_key) =
                 repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
-                    *field_mut(map(payload), field) = to.clone();
+                    let slot = map(payload)
+                        .iter_mut()
+                        .find_map(|(key, value)| {
+                            (key == &Value::Text(field.to_owned())).then_some(value)
+                        })
+                        .unwrap();
+                    *slot = to.clone();
                 });
             assert_eq!(
                 decode_grant_activated_event(&bytes, &bad_key, genesis.identity()),

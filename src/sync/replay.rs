@@ -135,12 +135,11 @@ pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) 
     // gating on a blank cursor would skip the remaining restore forever.
     match prepare_suffix(store, scope, cursor).await {
         Ok(prepared) => {
-            let publish = !prepared.from_packs;
             match apply_suffix(handle, scope, prepared).await {
                 Ok((local_cursor, observed_head, retained)) => {
                     // Publication is a best-effort hint: any failure inside it leaves the
                     // just-committed replay result untouched.
-                    if publish {
+                    if let Some(retained) = retained {
                         accelerator::publish_packs_after_replay(store, scope, &retained).await;
                     }
                     match handle.claims_restored(scope).await {
@@ -287,7 +286,11 @@ async fn install_checkpoint(
     destination: &Path,
 ) -> Option<DbHandle> {
     let observed = head::read(store, scope).await.ok().flatten()?;
-    let (catalog, _) = accelerator::read_current_catalog(store, scope).await?;
+    let accelerator::CurrentCatalog::Present(catalog, _) =
+        accelerator::read_current_catalog(store, scope).await
+    else {
+        return None;
+    };
     for certificate_ref in catalog.checkpoints().iter().rev() {
         if certificate_ref.sequence() > observed.head().tail().sequence() {
             continue;
@@ -362,7 +365,7 @@ async fn install_candidate(
         Ok(GetOutcome::NotFound) | Err(_) => return None,
     };
     if bytes.len() != length
-        || sha256_hex(&bytes) != certificate.payload().snapshot_digest().as_str()
+        || crate::scope::sha256(&bytes) != certificate.payload().snapshot_digest().as_str()
     {
         return None;
     }
@@ -438,11 +441,6 @@ fn staged_snapshot_valid(
         return false;
     };
     cursor == covered && active_plan.as_ref() == certificate.payload().covered_active_plan_digest()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn rebuild_files(path: &Path) -> Result<(), ScopeReplayError> {
@@ -650,26 +648,29 @@ fn parse_event_key(key: &str, prefix: &str) -> Option<ScopeEventRef> {
 /// Converts the prepared suffix, then applies its events through the worker.
 ///
 /// The returned retained events are the verified suffix in chain order, kept for
-/// opportunistic pack publication after the commit.
+/// opportunistic pack publication after the commit; `None` when the suffix came from
+/// packs and republishing it would add nothing.
 pub(crate) async fn apply_suffix(
     handle: &DbHandle,
     scope: &ScopeIdentity,
     mut prepared: PreparedSuffix,
-) -> Result<((u64, Digest), ObservedScopeHead, Vec<RetainedEvent>), ScopeReplayError> {
+) -> Result<((u64, Digest), ObservedScopeHead, Option<Vec<RetainedEvent>>), ScopeReplayError> {
     prepared.events.reverse();
     let scope_epoch = prepared.observed.head().scope_epoch().get();
-    let mut retained = Vec::with_capacity(prepared.events.len());
+    let mut retained = (!prepared.from_packs).then(|| Vec::with_capacity(prepared.events.len()));
     let mutations = prepared
         .events
         .into_iter()
         .map(|mut prepared| {
             let reference = prepared.decoded.event_ref().clone();
-            retained.push(RetainedEvent {
-                reference: reference.clone(),
-                parent: prepared.decoded.envelope().parent_event().cloned(),
-                payload_type: prepared.decoded.envelope().payload_type().to_owned(),
-                bytes: std::mem::take(&mut prepared.bytes),
-            });
+            if let Some(retained) = retained.as_mut() {
+                retained.push(RetainedEvent {
+                    reference: reference.clone(),
+                    parent: prepared.decoded.envelope().parent_event().cloned(),
+                    payload_type: prepared.decoded.envelope().payload_type().to_owned(),
+                    bytes: std::mem::take(&mut prepared.bytes),
+                });
+            }
             let (envelope, payload) = typed_payload(prepared, scope)?;
             ScopeProjectionEvent::new(scope.clone(), envelope, reference, payload, scope_epoch)
                 .map_err(|_| ScopeReplayError::HistoryConflict)
@@ -789,9 +790,6 @@ async fn prepare_chain(
     mut source: ChainEvents,
 ) -> Result<Vec<Prepared>, ScopeReplayError> {
     let unseen = precheck(&cursor, &tail, limits)?;
-    if unseen == 0 {
-        return Ok(Vec::new());
-    }
 
     let mut current = tail;
     let mut total_bytes = 0;
@@ -3235,7 +3233,7 @@ mod tests {
         let snapshot = fs::read(&snap_path).unwrap();
         fs::remove_file(&live_path).unwrap();
         fs::remove_file(&snap_path).unwrap();
-        let snapshot_digest = Digest::new(sha256_hex(&snapshot)).unwrap();
+        let snapshot_digest = Digest::new(crate::scope::sha256(&snapshot)).unwrap();
 
         let payload = ProjectionCheckpointPayload::new(
             snapshot_digest,
@@ -3455,7 +3453,7 @@ mod tests {
             };
             use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
             let payload = ProjectionCheckpointPayload::new(
-                Digest::new(sha256_hex(&junk)).unwrap(),
+                Digest::new(crate::scope::sha256(&junk)).unwrap(),
                 junk.len() as u64,
                 1,
                 genesis.event_ref().digest().clone(),
@@ -3515,7 +3513,7 @@ mod tests {
             };
             use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
             let payload = ProjectionCheckpointPayload::new(
-                Digest::new(sha256_hex(&fixture.snapshot)).unwrap(),
+                Digest::new(crate::scope::sha256(&fixture.snapshot)).unwrap(),
                 fixture.snapshot.len() as u64,
                 1,
                 genesis.event_ref().digest().clone(),
@@ -3607,7 +3605,7 @@ mod tests {
             };
             use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
             let payload = ProjectionCheckpointPayload::new(
-                Digest::new(sha256_hex(&foreign_snapshot)).unwrap(),
+                Digest::new(crate::scope::sha256(&foreign_snapshot)).unwrap(),
                 foreign_snapshot.len() as u64,
                 1,
                 genesis.event_ref().digest().clone(),

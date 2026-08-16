@@ -12,14 +12,13 @@ use std::{error::Error, fmt, io::Cursor, num::NonZeroUsize, path::Path};
 
 use ciborium::{de::from_reader_with_recursion_limit, ser::into_writer};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::{
     db::{projections::ApplyError, worker::DbHandle},
     distributed::claims::bounded_map,
     scope::{
         DecodedScopeEvent, Digest, MAX_COMPRESSED_BYTES, ProjectionCheckpointPayload,
-        ScopeEventRef, ScopeIdentity, decode_scope_event, scope_event_key,
+        ScopeEventRef, ScopeIdentity, decode_scope_event, scope_event_key, sha256,
     },
     storage::s3::{AttemptHistory, ETag, GetOutcome, MutationOutcome, S3Store},
     sync::WireError,
@@ -615,26 +614,22 @@ fn decode_cbor<T: Serialize + serde::de::DeserializeOwned>(bytes: &[u8]) -> Resu
     Ok(value)
 }
 
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 /// Reads and validates the current pointer and the catalog it names.
 ///
-/// `None` is an accelerator miss: an absent, oversized, malformed, or wrong-scope pointer
-/// or catalog. The pointer's ETag comes back for CAS replacement by a publisher.
-pub(crate) async fn read_current_catalog(
-    store: &S3Store,
-    scope: &ScopeIdentity,
-) -> Option<(ReplayCatalog, ETag)> {
+/// [`CurrentCatalog::Present`] carries the pointer's ETag for CAS replacement by a
+/// publisher; readers treat every other state as an accelerator miss.
+pub(crate) async fn read_current_catalog(store: &S3Store, scope: &ScopeIdentity) -> CurrentCatalog {
     let (bytes, etag) = match store
         .get_object(&replay_pointer_key(scope), MAX_POINTER_BYTES)
         .await
     {
         Ok(GetOutcome::Found { bytes, etag }) => (bytes, etag),
-        Ok(GetOutcome::NotFound) | Err(_) => return None,
+        Ok(GetOutcome::NotFound) => return CurrentCatalog::Absent,
+        Err(_) => return CurrentCatalog::Unusable,
     };
-    let catalog_digest = decode_pointer(&bytes, scope).ok()?;
+    let Ok(catalog_digest) = decode_pointer(&bytes, scope) else {
+        return CurrentCatalog::Unusable;
+    };
     let catalog_bytes = match store
         .get_object(
             &replay_catalog_key(scope, &catalog_digest),
@@ -643,10 +638,20 @@ pub(crate) async fn read_current_catalog(
         .await
     {
         Ok(GetOutcome::Found { bytes, .. }) => bytes,
-        Ok(GetOutcome::NotFound) | Err(_) => return None,
+        Ok(GetOutcome::NotFound) | Err(_) => return CurrentCatalog::Unusable,
     };
-    let catalog = decode_catalog(&catalog_bytes, &catalog_digest, scope).ok()?;
-    Some((catalog, etag))
+    match decode_catalog(&catalog_bytes, &catalog_digest, scope) {
+        Ok(catalog) => CurrentCatalog::Present(catalog, etag),
+        Err(_) => CurrentCatalog::Unusable,
+    }
+}
+
+pub(crate) enum CurrentCatalog {
+    /// No pointer object exists.
+    Absent,
+    /// The pointer or the catalog it names is unreadable, malformed, or wrong-scope.
+    Unusable,
+    Present(ReplayCatalog, ETag),
 }
 
 /// Chooses contiguous catalog rows whose union covers `first..=last`.
@@ -684,7 +689,9 @@ pub(crate) async fn packed_events(
     first: u64,
     last: u64,
 ) -> Option<Vec<StoredEvent>> {
-    let (catalog, _) = read_current_catalog(store, scope).await?;
+    let CurrentCatalog::Present(catalog, _) = read_current_catalog(store, scope).await else {
+        return None;
+    };
     packed_events_from_catalog(store, scope, &catalog, first, last).await
 }
 
@@ -832,31 +839,10 @@ pub(crate) async fn publish_packs_after_replay(
             return;
         }
     }
-    let existing = match store
-        .get_object(&replay_pointer_key(scope), MAX_POINTER_BYTES)
-        .await
-    {
-        Ok(GetOutcome::NotFound) => None,
-        Ok(GetOutcome::Found { bytes, etag }) => {
-            let Ok(catalog_digest) = decode_pointer(&bytes, scope) else {
-                return;
-            };
-            let catalog_bytes = match store
-                .get_object(
-                    &replay_catalog_key(scope, &catalog_digest),
-                    MAX_CATALOG_BYTES,
-                )
-                .await
-            {
-                Ok(GetOutcome::Found { bytes, .. }) => bytes,
-                Ok(GetOutcome::NotFound) | Err(_) => return,
-            };
-            let Ok(catalog) = decode_catalog(&catalog_bytes, &catalog_digest, scope) else {
-                return;
-            };
-            Some((catalog, etag))
-        }
-        Err(_) => return,
+    let existing = match read_current_catalog(store, scope).await {
+        CurrentCatalog::Absent => None,
+        CurrentCatalog::Unusable => return,
+        CurrentCatalog::Present(catalog, etag) => Some((catalog, etag)),
     };
     let (mut entries, mut checkpoints) = match &existing {
         Some((catalog, _)) => (catalog.entries().to_vec(), catalog.checkpoints().to_vec()),

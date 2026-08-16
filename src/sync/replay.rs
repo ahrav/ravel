@@ -16,10 +16,12 @@ use crate::{
         },
         worker::{DbHandle, OpenExistingError},
     },
+    distributed::claims::{MAX_CLAIM_BYTES, ScopeClaimState, decode_claim},
     domain::proposal::{MAX_PLAN_STORED_BYTES, PlanProposal, decode_plan},
     scope::{
-        Digest, PLAN_ADMITTED_PAYLOAD_TYPE, ScopeEventRef, ScopeIdentity,
-        plan_admitted_from_decoded, plan_key, root_event_from_decoded,
+        Digest, GRANT_ACTIVATED_PAYLOAD_TYPE, PLAN_ADMITTED_PAYLOAD_TYPE, ScopeEventRef,
+        ScopeIdentity, grant_activated_from_decoded, plan_admitted_from_decoded, plan_key,
+        root_event_from_decoded, scope_claim_key,
     },
     storage::s3::{GetError, GetOutcome, S3Store},
 };
@@ -50,6 +52,8 @@ pub enum ScopeReplayError {
     EventStorage,
     EventInvalid(WireError),
     UnsupportedPayload,
+    ClaimStorage,
+    ClaimInvalid(WireError),
     HistoryConflict,
     CursorAhead,
     TailMismatch,
@@ -68,6 +72,8 @@ impl fmt::Display for ScopeReplayError {
             Self::EventStorage => "scope event read failed",
             Self::EventInvalid(_) => "scope event is invalid",
             Self::UnsupportedPayload => "scope event payload is unsupported",
+            Self::ClaimStorage => "scope claim read failed",
+            Self::ClaimInvalid(_) => "scope claim is invalid",
             Self::HistoryConflict => "scope history conflicts with the local projection",
             Self::CursorAhead => "scope cursor is ahead of the observed head",
             Self::TailMismatch => "scope cursor differs from the observed head",
@@ -109,16 +115,85 @@ pub async fn refresh(store: &S3Store, handle: &DbHandle, scope: &ScopeIdentity) 
         Ok(cursor) => cursor,
         Err(error) => return ScopeReadiness::NotReady(ScopeReplayError::Apply(error)),
     };
+    // The durable flag, not the starting cursor, gates the claim reader: a crash or storage
+    // failure part-way through a rebuild leaves the cursor advanced but the flag down, and
+    // gating on a blank cursor would skip the remaining restore forever.
     match prepare_suffix(store, scope, cursor).await {
         Ok(prepared) => match apply_suffix(handle, scope, prepared).await {
-            Ok((local_cursor, observed_head)) => ScopeReadiness::Ready {
-                local_cursor,
-                observed_head: Box::new(observed_head),
-            },
+            Ok((local_cursor, observed_head)) => {
+                match handle.claims_restored(scope).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(error) = restore_claims(store, handle, scope).await {
+                            return ScopeReadiness::NotReady(error);
+                        }
+                    }
+                    Err(error) => {
+                        return ScopeReadiness::NotReady(ScopeReplayError::Apply(error));
+                    }
+                }
+                ScopeReadiness::Ready {
+                    local_cursor,
+                    observed_head: Box::new(observed_head),
+                }
+            }
             Err(error) => ScopeReadiness::NotReady(error),
         },
         Err(error) => ScopeReadiness::NotReady(error),
     }
+}
+
+/// Restores claim columns from the claim object at each admitted row's deterministic key.
+///
+/// An absent object restores nothing.
+/// A `Sealed` claim is skipped because terminal evidence has no representation in the projection.
+async fn restore_claims(
+    store: &S3Store,
+    handle: &DbHandle,
+    scope: &ScopeIdentity,
+) -> Result<(), ScopeReplayError> {
+    let works = handle
+        .admitted_work_refs(scope)
+        .await
+        .map_err(ScopeReplayError::Apply)?;
+    for work in works {
+        let key = scope_claim_key(scope, &work);
+        let bytes = match store.get_object(&key, MAX_CLAIM_BYTES).await {
+            Ok(GetOutcome::Found { bytes, .. }) => bytes,
+            Ok(GetOutcome::NotFound) => continue,
+            Err(GetError::TooLarge) => {
+                return Err(ScopeReplayError::ClaimInvalid(WireError::LimitExceeded));
+            }
+            Err(_) => return Err(ScopeReplayError::ClaimStorage),
+        };
+        let claim =
+            decode_claim(&bytes, &key, scope, &work).map_err(ScopeReplayError::ClaimInvalid)?;
+        match claim.state() {
+            ScopeClaimState::Active { lease_until } => {
+                // A fresh row records under the fence-free arm, so the takeover clock is never
+                // consulted; zero keeps that explicit. A partially restored retry can meet a row
+                // whose recorded state the object has since superseded; that rejection is a skip
+                // here, because the projection then lags the object only in the fail-closed
+                // direction and the next production claim record converges it.
+                match handle
+                    .record_claim(scope, work, claim.identity().claim_fence(), *lease_until, 0)
+                    .await
+                {
+                    Ok(()) | Err(ApplyError::Conflict) => {}
+                    Err(error) => return Err(ScopeReplayError::Apply(error)),
+                }
+            }
+            ScopeClaimState::Sealed { .. } => {}
+        }
+    }
+    // Each restored row commits in its own worker transaction, so this final flag-set is the
+    // restore's commit point: a crash anywhere earlier leaves the flag down and the next
+    // refresh re-runs the reader, which RECORD_CLAIM_SQL's fresh-row and monotonic arms make
+    // idempotent. A restore over zero admitted rows still commits here.
+    handle
+        .mark_claims_restored(scope)
+        .await
+        .map_err(ScopeReplayError::Apply)
 }
 
 /// Replaces the file after deterministic local format or history validation failures.
@@ -285,6 +360,16 @@ fn typed_payload(
                 event.envelope().clone(),
                 ScopeProjectionPayload::RootGenesis {
                     objective_digest: event.payload().config_digest().clone(),
+                },
+            ))
+        }
+        GRANT_ACTIVATED_PAYLOAD_TYPE => {
+            let event = grant_activated_from_decoded(prepared.decoded)
+                .map_err(ScopeReplayError::EventInvalid)?;
+            Ok((
+                event.envelope().clone(),
+                ScopeProjectionPayload::GrantActivated {
+                    payload: event.payload().clone(),
                 },
             ))
         }
@@ -1254,6 +1339,8 @@ mod tests {
                     admissible.stored_bytes().to_vec(),
                 ),
                 event_response(genesis.event_bytes().to_vec()),
+                response(404, &[], Vec::new()),
+                response(404, &[], Vec::new()),
             ]
         };
         // Comparing complete rows detects incorrect revisions, plan digests, attempt limits, and
@@ -1391,5 +1478,607 @@ mod tests {
         // The projection holds the event's admission, not the head's claim.
         assert_eq!(admitted_rows(&path), first);
         fs::remove_file(&path).unwrap();
+    }
+    /// Shared fixture for the grant round-trip tests: a validated two-work proposal, its
+    /// admission event at sequence 2, and the unowned head that activates it.
+    struct AdmittedFixture {
+        scope: ScopeIdentity,
+        plan_digest: Digest,
+        admissible_bytes: Vec<u8>,
+        admission_bytes: Vec<u8>,
+        head_bytes: Vec<u8>,
+    }
+
+    fn admitted_fixture(genesis: &crate::scope::RootGenesis, now_ms: u64) -> AdmittedFixture {
+        use crate::domain::proposal::{
+            ObservationFact, PlanProposal, ProposalBasis, ProposalFacts, TargetBounds, WorkSpec,
+            validate_proposal,
+        };
+        use crate::domain::work::WorkId;
+        use crate::scope::{PlanAdmittedEvent, PlanAdmittedPayload, encode_plan_admitted_event};
+
+        let scope = genesis.identity().clone();
+        let objective = genesis.config_digest().clone();
+        let proposal = PlanProposal::new(
+            scope.scope_id().clone(),
+            objective.clone(),
+            None,
+            vec![ProposalBasis::Observation {
+                event: genesis.event_ref().clone(),
+            }],
+            vec![
+                WorkSpec::new(
+                    WorkId::new("work-a".into()).unwrap(),
+                    Vec::new(),
+                    TargetBounds::new(3, now_ms + 600_000).unwrap(),
+                ),
+                WorkSpec::new(
+                    WorkId::new("work-b".into()).unwrap(),
+                    Vec::new(),
+                    TargetBounds::new(3, now_ms + 600_000).unwrap(),
+                ),
+            ],
+            100,
+        );
+        let facts = [ObservationFact::new(
+            scope.scope_id().clone(),
+            genesis.event_ref().clone(),
+            ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        let admissible = validate_proposal(
+            &proposal,
+            &ProposalFacts::new(&scope, &objective, None, 1, &facts),
+        )
+        .unwrap();
+        let event = PlanAdmittedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "admit-plan-1".into(),
+                crate::scope::PLAN_ADMITTED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            PlanAdmittedPayload::new(admissible.plan_digest().clone()),
+        )
+        .unwrap();
+        let encoded = encode_plan_admitted_event(&event).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            Some(admissible.plan_digest().clone()),
+            "admit-plan-1".into(),
+        )
+        .unwrap();
+        AdmittedFixture {
+            scope,
+            plan_digest: admissible.plan_digest().clone(),
+            admissible_bytes: admissible.stored_bytes().to_vec(),
+            admission_bytes: encoded.stored_bytes().to_vec(),
+            head_bytes: encode_head(&head).unwrap(),
+        }
+    }
+
+    fn claim_object(
+        fixture: &AdmittedFixture,
+        work: &crate::domain::work::WorkRef,
+        fence: u64,
+        state: crate::distributed::claims::ScopeClaimState,
+        operation: &str,
+    ) -> Vec<u8> {
+        use crate::distributed::claims::{ScopeClaim, encode_claim};
+        use crate::distributed::identity::ActorId;
+        encode_claim(
+            &ScopeClaim::new(
+                crate::scope::ScopeClaimIdentity::new(
+                    fixture.scope.clone(),
+                    fixture.plan_digest.clone(),
+                    work.clone(),
+                    fence,
+                )
+                .unwrap(),
+                ActorId::new("actor-a".into()).unwrap(),
+                InstanceId::new("worker-a".into()).unwrap(),
+                operation.to_owned(),
+                state,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn issue_ok(
+        store: &S3Store,
+        handle: &DbHandle,
+        authority: crate::distributed::scope_controller::ControllerAuthority,
+        grant: &crate::distributed::grants::EffectGrant,
+        now_ms: u64,
+    ) -> crate::distributed::scope_controller::ControllerAuthority {
+        use crate::storage::s3::AttemptHistory;
+        let [mut object, mut event, mut head] = [
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+        ];
+        match crate::distributed::grants::issue(
+            store,
+            handle,
+            authority,
+            grant,
+            [&mut object, &mut event, &mut head],
+            now_ms,
+        )
+        .await
+        {
+            crate::distributed::grants::IssueOutcome::Issued(refreshed) => refreshed,
+            _ => panic!("expected issuance"),
+        }
+    }
+
+    /// The scheduling-relevant columns of one admitted row.
+    /// `admitted_scope_epoch` is authority provenance, not scheduling state: a rebuild replays
+    /// under the current head epoch, so that one column may legitimately differ.
+    #[derive(Debug, Eq, PartialEq)]
+    struct SchedulingRow {
+        work_id: String,
+        work_revision: i64,
+        plan_digest: String,
+        max_attempts: i64,
+        deadline_unix_ms: i64,
+        claim_fence: Option<i64>,
+        claim_lease_until: Option<i64>,
+        grant_fence: Option<i64>,
+        grant_digest: Option<String>,
+        granted_attempt: Option<i64>,
+        granted_units: Option<i64>,
+        grant_deadline_unix_ms: Option<i64>,
+        terminal_result_digest: Option<String>,
+    }
+
+    fn scheduling_rows(path: &Path) -> Vec<SchedulingRow> {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .prepare(
+                "SELECT work_id, work_revision, plan_digest, max_attempts, deadline_unix_ms, \
+                 claim_fence, claim_lease_until, grant_fence, grant_digest, granted_attempt, \
+                 granted_units, grant_deadline_unix_ms, terminal_result_digest \
+                 FROM admitted_work ORDER BY work_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok(SchedulingRow {
+                    work_id: row.get(0)?,
+                    work_revision: row.get(1)?,
+                    plan_digest: row.get(2)?,
+                    max_attempts: row.get(3)?,
+                    deadline_unix_ms: row.get(4)?,
+                    claim_fence: row.get(5)?,
+                    claim_lease_until: row.get(6)?,
+                    grant_fence: row.get(7)?,
+                    grant_digest: row.get(8)?,
+                    granted_attempt: row.get(9)?,
+                    granted_units: row.get(10)?,
+                    grant_deadline_unix_ms: row.get(11)?,
+                    terminal_result_digest: row.get(12)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// I4: production writers populate the projection, the file is deleted, and a rebuild from
+    /// durable history alone reproduces the scheduling-relevant columns, including the
+    /// `granted_units` running total across two fences and the retained-stale-grant row.
+    #[tokio::test]
+    async fn rebuild_reproduces_grants_and_claims_from_durable_facts() {
+        use crate::distributed::claims::ScopeClaimState;
+        use crate::distributed::grants::EffectGrant;
+        use crate::distributed::scope_controller::{AcquireOutcome, RenewOutcome, acquire, renew};
+        use crate::domain::work::{WorkId, WorkRef};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let genesis = genesis();
+        let fixture = admitted_fixture(&genesis, NOW);
+        let scope = fixture.scope.clone();
+        let work_a = WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1);
+        let work_b = WorkRef::new(WorkId::new("work-b".into()).unwrap(), 1);
+        let grant = |work: &WorkRef,
+                     fence: u64,
+                     attempt: u64,
+                     units: u64,
+                     deadline: u64,
+                     operation: &str| {
+            EffectGrant::new(
+                crate::scope::ScopeClaimIdentity::new(
+                    scope.clone(),
+                    fixture.plan_digest.clone(),
+                    work.clone(),
+                    fence,
+                )
+                .unwrap(),
+                "git-push".into(),
+                "repo-a".into(),
+                attempt,
+                units,
+                deadline,
+                operation.into(),
+            )
+            .unwrap()
+        };
+        // Populate the live projection through the production writers.
+        let live_path = path("round-trip-live");
+        let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(fixture.head_bytes.clone()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            response(404, &[], Vec::new()),
+            response(404, &[], Vec::new()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let fence = |value: u64| std::num::NonZeroU64::new(value).unwrap();
+        handle
+            .record_claim(&scope, work_a.clone(), fence(2), fence(NOW + 10_000), NOW)
+            .await
+            .unwrap();
+        handle
+            .record_claim(&scope, work_b.clone(), fence(2), fence(NOW + 10_000), NOW)
+            .await
+            .unwrap();
+
+        // One store carries the authority: acquisition, three issuances, and one renewal.
+        let (authority_store, client) = replay_store(vec![
+            response(200, &[("etag", "\"h0\"")], fixture.head_bytes.clone()),
+            response(200, &[("etag", "\"h1\"")], Vec::new()),
+            response(200, &[], Vec::new()),
+            response(200, &[], Vec::new()),
+            response(200, &[("etag", "\"h2\"")], Vec::new()),
+            response(200, &[], Vec::new()),
+            response(200, &[], Vec::new()),
+            response(200, &[("etag", "\"h3\"")], Vec::new()),
+            response(200, &[], Vec::new()),
+            response(200, &[], Vec::new()),
+            response(200, &[("etag", "\"h4\"")], Vec::new()),
+            response(200, &[("etag", "\"h5\"")], Vec::new()),
+        ]);
+        let outcome = acquire(
+            &authority_store,
+            &scope,
+            &InstanceId::new("instance-a".into()).unwrap(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        let AcquireOutcome::Acquired(mut authority) = outcome else {
+            panic!("expected acquisition");
+        };
+        for (grant, now_ms) in [
+            (grant(&work_a, 2, 1, 7, NOW + 20_000, "grant-a-f2"), NOW),
+            (grant(&work_b, 2, 1, 5, NOW + 20_000, "grant-b-f2"), NOW),
+        ] {
+            authority = issue_ok(&authority_store, &handle, authority, &grant, now_ms).await;
+        }
+        // The fence-2 leases lapse, both works reclaim at fence 3, and only work-a draws again:
+        // work-b keeps its fence-2 grant columns beside the fence-3 claim.
+        handle
+            .record_claim(
+                &scope,
+                work_a.clone(),
+                fence(3),
+                fence(NOW + 29_000),
+                NOW + 15_000,
+            )
+            .await
+            .unwrap();
+        handle
+            .record_claim(
+                &scope,
+                work_b.clone(),
+                fence(3),
+                fence(NOW + 29_000),
+                NOW + 15_000,
+            )
+            .await
+            .unwrap();
+        authority = issue_ok(
+            &authority_store,
+            &handle,
+            authority,
+            &grant(&work_a, 3, 2, 9, NOW + 25_000, "grant-a-f3"),
+            NOW + 16_000,
+        )
+        .await;
+        // T-f: the returned authority renews against the committed head it observed.
+        let outcome = renew(&authority_store, authority, NOW + 16_500)
+            .await
+            .unwrap();
+        let RenewOutcome::Renewed(renewed) = outcome else {
+            panic!("expected renewal");
+        };
+        assert_eq!(renewed.scope_epoch().get(), 3);
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 12);
+        assert_eq!(requests[11].headers().get("if-match").unwrap(), "\"h4\"");
+        let renewed_head = crate::scope::decode_head(
+            requests[11].body().bytes().unwrap(),
+            &crate::scope::scope_head_key(&scope),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(renewed_head.tail().sequence(), 5);
+
+        handle.drain().await.unwrap();
+        drop(handle);
+        let live = scheduling_rows(&live_path);
+        assert_eq!(live.len(), 2);
+        // work-a drew at fences 2 and 3: the running total is both draws.
+        assert_eq!(live[0].claim_fence, Some(3));
+        assert_eq!(live[0].grant_fence, Some(3));
+        assert_eq!(live[0].granted_attempt, Some(2));
+        assert_eq!(live[0].granted_units, Some(16));
+        // work-b reclaimed to fence 3 without a new grant: the fence-2 grant columns remain.
+        assert_eq!(live[1].claim_fence, Some(3));
+        assert_eq!(live[1].grant_fence, Some(2));
+        assert_eq!(live[1].granted_units, Some(5));
+
+        // Rebuild from durable facts alone: the captured head, events, plan, and claim objects.
+        let final_head = requests[10].body().bytes().unwrap().to_vec();
+        let event_bytes = |index: usize| requests[index].body().bytes().unwrap().to_vec();
+        let rebuild_path = path("round-trip-rebuild");
+        let rebuilt = DbHandle::spawn(rebuild_path.clone()).await.unwrap();
+        let (store, rebuild_client) = replay_store(vec![
+            head_response(final_head.clone()),
+            event_response(event_bytes(9)),
+            event_response(event_bytes(6)),
+            event_response(event_bytes(3)),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"claim-a\"")],
+                claim_object(
+                    &fixture,
+                    &work_a,
+                    3,
+                    ScopeClaimState::Active {
+                        lease_until: fence(NOW + 29_000),
+                    },
+                    "claim-a-3",
+                ),
+            ),
+            response(
+                200,
+                &[("etag", "\"claim-b\"")],
+                claim_object(
+                    &fixture,
+                    &work_b,
+                    3,
+                    ScopeClaimState::Active {
+                        lease_until: fence(NOW + 29_000),
+                    },
+                    "claim-b-3",
+                ),
+            ),
+        ]);
+        assert!(matches!(
+            refresh(&store, &rebuilt, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        // D1: rebuild folds grant facts from events and never addresses a grant object.
+        assert!(
+            rebuild_client
+                .actual_requests()
+                .all(|request| !request.uri().contains("/grants/"))
+        );
+        // The completed restore is durable, so a routine refresh reads the head and no claim
+        // objects.
+        let (routine_store, routine_client) = replay_store(vec![head_response(final_head)]);
+        assert!(matches!(
+            refresh(&routine_store, &rebuilt, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(routine_client.actual_requests().count(), 1);
+        assert!(
+            routine_client
+                .actual_requests()
+                .all(|request| !request.uri().contains("/claims/"))
+        );
+        rebuilt.drain().await.unwrap();
+        drop(rebuilt);
+        assert_eq!(scheduling_rows(&rebuild_path), live);
+
+        fs::remove_file(live_path).unwrap();
+        fs::remove_file(rebuild_path).unwrap();
+    }
+
+    /// I6: a grant object with no committed activation event stays inert through a rebuild, and
+    /// a sealed claim restores nothing.
+    #[tokio::test]
+    async fn a_published_but_uncommitted_grant_stays_inert_through_rebuild() {
+        use crate::distributed::claims::ScopeClaimState;
+        use crate::domain::artifact::ArtifactRef;
+        use crate::domain::work::{WorkId, WorkRef};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let genesis = genesis();
+        let fixture = admitted_fixture(&genesis, NOW);
+        let scope = fixture.scope.clone();
+        let work_a = WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1);
+        let work_b = WorkRef::new(WorkId::new("work-b".into()).unwrap(), 1);
+        let fence = |value: u64| std::num::NonZeroU64::new(value).unwrap();
+
+        let db_path = path("inert-grant");
+        let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
+        // The trailing response simulates the publish-succeeded/append-failed window: a grant
+        // object sits at its fence key, and the rebuild must never request it.
+        let (store, client) = replay_store(vec![
+            head_response(fixture.head_bytes.clone()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"claim-a\"")],
+                claim_object(
+                    &fixture,
+                    &work_a,
+                    2,
+                    ScopeClaimState::Active {
+                        lease_until: fence(NOW + 10_000),
+                    },
+                    "claim-a-2",
+                ),
+            ),
+            response(
+                200,
+                &[("etag", "\"claim-b\"")],
+                claim_object(
+                    &fixture,
+                    &work_b,
+                    2,
+                    ScopeClaimState::Sealed {
+                        submission: ArtifactRef::new(
+                            "ab".repeat(32),
+                            64,
+                            "application/json".into(),
+                            "attempt-1".into(),
+                            NOW,
+                            None,
+                        )
+                        .unwrap(),
+                    },
+                    "claim-b-2",
+                ),
+            ),
+            response(200, &[("etag", "\"planted-grant\"")], b"planted".to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(client.actual_requests().count(), 6);
+        assert!(
+            client
+                .actual_requests()
+                .all(|request| !request.uri().contains("/grants/"))
+        );
+        handle.drain().await.unwrap();
+        drop(handle);
+        let rows = scheduling_rows(&db_path);
+        assert_eq!(rows.len(), 2);
+        // work-a: the active claim restores, and no grant column is populated.
+        assert_eq!(rows[0].claim_fence, Some(2));
+        assert_eq!(rows[0].claim_lease_until, Some((NOW + 10_000) as i64));
+        assert_eq!(rows[0].grant_fence, None);
+        assert_eq!(rows[0].grant_digest, None);
+        // work-b: a sealed claim restores nothing at all.
+        assert_eq!(rows[1].claim_fence, None);
+        assert_eq!(rows[1].claim_lease_until, None);
+        assert_eq!(rows[1].grant_fence, None);
+        assert_eq!(rows[1].terminal_result_digest, None);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// A retry meets a row a partial restore already populated whose claim object has since
+    /// advanced to a higher fence: the stale row is kept fail-closed and the restore completes
+    /// instead of wedging on the rejection.
+    #[tokio::test]
+    async fn a_restore_retry_skips_a_row_whose_claim_object_advanced() {
+        use crate::distributed::claims::ScopeClaimState;
+        use crate::domain::work::{WorkId, WorkRef};
+
+        const NOW: u64 = 1_700_000_000_000;
+        let genesis = genesis();
+        let fixture = admitted_fixture(&genesis, NOW);
+        let scope = fixture.scope.clone();
+        let work_a = WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1);
+        let fence = |value: u64| std::num::NonZeroU64::new(value).unwrap();
+
+        let db_path = path("restore-retry-skip");
+        let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![
+            // First refresh: replay admits both works, work-a's claim restores at fence 2,
+            // then work-b's claim GET returns 500, so claims_restored remains false.
+            head_response(fixture.head_bytes.clone()),
+            event_response(fixture.admission_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"plan\"")],
+                fixture.admissible_bytes.clone(),
+            ),
+            event_response(genesis.event_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"claim-a\"")],
+                claim_object(
+                    &fixture,
+                    &work_a,
+                    2,
+                    ScopeClaimState::Active {
+                        lease_until: fence(NOW + 10_000),
+                    },
+                    "claim-a-2",
+                ),
+            ),
+            response(500, &[], Vec::new()),
+            // Retry: work-a's claim object has fence 3 while its restored row has fence 2 and
+            // a live lease, and work-b's claim never existed.
+            head_response(fixture.head_bytes.clone()),
+            response(
+                200,
+                &[("etag", "\"claim-a-3\"")],
+                claim_object(
+                    &fixture,
+                    &work_a,
+                    3,
+                    ScopeClaimState::Active {
+                        lease_until: fence(NOW + 20_000),
+                    },
+                    "claim-a-3",
+                ),
+            ),
+            response(404, &[], Vec::new()),
+        ]);
+
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::NotReady { .. }
+        ));
+        assert!(!handle.claims_restored(&scope).await.unwrap());
+        assert!(matches!(
+            refresh(&store, &handle, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert!(handle.claims_restored(&scope).await.unwrap());
+        assert_eq!(client.actual_requests().count(), 9);
+
+        handle.drain().await.unwrap();
+        drop(handle);
+        let rows = scheduling_rows(&db_path);
+        // The skipped row retains the fence and lease recorded by the partial restore.
+        assert_eq!(rows[0].claim_fence, Some(2));
+        assert_eq!(rows[0].claim_lease_until, Some((NOW + 10_000) as i64));
+        fs::remove_file(db_path).unwrap();
     }
 }

@@ -152,7 +152,7 @@ async fn canonical_root_genesis_publishes_and_reads_back_exactly() {
         )
         .await
         .expect("root append succeeds"),
-        ScopeHeadCommitOutcome::Committed
+        ScopeHeadCommitOutcome::Committed(_)
     ));
 
     let stored_event = match store
@@ -222,7 +222,7 @@ async fn head_create_cas_and_transition_validation_hold_against_the_live_bucket(
         )
         .await
         .expect("first root append succeeds"),
-        ScopeHeadCommitOutcome::Committed
+        ScopeHeadCommitOutcome::Committed(_)
     ));
 
     // A byte-identical genesis retry resolves against the retained chain instead of
@@ -239,7 +239,7 @@ async fn head_create_cas_and_transition_validation_hold_against_the_live_bucket(
             )
             .await
             .expect("repeated root append resolves"),
-            ScopeHeadCommitOutcome::Committed
+            ScopeHeadCommitOutcome::Committed(_)
         ),
         "a byte-identical genesis retry must resolve as committed"
     );
@@ -295,7 +295,7 @@ async fn root_controller_lifecycle_fences_a_stale_owner() {
         )
         .await
         .expect("root append succeeds"),
-        ScopeHeadCommitOutcome::Committed
+        ScopeHeadCommitOutcome::Committed(_)
     ));
 
     let now_ms = u64::try_from(

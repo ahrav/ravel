@@ -23,6 +23,7 @@ use crate::{
         self, ApplyError, ApplyOutcome, ContinuableWork, GrantActivation, SchemaError,
         ScopeProjectionEvent, ValidateError,
     },
+    distributed::scope_controller::ControllerAuthority,
     domain::work::WorkRef,
     scope::{Digest, ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeIdentity},
 };
@@ -66,10 +67,36 @@ enum Command {
         scope_epoch: NonZeroU64,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
+    /// Grant recording has no production command: the fold of an applied `grant_activated`
+    /// event is the only production writer of the grant columns.
+    #[cfg(test)]
     RecordGrant {
         identity: Box<ScopeClaimIdentity>,
         activation: Box<GrantActivation>,
         now_ms: u64,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
+    GrantAdmissible {
+        identity: Box<ScopeClaimIdentity>,
+        activation: Box<GrantActivation>,
+        now_ms: u64,
+        respond: oneshot::Sender<Result<(), ApplyError>>,
+    },
+    OperationRecorded {
+        scope: Box<ScopeIdentity>,
+        operation_id: String,
+        respond: oneshot::Sender<Result<bool, ApplyError>>,
+    },
+    AdmittedWorkRefs {
+        scope: Box<ScopeIdentity>,
+        respond: oneshot::Sender<Result<Vec<WorkRef>, ApplyError>>,
+    },
+    ClaimsRestored {
+        scope: Box<ScopeIdentity>,
+        respond: oneshot::Sender<Result<bool, ApplyError>>,
+    },
+    MarkClaimsRestored {
+        scope: Box<ScopeIdentity>,
         respond: oneshot::Sender<Result<(), ApplyError>>,
     },
     ContinuableWork {
@@ -347,14 +374,13 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// `record_grant` records a grant only when `identity`'s claim fence, plan, scope epoch,
-    /// live lease, and admitted deadline are current, and `activation` stays inside the admitted
-    /// attempt bound and the plan's reserved budget.
+    /// Test-only guarded grant recording; production activation folds the committed event.
     ///
     /// # Errors
     ///
-    /// Returns [`ApplyError::Conflict`] when any of those bindings fails, [`ApplyError::Full`],
+    /// Returns [`ApplyError::Conflict`] when any binding fails, [`ApplyError::Full`],
     /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
+    #[cfg(test)]
     pub(crate) async fn record_grant(
         &self,
         identity: &ScopeClaimIdentity,
@@ -373,20 +399,121 @@ impl DbHandle {
         .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
-    /// Lists the revisions an existing claim and grant may continue under `scope_epoch` at
-    /// `now_ms`.
+    /// `grant_admissible` evaluates the issuance guards without writing: `identity`'s claim
+    /// fence, plan, scope epoch, live lease, and admitted deadline must be current, and
+    /// `activation` must stay inside the admitted attempt bound and the plan's reserved budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Conflict`] when any of those bindings fails, [`ApplyError::Full`],
+    /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
+    pub(crate) async fn grant_admissible(
+        &self,
+        identity: &ScopeClaimIdentity,
+        activation: GrantActivation,
+        now_ms: u64,
+    ) -> Result<(), ApplyError> {
+        let identity = Box::new(identity.clone());
+        let activation = Box::new(activation);
+        self.enqueue(|respond| Command::GrantAdmissible {
+            identity,
+            activation,
+            now_ms,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Reports whether `operation_id` was already applied for `scope`.
     ///
     /// # Errors
     ///
     /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
+    pub(crate) async fn scope_operation_recorded(
+        &self,
+        scope: &ScopeIdentity,
+        operation_id: &str,
+    ) -> Result<bool, ApplyError> {
+        let scope = Box::new(scope.clone());
+        let operation_id = operation_id.to_owned();
+        self.enqueue(|respond| Command::OperationRecorded {
+            scope,
+            operation_id,
+            respond,
+        })?
+        .await
+        .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Lists every admitted `(work, revision)` row of one scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub(crate) async fn admitted_work_refs(
+        &self,
+        scope: &ScopeIdentity,
+    ) -> Result<Vec<WorkRef>, ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::AdmittedWorkRefs { scope, respond })?
+            .await
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Reports whether the rebuild claim restore already completed for `scope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub(crate) async fn claims_restored(&self, scope: &ScopeIdentity) -> Result<bool, ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::ClaimsRestored { scope, respond })?
+            .await
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Marks the rebuild claim restore complete for `scope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::Conflict`] when the scope has no projected row,
+    /// [`ApplyError::Full`], [`ApplyError::Stopping`], or
+    /// [`ApplyError::DatabaseOperationFailed`].
+    pub(crate) async fn mark_claims_restored(
+        &self,
+        scope: &ScopeIdentity,
+    ) -> Result<(), ApplyError> {
+        let scope = Box::new(scope.clone());
+        self.enqueue(|respond| Command::MarkClaimsRestored { scope, respond })?
+            .await
+            .map_err(|_| ApplyError::DatabaseOperationFailed)?
+    }
+
+    /// Lists the revisions `authority` may continue at `now_ms`.
+    ///
+    /// The typed authority is checked here, at the public boundary; the worker command carries
+    /// only its epoch integer as provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::StaleAuthority`] when `authority` must stop at `now_ms` or the
+    /// projection already advanced past its epoch, [`ApplyError::Full`],
+    /// [`ApplyError::Stopping`], or [`ApplyError::DatabaseOperationFailed`].
     pub async fn continuable_work(
         &self,
         scope: &ScopeIdentity,
-        scope_epoch: NonZeroU64,
+        authority: &ControllerAuthority,
         now_ms: u64,
     ) -> Result<Vec<ContinuableWork>, ApplyError> {
+        if authority.must_stop(now_ms) {
+            return Err(ApplyError::StaleAuthority);
+        }
         let scope = Box::new(scope.clone());
+        let scope_epoch = authority.scope_epoch();
         self.enqueue(|respond| Command::ContinuableWork {
             scope,
             scope_epoch,
@@ -557,6 +684,7 @@ fn run(
                     scope_epoch,
                 ));
             }
+            #[cfg(test)]
             Command::RecordGrant {
                 identity,
                 activation,
@@ -569,6 +697,39 @@ fn run(
                     &activation,
                     now_ms,
                 ));
+            }
+            Command::GrantAdmissible {
+                identity,
+                activation,
+                now_ms,
+                respond,
+            } => {
+                let _ = respond.send(projections::grant_admissible(
+                    &connection,
+                    &identity,
+                    &activation,
+                    now_ms,
+                ));
+            }
+            Command::OperationRecorded {
+                scope,
+                operation_id,
+                respond,
+            } => {
+                let _ = respond.send(projections::scope_operation_recorded(
+                    &connection,
+                    &scope,
+                    &operation_id,
+                ));
+            }
+            Command::AdmittedWorkRefs { scope, respond } => {
+                let _ = respond.send(projections::admitted_work_refs(&connection, &scope));
+            }
+            Command::ClaimsRestored { scope, respond } => {
+                let _ = respond.send(projections::claims_restored(&connection, &scope));
+            }
+            Command::MarkClaimsRestored { scope, respond } => {
+                let _ = respond.send(projections::mark_claims_restored(&connection, &scope));
             }
             Command::ContinuableWork {
                 scope,
@@ -745,9 +906,10 @@ mod tests {
             Err(ApplyError::Full)
         );
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Full));
+        let authority = test_authority(&genesis).await;
         assert_eq!(
-            work_commands(&handle, &genesis).await,
-            [Err(ApplyError::Full); 7]
+            work_commands(&handle, &genesis, &authority).await,
+            [Err(ApplyError::Full); 10]
         );
 
         drop(receiver.recv().unwrap());
@@ -781,20 +943,61 @@ mod tests {
         );
         assert_eq!(handle.diagnostics().await.err(), Some(ApplyError::Stopping));
         assert_eq!(
-            work_commands(&handle, &genesis).await,
-            [Err(ApplyError::Stopping); 7]
+            work_commands(&handle, &genesis, &authority).await,
+            [Err(ApplyError::Stopping); 10]
         );
         drop(pending);
+    }
+
+    /// Acquires a live `ControllerAuthority` so `continuable_work` reaches queue admission.
+    async fn test_authority(
+        genesis: &crate::scope::RootGenesis,
+    ) -> crate::distributed::scope_controller::ControllerAuthority {
+        use crate::distributed::identity::InstanceId;
+        use crate::distributed::scope_controller::{AcquireOutcome, acquire};
+        use crate::storage::s3::test_support::{replay_store, response};
+
+        let (store, _) = replay_store(vec![
+            response(200, &[("etag", "\"head\"")], genesis.head_bytes().to_vec()),
+            response(200, &[("etag", "\"next\"")], Vec::new()),
+        ]);
+        let outcome = acquire(
+            &store,
+            genesis.identity(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+        let AcquireOutcome::Acquired(authority) = outcome else {
+            panic!("expected acquisition");
+        };
+        authority
     }
 
     /// Admission for every work command, mapped to `()` so one array compares them all.
     async fn work_commands(
         handle: &DbHandle,
         genesis: &crate::scope::RootGenesis,
-    ) -> [Result<(), ApplyError>; 7] {
+        authority: &crate::distributed::scope_controller::ControllerAuthority,
+    ) -> [Result<(), ApplyError>; 10] {
         let scope = genesis.identity();
         let work = WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
         let fence = NonZeroU64::new(1).unwrap();
+        let identity = ScopeClaimIdentity::new(
+            scope.clone(),
+            genesis.config_digest().clone(),
+            work.clone(),
+            fence.get(),
+        )
+        .unwrap();
+        let activation = || GrantActivation {
+            scope_epoch: fence,
+            attempt: fence,
+            units: fence,
+            deadline_unix_ms: fence,
+            digest: genesis.config_digest().clone(),
+        };
         [
             handle
                 .admit_work(
@@ -811,27 +1014,18 @@ mod tests {
             handle
                 .record_terminal(scope, work.clone(), fence, genesis.config_digest().clone())
                 .await,
+            handle.record_grant(&identity, activation(), 1).await,
+            handle.grant_admissible(&identity, activation(), 1).await,
             handle
-                .record_grant(
-                    &ScopeClaimIdentity::new(
-                        scope.clone(),
-                        genesis.config_digest().clone(),
-                        work.clone(),
-                        fence.get(),
-                    )
-                    .unwrap(),
-                    GrantActivation {
-                        scope_epoch: fence,
-                        attempt: fence,
-                        units: fence,
-                        deadline_unix_ms: fence,
-                        digest: genesis.config_digest().clone(),
-                    },
-                    1,
-                )
-                .await,
+                .scope_operation_recorded(scope, "operation")
+                .await
+                .map(|_| ()),
+            handle.admitted_work_refs(scope).await.map(|_| ()),
             handle.claimable_work(scope, 1).await.map(|_| ()),
-            handle.continuable_work(scope, fence, 1).await.map(|_| ()),
+            handle
+                .continuable_work(scope, authority, 1)
+                .await
+                .map(|_| ()),
             handle.drain().await,
         ]
     }

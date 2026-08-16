@@ -197,6 +197,16 @@ fn validate_registered(
             Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
         };
     }
+    if envelope.payload_type() == crate::scope::GRANT_ACTIVATED_PAYLOAD_TYPE {
+        let activated =
+            crate::scope::decode_grant_activated_event(encoded.stored_bytes(), key, scope)
+                .map_err(ScopeEventPublicationError::Invalid)?;
+        return if activated.envelope() == envelope {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
+    }
     #[cfg(test)]
     if envelope.payload_type() == crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE {
         let decoded = decode_scope_event::<Value>(encoded.stored_bytes(), key, scope, None)

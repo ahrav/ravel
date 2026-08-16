@@ -31,8 +31,8 @@ use crate::{
         work::{WorkId, WorkRef},
     },
     scope::{
-        Digest, EventEnvelope, ScopeClaimIdentity, ScopeEventRef, ScopeHead, ScopeIdentity,
-        payload_type_registered,
+        Digest, EventEnvelope, GrantActivatedPayload, ScopeClaimIdentity, ScopeEventRef, ScopeHead,
+        ScopeIdentity, payload_type_registered,
     },
 };
 
@@ -57,6 +57,10 @@ const EVENT_AT_SEQUENCE_SQL: &str =
     "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
 const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
+/// `issue()`'s pre-append probe: an operation id already applied means this issuance committed
+/// on an earlier attempt, so the retry must not append a duplicate event.
+const OPERATION_RECORDED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
+     WHERE scope_id = ?1 AND operation_id = ?2)";
 const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
 const SCOPE_UPDATE_SQL: &str = "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2, \
@@ -79,7 +83,13 @@ const ADMIT_WORK_SQL: &str = "INSERT INTO admitted_work \
      WHERE admitted_scope_epoch <= ?5 AND plan_digest = ?4";
 const ADMITTED_REVISION_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM admitted_work \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3)";
+/// Enumerates the rows a rebuild's claim reader must consult; replayed admissions are the only
+/// source of work identity, so no object listing exists anywhere in the read path.
+const ADMITTED_WORK_REFS_SQL: &str = "SELECT work_id, work_revision FROM admitted_work \
+     WHERE scope_id = ?1 ORDER BY work_id, work_revision";
 const PROJECTED_SCOPE_EPOCH_SQL: &str = "SELECT scope_epoch FROM scopes WHERE scope_id = ?1";
+const CLAIMS_RESTORED_SQL: &str = "SELECT claims_restored FROM scopes WHERE scope_id = ?1";
+const MARK_CLAIMS_RESTORED_SQL: &str = "UPDATE scopes SET claims_restored = 1 WHERE scope_id = ?1";
 const OBJECTIVE_SQL: &str = "SELECT objective_digest FROM scopes WHERE scope_id = ?1";
 const OBSERVATION_FACT_SQL: &str =
     "SELECT digest, payload_type FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
@@ -88,31 +98,27 @@ const ADMIT_PLAN_SQL: &str = "UPDATE scopes \
      SET active_plan_digest = ?2, reserved_budget_units = ?3 \
      WHERE scope_id = ?1 AND active_plan_digest IS NULL";
 /// A grant is bound to the exact claim fence it was issued for, so a reclaimed work revision
-/// cannot continue under a grant minted for the fence it superseded. Recording also requires the
-/// issuing authority's plan to match the scope row, its epoch to be no older than the projected
-/// one, a live claim lease at `?7`, and a grant deadline no later than the admitted work
-/// deadline. The projected epoch may lag an eventless authority transition, hence `<=`.
+/// cannot continue under a grant minted for the fence it superseded. Admissibility also requires
+/// the issuing authority's plan to match the scope row, its epoch to be no older than the
+/// projected one, a live claim lease at `?7`, and a grant deadline no later than the admitted
+/// work deadline. The projected epoch may lag an eventless authority transition, hence `<=`.
 ///
-/// `?6 > ?7` refuses a grant whose own deadline has already passed, so an expired object cannot be
-/// activated and cannot charge units for authority nobody can use.
-///
-/// The grant's own deadline is stored with the other grant columns so `continuable_work` can
-/// exclude authority that has already died; re-recording the identical object at the same fence
-/// carries the same deadline (the digest pins the object), so the SET needs no CASE.
+/// `?6 > ?7` refuses a grant whose own deadline has already passed, so an expired object cannot
+/// be activated and cannot charge units for authority nobody can use.
 ///
 /// Attempts are consumed, not merely labelled: `granted_attempt` records the last attempt this
 /// revision drew, a new fence must name a strictly higher one, and `?9 <= max_attempts` caps the
-/// series. Re-recording the identical object at the same fence repeats its attempt and draws
-/// nothing; a different object at an already-granted fence is refused.
+/// series. The identical object at the same fence repeats its attempt and draws nothing; a
+/// different object at an already-granted fence is refused.
 ///
 /// `granted_units` accumulates every grant this revision has drawn, so successive fences add up
-/// instead of replacing one another, and the running total plus every sibling revision's must stay
-/// within `reserved_budget_units`.
-const RECORD_GRANT_SQL: &str = "UPDATE admitted_work \
-     SET grant_fence = ?4, grant_digest = ?11, granted_attempt = ?9, \
-         grant_deadline_unix_ms = ?6, \
-         granted_units = CASE WHEN grant_fence = ?4 AND grant_digest = ?11 \
-             THEN granted_units ELSE COALESCE(granted_units, 0) + ?10 END \
+/// instead of replacing one another, and the running total plus every sibling revision's must
+/// stay within `reserved_budget_units`.
+///
+/// This SELECT is `issue()`'s dry-run: the same predicates the guarded grant UPDATE used to
+/// enforce, evaluated before the activation event is appended. After the event commits, the
+/// fold applies its facts unconditionally.
+const GRANT_ADMISSIBLE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM admitted_work \
      WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
        AND terminal_result_digest IS NULL AND claim_fence = ?4 \
        AND claim_lease_until > ?7 \
@@ -130,7 +136,23 @@ const RECORD_GRANT_SQL: &str = "UPDATE admitted_work \
                   AND NOT (sibling.work_id = ?2 AND sibling.work_revision = ?3)) \
            <= (SELECT reserved_budget_units FROM scopes WHERE scope_id = ?1) \
        AND EXISTS(SELECT 1 FROM scopes WHERE scope_id = ?1 \
-             AND active_plan_digest = ?5 AND scope_epoch <= ?8)";
+             AND active_plan_digest = ?5 AND scope_epoch <= ?8))";
+/// The fold applies one committed `grant_activated` event as fact: issuance-time guards ran
+/// before the event was appended, so no arm here re-checks lease liveness, fences, attempts, or
+/// budget. The applied-events cursor already refuses a replayed sequence, so the accumulation
+/// cannot run twice for one event.
+const FOLD_GRANT_SQL: &str = "UPDATE admitted_work \
+     SET grant_fence = ?4, grant_digest = ?5, granted_attempt = ?6, \
+         grant_deadline_unix_ms = ?7, \
+         granted_units = COALESCE(granted_units, 0) + ?8 \
+     WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3";
+/// The re-record probe keeps the test-only `record_grant` faithful to the event path: an
+/// identical object at an already-granted fence is the probe-skipped duplicate, which draws
+/// nothing instead of folding again.
+#[cfg(test)]
+const GRANT_RERECORD_SQL: &str = "SELECT EXISTS(SELECT 1 FROM admitted_work \
+     WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3 \
+       AND grant_fence = ?4 AND grant_digest = ?5)";
 /// A restart continues a revision only while every binding is still current: the admitting epoch
 /// is not ahead of the controller's `?2`, the revision carries no terminal evidence, its deadline
 /// is still ahead of `?3`, its claim lease is live at `?3`, a grant is bound to that exact claim
@@ -219,6 +241,11 @@ CREATE TABLE scopes (
     scope_epoch INTEGER NOT NULL,
     objective_digest TEXT NOT NULL,
     reserved_budget_units INTEGER,
+    -- Claim columns live only in worker-published objects, so a rebuilt projection must read
+    -- them back. The flag stays 0 until one refresh completes that restore, and a crash or
+    -- storage failure mid-restore leaves it 0 so the next refresh retries the reader.
+    claims_restored INTEGER NOT NULL,
+    CHECK (claims_restored IN (0, 1)),
     CHECK (length(scope_id) = 64 AND length(CAST(scope_id AS BLOB)) = 64
         AND scope_id NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(CAST(campaign_id AS BLOB)) BETWEEN 1 AND 128
@@ -402,6 +429,9 @@ pub enum ApplyError {
     Full,
     /// Emitted by [`crate::db::worker::DbHandle`] when its receiver is disconnected.
     Stopping,
+    /// The supplied controller authority is stopped or the projection already advanced past its
+    /// epoch; either way it authorizes nothing, and the caller reacquires instead of retrying.
+    StaleAuthority,
     DatabaseOperationFailed,
 }
 
@@ -411,6 +441,7 @@ impl fmt::Display for ApplyError {
             Self::Conflict => "scope event conflicts with local projection state",
             Self::Full => "scope database command queue is full",
             Self::Stopping => "scope database worker is stopping",
+            Self::StaleAuthority => "controller authority is stopped or superseded",
             Self::DatabaseOperationFailed => "scope database operation failed",
         })
     }
@@ -435,6 +466,10 @@ pub(crate) enum ScopeProjectionPayload {
     PlanAdmitted {
         plan_digest: Digest,
         proposal: Box<PlanProposal>,
+    },
+    /// Carries every grant fact the fold writes, so the projection needs no grant-object read.
+    GrantActivated {
+        payload: GrantActivatedPayload,
     },
     #[cfg(test)]
     TestSuccessor,
@@ -901,6 +936,9 @@ pub(crate) struct GrantActivation {
     pub(crate) digest: Digest,
 }
 
+/// Evaluates the issuance guards without writing anything: the projection changes only when the
+/// committed activation event folds.
+///
 /// # Errors
 ///
 /// Returns [`ApplyError::Conflict`] when the revision is unknown, terminal, claimed at another
@@ -910,14 +948,14 @@ pub(crate) struct GrantActivation {
 /// another object already holds this fence, or when the scope's active plan is not the identity's
 /// or the projected epoch is ahead of `scope_epoch`; and
 /// [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
-pub(crate) fn record_grant(
+pub(crate) fn grant_admissible(
     connection: &rusqlite::Connection,
     identity: &ScopeClaimIdentity,
     activation: &GrantActivation,
     now_ms: u64,
 ) -> Result<(), ApplyError> {
-    let updated = connection.execute(
-        RECORD_GRANT_SQL,
+    let admissible: bool = connection.query_row(
+        GRANT_ADMISSIBLE_SQL,
         params![
             identity.scope().scope_id().as_str(),
             identity.work().id().as_str(),
@@ -930,6 +968,55 @@ pub(crate) fn record_grant(
             stored_u64(activation.attempt.get())?,
             stored_u64(activation.units.get())?,
             activation.digest.as_str(),
+        ],
+        |row| row.get(0),
+    )?;
+    if admissible {
+        Ok(())
+    } else {
+        Err(ApplyError::Conflict)
+    }
+}
+
+/// Test-only guarded recording; production activation goes dry-run, event append, then fold.
+///
+/// # Errors
+///
+/// Returns exactly [`grant_admissible`]'s errors; a passing re-record of the identical object at
+/// the same fence draws nothing.
+#[cfg(test)]
+pub(crate) fn record_grant(
+    connection: &rusqlite::Connection,
+    identity: &ScopeClaimIdentity,
+    activation: &GrantActivation,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
+    grant_admissible(connection, identity, activation, now_ms)?;
+    let rerecord: bool = connection.query_row(
+        GRANT_RERECORD_SQL,
+        params![
+            identity.scope().scope_id().as_str(),
+            identity.work().id().as_str(),
+            stored_u64(identity.work().revision())?,
+            stored_u64(identity.claim_fence().get())?,
+            activation.digest.as_str(),
+        ],
+        |row| row.get(0),
+    )?;
+    if rerecord {
+        return Ok(());
+    }
+    let updated = connection.execute(
+        FOLD_GRANT_SQL,
+        params![
+            identity.scope().scope_id().as_str(),
+            identity.work().id().as_str(),
+            stored_u64(identity.work().revision())?,
+            stored_u64(identity.claim_fence().get())?,
+            activation.digest.as_str(),
+            stored_u64(activation.attempt.get())?,
+            stored_u64(activation.deadline_unix_ms.get())?,
+            stored_u64(activation.units.get())?,
         ],
     )?;
     if updated == 1 {
@@ -958,7 +1045,7 @@ impl ContinuableWork {
         self.claim_fence
     }
 
-    /// `grant_digest` identifies the grant that [`record_grant`] activated at
+    /// `grant_digest` identifies the grant whose `grant_activated` fold landed at
     /// [`Self::claim_fence`].
     pub fn grant_digest(&self) -> &Digest {
         &self.grant_digest
@@ -975,7 +1062,9 @@ impl ContinuableWork {
 ///
 /// # Errors
 ///
-/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a stored row cannot be
+/// Returns [`ApplyError::StaleAuthority`] when the projected scope epoch is ahead of
+/// `scope_epoch`, which proves the supplied authority superseded rather than the set empty, and
+/// [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a stored row cannot be
 /// converted back into a validated work reference.
 pub(crate) fn continuable_work(
     connection: &rusqlite::Connection,
@@ -983,6 +1072,20 @@ pub(crate) fn continuable_work(
     scope_epoch: NonZeroU64,
     now_ms: u64,
 ) -> Result<Vec<ContinuableWork>, ApplyError> {
+    let projected: Option<i64> = connection
+        .query_row(
+            PROJECTED_SCOPE_EPOCH_SQL,
+            [scope.scope_id().as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // A projection ahead of the caller's epoch was written under newer authority; answering
+    // with rows (or none) would let a superseded controller mistake supersession for idleness.
+    if let Some(projected) = projected
+        && !u64::try_from(projected).is_ok_and(|epoch| epoch <= scope_epoch.get())
+    {
+        return Err(ApplyError::StaleAuthority);
+    }
     let mut statement = connection.prepare(CONTINUABLE_WORK_SQL)?;
     let rows = statement
         .query_map(
@@ -1062,8 +1165,77 @@ fn work_refs(rows: Vec<(String, i64)>) -> Result<Vec<WorkRef>, ApplyError> {
         .collect()
 }
 
+/// Lists every admitted `(work, revision)` row of one scope.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails or a stored row cannot be
+/// converted back into a validated work reference.
+pub(crate) fn admitted_work_refs(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+) -> Result<Vec<WorkRef>, ApplyError> {
+    let mut statement = connection.prepare(ADMITTED_WORK_REFS_SQL)?;
+    let rows = statement
+        .query_map([scope.scope_id().as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    work_refs(rows)
+}
+
+/// Reports whether one scope already applied an event under `operation_id`.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
+pub(crate) fn scope_operation_recorded(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+    operation_id: &str,
+) -> Result<bool, ApplyError> {
+    connection
+        .query_row(
+            OPERATION_RECORDED_SQL,
+            params![scope.scope_id().as_str(), operation_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 fn stored_u64(value: u64) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::DatabaseOperationFailed)
+}
+
+/// # Errors
+///
+/// Returns [`ApplyError::DatabaseOperationFailed`] when the scope row is missing or SQLite
+/// fails.
+pub(crate) fn claims_restored(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+) -> Result<bool, ApplyError> {
+    connection
+        .query_row(CLAIMS_RESTORED_SQL, [scope.scope_id().as_str()], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
+}
+
+/// # Errors
+///
+/// Returns [`ApplyError::Conflict`] when the scope row is missing and
+/// [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
+pub(crate) fn mark_claims_restored(
+    connection: &rusqlite::Connection,
+    scope: &ScopeIdentity,
+) -> Result<(), ApplyError> {
+    let updated = connection.execute(MARK_CLAIMS_RESTORED_SQL, [scope.scope_id().as_str()])?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(ApplyError::Conflict)
+    }
 }
 
 pub(crate) fn apply_scope_event(
@@ -1132,8 +1304,8 @@ pub(crate) fn apply_scope_event(
             transaction.execute(
                 "INSERT INTO scopes (scope_id, campaign_id, parent_scope_id, delegation_digest, \
                  sequence, tail_event_digest, active_plan_digest, scope_epoch, objective_digest, \
-                 reserved_budget_units) \
-                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, ?5, ?6, NULL)",
+                 reserved_budget_units, claims_restored) \
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, ?5, ?6, NULL, 0)",
                 params![
                     scope_id,
                     event.scope.campaign_id().as_str(),
@@ -1186,6 +1358,27 @@ pub(crate) fn apply_scope_event(
     } = &event.payload
     {
         admit_plan(&transaction, event, plan_digest, proposal)?;
+    }
+
+    // A committed activation event is fact (I2): rowcount 0 means the history names a revision
+    // no admission produced, which a well-formed chain cannot do.
+    if let ScopeProjectionPayload::GrantActivated { payload } = &event.payload {
+        let updated = transaction.execute(
+            FOLD_GRANT_SQL,
+            params![
+                scope_id,
+                payload.work().id().as_str(),
+                stored_u64(payload.work().revision())?,
+                stored_u64(payload.claim_fence().get())?,
+                payload.grant_digest().as_str(),
+                stored_u64(payload.attempt().get())?,
+                stored_u64(payload.deadline_unix_ms().get())?,
+                stored_u64(payload.units().get())?,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(ApplyError::Conflict);
+        }
     }
 
     let duplicate: bool = transaction.query_row(
@@ -1768,11 +1961,32 @@ mod tests {
             query_plan(&connection, CLAIMABLE_WORK_SQL, &[&scope_id, &sequence]),
             query_plan(
                 &connection,
-                RECORD_GRANT_SQL,
+                GRANT_ADMISSIBLE_SQL,
                 &[
                     &scope_id, &work_id, &revision, &sequence, &digest, &sequence, &sequence,
                     &sequence, &sequence, &sequence, &digest,
                 ],
+            ),
+            query_plan(
+                &connection,
+                FOLD_GRANT_SQL,
+                &[
+                    &scope_id, &work_id, &revision, &sequence, &digest, &sequence, &sequence,
+                    &sequence,
+                ],
+            ),
+            query_plan(
+                &connection,
+                GRANT_RERECORD_SQL,
+                &[&scope_id, &work_id, &revision, &sequence, &digest],
+            ),
+            query_plan(&connection, ADMITTED_WORK_REFS_SQL, &[&scope_id]),
+            query_plan(&connection, CLAIMS_RESTORED_SQL, &[&scope_id]),
+            query_plan(&connection, MARK_CLAIMS_RESTORED_SQL, &[&scope_id]),
+            query_plan(
+                &connection,
+                OPERATION_RECORDED_SQL,
+                &[&scope_id, &operation],
             ),
             query_plan(
                 &connection,
@@ -2274,6 +2488,160 @@ mod tests {
         let (db_path, connection, scope) = genesis_scope(label);
         seed_active_plan(&connection, &scope, 1);
         (db_path, connection, scope)
+    }
+
+    #[test]
+    fn a_grant_activation_for_an_unadmitted_revision_applies_nothing() {
+        let (db_path, mut connection, scope) = admitted_scope("grant-fold-unadmitted");
+        admit(&mut connection, &scope, &work("work-a", 1), &[], epoch(1)).unwrap();
+
+        // Revision 2 of work-a was never admitted, so the fold updates zero rows.
+        let payload = GrantActivatedPayload::new(
+            work("work-a", 2),
+            2,
+            Digest::new(DIGEST_3.into()).unwrap(),
+            1,
+            5,
+            60_000,
+        )
+        .unwrap();
+        let envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            2,
+            Some(ScopeEventRef::new(1, Digest::new(DIGEST_1.into()).unwrap()).unwrap()),
+            1,
+            "grant-op-2".into(),
+            crate::scope::GRANT_ACTIVATED_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let event = ScopeProjectionEvent::new(
+            scope.clone(),
+            envelope,
+            ScopeEventRef::new(2, Digest::new(DIGEST_2.into()).unwrap()).unwrap(),
+            ScopeProjectionPayload::GrantActivated { payload },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_scope_event(&mut connection, &event),
+            Err(ApplyError::Conflict)
+        );
+        // The fold and the cursor advance share one transaction, so the refused event leaves
+        // no trace: the cursor still names genesis and no event row exists at sequence 2.
+        assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 1);
+        let recorded: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
+                 WHERE scope_id = ?1 AND sequence = 2)",
+                [scope.scope_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!recorded);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn a_grant_activation_event_folds_exactly_once() {
+        let (db_path, mut connection, scope) = admitted_scope("grant-fold-once");
+        admit(&mut connection, &scope, &work("work-a", 1), &[], epoch(1)).unwrap();
+
+        let grant_event = |sequence: u64,
+                           parent: &str,
+                           digest: &str,
+                           target: WorkRef,
+                           fence: u64,
+                           attempt: u64,
+                           units: u64| {
+            let payload = GrantActivatedPayload::new(
+                target,
+                fence,
+                Digest::new(DIGEST_3.into()).unwrap(),
+                attempt,
+                units,
+                60_000,
+            )
+            .unwrap();
+            let envelope = EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(
+                    ScopeEventRef::new(sequence - 1, Digest::new(parent.into()).unwrap()).unwrap(),
+                ),
+                1,
+                format!("grant-op-{sequence}"),
+                crate::scope::GRANT_ACTIVATED_PAYLOAD_TYPE.into(),
+            )
+            .unwrap();
+            ScopeProjectionEvent::new(
+                scope.clone(),
+                envelope,
+                ScopeEventRef::new(sequence, Digest::new(digest.into()).unwrap()).unwrap(),
+                ScopeProjectionPayload::GrantActivated { payload },
+                1,
+            )
+            .unwrap()
+        };
+        let grant_columns = |connection: &rusqlite::Connection| {
+            connection
+                .query_row(
+                    "SELECT grant_fence, grant_digest, granted_attempt, granted_units, \
+                     grant_deadline_unix_ms FROM admitted_work \
+                     WHERE scope_id = ?1 AND work_id = 'work-a' AND work_revision = 1",
+                    [scope.scope_id().as_str()],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+
+        // The fold is a fact application: no claim exists, and it lands anyway.
+        let first = grant_event(2, DIGEST_1, DIGEST_2, work("work-a", 1), 2, 1, 5);
+        assert_eq!(
+            apply_scope_event(&mut connection, &first),
+            Ok(ApplyOutcome::Applied)
+        );
+        let after = grant_columns(&connection);
+        assert_eq!(after, (2, DIGEST_3.to_owned(), 1, 5, 60_000));
+
+        // A replayed sequence is recognised, so the running total cannot double-accumulate.
+        assert_eq!(
+            apply_scope_event(&mut connection, &first),
+            Ok(ApplyOutcome::AlreadyApplied)
+        );
+        assert_eq!(grant_columns(&connection), after);
+
+        // A later fence accumulates units instead of replacing them.
+        let second = grant_event(3, DIGEST_2, DIGEST_3, work("work-a", 1), 3, 2, 7);
+        assert_eq!(
+            apply_scope_event(&mut connection, &second),
+            Ok(ApplyOutcome::Applied)
+        );
+        assert_eq!(
+            grant_columns(&connection),
+            (3, DIGEST_3.to_owned(), 2, 12, 60_000)
+        );
+
+        // An event naming an unadmitted revision is a conflict, and nothing commits.
+        let missing = grant_event(4, DIGEST_3, DIGEST_1, work("work-x", 1), 4, 3, 1);
+        assert_eq!(
+            apply_scope_event(&mut connection, &missing),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 3);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
     }
 
     #[test]
@@ -3272,6 +3640,39 @@ mod tests {
             admit(&mut connection, &scope, &target, &[], epoch(2)),
             Err(ApplyError::Conflict)
         );
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn a_sibling_draw_counts_against_the_scope_reservation() {
+        let (db_path, mut connection, scope) = admitted_scope("grant-sibling-budget");
+        seed_active_plan(&connection, &scope, 3);
+        let sibling = work("work-a", 1);
+        let target = work("work-b", 1);
+        let fence = NonZeroU64::new(2).unwrap();
+        let lease = NonZeroU64::new(31_000).unwrap();
+        let deadline = NonZeroU64::new(MAX_STORED_INTEGER).unwrap();
+        admit(&mut connection, &scope, &sibling, &[], epoch(3)).unwrap();
+        admit(&mut connection, &scope, &target, &[], epoch(3)).unwrap();
+        record_claim(&connection, &scope, &sibling, fence, lease, 1_000).unwrap();
+        record_claim(&connection, &scope, &target, fence, lease, 1_000).unwrap();
+
+        // The reservation is scope-wide, not per revision: after the sibling draws 60 of the
+        // 100 reserved units, a 41-unit grant that is fine in isolation must be refused.
+        grant_bounded(&connection, &scope, &sibling, fence, 3, deadline, 1, 60).unwrap();
+        assert_eq!(
+            grant_bounded(&connection, &scope, &target, fence, 3, deadline, 1, 41),
+            Err(ApplyError::Conflict)
+        );
+        // The refusal draws nothing from either revision.
+        assert_eq!(granted_units(&connection, &sibling), Some(60));
+        assert_eq!(granted_units(&connection, &target), None);
+        // The remaining 40 units are still drawable.
+        grant_bounded(&connection, &scope, &target, fence, 3, deadline, 1, 40).unwrap();
+        assert_eq!(granted_units(&connection, &sibling), Some(60));
+        assert_eq!(granted_units(&connection, &target), Some(40));
 
         drop(connection);
         fs::remove_file(db_path).unwrap();

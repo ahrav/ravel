@@ -17,8 +17,9 @@ use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 use crate::{
     domain::proposal::AdmissibleProposal,
     scope::{
-        EventEnvelope, MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PlanAdmittedEvent,
-        ScopeAuthority, ScopeHead, ScopeIdentity, decode_head, decode_plan_admitted_event,
+        EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent, GrantActivatedPayload,
+        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PlanAdmittedEvent, ScopeAuthority, ScopeHead,
+        ScopeIdentity, decode_head, decode_plan_admitted_event, encode_grant_activated_event,
         encode_head, encode_plan_admitted_event, plan_key, scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
@@ -204,8 +205,10 @@ impl ScopeHeadTransition {
 #[must_use]
 /// Result of conditional head publication and retained-chain reconciliation.
 pub enum ScopeHeadCommitOutcome {
-    /// Candidate is the authoritative head.
-    Committed,
+    /// Candidate is the authoritative head. Carries the committed observation when the write
+    /// (or its resolution read) yielded an ETag, so a caller can chain the next conditional
+    /// write without rereading.
+    Committed(Option<Box<ObservedScopeHead>>),
     /// Candidate is proven in the retained ancestry below a newer head.
     CommittedSuperseded,
     /// The traversal reaches the original parent or genesis boundary without finding
@@ -352,6 +355,89 @@ pub async fn append_plan_admitted(
     Ok(commit(store, transition, head_history).await)
 }
 
+/// Bindings of one published grant-activation event, returned beside the commit outcome so the
+/// issuer can fold the same event into its local projection.
+pub(crate) struct GrantActivatedAppend {
+    pub(crate) outcome: ScopeHeadCommitOutcome,
+    pub(crate) envelope: EventEnvelope,
+    pub(crate) reference: crate::scope::ScopeEventRef,
+}
+
+/// Publishes the grant-activation event and commits the head that appends it.
+///
+/// The grant object itself is already published by the issuer; this appends only the durable
+/// activation fact. The candidate head keeps the parent's authority, epoch, and active plan,
+/// moving only the tail and operation identity. Each activation permanently spends one of the
+/// 4,096 lifetime replay events; replay's `Overflow` bound is the check.
+///
+/// # Errors
+///
+/// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent, an unrepresentable sequence,
+/// an invalid envelope or payload binding, or an invalid transition, and publication errors
+/// verbatim.
+pub(crate) async fn append_grant_activated(
+    store: &S3Store,
+    parent: ScopeHeadParent,
+    scope: &ScopeIdentity,
+    payload: &GrantActivatedPayload,
+    operation_id: &str,
+    event_history: &mut AttemptHistory,
+    head_history: &mut AttemptHistory,
+) -> Result<GrantActivatedAppend, ScopeAppendError> {
+    let ScopeHeadParent::Existing(observed) = &parent else {
+        // Activation always succeeds an owned head, so there is a parent to fence against.
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    let sequence = observed
+        .head()
+        .tail()
+        .sequence()
+        .checked_add(1)
+        .ok_or(ScopeAppendError::InvalidInput)?;
+    let event = GrantActivatedEvent::new(
+        EventEnvelope::new(
+            scope.scope_id().clone(),
+            sequence,
+            Some(observed.head().tail().clone()),
+            observed.head().scope_epoch().get(),
+            operation_id.to_owned(),
+            GRANT_ACTIVATED_PAYLOAD_TYPE.to_owned(),
+        )
+        .map_err(|_| ScopeAppendError::InvalidInput)?,
+        payload.clone(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let (authority, scope_epoch) = (
+        observed.head().authority().clone(),
+        observed.head().scope_epoch().get(),
+    );
+    let active_plan = observed.head().active_plan_digest().cloned();
+    let encoded = encode_grant_activated_event(&event)
+        .map_err(ScopeEventPublicationError::Invalid)
+        .map_err(ScopeAppendError::Publication)?;
+    let publication = publish_encoded(store, scope, event.envelope(), encoded, event_history)
+        .await
+        .map_err(ScopeAppendError::Publication)?;
+    let candidate = ScopeHead::new(
+        scope.clone(),
+        authority,
+        scope_epoch,
+        publication.event_ref().clone(),
+        active_plan,
+        operation_id.to_owned(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let envelope = event.envelope().clone();
+    let reference = publication.event_ref().clone();
+    let transition = ScopeHeadTransition::new(parent, candidate, publication)
+        .map_err(|_| ScopeAppendError::InvalidInput)?;
+    Ok(GrantActivatedAppend {
+        outcome: commit(store, transition, head_history).await,
+        envelope,
+        reference,
+    })
+}
+
 /// Publishes immutable event bytes before validating or mutating the head.
 ///
 /// The event's `writer_epoch` must equal the parent head's `scope_epoch`, which is 1 at genesis;
@@ -461,7 +547,19 @@ pub async fn commit(
         }
     };
     match outcome {
-        MutationOutcome::Committed { .. } => ScopeHeadCommitOutcome::Committed,
+        MutationOutcome::Committed { etag } => {
+            // The witness lets the committer chain its next conditional write; a response
+            // without a token commits with no witness and the caller rereads if it needs one.
+            let observed = etag.map(|etag| {
+                Box::new(ObservedScopeHead::proven(
+                    transition.candidate,
+                    transition.head_bytes,
+                    etag,
+                    store.namespace().to_owned(),
+                ))
+            });
+            ScopeHeadCommitOutcome::Committed(observed)
+        }
         MutationOutcome::ProvenNotSent => ScopeHeadCommitOutcome::RetryIdentically(transition),
         MutationOutcome::Conflict
         | MutationOutcome::PreconditionFailed
@@ -503,7 +601,7 @@ async fn resolve(store: &S3Store, mut transition: ScopeHeadTransition) -> ScopeH
                 if bytes == transition.event.canonical_bytes()
                     && decoded.envelope() == transition.event.envelope() =>
             {
-                ScopeHeadCommitOutcome::Committed
+                ScopeHeadCommitOutcome::Committed(Some(Box::new(current)))
             }
             _ => ScopeHeadCommitOutcome::Unresolved(transition),
         };
@@ -753,7 +851,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            ScopeHeadCommitOutcome::Committed
+            ScopeHeadCommitOutcome::Committed(_)
         ));
         let requests = client.actual_requests().collect::<Vec<_>>();
         assert_eq!(requests.len(), 2);
@@ -796,7 +894,7 @@ mod tests {
                 &mut AttemptHistory::default()
             )
             .await,
-            ScopeHeadCommitOutcome::Committed
+            ScopeHeadCommitOutcome::Committed(_)
         ));
         assert_eq!(
             client
@@ -953,7 +1051,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                matches!(outcome, ScopeHeadCommitOutcome::Committed),
+                matches!(outcome, ScopeHeadCommitOutcome::Committed(_)),
                 exact_event
             );
             assert_eq!(
@@ -1101,7 +1199,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                matches!(outcome, ScopeHeadCommitOutcome::Committed),
+                matches!(outcome, ScopeHeadCommitOutcome::Committed(_)),
                 committed
             );
             assert_eq!(
@@ -1899,7 +1997,7 @@ mod tests {
                 &mut AttemptHistory::default()
             )
             .await,
-            ScopeHeadCommitOutcome::Committed
+            ScopeHeadCommitOutcome::Committed(_)
         ));
     }
 
@@ -2196,7 +2294,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            ScopeHeadCommitOutcome::Committed
+            ScopeHeadCommitOutcome::Committed(_)
         ));
         let requests = client.actual_requests().collect::<Vec<_>>();
         assert_eq!(requests.len(), 4);

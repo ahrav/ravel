@@ -15,14 +15,16 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     distributed::identity::{InstanceId, WorkspaceId},
     domain::{
+        proposal::MAX_STORED_INTEGER,
         validation::{ValidationError, is_digest, validate_key_segment, validate_sequence},
-        work::WorkRef,
+        work::{WorkId, WorkRef},
     },
     sync::WireError,
 };
 
 pub(crate) const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
 pub(crate) const PLAN_ADMITTED_PAYLOAD_TYPE: &str = "plan_admitted";
+pub(crate) const GRANT_ACTIVATED_PAYLOAD_TYPE: &str = "grant_activated";
 #[cfg(test)]
 pub(crate) const TEST_SUCCESSOR_PAYLOAD_TYPE: &str = "test_successor";
 const ROOT_SCOPE_DOMAIN: &[u8] = b"ravel.scope.root\0";
@@ -369,6 +371,102 @@ impl PlanAdmittedEvent {
     }
 
     pub fn payload(&self) -> &PlanAdmittedPayload {
+        &self.payload
+    }
+}
+
+/// Payload of the event that activates one issued grant.
+///
+/// It carries every fact the projection's grant columns store, so a rebuild folds the event
+/// without reading the grant object back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantActivatedPayload {
+    work: WorkRef,
+    claim_fence: NonZeroU64,
+    grant_digest: Digest,
+    attempt: NonZeroU64,
+    units: NonZeroU64,
+    deadline_unix_ms: NonZeroU64,
+}
+
+impl GrantActivatedPayload {
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::OutOfRange`] when the revision, fence, attempt, units, or
+    /// deadline is zero or exceeds the stored-integer range.
+    pub fn new(
+        work: WorkRef,
+        claim_fence: u64,
+        grant_digest: Digest,
+        attempt: u64,
+        units: u64,
+        deadline_unix_ms: u64,
+    ) -> Result<Self, ValidationError> {
+        let bounded = |value: u64| {
+            NonZeroU64::new(value)
+                .filter(|value| value.get() <= MAX_STORED_INTEGER)
+                .ok_or(ValidationError::OutOfRange)
+        };
+        bounded(work.revision())?;
+        Ok(Self {
+            work,
+            claim_fence: bounded(claim_fence)?,
+            grant_digest,
+            attempt: bounded(attempt)?,
+            units: bounded(units)?,
+            deadline_unix_ms: bounded(deadline_unix_ms)?,
+        })
+    }
+
+    pub fn work(&self) -> &WorkRef {
+        &self.work
+    }
+
+    pub fn claim_fence(&self) -> NonZeroU64 {
+        self.claim_fence
+    }
+
+    pub fn grant_digest(&self) -> &Digest {
+        &self.grant_digest
+    }
+
+    pub fn attempt(&self) -> NonZeroU64 {
+        self.attempt
+    }
+
+    pub fn units(&self) -> NonZeroU64 {
+        self.units
+    }
+
+    pub fn deadline_unix_ms(&self) -> NonZeroU64 {
+        self.deadline_unix_ms
+    }
+}
+
+/// One validated grant-activation event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantActivatedEvent {
+    envelope: EventEnvelope,
+    payload: GrantActivatedPayload,
+}
+
+impl GrantActivatedEvent {
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidValue`] unless the envelope carries the `grant_activated`
+    /// payload type at a sequence above genesis.
+    pub fn new(envelope: EventEnvelope, payload: GrantActivatedPayload) -> Result<Self, WireError> {
+        if envelope.payload_type() != GRANT_ACTIVATED_PAYLOAD_TYPE || envelope.sequence() < 2 {
+            return Err(WireError::InvalidValue);
+        }
+        Ok(Self { envelope, payload })
+    }
+
+    pub fn envelope(&self) -> &EventEnvelope {
+        &self.envelope
+    }
+
+    pub fn payload(&self) -> &GrantActivatedPayload {
         &self.payload
     }
 }
@@ -759,6 +857,18 @@ struct WirePlanAdmittedPayload {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct WireGrantActivatedPayload {
+    work_id: String,
+    work_revision: u64,
+    claim_fence: u64,
+    grant_digest: String,
+    attempt: u64,
+    units: u64,
+    deadline_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct WireRootGenesisPayload {
     campaign_id: String,
     parent_scope_id: Option<String>,
@@ -956,6 +1066,86 @@ pub fn encode_plan_admitted_event(
     )
 }
 
+/// Encodes one validated grant-activation event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for serialization, compression, or size-limit failures.
+pub fn encode_grant_activated_event(
+    event: &GrantActivatedEvent,
+) -> Result<EncodedScopeEvent, WireError> {
+    encode_scope_event(
+        event.envelope(),
+        &WireGrantActivatedPayload {
+            work_id: event.payload().work().id().as_str().to_owned(),
+            work_revision: event.payload().work().revision(),
+            claim_fence: event.payload().claim_fence().get(),
+            grant_digest: event.payload().grant_digest().as_str().to_owned(),
+            attempt: event.payload().attempt().get(),
+            units: event.payload().units().get(),
+            deadline_unix_ms: event.payload().deadline_unix_ms().get(),
+        },
+    )
+}
+
+/// Converts one opaque decoded event into a grant-activation event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for a payload type other than `grant_activated`, noncanonical payload
+/// bytes, or an out-of-range binding.
+pub(crate) fn grant_activated_from_decoded(
+    decoded: DecodedScopeEvent<ciborium::Value>,
+) -> Result<GrantActivatedEvent, WireError> {
+    if decoded.envelope.payload_type() != GRANT_ACTIVATED_PAYLOAD_TYPE {
+        return Err(WireError::InvalidValue);
+    }
+    let mut original = Vec::new();
+    into_writer(&decoded.payload, &mut original).map_err(|_| WireError::InvalidEncoding)?;
+    let payload: WireGrantActivatedPayload = decoded
+        .payload
+        .deserialized()
+        .map_err(|_| WireError::InvalidEncoding)?;
+    let mut canonical = Vec::new();
+    into_writer(&payload, &mut canonical).map_err(|_| WireError::InvalidEncoding)?;
+    if original != canonical {
+        return Err(WireError::NonCanonical);
+    }
+    let work = WorkRef::new(
+        WorkId::new(payload.work_id).map_err(|_| WireError::InvalidValue)?,
+        payload.work_revision,
+    );
+    let payload = GrantActivatedPayload::new(
+        work,
+        payload.claim_fence,
+        Digest::new(payload.grant_digest).map_err(|_| WireError::InvalidValue)?,
+        payload.attempt,
+        payload.units,
+        payload.deadline_unix_ms,
+    )
+    .map_err(|_| WireError::InvalidValue)?;
+    GrantActivatedEvent::new(decoded.envelope, payload)
+}
+
+/// Decodes only the exact grant-activation event for `expected_scope` at `expected_key`.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for framing, size, canonicality, identity, or key failures.
+pub fn decode_grant_activated_event(
+    stored_bytes: &[u8],
+    expected_key: &str,
+    expected_scope: &ScopeIdentity,
+) -> Result<GrantActivatedEvent, WireError> {
+    let decoded = decode_scope_event::<ciborium::Value>(
+        stored_bytes,
+        expected_key,
+        expected_scope,
+        Some(GRANT_ACTIVATED_PAYLOAD_TYPE),
+    )?;
+    grant_activated_from_decoded(decoded)
+}
+
 /// Converts one opaque decoded event into a plan-admission event.
 ///
 /// # Errors
@@ -1031,7 +1221,10 @@ pub fn decode_root_event(
 }
 
 pub(crate) fn payload_type_registered(payload_type: &str) -> bool {
-    if payload_type == ROOT_GENESIS_PAYLOAD_TYPE || payload_type == PLAN_ADMITTED_PAYLOAD_TYPE {
+    if payload_type == ROOT_GENESIS_PAYLOAD_TYPE
+        || payload_type == PLAN_ADMITTED_PAYLOAD_TYPE
+        || payload_type == GRANT_ACTIVATED_PAYLOAD_TYPE
+    {
         return true;
     }
     #[cfg(test)]
@@ -1321,6 +1514,117 @@ mod codec_tests {
                 .unwrap()
                 .stored_bytes(),
             genesis.event_bytes()
+        );
+    }
+
+    #[test]
+    fn grant_activated_events_round_trip_and_reject_corruption() {
+        use crate::domain::work::{WorkId, WorkRef};
+
+        let genesis = fixture();
+        let payload = GrantActivatedPayload::new(
+            WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1),
+            2,
+            Digest::new("ab".repeat(32)).unwrap(),
+            1,
+            5,
+            1_700_000_060_000,
+        )
+        .unwrap();
+        let event = GrantActivatedEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "grant-op-1".into(),
+                GRANT_ACTIVATED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload.clone(),
+        )
+        .unwrap();
+
+        let encoded = encode_grant_activated_event(&event).unwrap();
+        let key = scope_event_key(genesis.identity(), encoded.event_ref());
+        assert_eq!(
+            decode_grant_activated_event(encoded.stored_bytes(), &key, genesis.identity()).unwrap(),
+            event
+        );
+        // Genesis bytes are a registered event, but not this payload type.
+        assert_eq!(
+            decode_grant_activated_event(
+                genesis.event_bytes(),
+                genesis.event_key(),
+                genesis.identity()
+            ),
+            Err(WireError::InvalidValue)
+        );
+        // An activation cannot occupy the genesis sequence.
+        assert_eq!(
+            GrantActivatedEvent::new(
+                EventEnvelope::new(
+                    genesis.identity().scope_id().clone(),
+                    1,
+                    None,
+                    1,
+                    "grant-op-1".into(),
+                    GRANT_ACTIVATED_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                payload.clone(),
+            ),
+            Err(WireError::InvalidValue)
+        );
+
+        // Unknown payload fields are rejected.
+        let cbor = zstd::bulk::decompress(encoded.stored_bytes(), MAX_DECOMPRESSED_BYTES).unwrap();
+        let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+        let root = map(&mut value);
+        let nested = root
+            .iter_mut()
+            .find_map(|(key, value)| (key == &Value::Text("payload".into())).then_some(value))
+            .unwrap();
+        map(nested).push((Value::Text("extra".into()), Value::Integer(1.into())));
+        let mut extended = Vec::new();
+        into_writer(&value, &mut extended).unwrap();
+        let extended = compress(&extended).unwrap();
+        let extended_ref = ScopeEventRef::new(2, Digest::new(sha256(&extended)).unwrap()).unwrap();
+        let extended_key = scope_event_key(genesis.identity(), &extended_ref);
+        assert!(
+            decode_grant_activated_event(&extended, &extended_key, genesis.identity()).is_err()
+        );
+
+        // Every integer binding is bounded by the stored-integer range and must be nonzero.
+        let work = || WorkRef::new(WorkId::new("work-17".into()).unwrap(), 1);
+        let digest = || Digest::new("ab".repeat(32)).unwrap();
+        let max = crate::domain::proposal::MAX_STORED_INTEGER;
+        assert!(GrantActivatedPayload::new(work(), max, digest(), max, max, max).is_ok());
+        for (fence, attempt, units, deadline) in [
+            (0, 1, 1, 1),
+            (1, 0, 1, 1),
+            (1, 1, 0, 1),
+            (1, 1, 1, 0),
+            (max + 1, 1, 1, 1),
+            (1, max + 1, 1, 1),
+            (1, 1, max + 1, 1),
+            (1, 1, 1, max + 1),
+        ] {
+            assert_eq!(
+                GrantActivatedPayload::new(work(), fence, digest(), attempt, units, deadline),
+                Err(crate::domain::validation::ValidationError::OutOfRange)
+            );
+        }
+        assert_eq!(
+            GrantActivatedPayload::new(
+                WorkRef::new(WorkId::new("work-17".into()).unwrap(), 0),
+                1,
+                digest(),
+                1,
+                1,
+                1
+            ),
+            Err(crate::domain::validation::ValidationError::OutOfRange)
         );
     }
 

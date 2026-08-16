@@ -870,6 +870,16 @@ pub async fn append_batch(
         if envelope.payload_type() == GRANT_ACTIVATED_PAYLOAD_TYPE {
             return Err(ScopeAppendError::InvalidInput);
         }
+        // An artifact reference has the same shape of unwitnessable proof, twice over: its fold
+        // requires admitted work and a matching activation in the projection, and its blob's
+        // existence and contents are proven only by `append_artifact_reference`'s witness and
+        // record decode — a batch caller holds neither. A reference that won the head CAS
+        // without them could name missing or malformed bytes and poison every replay, so
+        // reference members are refused before any request: references route through
+        // `append_artifact_reference`. commentlint: allow(JUDGE)
+        if envelope.payload_type() == ARTIFACT_REFERENCE_PAYLOAD_TYPE {
+            return Err(ScopeAppendError::InvalidInput);
+        }
     }
     let active_plan = {
         let views: Vec<BatchEventView<'_>> =
@@ -4871,6 +4881,80 @@ mod tests {
             client.actual_requests().count(),
             1,
             "parent read only; the grant member is refused before any batch request"
+        );
+    }
+
+    /// An artifact reference's admission proofs — the published-artifact witness, the record
+    /// decode, and the parent-binding comparison — live in `append_artifact_reference` and
+    /// nowhere in a batch caller's hands, so the batch preflight refuses the member before
+    /// letting an unprovable reference near the head CAS.
+    #[tokio::test]
+    async fn a_batch_artifact_reference_member_is_refused_before_any_request() {
+        use crate::scope::{
+            ArtifactKind, ArtifactReferenceEvent, ArtifactReferencePayload,
+            encode_artifact_reference_event,
+        };
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "artifact-batch-op-2");
+        let (env3, enc3) = {
+            let kind = ArtifactKind::InvocationManifest;
+            let payload = ArtifactReferencePayload::new(
+                kind,
+                crate::domain::artifact::ArtifactRef::new(
+                    "cd".repeat(32),
+                    4_096,
+                    kind.media_type().into(),
+                    "attempt-1".into(),
+                    1_700_000_123_456,
+                    None,
+                )
+                .unwrap(),
+                crate::domain::work::WorkId::new("work-a".into()).unwrap(),
+                1,
+                Digest::new("ab".repeat(32)).unwrap(),
+                1,
+                None,
+            )
+            .unwrap();
+            let event = ArtifactReferenceEvent::new(
+                EventEnvelope::new(
+                    scope.scope_id().clone(),
+                    3,
+                    Some(enc2.event_ref().clone()),
+                    1,
+                    "artifact-batch-op-3".into(),
+                    ARTIFACT_REFERENCE_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                payload,
+            )
+            .unwrap();
+            let encoded = encode_artifact_reference_event(&event).unwrap();
+            (event.envelope().clone(), encoded)
+        };
+        let (store, client) = replay_store(vec![response(
+            200,
+            &[("etag", "\"parent\"")],
+            encode_head(genesis.head()).unwrap(),
+        )]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                vec![(env2, enc2), (env3, enc3)],
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert_eq!(
+            client.actual_requests().count(),
+            1,
+            "parent read only; the reference member is refused before any batch request"
         );
     }
 

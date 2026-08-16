@@ -466,7 +466,7 @@ fn wire_record(
 /// # Errors
 ///
 /// Returns [`WireError`] for malformed, noncanonical, oversized, or mismatched input.
-pub fn decode_claim(
+pub(crate) fn decode_claim(
     bytes: &[u8],
     expected_key: &str,
     expected_scope: &ScopeIdentity,

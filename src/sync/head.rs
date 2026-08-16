@@ -174,6 +174,8 @@ impl ScopeHeadTransition {
         let active_plan = {
             let views: Vec<BatchEventView<'_>> =
                 events.iter().map(BatchEventView::of_publication).collect();
+            // Re-proven after publication because `new` is public API and must be sound on its
+            // own, even for a caller that skipped `append_batch`'s preflight.
             validate_batch_chain(&parent, &views)?
         };
         // All members must be witnessed in one store namespace: `commit` compares only the stored final publication against its target store, so agreement across the batch is proven here. commentlint: allow(JUDGE)
@@ -307,6 +309,10 @@ impl<'a> BatchEventView<'a> {
 /// during lost-CAS resolution), and the active plan folded left-to-right through the one
 /// transition rule. Genesis stays a one-event transition: the first head names exactly one
 /// root event, so a wider batch has no parent boundary to chain from.
+///
+/// `validate_batch_chain` checks operation-ID distinctness within the batch and against the
+/// parent head only; replay and projection apply refuse collisions with older retained
+/// operations.
 ///
 /// Returns the active-plan digest the candidate head must carry.
 ///
@@ -632,10 +638,15 @@ pub(crate) async fn append_checkpoint(
 /// batch before the CAS. The candidate head carries the final event's operation identity, so
 /// lost-CAS resolution and reconciliation identify the batch exactly as a single append.
 ///
+/// Events are published sequentially, one create-only PUT at a time. The caller owns
+/// batch-size policy: the only enforced bound is the replay ceiling on the final sequence,
+/// so a large batch serializes that many PUTs with no intermediate progress signal.
+///
 /// # Errors
 ///
 /// Returns [`ScopeAppendError::InvalidInput`] for a genesis parent (genesis stays a one-event
-/// transition through [`append_root`]), an empty batch, any batch-internal chain violation, or
+/// transition through [`append_root`]), an empty batch, any batch-internal chain violation, a
+/// projection-checkpoint member, a plan admission whose named plan object is not readable, or
 /// an invalid transition, and publication errors verbatim.
 pub async fn append_batch(
     store: &S3Store,
@@ -649,6 +660,8 @@ pub async fn append_batch(
     };
     // Same pre-publication discipline as the single-event appends, widened to the whole batch:
     // every member must decode consistently and the chain must hold before any object exists.
+    // publish_encoded re-validates each member at its own PUT; this pass exists so member N's
+    // failure cannot follow members 1..N-1 into the bucket. commentlint: allow(JUDGE)
     for (envelope, encoded) in &events {
         let key = scope_event_key(scope, encoded.event_ref());
         validate_registered(scope, envelope, encoded, &key)

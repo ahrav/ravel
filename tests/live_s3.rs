@@ -25,9 +25,12 @@ use ravel::{
             AcquireOutcome, ReleaseOutcome, RenewOutcome, STOP_MARGIN_MS, acquire, release, renew,
         },
     },
+    domain::work::{WorkId, WorkRef},
     scope::{
-        AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeIdentity,
-        decode_head, decode_root_event, encode_head, root_genesis, scope_event_key, scope_head_key,
+        AdmittedCampaignConfig, CampaignId, Digest, EventEnvelope, GrantActivatedEvent,
+        GrantActivatedPayload, RootGenesis, ScopeAuthority, ScopeIdentity, decode_head,
+        decode_root_event, encode_grant_activated_event, encode_head, root_genesis,
+        scope_event_key, scope_head_key,
     },
     storage::s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
     sync::{
@@ -38,7 +41,7 @@ use ravel::{
         event::publish_root,
         head::{
             ObservedScopeHead, ScopeAppendError, ScopeHeadCommitOutcome, ScopeHeadParent,
-            append_root, read,
+            append_batch, append_root, read,
         },
         replay::{ScopeReadiness, open_projection, refresh},
     },
@@ -433,6 +436,127 @@ async fn append_reports_publication_errors_with_exact_dispatch_evidence() {
         !event_history.may_have_been_sent(),
         "an absent bucket answers with a proven 404, which must not claim a possible send"
     );
+}
+
+#[tokio::test]
+async fn a_batched_commit_adds_exactly_its_event_keys_and_one_head_advance() {
+    if !ready() {
+        return;
+    }
+    let config = aws_config::load_from_env().await;
+    let store = store(&config);
+    let genesis = genesis_for(run_campaign());
+    let scope = genesis.identity();
+    let root = decode_root_event(genesis.event_bytes(), genesis.event_key(), scope)
+        .expect("canonical fixture decodes");
+    assert!(matches!(
+        append_root(
+            &store,
+            ScopeHeadParent::Genesis,
+            scope,
+            &root,
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .expect("root append succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("current Unix time fits u64 milliseconds");
+    let instance = InstanceId::new("live-batch-controller".into()).expect("instance id is valid");
+    let AcquireOutcome::Acquired(authority) = acquire(&store, scope, &instance, now_ms)
+        .await
+        .expect("acquisition succeeds")
+    else {
+        panic!("expected acquisition");
+    };
+    let parent_head = authority.head().clone();
+    let Ok(parent) = authority.into_parent(now_ms) else {
+        panic!("authority is within its term");
+    };
+
+    let before = store
+        .list_keys(&scope_events_prefix(scope), None, 64)
+        .await
+        .expect("listing before the batch succeeds");
+
+    let epoch = parent_head.scope_epoch().get();
+    let mut parent_ref = parent_head.tail().clone();
+    let mut batch = Vec::new();
+    let mut expected_keys = Vec::new();
+    for (index, fill) in ["a", "b", "c"].iter().enumerate() {
+        let sequence = parent_head.tail().sequence() + 1 + index as u64;
+        let payload = GrantActivatedPayload::new(
+            WorkRef::new(
+                WorkId::new(format!("live-batch-work-{index}")).expect("work id is valid"),
+                1,
+            ),
+            1,
+            Digest::new(fill.repeat(64)).expect("grant digest is valid"),
+            1,
+            1,
+            now_ms + 60_000,
+        )
+        .expect("grant payload is within bounds");
+        let event = GrantActivatedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent_ref.clone()),
+                epoch,
+                format!("live-batch-op-{index}"),
+                "grant_activated".to_owned(),
+            )
+            .expect("envelope is valid"),
+            payload,
+        )
+        .expect("grant event is valid");
+        let encoded = encode_grant_activated_event(&event).expect("grant event encodes");
+        parent_ref = encoded.event_ref().clone();
+        expected_keys.push(scope_event_key(scope, encoded.event_ref()));
+        batch.push((event.envelope().clone(), encoded));
+    }
+
+    assert!(matches!(
+        append_batch(&store, parent, scope, batch, &mut AttemptHistory::default(),)
+            .await
+            .expect("batch append succeeds"),
+        ScopeHeadCommitOutcome::Committed(_)
+    ));
+
+    let after = store
+        .list_keys(&scope_events_prefix(scope), None, 64)
+        .await
+        .expect("listing after the batch succeeds");
+    assert!(
+        before.iter().all(|key| after.contains(key)),
+        "no protocol path deletes objects"
+    );
+    let mut added: Vec<String> = after
+        .iter()
+        .filter(|key| !before.contains(*key))
+        .cloned()
+        .collect();
+    added.sort();
+    expected_keys.sort();
+    assert_eq!(
+        added, expected_keys,
+        "the LIST set difference must be exactly the batch's synthesized keys"
+    );
+
+    let final_head = observed(&store, scope).await;
+    assert_eq!(
+        final_head.head().tail().sequence(),
+        parent_head.tail().sequence() + 3
+    );
+    assert_eq!(final_head.head().operation_id(), "live-batch-op-2");
 }
 
 /// Opens a fresh projection under a per-run temporary path.

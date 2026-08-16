@@ -2938,6 +2938,77 @@ mod tests {
         fs::remove_file(listed_path).unwrap();
     }
 
+    /// A batched suffix produces the same cursor and projection content through the serial
+    /// walk, LIST, and packs.
+    #[tokio::test]
+    async fn a_batched_suffix_replays_identically_through_every_rung() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (events, head) = accel_chain(&genesis, 4);
+        let keys = event_keys(&scope, &events);
+
+        let serial_path = path("batched-suffix-serial");
+        let serial = DbHandle::spawn(serial_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            accel_miss(),
+            accel_miss(),
+            event_response(events[3].1.clone()),
+            event_response(events[2].1.clone()),
+            event_response(events[1].1.clone()),
+            event_response(events[0].1.clone()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &serial, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        let serial_cursor = serial.scope_cursor(&scope).await.unwrap();
+        assert_eq!(serial_cursor, (4, Some(events[3].0.digest().clone())));
+        drop(serial);
+
+        let listed_path = path("batched-suffix-listed");
+        let listed = DbHandle::spawn(listed_path.clone()).await.unwrap();
+        let (store, _) = keyed_store(accel_route(&scope, &head, &events, keys));
+        assert!(matches!(
+            refresh(&store, &listed, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(listed.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        drop(listed);
+
+        let slices: Vec<&[u8]> = events.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        let pack = build_pack(&scope, None, 1, &slices).unwrap();
+        let entry = PackEntry::new(1, 4, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+        let packed_path = path("batched-suffix-packed");
+        let packed = DbHandle::spawn(packed_path.clone()).await.unwrap();
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            refresh(&store, &packed, &scope).await,
+            ScopeReadiness::Ready { .. }
+        ));
+        assert_eq!(packed.scope_cursor(&scope).await.unwrap(), serial_cursor);
+        drop(packed);
+
+        assert_eq!(
+            projection_content(&listed_path),
+            projection_content(&serial_path)
+        );
+        assert_eq!(
+            projection_content(&packed_path),
+            projection_content(&serial_path)
+        );
+        for path in [serial_path, listed_path, packed_path] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
     /// Anomalous listings fall back to the serial walk without changing the outcome, and a
     /// candidate beyond the pinned tail is ignored rather than treated as an anomaly.
     #[tokio::test]

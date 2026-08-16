@@ -3560,4 +3560,587 @@ mod tests {
             }
         }
     }
+
+    fn successor_batch(
+        scope: &ScopeIdentity,
+        parent: &ScopeEventRef,
+        first_sequence: u64,
+        operations: &[&str],
+    ) -> Vec<(EventEnvelope, crate::scope::EncodedScopeEvent)> {
+        let mut parent_ref = parent.clone();
+        let mut batch = Vec::with_capacity(operations.len());
+        for (index, operation) in operations.iter().enumerate() {
+            let (envelope, encoded) =
+                successor(scope, &parent_ref, first_sequence + index as u64, operation);
+            parent_ref = encoded.event_ref().clone();
+            batch.push((envelope, encoded));
+        }
+        batch
+    }
+
+    fn plan_admitted_pair(
+        scope: &ScopeIdentity,
+        parent: &ScopeEventRef,
+        sequence: u64,
+        operation: &str,
+        plan: Digest,
+    ) -> (EventEnvelope, crate::scope::EncodedScopeEvent) {
+        let event = PlanAdmittedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent.clone()),
+                1,
+                operation.to_owned(),
+                PLAN_ADMITTED_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            crate::scope::PlanAdmittedPayload::new(plan),
+        )
+        .unwrap();
+        let encoded = encode_plan_admitted_event(&event).unwrap();
+        (event.envelope().clone(), encoded)
+    }
+
+    /// Every batch-internal chain violation is refused before the first S3 request, so a
+    /// doomed batch never publishes an immutable object.
+    #[tokio::test]
+    async fn batch_preflight_refuses_chain_violations_before_any_request() {
+        use crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS;
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let tail = genesis.event_ref().clone();
+
+        // A member past its slot whose own envelope still chains to a self-consistent parent.
+        let gap = {
+            let (env2, enc2) = successor(&scope, &tail, 2, "gap-op-2");
+            let phantom = ScopeEventRef::new(3, Digest::new("a".repeat(64)).unwrap()).unwrap();
+            let (env4, enc4) = successor(&scope, &phantom, 4, "gap-op-4");
+            vec![(env2, enc2), (env4, enc4)]
+        };
+        // A contiguous sequence whose second member names a rival predecessor digest.
+        let wrong_parent = {
+            let (env2, enc2) = successor(&scope, &tail, 2, "wrong-parent-2");
+            let rival = ScopeEventRef::new(2, Digest::new("b".repeat(64)).unwrap()).unwrap();
+            let (env3, enc3) = successor(&scope, &rival, 3, "wrong-parent-3");
+            vec![(env2, enc2), (env3, enc3)]
+        };
+        let mixed_epoch = {
+            let (env2, enc2) = successor(&scope, &tail, 2, "mixed-epoch-2");
+            let parent2 = enc2.event_ref().clone();
+            let (env3, enc3) = successor_at(&scope, &parent2, 3, "mixed-epoch-3", 2);
+            vec![(env2, enc2), (env3, enc3)]
+        };
+        let duplicate_operation = successor_batch(&scope, &tail, 2, &["dup-op", "dup-op"]);
+        let parent_operation = successor_batch(&scope, &tail, 2, &[genesis.head().operation_id()]);
+        let double_admission = {
+            let (env2, enc2) = plan_admitted_pair(
+                &scope,
+                &tail,
+                2,
+                "admit-op-1",
+                Digest::new("c".repeat(64)).unwrap(),
+            );
+            let parent2 = enc2.event_ref().clone();
+            let (env3, enc3) = plan_admitted_pair(
+                &scope,
+                &parent2,
+                3,
+                "admit-op-2",
+                Digest::new("d".repeat(64)).unwrap(),
+            );
+            vec![(env2, enc2), (env3, enc3)]
+        };
+
+        let cases = vec![
+            ("a sequence gap", gap),
+            ("a wrong parent reference", wrong_parent),
+            ("a mixed writer epoch", mixed_epoch),
+            ("a duplicate operation id", duplicate_operation),
+            ("an operation id equal to the parent's", parent_operation),
+            ("a second plan admission", double_admission),
+            ("an empty batch", Vec::new()),
+        ];
+        for (label, batch) in cases {
+            let (store, client) = replay_store(vec![]);
+            assert!(
+                matches!(
+                    append_batch(
+                        &store,
+                        ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
+                        &scope,
+                        batch,
+                        &mut AttemptHistory::default(),
+                    )
+                    .await,
+                    Err(ScopeAppendError::InvalidInput)
+                ),
+                "{label} must be refused"
+            );
+            assert_eq!(
+                client.actual_requests().count(),
+                0,
+                "{label} must send nothing"
+            );
+        }
+
+        // A final sequence past the replay ceiling is refused even when the chain itself holds.
+        let boundary = ScopeEventRef::new(
+            MAX_SCOPE_REPLAY_EVENTS - 1,
+            Digest::new("d".repeat(64)).unwrap(),
+        )
+        .unwrap();
+        let high_parent = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            boundary.clone(),
+            None,
+            "parent-op".into(),
+        )
+        .unwrap();
+        let over = successor_batch(
+            &scope,
+            &boundary,
+            MAX_SCOPE_REPLAY_EVENTS,
+            &["ceiling-op-1", "ceiling-op-2"],
+        );
+        let (store, client) = replay_store(vec![]);
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(observed(&high_parent).await)),
+                &scope,
+                over,
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+
+        // Genesis has no fenced boundary to chain a batch from.
+        let genesis_batch = successor_batch(&scope, &tail, 2, &["genesis-batch-op"]);
+        let (store, client) = replay_store(vec![]);
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::Genesis,
+                &scope,
+                genesis_batch,
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    /// Genesis stays a one-event transition at the constructor too, so no caller can widen the
+    /// protocol's first head into a batch.
+    #[tokio::test]
+    async fn a_multi_event_genesis_batch_is_refused() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let root =
+            crate::scope::decode_root_event(genesis.event_bytes(), genesis.event_key(), &scope)
+                .unwrap();
+        let root_publication = published(
+            &scope,
+            root.envelope(),
+            crate::scope::encode_root_event(&root).unwrap(),
+        )
+        .await;
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "genesis-batch-2");
+        let tail = enc2.event_ref().clone();
+        let publication2 = published(&scope, &env2, enc2).await;
+        let candidate = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            tail,
+            None,
+            "genesis-batch-2".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ScopeHeadTransition::new_batch(
+                ScopeHeadParent::Genesis,
+                candidate,
+                vec![root_publication, publication2],
+            ),
+            Err(WireError::InvalidValue)
+        ));
+    }
+
+    /// A committed batch is B create-only event publications in order and exactly one
+    /// conditional head CAS, advancing the head by B to the final member.
+    #[tokio::test]
+    async fn a_committed_batch_advances_the_head_once_past_every_member() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let batch = successor_batch(
+            &scope,
+            genesis.event_ref(),
+            2,
+            &["batch-op-2", "batch-op-3", "batch-op-4"],
+        );
+        let keys: Vec<String> = batch
+            .iter()
+            .map(|(_, encoded)| scope_event_key(&scope, encoded.event_ref()))
+            .collect();
+        let last_ref = batch.last().unwrap().1.event_ref().clone();
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"committed\"")], SdkBody::empty()),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        let outcome = append_batch(
+            &store,
+            ScopeHeadParent::existing(Box::new(parent)),
+            &scope,
+            batch,
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .unwrap();
+        let ScopeHeadCommitOutcome::Committed(Some(committed)) = outcome else {
+            panic!("the batch must commit with a witness");
+        };
+        assert_eq!(committed.head().tail(), &last_ref);
+        assert_eq!(committed.head().tail().sequence(), 4);
+        assert_eq!(committed.head().operation_id(), "batch-op-4");
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 5);
+        for (request, key) in requests[1..4].iter().zip(&keys) {
+            let uri = request.uri().parse::<http::Uri>().unwrap();
+            assert_eq!(uri.path(), format!("/{key}"));
+            assert_eq!(request.headers().get("if-none-match").unwrap(), "*");
+        }
+        let head_uri = requests[4].uri().parse::<http::Uri>().unwrap();
+        assert!(head_uri.path().ends_with("/head"));
+        assert_eq!(requests[4].headers().get("if-match").unwrap(), "\"parent\"");
+        let committed_head = decode_head(
+            requests[4].body().bytes().unwrap(),
+            &scope_head_key(&scope),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(committed_head.tail(), &last_ref);
+    }
+
+    /// Two overlapping batches race one parent: the CAS admits at most one, and authoritative
+    /// replay reaches exactly the winning batch's cursor.
+    #[tokio::test]
+    async fn racing_batches_admit_at_most_one_winner_and_replay_reaches_it() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let winner_batch = successor_batch(
+            &scope,
+            genesis.event_ref(),
+            2,
+            &["win-op-2", "win-op-3", "win-op-4"],
+        );
+        let winner_events: Vec<(ScopeEventRef, Vec<u8>)> = winner_batch
+            .iter()
+            .map(|(_, encoded)| (encoded.event_ref().clone(), encoded.stored_bytes().to_vec()))
+            .collect();
+        let winner_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            winner_events[2].0.clone(),
+            None,
+            "win-op-4".into(),
+        )
+        .unwrap();
+        let (store, _) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[("etag", "\"won\"")], SdkBody::empty()),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                winner_batch,
+                &mut AttemptHistory::default(),
+            )
+            .await
+            .unwrap(),
+            ScopeHeadCommitOutcome::Committed(_)
+        ));
+
+        // The loser publishes its members, loses the CAS, and the retained walk proves its
+        // final operation absent between the winner's tail and the shared parent boundary.
+        let loser_batch =
+            successor_batch(&scope, genesis.event_ref(), 2, &["lose-op-2", "lose-op-3"]);
+        let mut responses = vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"winner\"")],
+                encode_head(&winner_head).unwrap(),
+            ),
+            response(404, &[], SdkBody::empty()),
+        ];
+        responses.extend(
+            winner_events
+                .iter()
+                .rev()
+                .map(|(_, bytes)| response(200, &[("etag", "\"event\"")], bytes.clone())),
+        );
+        let (store, client) = replay_store(responses);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                loser_batch,
+                &mut AttemptHistory::default(),
+            )
+            .await
+            .unwrap(),
+            ScopeHeadCommitOutcome::ProvenNotCommitted
+        ));
+        assert_eq!(client.actual_requests().count(), 9);
+
+        // Authoritative replay of the winning head folds the whole batch at its cursor.
+        let path = std::env::temp_dir().join(format!(
+            "ravel-head-batch-race-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let handle = crate::db::worker::DbHandle::spawn(path.clone())
+            .await
+            .unwrap();
+        let mut responses = vec![
+            response(
+                200,
+                &[("etag", "\"winner\"")],
+                encode_head(&winner_head).unwrap(),
+            ),
+            response(404, &[], SdkBody::empty()),
+            response(404, &[], SdkBody::empty()),
+        ];
+        responses.extend(
+            winner_events
+                .iter()
+                .rev()
+                .map(|(_, bytes)| response(200, &[("etag", "\"event\"")], bytes.clone())),
+        );
+        responses.push(response(
+            200,
+            &[("etag", "\"event\"")],
+            genesis.event_bytes().to_vec(),
+        ));
+        let (store, _) = replay_store(responses);
+        match crate::sync::replay::refresh(&store, &handle, &scope).await {
+            crate::sync::replay::ScopeReadiness::Ready { local_cursor, .. } => {
+                assert_eq!(local_cursor.0, 4);
+                assert_eq!(local_cursor.1, *winner_events[2].0.digest());
+            }
+            crate::sync::replay::ScopeReadiness::NotReady(error) => {
+                panic!("replay must reach the winning head: {error}")
+            }
+        }
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A lost batch CAS response reconciles by the batch's final operation identity: the exact
+    /// candidate proves committed, a longer winning batch containing the complete candidate
+    /// batch proves superseded, and a rival chain reaching the shared boundary without the
+    /// final operation proves not committed.
+    #[tokio::test]
+    async fn a_lost_batch_cas_reconciles_by_the_final_operation_identity() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+
+        // Committed: the current head is exactly the candidate and its tail bytes match.
+        let batch = successor_batch(&scope, genesis.event_ref(), 2, &["lost-op-2", "lost-op-3"]);
+        let tail_ref = batch[1].1.event_ref().clone();
+        let tail_bytes = batch[1].1.stored_bytes().to_vec();
+        let candidate = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            tail_ref,
+            None,
+            "lost-op-3".into(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"candidate\"")],
+                encode_head(&candidate).unwrap(),
+            ),
+            response(200, &[("etag", "\"event\"")], tail_bytes),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                batch,
+                &mut AttemptHistory::default(),
+            )
+            .await
+            .unwrap(),
+            ScopeHeadCommitOutcome::Committed(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 6);
+
+        // CommittedSuperseded: a longer winning batch carries our two members plus one more.
+        let ours = successor_batch(
+            &scope,
+            genesis.event_ref(),
+            2,
+            &["super-op-2", "super-op-3"],
+        );
+        let our_events: Vec<(ScopeEventRef, Vec<u8>)> = ours
+            .iter()
+            .map(|(_, encoded)| (encoded.event_ref().clone(), encoded.stored_bytes().to_vec()))
+            .collect();
+        let (_, extension) = successor(&scope, &our_events[1].0, 4, "super-op-4");
+        let longer_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            extension.event_ref().clone(),
+            None,
+            "super-op-4".into(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"longer\"")],
+                encode_head(&longer_head).unwrap(),
+            ),
+            response(404, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"e4\"")],
+                extension.stored_bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"e3\"")], our_events[1].1.clone()),
+            response(200, &[("etag", "\"e2\"")], our_events[0].1.clone()),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                ours,
+                &mut AttemptHistory::default(),
+            )
+            .await
+            .unwrap(),
+            ScopeHeadCommitOutcome::CommittedSuperseded
+        ));
+        assert_eq!(client.actual_requests().count(), 9);
+
+        // ProvenNotCommitted: a rival chain fills the boundary range without our final
+        // operation.
+        let mine = successor_batch(&scope, genesis.event_ref(), 2, &["mine-op-2", "mine-op-3"]);
+        let rivals = successor_batch(
+            &scope,
+            genesis.event_ref(),
+            2,
+            &["rival-op-2", "rival-op-3"],
+        );
+        let rival_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            rivals[1].1.event_ref().clone(),
+            None,
+            "rival-op-3".into(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(genesis.head()).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(412, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"rival\"")],
+                encode_head(&rival_head).unwrap(),
+            ),
+            response(404, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"r3\"")],
+                rivals[1].1.stored_bytes().to_vec(),
+            ),
+            response(
+                200,
+                &[("etag", "\"r2\"")],
+                rivals[0].1.stored_bytes().to_vec(),
+            ),
+        ]);
+        let parent = read(&store, &scope).await.unwrap().unwrap();
+        assert!(matches!(
+            append_batch(
+                &store,
+                ScopeHeadParent::existing(Box::new(parent)),
+                &scope,
+                mine,
+                &mut AttemptHistory::default(),
+            )
+            .await
+            .unwrap(),
+            ScopeHeadCommitOutcome::ProvenNotCommitted
+        ));
+        assert_eq!(client.actual_requests().count(), 8);
+    }
 }

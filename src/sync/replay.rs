@@ -2202,7 +2202,7 @@ mod tests {
         )
         .unwrap();
 
-        let kind = ArtifactKind::InvocationTrace;
+        let kind = ArtifactKind::InvocationManifest;
         let reference = encode_artifact_reference_event(
             &ArtifactReferenceEvent::new(
                 envelope(

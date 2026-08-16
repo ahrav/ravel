@@ -48,8 +48,7 @@ impl Error for ValidationError {}
 ///
 /// Returns the option rather than an error so each caller keeps its own rejection category:
 /// the same bound is checked from wire decoders, protocol constructors, and record builders,
-/// which do not share an error type. Six copies of this predicate had drifted apart into
-/// six closures before it moved here.
+/// which do not share an error type.
 pub(crate) fn bounded_stored(value: u64) -> Option<NonZeroU64> {
     NonZeroU64::new(value).filter(|value| value.get() <= MAX_STORED_INTEGER)
 }

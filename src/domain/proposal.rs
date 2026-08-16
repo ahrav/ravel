@@ -41,7 +41,6 @@ use crate::{
 const PLAN_PROPOSAL_DOMAIN: &[u8] = b"ravel.plan.proposal\0";
 const CBOR_RECURSION_LIMIT: usize = 16;
 
-/// Highest value the durable integer columns and 16-digit key encodings accept.
 /// Cap on the CBOR body of one plan object.
 pub const MAX_PLAN_CANONICAL_BYTES: usize = 1024 * 1024;
 /// Cap on one stored plan object: the domain prefix plus the CBOR body.

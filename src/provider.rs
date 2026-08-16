@@ -44,7 +44,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
 /// Ceiling on any profile's own output-token ceiling.
 ///
 /// `InferenceConfiguration::max_tokens` is an `i32`, so a cap above this cannot be sent.
-const MAX_OUTPUT_TOKEN_CEILING: u32 = i32::MAX as u32;
+pub(crate) const MAX_OUTPUT_TOKEN_CEILING: u32 = i32::MAX as u32;
 /// Bound on one prompt or system text, applied before dispatch.
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 /// Bound on the completion text retained from one response.

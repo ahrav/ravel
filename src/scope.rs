@@ -571,6 +571,10 @@ impl ArtifactReferencePayload {
     /// Returns [`ValidationError::OutOfRange`] when the revision, attempt, artifact size, or
     /// creation time is zero or exceeds the stored-integer range. `ArtifactRef` accepts any
     /// size by design, so this is where an artifact entering durable history is bounded.
+    /// Returns [`ValidationError::InvalidIdentity`] when the artifact's media type is not the
+    /// one `kind` pins, or its producer-attempt string names an attempt other than `attempt`:
+    /// each pair is two records of one fact, and both paths into history — the append boundary
+    /// and the replay decoder — route through here, so neither can admit a contradiction.
     pub(crate) fn new(
         kind: ArtifactKind,
         artifact: ArtifactRef,
@@ -582,13 +586,20 @@ impl ArtifactReferencePayload {
         let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
         bounded(artifact.size())?;
         bounded(artifact.creation_time_unix_ms())?;
+        let work_revision = bounded(work_revision)?;
+        let attempt_bound = bounded(attempt)?;
+        if artifact.media_type() != kind.media_type()
+            || artifact.producer_attempt() != format!("attempt-{attempt}")
+        {
+            return Err(ValidationError::InvalidIdentity);
+        }
         Ok(Self {
             kind,
             artifact,
             work_id,
-            work_revision: bounded(work_revision)?,
+            work_revision,
             grant_digest,
-            attempt: bounded(attempt)?,
+            attempt: attempt_bound,
         })
     }
 
@@ -1950,7 +1961,7 @@ mod codec_tests {
     /// compressed CBOR, so both the `ciborium` and `zstd-sys` lockfile pins are byte-affecting
     /// for this value, as is any change to the wire struct's field set or declaration order.
     const ARTIFACT_REFERENCE_EVENT_DIGEST: &str =
-        "0d85aa9ae27b516435847e88f9da07901b788f255d70144ed977a51c7135b624";
+        "9078b178c3d70a5d2188bceaed3b95a5bf58db810dac81fbfcc83e38b0f472fa";
 
     /// Stored-byte address of the activation event
     /// `grant_activated_events_round_trip_and_reject_corruption` builds. The preimage is the
@@ -2198,7 +2209,7 @@ mod codec_tests {
                 "cd".repeat(32),
                 4_096,
                 "application/vnd.ravel.invocation-trace+cbor".into(),
-                "attempt-7-of-work-a".into(),
+                "attempt-7".into(),
                 1_700_000_123_456,
                 Some("pilot".into()),
             )
@@ -2257,7 +2268,7 @@ mod codec_tests {
             payload.artifact().media_type(),
             "application/vnd.ravel.invocation-trace+cbor"
         );
-        assert_eq!(payload.artifact().producer_attempt(), "attempt-7-of-work-a");
+        assert_eq!(payload.artifact().producer_attempt(), "attempt-7");
         assert_eq!(
             payload.artifact().creation_time_unix_ms(),
             1_700_000_123_456
@@ -2323,6 +2334,42 @@ mod codec_tests {
         }
     }
 
+    /// The kind/media-type and attempt/producer pins hold on the decode path, not just at the
+    /// append boundary: canonical stored bytes whose two records of one fact disagree are
+    /// refused on replay exactly as publication would have refused them.
+    #[test]
+    fn a_stored_reference_whose_pinned_fields_disagree_is_refused_by_the_decoder() {
+        let genesis = fixture();
+        let encoded = encode_artifact_reference_event(&artifact_event(&genesis)).unwrap();
+
+        // The fixture is a trace at attempt 7, so each mutation contradicts exactly one pin.
+        for (label, field, value) in [
+            (
+                "the other kind's media type",
+                "media_type",
+                Value::Text("application/vnd.ravel.invocation-manifest+cbor".into()),
+            ),
+            (
+                "a producer string naming another attempt",
+                "producer_attempt",
+                Value::Text("attempt-8".into()),
+            ),
+        ] {
+            let (bytes, key) = repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
+                let slot = map(payload)
+                    .iter_mut()
+                    .find_map(|(key, target)| (key == &Value::Text(field.into())).then_some(target))
+                    .unwrap();
+                *slot = value.clone();
+            });
+            assert_eq!(
+                decode_artifact_reference_event(&bytes, &key, genesis.identity()),
+                Err(WireError::InvalidValue),
+                "{label}"
+            );
+        }
+    }
+
     /// Every integer an artifact reference carries is bounded where the reference is built,
     /// including the two `ArtifactRef` accepts unbounded by design.
     #[test]
@@ -2331,13 +2378,14 @@ mod codec_tests {
 
         let max = MAX_STORED_INTEGER;
         let build = |size: u64, creation: u64, revision: u64, attempt: u64| {
+            let kind = ArtifactKind::InvocationManifest;
             ArtifactReferencePayload::new(
-                ArtifactKind::InvocationManifest,
+                kind,
                 crate::domain::artifact::ArtifactRef::new(
                     "cd".repeat(32),
                     size,
-                    "text/plain".into(),
-                    "attempt-1".into(),
+                    kind.media_type().into(),
+                    format!("attempt-{attempt}"),
                     creation,
                     None,
                 )

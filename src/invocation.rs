@@ -24,7 +24,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     domain::{validation::bounded_stored, work::WorkId},
-    provider::{InvocationRequest, MAX_IDENTIFIER_BYTES, ModelProvider, ReportedUse},
+    provider::{
+        InvocationRequest, MAX_IDENTIFIER_BYTES, MAX_OUTPUT_TOKEN_CEILING, ModelProvider,
+        ReportedUse,
+    },
     scope::{Digest, ScopeId},
 };
 
@@ -135,8 +138,9 @@ impl BoundedText {
     /// # Errors
     ///
     /// Returns [`RecordError::InvalidEncoding`] when the retained prefix exceeds
-    /// [`MAX_RETAINED_TEXT_BYTES`], the address is not a digest, or the claimed full length is
-    /// shorter than the prefix retained from it.
+    /// [`MAX_RETAINED_TEXT_BYTES`], the address is not a digest, the claimed full length is
+    /// shorter than the prefix retained from it, or the text is complete but the address is
+    /// not its hash.
     fn rebuilt(
         retained: String,
         full_bytes: u64,
@@ -145,6 +149,13 @@ impl BoundedText {
         if retained.len() > MAX_RETAINED_TEXT_BYTES
             || !crate::domain::validation::is_digest(&full_digest)
             || full_bytes < retained.len() as u64
+        {
+            return Err(RecordError::InvalidEncoding);
+        }
+        // A complete text is its own retained prefix, so the address is checkable right here;
+        // only a truncated text's digest has to be taken on faith from the bytes.
+        if full_bytes == retained.len() as u64
+            && format!("{:x}", Sha256::digest(retained.as_bytes())) != full_digest
         {
             return Err(RecordError::InvalidEncoding);
         }
@@ -240,6 +251,14 @@ impl InvocationBinding {
         })
     }
 
+    pub fn scope_id(&self) -> &ScopeId {
+        &self.scope_id
+    }
+
+    pub fn plan_digest(&self) -> &Digest {
+        &self.plan_digest
+    }
+
     pub fn work_id(&self) -> &WorkId {
         &self.work_id
     }
@@ -325,9 +344,9 @@ impl InvocationManifest {
     /// Builds a manifest from the fields the wire form holds, one per parameter.
     ///
     /// The wire form carries the profile's identity rather than the profile, so a decoder
-    /// recovers what an invocation ran under with no [`ModelProfile`] to hand. Construction
-    /// from a live request routes through here as well, which is what keeps a decoded manifest
-    /// and a fresh one subject to the same bounds.
+    /// recovers what an invocation ran under with no [`crate::provider::ModelProfile`] to
+    /// hand. Construction from a live request routes through here as well, which is what
+    /// keeps a decoded manifest and a fresh one subject to the same bounds.
     #[expect(
         clippy::too_many_arguments,
         reason = "one parameter per wire field, so the rebuild cannot silently drop one"
@@ -344,6 +363,12 @@ impl InvocationManifest {
     ) -> Result<Self, RecordError> {
         identifier(&model_id)?;
         identifier(&operation_id)?;
+        // A live request's cap is a `NonZeroU32` already checked against the profile ceiling,
+        // so this bound bites only on decode — where the wire form could otherwise claim a
+        // request this transport can never send.
+        if max_output_tokens > u64::from(MAX_OUTPUT_TOKEN_CEILING) {
+            return Err(RecordError::OutOfRange);
+        }
         Ok(Self {
             binding,
             provider,
@@ -364,6 +389,10 @@ impl InvocationManifest {
     /// and [`RecordError::InvalidEncoding`] on a serialization failure.
     pub fn stored_bytes(&self) -> Result<(Vec<u8>, String), RecordError> {
         encode(MANIFEST_DOMAIN, &WireManifest::from(self))
+    }
+
+    pub fn binding(&self) -> &InvocationBinding {
+        &self.binding
     }
 }
 
@@ -412,6 +441,10 @@ impl InvocationTrace {
     }
 
     /// The manifest this trace terminates, so a reader needs no external index to pair them.
+    pub fn manifest_digest(&self) -> &Digest {
+        &self.manifest_digest
+    }
+
     pub fn outcome(&self) -> TerminalOutcome {
         self.outcome
     }
@@ -428,6 +461,10 @@ impl InvocationTrace {
     /// and [`RecordError::InvalidEncoding`] on a serialization failure.
     pub fn stored_bytes(&self) -> Result<(Vec<u8>, String), RecordError> {
         encode(TRACE_DOMAIN, &WireTrace::from(self))
+    }
+
+    pub fn binding(&self) -> &InvocationBinding {
+        &self.binding
     }
 }
 
@@ -1071,9 +1108,43 @@ mod tests {
             }),
             Err(RecordError::InvalidEncoding)
         );
+        // A complete text is its own retained prefix, so a well-formed address that is not
+        // its hash is refused: the record would attest output the digest never covered.
+        assert_eq!(
+            bounded(BoundedText {
+                retained: "zz".into(),
+                full_bytes: 2,
+                full_digest: digest(0x66).as_str().to_owned(),
+            }),
+            Err(RecordError::InvalidEncoding)
+        );
         // Exactly at the bound, with the full text retained, is the boundary case that holds.
         let at_bound = BoundedText::new(&"z".repeat(MAX_RETAINED_TEXT_BYTES));
         assert!(!at_bound.truncated());
         assert!(bounded(at_bound).is_ok());
+    }
+
+    /// The wire decoder routes through `from_parts`, so a canonical manifest claiming a cap
+    /// this transport can never send is refused with the same ceiling the profile enforces.
+    #[test]
+    fn a_decoded_manifest_cannot_claim_a_cap_above_the_provider_ceiling() {
+        let build = |cap: u64| {
+            InvocationManifest::from_parts(
+                binding(),
+                ModelProvider::Bedrock,
+                "anthropic.claude-fixture-v1:0".into(),
+                digest(0x33),
+                digest(0x44),
+                cap,
+                1_700_000_060_000,
+                "invoke-op-1".into(),
+            )
+        };
+
+        assert!(build(u64::from(MAX_OUTPUT_TOKEN_CEILING)).is_ok());
+        assert_eq!(
+            build(u64::from(MAX_OUTPUT_TOKEN_CEILING) + 1),
+            Err(RecordError::OutOfRange)
+        );
     }
 }

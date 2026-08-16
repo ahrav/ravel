@@ -618,6 +618,16 @@ impl BedrockTransport {
             // `MessageBuilder::build` fails only on an absent role or content, both set
             // above, so no input reaches this arm. It stays because the outcome has to be
             // total, and because a request that cannot be built was never dispatched.
+            //
+            // Proving this attempt sent nothing does not prove the operation did. An earlier
+            // attempt on this history may already have reached the provider and been billed,
+            // and no later attempt retires that, so the stronger claim is reserved for a
+            // clean history.
+            Err(_) if history.may_have_been_sent() => {
+                return InvocationOutcome::Unknown {
+                    provider_request_id: None,
+                };
+            }
             Err(_) => return InvocationOutcome::ProvenNotSent,
         };
         let mut call = self
@@ -644,7 +654,7 @@ impl BedrockTransport {
         #[cfg(not(debug_assertions))]
         history.bind(request.operation_id());
         let prior_unknown = history.mark_possible_send();
-        let outcome = classify(call.send().await);
+        let outcome = classify(call.send().await, prior_unknown);
         // A verdict about this attempt is not a verdict about an earlier one. An invocation
         // has no remote state to reconcile, so nothing retires the possibility that a prior
         // attempt already reached the provider and was billed; the prior value therefore
@@ -680,10 +690,13 @@ fn configured(region: Region, builder: Builder) -> aws_sdk_bedrockruntime::Confi
         .build()
 }
 
-fn classify(result: Result<ConverseResponse, SdkError<ConverseError>>) -> InvocationOutcome {
+fn classify(
+    result: Result<ConverseResponse, SdkError<ConverseError>>,
+    prior_unknown: bool,
+) -> InvocationOutcome {
     let response = match result {
         Ok(response) => response,
-        Err(error) => return classify_error(error),
+        Err(error) => return classify_error(error, prior_unknown),
     };
     let reason = terminal_reason(response.stop_reason());
     let provider_request_id = request_id(&response);
@@ -814,12 +827,17 @@ fn terminal_reason(reason: &StopReason) -> TerminalReason {
 /// Every retryable service condition is named explicitly. `ModelNotReadyException` is one
 /// of them: the SDK would have retried it on its own, and disabling retries moves that
 /// decision here.
-fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
+fn classify_error(error: SdkError<ConverseError>, prior_unknown: bool) -> InvocationOutcome {
     use aws_sdk_bedrockruntime::operation::RequestId;
 
     let provider_request_id = error.request_id().map(str::to_owned);
     match error {
-        SdkError::ConstructionFailure(_) => InvocationOutcome::ProvenNotSent,
+        // Same reservation as the pre-dispatch refusal above: only a clean history lets a
+        // construction failure speak for the whole operation rather than for this attempt.
+        SdkError::ConstructionFailure(_) if !prior_unknown => InvocationOutcome::ProvenNotSent,
+        SdkError::ConstructionFailure(_) => InvocationOutcome::Unknown {
+            provider_request_id,
+        },
         SdkError::TimeoutError(_) => InvocationOutcome::TimedOut {
             provider_request_id,
         },
@@ -1682,6 +1700,23 @@ mod tests {
 
         transport.invoke(&request(), &mut history).await;
         transport.invoke(&changed, &mut history).await;
+    }
+
+    /// A construction failure proves this attempt sent nothing, never that the operation
+    /// did. No input reaches that arm through `invoke`, so the classifier is exercised
+    /// directly: the claim that matters is which of the two answers a dirty history gets.
+    #[test]
+    fn a_construction_failure_only_proves_no_send_on_a_clean_history() {
+        assert_eq!(
+            classify_error(SdkError::construction_failure("unbuildable"), false),
+            InvocationOutcome::ProvenNotSent
+        );
+        assert_eq!(
+            classify_error(SdkError::construction_failure("unbuildable"), true),
+            InvocationOutcome::Unknown {
+                provider_request_id: None
+            }
+        );
     }
 
     /// Every stop reason maps to its own terminal reason, and one this crate does not model

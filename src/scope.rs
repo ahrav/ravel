@@ -161,10 +161,11 @@ pub struct ScopeClaimIdentity {
 impl ScopeClaimIdentity {
     /// Creates a scoped claim identity with a nonzero claim fence.
     ///
-    /// Crate-private because a claim identity is only ever built from a row the projection read,
-    /// and [`WorkRef`] has no public constructor. The row readers on
-    /// [`crate::db::worker::DbHandle`] do hand out a `WorkRef`, so the restriction is on who may
-    /// pair one with a plan digest and a fence, not on who may hold one.
+    /// Crate-private because the work reference in a claim identity is only ever a row the
+    /// projection read: [`WorkRef`] has no public constructor. Both production call sites are
+    /// decoders, which pair that row-backed reference with a plan digest and a fence taken from the
+    /// record's own bytes. The row readers on [`crate::db::worker::DbHandle`] do hand out a
+    /// `WorkRef`, so the restriction is on who may pair one, not on who may hold one.
     ///
     /// # Errors
     ///
@@ -1619,7 +1620,7 @@ mod codec_tests {
 
         // Rewriting the payload and re-keying the result is the only way to reach the decoder's own
         // rejections: the encoder cannot produce these bytes, and a stale key would be refused for
-        // its address before the payload was read.
+        // its address before its payload was interpreted.
         fn repacked(
             stored: &[u8],
             scope: &ScopeIdentity,

@@ -2723,8 +2723,9 @@ mod tests {
         fs::remove_file(db_path).unwrap();
     }
 
-    /// `apply_scope_event_in_transaction` derives `grant_digest` from a match on the typed payload,
-    /// so neither violation is reachable through the writer and both rows are inserted directly.
+    /// `apply_scope_event_in_transaction` writes `grant_digest` from a match on the typed payload,
+    /// and replay dispatches that payload on the same `payload_type` the row records, so neither
+    /// violation is reachable through the writer and both rows are inserted directly.
     /// `validate_schema` compares a live file's DDL against the `SCHEMA` constant, which moves with
     /// any edit to that constant, so the constraint's effect is what pins it.
     #[test]
@@ -3253,10 +3254,11 @@ mod tests {
 
         // The superseded revision stays readable through the projection's own reader, beside the
         // plan that admitted it, so a stale result remains auditable after it stops scheduling.
-        // With the `continuable` assertion above for the fence, three of the four bindings an
-        // executable record carries — plan digest, work revision, authority fence — are asserted
-        // through a reader rather than through direct SQL. The scope binding is not: this database
-        // holds one scope, so dropping `scope_id` from `ADMITTED_WORK_REFS_SQL` would still pass.
+        // With the first `continuable` assertion in this test for the fence, three of the four
+        // bindings an executable record carries — plan digest, work revision, authority fence —
+        // are asserted through a reader rather than through direct SQL. The scope binding is not:
+        // this database holds one scope, so the `scope_id` filter in `ADMITTED_WORK_REFS_SQL`
+        // narrows nothing here.
         assert_eq!(
             admitted_work_refs(&connection, &scope).unwrap(),
             vec![

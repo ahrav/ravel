@@ -1094,6 +1094,9 @@ mod tests {
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (LIMITS.events, Some(references[last].digest().clone()))
         );
+        let diagnostics = handle.diagnostics().await.unwrap();
+        assert_eq!(diagnostics.suffix_count, 1);
+        assert_eq!(diagnostics.apply_count, LIMITS.events as usize);
         drop(handle);
         fs::remove_file(path).unwrap();
     }

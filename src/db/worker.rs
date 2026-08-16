@@ -1,12 +1,12 @@
 //! A dedicated blocking thread owns one SQLite connection and serializes mutations.
 //!
-//! Reads and writes share one queue bounded at 64. Admission fails with full or stopping
-//! instead of blocking. One suffix application is one command and one transaction. Accepted
-//! commands remain owned by the detached worker if callers drop response futures. SQLite values
-//! and guards remain on the worker thread. The connection runs in
-//! rollback-journal `delete` mode, which keeps the projection a single file with no
-//! write-ahead-log sidecars. The worker creates a fresh projection or opens an existing file
-//! after validating it.
+//! Reads and writes share one queue bounded at 64. Admission fails with full or stopping instead
+//! of blocking. One suffix application is one command and one transaction, so a full-limit suffix
+//! holds the worker — and every queued read — for its whole duration. Accepted commands remain
+//! owned by the detached worker if callers drop response futures. SQLite values and guards remain
+//! on the worker thread. The connection runs in rollback-journal `delete` mode, which keeps the
+//! projection a single file with no write-ahead-log sidecars. The worker creates a fresh
+//! projection or opens an existing file after validating it.
 
 use std::{
     error::Error,
@@ -33,7 +33,6 @@ use crate::{
 use crate::{
     db::projections::{ApplyOutcome, ScopeProjectionPayload},
     domain::work::WorkId,
-    scope::ScopeEventRef,
 };
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
@@ -58,15 +57,6 @@ enum Command {
     Cursor {
         scope: Box<ScopeIdentity>,
         respond: oneshot::Sender<Result<(u64, Option<Digest>), ApplyError>>,
-    },
-    /// Standalone conflict probes have no production command: `ApplySuffix` performs duplicate
-    /// checks inside the suffix transaction.
-    #[cfg(test)]
-    ConflictingOperation {
-        scope: Box<ScopeIdentity>,
-        operation_id: String,
-        reference: ScopeEventRef,
-        respond: oneshot::Sender<Result<bool, ApplyError>>,
     },
     MatchesHead {
         head: Box<ScopeHead>,
@@ -158,7 +148,11 @@ pub(crate) struct Diagnostics {
     pub(crate) worker_thread: thread::ThreadId,
     pub(crate) apply_thread: Option<thread::ThreadId>,
     pub(crate) journal_mode: String,
+    /// `apply_count` includes worker-thread event attempts, including attempts rolled back with
+    /// their suffix.
     pub(crate) apply_count: usize,
+    /// `suffix_count` is the number of `ApplySuffix` commands executed, each one transaction.
+    pub(crate) suffix_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -304,8 +298,9 @@ impl DbHandle {
     ///
     /// Dropping the returned future does not revoke a command that was already accepted;
     /// the suffix still applies, and only the response is discarded. A lost response does not
-    /// indicate whether the accepted suffix committed. Any apply error or head mismatch rolls
-    /// back the whole suffix and leaves the cursor unchanged.
+    /// indicate whether the accepted suffix committed. An accepted command retains its whole
+    /// suffix (up to 64 MiB) in the queue until the worker processes it. Any apply error or
+    /// head mismatch rolls back the whole suffix and leaves the cursor unchanged.
     ///
     /// # Errors
     ///
@@ -343,32 +338,6 @@ impl DbHandle {
         self.enqueue(|respond| Command::Cursor { scope, respond })?
             .await
             .map_err(|_| ApplyError::DatabaseOperationFailed)?
-    }
-
-    /// Reports whether one scope recorded `operation_id` for an event other than `reference`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
-    /// [`ApplyError::DatabaseOperationFailed`].
-    #[cfg(test)]
-    pub(crate) async fn scope_conflicting_operation(
-        &self,
-        scope: &ScopeIdentity,
-        operation_id: &str,
-        reference: &ScopeEventRef,
-    ) -> Result<bool, ApplyError> {
-        let scope = Box::new(scope.clone());
-        let operation_id = operation_id.to_owned();
-        let reference = reference.clone();
-        self.enqueue(|respond| Command::ConflictingOperation {
-            scope,
-            operation_id,
-            reference,
-            respond,
-        })?
-        .await
-        .map_err(|_| ApplyError::DatabaseOperationFailed)?
     }
 
     /// Reports whether the committed projection row equals `head`.
@@ -689,6 +658,8 @@ fn run(
     let mut last_apply_thread: Option<thread::ThreadId> = None;
     #[cfg(test)]
     let mut apply_count = 0;
+    #[cfg(test)]
+    let mut suffix_count = 0;
     while let Ok(command) = commands.recv() {
         match command {
             #[cfg(test)]
@@ -707,6 +678,7 @@ fn run(
                 {
                     last_apply_thread = Some(thread::current().id());
                     apply_count += mutations.len();
+                    suffix_count += 1;
                 }
                 let _ = respond.send(projections::apply_scope_suffix(
                     &mut connection,
@@ -716,20 +688,6 @@ fn run(
             }
             Command::Cursor { scope, respond } => {
                 let _ = respond.send(projections::scope_cursor(&connection, &scope));
-            }
-            #[cfg(test)]
-            Command::ConflictingOperation {
-                scope,
-                operation_id,
-                reference,
-                respond,
-            } => {
-                let _ = respond.send(projections::scope_conflicting_operation(
-                    &connection,
-                    &scope,
-                    &operation_id,
-                    &reference,
-                ));
             }
             Command::MatchesHead { head, respond } => {
                 let _ = respond.send(projections::scope_matches_head(&connection, &head));
@@ -866,6 +824,7 @@ fn run(
                         apply_thread: last_apply_thread,
                         journal_mode,
                         apply_count,
+                        suffix_count,
                     })
                     .map_err(ApplyError::from);
                 let _ = respond.send(diagnostics);
@@ -972,12 +931,6 @@ mod tests {
             Err(ApplyError::Full)
         );
         assert_eq!(
-            handle
-                .scope_conflicting_operation(genesis.identity(), "operation", genesis.event_ref())
-                .await,
-            Err(ApplyError::Full)
-        );
-        assert_eq!(
             handle.scope_matches_head(genesis.head()).await,
             Err(ApplyError::Full)
         );
@@ -1011,12 +964,6 @@ mod tests {
         );
         assert_eq!(
             handle.scope_cursor(genesis.identity()).await,
-            Err(ApplyError::Stopping)
-        );
-        assert_eq!(
-            handle
-                .scope_conflicting_operation(genesis.identity(), "operation", genesis.event_ref())
-                .await,
             Err(ApplyError::Stopping)
         );
         assert_eq!(
@@ -1269,28 +1216,12 @@ mod tests {
             handle.scope_cursor(genesis.identity()).await.unwrap(),
             (1, Some(genesis.event_ref().digest().clone()))
         );
-        assert!(
-            !handle
-                .scope_conflicting_operation(
-                    genesis.identity(),
-                    genesis.head().operation_id(),
-                    genesis.event_ref()
-                )
-                .await
-                .unwrap()
-        );
-        let reused = ScopeEventRef::new(2, genesis.event_ref().digest().clone()).unwrap();
-        assert!(
-            handle
-                .scope_conflicting_operation(
-                    genesis.identity(),
-                    genesis.head().operation_id(),
-                    &reused
-                )
-                .await
-                .unwrap()
-        );
         assert!(handle.scope_matches_head(genesis.head()).await.unwrap());
+
+        handle
+            .apply_suffix(vec![test_mutation()], genesis.head())
+            .await
+            .unwrap();
 
         let diagnostics_after = handle.diagnostics().await.unwrap();
         assert_eq!(diagnostics_after.worker_thread, diagnostics.worker_thread);
@@ -1299,7 +1230,8 @@ mod tests {
             Some(diagnostics.worker_thread)
         );
         assert_eq!(diagnostics_after.journal_mode, "delete");
-        assert_eq!(diagnostics_after.apply_count, 2);
+        assert_eq!(diagnostics_after.apply_count, 3);
+        assert_eq!(diagnostics_after.suffix_count, 1);
 
         assert_eq!(
             DbHandle::spawn(path.clone()).await.err(),

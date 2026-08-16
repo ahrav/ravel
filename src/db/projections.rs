@@ -55,9 +55,6 @@ const SCOPE_HEAD_MATCH_SQL: &str = "SELECT scope.campaign_id, scope.sequence, \
      WHERE scope.scope_id = ?1";
 const EVENT_AT_SEQUENCE_SQL: &str =
     "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
-#[cfg(test)]
-const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
-     WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
 /// `issue()`'s pre-append probe. One id namespace holds every payload type, so the second column
 /// asks the narrower question: did the event applied under this id name this exact grant? The
 /// answer comes from the activation event's own row, which no later fold rewrites.
@@ -588,29 +585,6 @@ pub(crate) fn scope_cursor(
             ))
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn scope_conflicting_operation(
-    connection: &rusqlite::Connection,
-    scope: &ScopeIdentity,
-    operation_id: &str,
-    reference: &ScopeEventRef,
-) -> Result<bool, ApplyError> {
-    let sequence =
-        i64::try_from(reference.sequence()).map_err(|_| ApplyError::DatabaseOperationFailed)?;
-    connection
-        .query_row(
-            OPERATION_CONFLICT_SQL,
-            params![
-                scope.scope_id().as_str(),
-                operation_id,
-                sequence,
-                reference.digest().as_str()
-            ],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
 }
 
 pub(crate) fn scope_matches_head(
@@ -1495,8 +1469,9 @@ fn apply_scope_event_in_transaction(
 /// or grant-fold checks, or when the state after the last event does not match `head`.
 /// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
 ///
-/// The suffix bound (4,096 events / 64 MiB) is owned by the caller (`prepare_chain`); this
-/// function imposes no internal cap.
+/// Every event must name `head.scope()`; an empty suffix performs the head check only. Callers
+/// bound the suffix — replay enforces 4,096 events / 64 MiB before the worker command and the
+/// grant fold passes exactly one event — so this function imposes no internal cap.
 pub(crate) fn apply_scope_suffix(
     connection: &mut rusqlite::Connection,
     events: &[ScopeProjectionEvent],
@@ -1504,6 +1479,7 @@ pub(crate) fn apply_scope_suffix(
 ) -> Result<(), ApplyError> {
     let transaction = connection.transaction()?;
     for event in events {
+        // `AlreadyApplied` is an idempotent skip; only errors abort the suffix.
         apply_scope_event_in_transaction(&transaction, event)?;
     }
     if !scope_matches_head(&transaction, head)? {
@@ -2031,11 +2007,6 @@ mod tests {
             query_plan(&connection, EVENT_AT_SEQUENCE_SQL, &[&scope_id, &sequence]),
             query_plan(
                 &connection,
-                OPERATION_CONFLICT_SQL,
-                &[&scope_id, &operation, &sequence, &digest],
-            ),
-            query_plan(
-                &connection,
                 DUPLICATE_EXISTS_SQL,
                 &[&scope_id, &digest, &operation],
             ),
@@ -2208,6 +2179,7 @@ mod tests {
         let scope = scope("workspace-a", "campaign-a");
         let genesis = mutation(&scope, 1, DIGEST_1, None);
         apply_scope_event(&mut connection, &genesis).unwrap();
+        let before = snapshot(&connection);
         let second = mutation(&scope, 2, DIGEST_2, Some(DIGEST_1));
         let third = mutation_with_operation(
             &scope,
@@ -2230,18 +2202,19 @@ mod tests {
             apply_scope_suffix(&mut connection, &[second, third], &head),
             Err(ApplyError::Conflict)
         );
+        assert_eq!(snapshot(&connection), before);
+
+        // A divergent digest at an already-applied sequence conflicts through the suffix path
+        // rather than skipping as `AlreadyApplied`.
         assert_eq!(
-            scope_cursor(&connection, &scope).unwrap(),
-            (1, Some(Digest::new(DIGEST_1.into()).unwrap()))
+            apply_scope_suffix(
+                &mut connection,
+                &[mutation(&scope, 1, DIGEST_2, None)],
+                &head
+            ),
+            Err(ApplyError::Conflict)
         );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM applied_scope_events", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
+        assert_eq!(snapshot(&connection), before);
         drop(connection);
         fs::remove_file(path).unwrap();
     }
@@ -2253,8 +2226,9 @@ mod tests {
         let scope = scope("workspace-a", "campaign-a");
         let genesis = mutation(&scope, 1, DIGEST_1, None);
         apply_scope_event(&mut connection, &genesis).unwrap();
+        let before = snapshot(&connection);
         let second = mutation(&scope, 2, DIGEST_2, Some(DIGEST_1));
-        let head = ScopeHead::new(
+        let mismatched = ScopeHead::new(
             scope.clone(),
             crate::scope::ScopeAuthority::Unowned,
             1,
@@ -2265,21 +2239,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            apply_scope_suffix(&mut connection, &[second], &head),
+            apply_scope_suffix(&mut connection, std::slice::from_ref(&second), &mismatched),
             Err(ApplyError::Conflict)
+        );
+        assert_eq!(snapshot(&connection), before);
+
+        let matching = ScopeHead::new(
+            scope.clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            second.reference.clone(),
+            None,
+            second.envelope.operation_id().to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_scope_suffix(&mut connection, &[second], &matching),
+            Ok(())
         );
         assert_eq!(
             scope_cursor(&connection, &scope).unwrap(),
-            (1, Some(Digest::new(DIGEST_1.into()).unwrap()))
+            (2, Some(Digest::new(DIGEST_2.into()).unwrap()))
         );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM applied_scope_events", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
+        assert_eq!(snapshot(&connection).events.len(), 2);
         drop(connection);
         fs::remove_file(path).unwrap();
     }

@@ -773,14 +773,15 @@ mod tests {
     /// Pinned because every other assertion in this file is satisfied by any encoding that
     /// round-trips: swapping two same-typed wire fields, renaming a key, or encoding an
     /// integer as text all leave `decode(encode(x)) == x` true while moving these bytes.
-    /// The address is what a published artifact is named by, so once one exists no such change
-    /// is compatible. A failure here is not a wrong digest to update — it is a wire change,
-    /// and it needs a new artifact kind rather than a new constant.
+    /// The address is what a published artifact is named by, so a failure here is a wire change,
+    /// not a stale digest. Updating the constant is legitimate only while no artifact of this
+    /// kind has been published; after that a reader holding the old address would be asking for
+    /// bytes that no longer describe what it stored, and the change needs a new artifact kind.
     const MANIFEST_FIXTURE_ADDRESS: &str =
         "8319488b439971f49d174ae6ee3b1efe45788cef4bf4fb32821b1c1c55ab8465";
     /// Address of the fixture trace's stored bytes. See [`MANIFEST_FIXTURE_ADDRESS`].
     const TRACE_FIXTURE_ADDRESS: &str =
-        "8bd3140a4f610d890f8bd49a38aead0ad72c533ab803d7db7ea9af7aa881707b";
+        "ff48ae03199ff49ace58df7c401f14c6cc7ed3fa302d5576a5849de873a12159";
 
     #[test]
     fn a_manifest_round_trips_and_addresses_its_own_bytes() {

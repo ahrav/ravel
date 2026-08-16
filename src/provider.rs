@@ -356,11 +356,20 @@ impl fmt::Debug for InvocationRequest {
 /// Provider-reported token use, copied out of the response as scalars.
 ///
 /// Reported use is evidence, not confirmed spend.
+///
+/// The cache counters are `None` when the response reports no cache activity, which is the
+/// expected shape here because this boundary sends no cache points. They are kept rather
+/// than dropped because the provider reports them as their own billing categories, and
+/// deciding which categories cost reconciliation needs is not this boundary's decision to
+/// make: a gateway or a later configuration that enables prompt caching would otherwise lose
+/// the counters between the response and the trace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReportedUse {
     input_tokens: u32,
     output_tokens: u32,
     total_tokens: u32,
+    cache_read_input_tokens: Option<u32>,
+    cache_write_input_tokens: Option<u32>,
 }
 
 impl ReportedUse {
@@ -374,6 +383,14 @@ impl ReportedUse {
 
     pub fn total_tokens(self) -> u32 {
         self.total_tokens
+    }
+
+    pub fn cache_read_input_tokens(self) -> Option<u32> {
+        self.cache_read_input_tokens
+    }
+
+    pub fn cache_write_input_tokens(self) -> Option<u32> {
+        self.cache_write_input_tokens
     }
 }
 
@@ -613,6 +630,18 @@ impl BedrockTransport {
             call = call.system(SystemContentBlock::Text(request.system.clone()));
         }
 
+        // The digest covers every immutable request field, so an operation id reused after
+        // a changed prompt, profile, or cap is caught rather than silently sharing one
+        // attempt history across two distinct provider calls. Computed only where the check
+        // runs: hashing a prompt on every dispatch to feed a debug assertion is not a cost
+        // this boundary should pay in release.
+        #[cfg(debug_assertions)]
+        history.bind(&format!(
+            "{}|{}",
+            request.operation_id(),
+            request.request_digest()
+        ));
+        #[cfg(not(debug_assertions))]
         history.bind(request.operation_id());
         let prior_unknown = history.mark_possible_send();
         let outcome = classify(call.send().await);
@@ -715,15 +744,21 @@ fn completion_text(response: &ConverseResponse) -> Option<String> {
         return None;
     }
     let mut text = String::new();
+    // Presence is tracked apart from length. A model that emits a configured stop sequence
+    // immediately answers with an empty text block, which is a completion; a frame with no
+    // text block at all is one this boundary cannot read. Collapsing the two would report
+    // dispatch uncertainty for an attempt the provider had already answered.
+    let mut answered = false;
     for block in message.content() {
         if let ContentBlock::Text(chunk) = block {
+            answered = true;
             if text.len().saturating_add(chunk.len()) > MAX_COMPLETION_BYTES {
                 return None;
             }
             text.push_str(chunk);
         }
     }
-    (!text.is_empty()).then_some(text)
+    answered.then_some(text)
 }
 
 /// Reads the provider's token counts, refusing a negative one rather than normalizing it.
@@ -732,10 +767,19 @@ fn completion_text(response: &ConverseResponse) -> Option<String> {
 /// outside what the operation can mean, so it is rejected at the boundary instead of being
 /// carried inward as a plausible number.
 fn token_use(usage: &TokenUsage) -> Option<ReportedUse> {
+    // An absent cache counter and a negative one are different answers: absent means the
+    // response reported no cache activity, while a negative count is a number the operation
+    // cannot mean, and rejecting it is what keeps a fabricated category out of the trace.
+    let optional = |count: Option<i32>| match count {
+        None => Some(None),
+        Some(count) => u32::try_from(count).ok().map(Some),
+    };
     Some(ReportedUse {
         input_tokens: u32::try_from(usage.input_tokens()).ok()?,
         output_tokens: u32::try_from(usage.output_tokens()).ok()?,
         total_tokens: u32::try_from(usage.total_tokens()).ok()?,
+        cache_read_input_tokens: optional(usage.cache_read_input_tokens())?,
+        cache_write_input_tokens: optional(usage.cache_write_input_tokens())?,
     })
 }
 
@@ -782,13 +826,20 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
         SdkError::DispatchFailure(_) => InvocationOutcome::Unknown {
             provider_request_id,
         },
-        // No fake here reaches this arm: a body the deserializer rejects arrives as a
-        // service error whose source is a deserialization failure, which the success-status
-        // guard below catches. It yields no usage either way, and the request id comes off
-        // the raw response rather than the decoded body.
-        SdkError::ResponseError(_) => InvocationOutcome::MalformedResponse {
+        // Split on the raw status for the same reason the service-error arm below is: a
+        // frame this boundary could not read is only a malformed completion if the provider
+        // said the call succeeded. On a failure status an unreadable body proves nothing
+        // about whether work was done, so it stays unknown rather than inviting
+        // malformed-output handling. Either way there is no usage, and the request id comes
+        // off the raw response rather than the decoded body.
+        SdkError::ResponseError(ref error) if error.raw().status().is_success() => {
+            InvocationOutcome::MalformedResponse {
+                provider_request_id,
+                reported_use: None,
+            }
+        }
+        SdkError::ResponseError(_) => InvocationOutcome::Unknown {
             provider_request_id,
-            reported_use: None,
         },
         SdkError::ServiceError(service) => {
             match service.err() {
@@ -1356,7 +1407,6 @@ mod tests {
         for frame in [json(definite), json(refused), rejected(), throttled()] {
             let (transport, _) = replay(vec![frame]);
             let mut history = AttemptHistory::default();
-            history.bind(OPERATION_ID);
             history.mark_possible_send();
             let outcome = transport.invoke(&request(), &mut history).await;
             assert!(
@@ -1537,6 +1587,101 @@ mod tests {
             // Neither answer involved model work, so neither leaves dispatch uncertainty.
             assert!(!history.may_have_been_sent(), "{error_type}");
         }
+    }
+
+    /// Every usage category the provider reports is kept. This boundary sends no cache
+    /// points, so cache counters are normally absent, but a gateway or a later configuration
+    /// can enable prompt caching, and those counters are their own billing categories rather
+    /// than something already folded into the aggregates.
+    #[tokio::test]
+    async fn cache_token_counters_survive_into_reported_use() {
+        let (transport, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15,"cacheReadInputTokens":7,"cacheWriteInputTokens":3}}"#,
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::Completed { reported_use, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        let reported = reported_use.expect("usage block present");
+        assert_eq!(reported.cache_read_input_tokens(), Some(7));
+        assert_eq!(reported.cache_write_input_tokens(), Some(3));
+
+        // Absent is not zero: a response reporting no cache activity says nothing about
+        // cache billing, and a zero would be a claim that it did.
+        let (plain, _) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((1, 1, 2)),
+            "answer",
+        ))]);
+        let outcome = invoke(&plain).await;
+        let InvocationOutcome::Completed { reported_use, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        let reported = reported_use.expect("usage block present");
+        assert_eq!(reported.cache_read_input_tokens(), None);
+        assert_eq!(reported.cache_write_input_tokens(), None);
+    }
+
+    /// A negative cache counter is refused on the same terms as a negative aggregate: the
+    /// frame's own accounting will not read, so the frame will not read.
+    #[tokio::test]
+    async fn a_negative_cache_counter_makes_the_frame_malformed() {
+        let (transport, _) = replay(vec![json(String::from(
+            r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2,"cacheReadInputTokens":-1}}"#,
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::MalformedResponse { reported_use, .. } = &outcome else {
+            panic!("expected an unreadable frame, got {outcome:?}");
+        };
+        assert_eq!(*reported_use, None);
+    }
+
+    /// An empty text block is an answer. A model that emits a configured stop sequence
+    /// immediately produces one, and reporting it as unreadable would leave dispatch
+    /// uncertainty on an attempt the provider had already resolved.
+    #[tokio::test]
+    async fn an_empty_text_block_is_a_completion_rather_than_an_unreadable_frame() {
+        let (transport, _) = replay(vec![json(converse_body(
+            "stop_sequence",
+            Some((1, 0, 1)),
+            "",
+        ))]);
+        let mut history = AttemptHistory::default();
+
+        let outcome = transport.invoke(&request(), &mut history).await;
+        let InvocationOutcome::Completed { text, reason, .. } = &outcome else {
+            panic!("expected a completion, got {outcome:?}");
+        };
+        assert!(text.is_empty());
+        assert_eq!(*reason, TerminalReason::StopSequence);
+        assert!(!history.may_have_been_sent());
+    }
+
+    /// One attempt history covers one immutable request. Reusing an operation id after
+    /// changing what is sent would carry the first call's possible-send and billing evidence
+    /// into a different call, so the binding covers the request digest and not just the label.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "one operation identity")]
+    async fn one_history_cannot_span_two_different_requests_sharing_an_operation_id() {
+        let (transport, _) = replay(vec![
+            json(converse_body("end_turn", Some((1, 1, 2)), "answer")),
+            json(converse_body("end_turn", Some((1, 1, 2)), "answer")),
+        ]);
+        let mut history = AttemptHistory::default();
+        let changed = InvocationRequest::new(
+            profile(),
+            "be terse".into(),
+            "a different prompt".into(),
+            cap(512),
+            OPERATION_ID.into(),
+        )
+        .unwrap();
+
+        transport.invoke(&request(), &mut history).await;
+        transport.invoke(&changed, &mut history).await;
     }
 
     /// Every stop reason maps to its own terminal reason, and one this crate does not model

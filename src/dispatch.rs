@@ -68,12 +68,11 @@ impl AttemptHistory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "one operation identity")]
     fn one_history_cannot_span_two_operation_identities() {
         let mut history = AttemptHistory::default();

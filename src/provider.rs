@@ -291,9 +291,13 @@ impl InvocationRequest {
     /// Length-prefixing each field keeps two different splits of the same bytes from
     /// colliding.
     pub fn request_digest(&self) -> String {
+        self.digest_over(&self.profile.configuration_digest())
+    }
+
+    fn digest_over(&self, configuration_digest: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(REQUEST_DOMAIN);
-        absorb(&mut hasher, self.profile.configuration_digest().as_bytes());
+        absorb(&mut hasher, configuration_digest.as_bytes());
         absorb(&mut hasher, self.system.as_bytes());
         absorb(&mut hasher, self.prompt.as_bytes());
         absorb_number(&mut hasher, u64::from(self.max_output_tokens.get()));
@@ -317,11 +321,14 @@ fn absorb_number(hasher: &mut Sha256, value: u64) {
 /// request, which is the exposure this boundary exists to contain.
 impl fmt::Debug for InvocationRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `request_digest` absorbs the configuration digest, so computing it once and
+        // reusing it keeps one format to two hash passes rather than three.
+        let configuration_digest = self.profile.configuration_digest();
         formatter
             .debug_struct("InvocationRequest")
             .field("model_id", &self.profile.model_id)
-            .field("configuration_digest", &self.profile.configuration_digest())
-            .field("request_digest", &self.request_digest())
+            .field("configuration_digest", &configuration_digest)
+            .field("request_digest", &self.digest_over(&configuration_digest))
             .field("max_output_tokens", &self.max_output_tokens)
             .field("operation_id", &self.operation_id)
             .field("system_bytes", &self.system.len())
@@ -373,10 +380,11 @@ pub enum TerminalReason {
 impl TerminalReason {
     /// Whether this reason is a definite answer that cannot carry a usable completion.
     ///
-    /// Each of these arrives on a success status with no assistant text, so deciding the
-    /// outcome from the reason rather than from the text is what keeps the reason, the
-    /// provider request id, and the reported use that came with it. A context-window
-    /// rejection in particular reports the input tokens the account was billed for.
+    /// Each of these may arrive with no assistant text, and any text it does carry is not a
+    /// completion. Deciding the outcome from the reason rather than from the text is what
+    /// keeps the reason, the provider request id, and the reported use that came with it. A
+    /// context-window rejection in particular reports the input tokens the account was
+    /// billed for.
     fn precludes_completion(self) -> bool {
         matches!(
             self,
@@ -426,8 +434,14 @@ pub enum InvocationOutcome {
     TimedOut,
     /// The request never reached construction, so no dispatch was possible.
     ProvenNotSent,
-    /// A response arrived that this boundary cannot read as a completion.
-    MalformedResponse,
+    /// A response arrived that this boundary cannot read as a completion, either because a
+    /// stop reason this crate does not model carried no usable text or because the frame
+    /// itself would not decode. Any evidence that did arrive is kept: a frame that reports
+    /// token use was billed whether or not this crate could interpret the rest of it.
+    MalformedResponse {
+        provider_request_id: Option<String>,
+        reported_use: Option<ReportedUse>,
+    },
     /// No available evidence proves whether the provider accepted the request.
     Unknown,
 }
@@ -465,7 +479,14 @@ impl fmt::Debug for InvocationOutcome {
             Self::Rejected => formatter.write_str("Rejected"),
             Self::TimedOut => formatter.write_str("TimedOut"),
             Self::ProvenNotSent => formatter.write_str("ProvenNotSent"),
-            Self::MalformedResponse => formatter.write_str("MalformedResponse"),
+            Self::MalformedResponse {
+                provider_request_id,
+                reported_use,
+            } => formatter
+                .debug_struct("MalformedResponse")
+                .field("provider_request_id", provider_request_id)
+                .field("reported_use", reported_use)
+                .finish(),
             Self::Unknown => formatter.write_str("Unknown"),
         }
     }
@@ -529,7 +550,7 @@ impl BedrockTransport {
                     outcome,
                     InvocationOutcome::RateLimited
                         | InvocationOutcome::TimedOut
-                        | InvocationOutcome::MalformedResponse
+                        | InvocationOutcome::MalformedResponse { .. }
                         | InvocationOutcome::Unknown
                 ),
         );
@@ -580,7 +601,10 @@ fn classify(result: Result<ConverseResponse, SdkError<ConverseError>>) -> Invoca
             provider_request_id,
             reported_use,
         },
-        None => InvocationOutcome::MalformedResponse,
+        None => InvocationOutcome::MalformedResponse {
+            provider_request_id,
+            reported_use,
+        },
     }
 }
 
@@ -644,7 +668,11 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
         SdkError::ConstructionFailure(_) => InvocationOutcome::ProvenNotSent,
         SdkError::TimeoutError(_) => InvocationOutcome::TimedOut,
         SdkError::DispatchFailure(_) => InvocationOutcome::Unknown,
-        SdkError::ResponseError(_) => InvocationOutcome::MalformedResponse,
+        // A frame that would not decode carries no evidence this boundary can trust.
+        SdkError::ResponseError(_) => InvocationOutcome::MalformedResponse {
+            provider_request_id: None,
+            reported_use: None,
+        },
         SdkError::ServiceError(service) => match service.err() {
             ConverseError::ThrottlingException(_)
             | ConverseError::ServiceUnavailableException(_)
@@ -662,7 +690,10 @@ fn classify_error(error: SdkError<ConverseError>) -> InvocationOutcome {
             // read — a body-deserialization failure arrives here, not as `ResponseError`.
             // On a failure status it is a service condition this crate does not model, and
             // an unnamed condition says nothing about whether the provider did work.
-            _ if service.raw().status().is_success() => InvocationOutcome::MalformedResponse,
+            _ if service.raw().status().is_success() => InvocationOutcome::MalformedResponse {
+                provider_request_id: None,
+                reported_use: None,
+            },
             _ => InvocationOutcome::Unknown,
         },
         _ => InvocationOutcome::Unknown,
@@ -684,6 +715,7 @@ mod tests {
     use super::*;
 
     const MODEL_ID: &str = "anthropic.claude-fixture-v1:0";
+    const PROVIDER_REQUEST_ID: &str = "req-fixture-1";
     const OPERATION_ID: &str = "invoke-op-1";
 
     fn cap(value: u32) -> NonZeroU32 {
@@ -764,8 +796,17 @@ mod tests {
         )
     }
 
+    /// Success frames carry a provider request id, so every outcome built from one can be
+    /// checked for the correlation handle it is meant to keep.
     fn json(body: String) -> http::Response<SdkBody> {
-        response(200, &[("content-type", "application/json")], body)
+        response(
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("x-amzn-requestid", PROVIDER_REQUEST_ID),
+            ],
+            body,
+        )
     }
 
     async fn invoke(transport: &BedrockTransport) -> InvocationOutcome {
@@ -785,11 +826,16 @@ mod tests {
             text,
             reason,
             reported_use,
-            ..
+            provider_request_id,
         } = invoke(&transport).await
         else {
             panic!("expected a completion");
         };
+        assert_eq!(
+            provider_request_id.as_deref(),
+            Some(PROVIDER_REQUEST_ID),
+            "a completion keeps the handle that correlates it with provider-side logs"
+        );
         assert_eq!(text, "rayleigh scattering");
         assert_eq!(reason, TerminalReason::EndTurn);
         let reported = reported_use.expect("usage block present");
@@ -946,19 +992,42 @@ mod tests {
     #[tokio::test]
     async fn frames_without_readable_text_are_malformed() {
         for body in [
-            String::from("{\"stopReason\":\"end_turn\",\"usage\":null}"),
+            String::from("{\"stopReason\":\"end_turn\"}"),
             String::from(
                 "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[]}},\
-                 \"stopReason\":\"end_turn\",\"usage\":null}",
+                 \"stopReason\":\"end_turn\"}",
             ),
         ] {
             let (transport, _) = replay(vec![json(body.clone())]);
-            assert_eq!(
-                invoke(&transport).await,
-                InvocationOutcome::MalformedResponse,
-                "{body}"
+            let outcome = invoke(&transport).await;
+            assert!(
+                matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
+                "{body} gave {outcome:?}"
             );
         }
+    }
+
+    /// An unreadable frame keeps whatever evidence arrived with it. A stop reason this crate
+    /// does not model is the reachable case, and dropping its usage would lose spend the
+    /// account was charged for the same way a modelled reason would.
+    #[tokio::test]
+    async fn an_unreadable_frame_keeps_the_evidence_that_arrived_with_it() {
+        let (transport, _) = replay(vec![json(String::from(
+            "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[]}},\
+             \"stopReason\":\"a_reason_added_after_this_crate\",\
+             \"usage\":{\"inputTokens\":900000,\"outputTokens\":0,\"totalTokens\":900000}}",
+        ))]);
+
+        let outcome = invoke(&transport).await;
+        let InvocationOutcome::MalformedResponse { reported_use, .. } = outcome else {
+            panic!("expected an unreadable frame, got {outcome:?}");
+        };
+        assert_eq!(
+            reported_use
+                .expect("usage survives an unreadable frame")
+                .input_tokens(),
+            900_000
+        );
     }
 
     /// A body that is not a `Converse` frame at all fails inside the SDK's deserializer.
@@ -966,9 +1035,10 @@ mod tests {
     async fn an_unparseable_body_is_malformed() {
         let (transport, _) = replay(vec![json(String::from("not json"))]);
 
-        assert_eq!(
-            invoke(&transport).await,
-            InvocationOutcome::MalformedResponse
+        let outcome = invoke(&transport).await;
+        assert!(
+            matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
+            "{outcome:?}"
         );
     }
 
@@ -1067,6 +1137,11 @@ mod tests {
     /// A connector that cannot reach the service is the one failure that never produced a
     /// response, and it is still unknown rather than proven-not-sent: the bytes may have
     /// left the process. A closed loopback port refuses immediately, so no network is used.
+    ///
+    /// The default client honors `HTTP_PROXY`, so under a proxy the connect may reach it
+    /// instead and a non-success proxy reply reaches the same outcome by another path. The
+    /// assertion still holds; what it stops proving is which path produced it. A connect
+    /// that timed out instead would fail this test rather than pass it.
     #[tokio::test]
     async fn a_connector_failure_is_unknown_and_keeps_possible_send_evidence() {
         let transport = BedrockTransport::new(
@@ -1099,6 +1174,9 @@ mod tests {
                 "malformed_model_output",
                 TerminalReason::ModelOutputMalformed,
             ),
+            // Sharing an arm with the reason above is what makes this a definite verdict
+            // rather than a completion, so its own wire string has to be exercised.
+            ("malformed_tool_use", TerminalReason::ModelOutputMalformed),
         ] {
             let (transport, _) = replay(vec![json(format!(
                 "{{\"output\":{{\"message\":{{\"role\":\"assistant\",\"content\":[]}}}},\
@@ -1113,12 +1191,13 @@ mod tests {
             let InvocationOutcome::Refused {
                 reason,
                 reported_use,
-                ..
+                provider_request_id,
             } = outcome
             else {
                 panic!("expected a definite verdict for {wire}, got {outcome:?}");
             };
             assert_eq!(reason, expected);
+            assert_eq!(provider_request_id.as_deref(), Some(PROVIDER_REQUEST_ID));
             assert_eq!(
                 reported_use
                     .expect("usage survives the verdict")
@@ -1152,10 +1231,24 @@ mod tests {
         }
     }
 
-    /// A completion past the retained bound is refused rather than truncated, so a caller
-    /// cannot mistake a shortened answer for a whole one.
+    /// A completion past the retained bound is rejected rather than truncated, so a caller
+    /// cannot mistake a shortened answer for a whole one. It is not a `Refused` verdict: the
+    /// provider did not decline, it answered in a way this boundary will not carry.
     #[tokio::test]
-    async fn a_completion_past_the_retained_bound_is_refused() {
+    async fn a_completion_past_the_retained_bound_is_malformed() {
+        // A completion at exactly the bound is kept, so `>` cannot drift to `>=`.
+        let (at_bound, _) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((1, 1, 2)),
+            &"x".repeat(MAX_COMPLETION_BYTES),
+        ))]);
+        assert!(matches!(
+            at_bound
+                .invoke(&request(), &mut AttemptHistory::default())
+                .await,
+            InvocationOutcome::Completed { .. }
+        ));
+
         let oversized = "x".repeat(MAX_COMPLETION_BYTES + 1);
         let (transport, _) = replay(vec![json(converse_body(
             "end_turn",
@@ -1163,11 +1256,12 @@ mod tests {
             &oversized,
         ))]);
 
-        assert_eq!(
-            transport
-                .invoke(&request(), &mut AttemptHistory::default())
-                .await,
-            InvocationOutcome::MalformedResponse
+        let outcome = transport
+            .invoke(&request(), &mut AttemptHistory::default())
+            .await;
+        assert!(
+            matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
+            "{outcome:?}"
         );
     }
 
@@ -1293,6 +1387,47 @@ mod tests {
             .is_err()
         );
         assert!(history.may_have_been_sent());
+    }
+
+    /// Formatting a request or an outcome must not reproduce the prompt or the completion.
+    /// The derived implementations did, which is what these hand-written ones replace, and a
+    /// single `#[derive(Debug)]` added back would undo it silently.
+    #[tokio::test]
+    async fn formatting_a_request_or_an_outcome_never_reveals_its_text() {
+        const SECRET_PROMPT: &str = "a-prompt-that-must-not-be-logged";
+        const SECRET_SYSTEM: &str = "a-system-text-that-must-not-be-logged";
+        const SECRET_COMPLETION: &str = "a-completion-that-must-not-be-logged";
+
+        let request = InvocationRequest::new(
+            profile(),
+            SECRET_SYSTEM.into(),
+            SECRET_PROMPT.into(),
+            cap(512),
+            OPERATION_ID.into(),
+        )
+        .unwrap();
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(SECRET_PROMPT), "{rendered}");
+        assert!(!rendered.contains(SECRET_SYSTEM), "{rendered}");
+        // What identifies the request is still there, so the redaction stays diagnosable.
+        assert!(rendered.contains(&request.request_digest()), "{rendered}");
+        assert!(rendered.contains(OPERATION_ID), "{rendered}");
+
+        let (transport, _) = replay(vec![json(converse_body(
+            "end_turn",
+            Some((1, 1, 2)),
+            SECRET_COMPLETION,
+        ))]);
+        let outcome = transport
+            .invoke(&request, &mut AttemptHistory::default())
+            .await;
+        assert!(
+            matches!(outcome, InvocationOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        let rendered = format!("{outcome:?}");
+        assert!(!rendered.contains(SECRET_COMPLETION), "{rendered}");
+        assert!(rendered.contains("text_bytes"), "{rendered}");
     }
 
     #[test]
@@ -1591,6 +1726,17 @@ mod tests {
             )
             .is_ok()
         );
+        // Each text and identity bound holds at exactly the limit, so no `>` can drift.
+        assert!(
+            InvocationRequest::new(
+                profile(),
+                "s".repeat(MAX_PROMPT_BYTES),
+                "p".repeat(MAX_PROMPT_BYTES),
+                cap(512),
+                "o".repeat(MAX_IDENTIFIER_BYTES),
+            )
+            .is_ok()
+        );
         for (system, prompt, operation, expected) in [
             (
                 String::new(),
@@ -1602,6 +1748,12 @@ mod tests {
                 String::new(),
                 String::from("prompt"),
                 "",
+                ProfileError::OperationIdentityInvalid,
+            ),
+            (
+                String::new(),
+                String::from("prompt"),
+                "o".repeat(MAX_IDENTIFIER_BYTES + 1).leak(),
                 ProfileError::OperationIdentityInvalid,
             ),
             (

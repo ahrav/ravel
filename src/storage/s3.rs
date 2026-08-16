@@ -177,7 +177,12 @@ impl AttemptHistory {
 }
 
 impl AttemptHistory {
-    /// An earlier attempt for this operation identity may have reached the remote service.
+    /// An earlier attempt for this operation identity may have reached the remote service
+    /// without a result that resolves the question.
+    ///
+    /// A definite verdict clears this where the boundary can reconcile one, so `false` means
+    /// no unresolved uncertainty rather than no dispatch. What reached the service is read
+    /// from the outcome, not from here.
     pub fn may_have_been_sent(&self) -> bool {
         self.may_have_been_sent
     }

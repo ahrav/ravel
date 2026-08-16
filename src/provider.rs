@@ -80,6 +80,7 @@ pub enum ProfileError {
     CapAboveCeiling,
     ProbabilityOutOfRange,
     TooManyStopSequences,
+    StopSequenceEmpty,
     StopSequenceTooLong,
     TextTooLarge,
     TextEmpty,
@@ -95,6 +96,7 @@ impl fmt::Display for ProfileError {
             Self::CapAboveCeiling => "output-token cap exceeds the profile ceiling",
             Self::ProbabilityOutOfRange => "sampling probability is outside 0..=1",
             Self::TooManyStopSequences => "profile declares more stop sequences than permitted",
+            Self::StopSequenceEmpty => "profile stop sequence is empty",
             Self::StopSequenceTooLong => "profile stop sequence exceeds the sendable length",
             Self::TextTooLarge => "request text exceeds the prompt limit",
             Self::TextEmpty => "request text is empty",
@@ -127,7 +129,7 @@ pub const MAX_STOP_SEQUENCE_BYTES: usize = 256;
 /// is part of the pinned configuration rather than a vendor table, because a per-model
 /// ceiling this crate hardcodes would be an unverifiable claim about the provider that
 /// drifts silently when the provider changes it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ModelProfile {
     provider: ModelProvider,
     model_id: String,
@@ -172,6 +174,12 @@ impl ModelProfile {
         }
         if stop_sequences.len() > MAX_STOP_SEQUENCES {
             return Err(ProfileError::TooManyStopSequences);
+        }
+        // An empty sequence matches nothing the provider can act on and `Converse` rejects
+        // it, so it is a configuration error this boundary catches rather than a request it
+        // sends and has answered for it.
+        if stop_sequences.iter().any(String::is_empty) {
+            return Err(ProfileError::StopSequenceEmpty);
         }
         if stop_sequences
             .iter()
@@ -333,6 +341,28 @@ fn absorb_number(hasher: &mut Sha256, value: u64) {
 
 /// Prints what identifies the request, never what it says.
 ///
+/// Prints a profile's identifiers and shape, never its stop-sequence text.
+///
+/// A stop sequence is provider-bound text and can be user-derived, so a derived
+/// implementation would put it in any log line that formats a profile, which is the same
+/// exposure the request and outcome implementations exist to contain. The configuration
+/// digest covers the exact sequences, so what identifies the configuration survives.
+impl fmt::Debug for ModelProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelProfile")
+            .field("provider", &self.provider)
+            .field("model_id", &self.model_id)
+            .field("configuration_id", &self.configuration_id)
+            .field("configuration_digest", &self.configuration_digest())
+            .field("output_token_ceiling", &self.output_token_ceiling)
+            .field("temperature_thousandths", &self.temperature_thousandths)
+            .field("top_p_thousandths", &self.top_p_thousandths)
+            .field("stop_sequences", &self.stop_sequences.len())
+            .finish()
+    }
+}
+
 /// A derived implementation would reproduce the prompt in any log line that formats a
 /// request, which is the exposure this boundary exists to contain.
 impl fmt::Debug for InvocationRequest {
@@ -1925,6 +1955,30 @@ mod tests {
         assert!(rendered.contains(&request.request_digest()), "{rendered}");
         assert!(rendered.contains(OPERATION_ID), "{rendered}");
 
+        // A profile is public and crosses this boundary, and a stop sequence is
+        // provider-bound text that can be user-derived, so formatting one redacts it too.
+        const SECRET_STOP: &str = "a-stop-sequence-that-must-not-be-logged";
+        let pinned = ModelProfile::new(
+            ModelProvider::Bedrock,
+            MODEL_ID.into(),
+            "profile-a".into(),
+            cap(4096),
+            None,
+            None,
+            vec![SECRET_STOP.into()],
+        )
+        .unwrap();
+        let profile_rendered = format!("{pinned:?}");
+        assert!(
+            !profile_rendered.contains(SECRET_STOP),
+            "{profile_rendered}"
+        );
+        assert!(
+            profile_rendered.contains(&pinned.configuration_digest()),
+            "{profile_rendered}"
+        );
+        assert!(profile_rendered.contains(MODEL_ID), "{profile_rendered}");
+
         let (transport, _) = replay(vec![json(converse_body(
             "end_turn",
             Some((1, 1, 2)),
@@ -2195,6 +2249,18 @@ mod tests {
                     vec![String::from("a"); MAX_STOP_SEQUENCES + 1],
                 ),
                 ProfileError::TooManyStopSequences,
+            ),
+            (
+                ModelProfile::new(
+                    ModelProvider::Bedrock,
+                    MODEL_ID.into(),
+                    "profile-a".into(),
+                    cap(1),
+                    None,
+                    None,
+                    vec![String::new()],
+                ),
+                ProfileError::StopSequenceEmpty,
             ),
             // Counting the sequences is not bounding them: one oversized sequence carries
             // provider-bound text past every other bound this boundary applies.

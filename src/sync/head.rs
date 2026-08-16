@@ -27,6 +27,7 @@ use crate::{
 
 use super::{
     WireError,
+    accelerator::{self, StoredEvent},
     event::{
         ResolvedScopeEventPublication, ScopeEventPublicationError, payload_registered,
         publish_encoded, publish_root, read_opaque, root_domain_valid, root_payload_valid,
@@ -644,85 +645,208 @@ async fn reconcile(
             Some((parent.head.tail().clone(), parent.head.scope_epoch()))
         }
     };
-    let mut current_ref = current.head.tail().clone();
+    let tail = current.head.tail().clone();
     let hops = match &boundary {
-        Some((boundary, _)) if current_ref.sequence() > boundary.sequence() => {
-            current_ref.sequence() - boundary.sequence()
+        Some((boundary, _)) if tail.sequence() > boundary.sequence() => {
+            tail.sequence() - boundary.sequence()
         }
         Some(_) => return ScopeHeadCommitOutcome::Unresolved(transition),
-        None => current_ref.sequence(),
+        None => tail.sequence(),
     };
     if hops > MAX_RECONCILE_HOPS {
         return ScopeHeadCommitOutcome::Unresolved(transition);
     }
-    let mut seen = HashSet::new();
-    let mut total_bytes = 0usize;
-    let mut found = false;
-    let mut child_writer_epoch: Option<NonZeroU64> = None;
-    for hop in 0..hops {
-        if !seen.insert(current_ref.digest().as_str().to_owned()) {
-            return ScopeHeadCommitOutcome::Unresolved(transition);
+
+    // Packs are hints: only a positive proof is accepted from them, and every other
+    // outcome re-runs the serial walk, whose evidence and verdicts stay authoritative.
+    let first = boundary
+        .as_ref()
+        .map_or(1, |(boundary, _)| boundary.sequence().saturating_add(1));
+    if let Some(events) =
+        accelerator::packed_events(store, transition.candidate.scope(), first, tail.sequence())
+            .await
+    {
+        let checker = ReconcileChecker::new(&transition, &current, boundary.clone());
+        match packed_verdict(checker, tail.clone(), hops, events) {
+            Some(ReconcileVerdict::CommittedSuperseded) => {
+                return ScopeHeadCommitOutcome::CommittedSuperseded;
+            }
+            Some(ReconcileVerdict::ProvenNotCommitted) => {
+                return ScopeHeadCommitOutcome::ProvenNotCommitted;
+            }
+            Some(ReconcileVerdict::Unresolved) | None => {}
         }
+    }
+
+    let mut checker = ReconcileChecker::new(&transition, &current, boundary);
+    let mut current_ref = tail;
+    for hop in 0..hops {
         let (decoded, bytes) =
             match read_opaque(store, transition.candidate.scope(), &current_ref).await {
                 Ok(Some(event)) => event,
                 Ok(None) | Err(_) => return ScopeHeadCommitOutcome::Unresolved(transition),
             };
-        total_bytes = match total_bytes.checked_add(bytes.len()) {
+        match checker.check(hop, &current_ref, &decoded, &bytes) {
+            ReconcileStep::Continue(parent) => current_ref = parent,
+            ReconcileStep::Concluded(ReconcileVerdict::CommittedSuperseded) => {
+                return ScopeHeadCommitOutcome::CommittedSuperseded;
+            }
+            ReconcileStep::Concluded(ReconcileVerdict::ProvenNotCommitted) => {
+                return ScopeHeadCommitOutcome::ProvenNotCommitted;
+            }
+            ReconcileStep::Concluded(ReconcileVerdict::Unresolved) => {
+                return ScopeHeadCommitOutcome::Unresolved(transition);
+            }
+        }
+    }
+    ScopeHeadCommitOutcome::Unresolved(transition)
+}
+
+/// `None` means the packs could not even feed the walk: a missing sequence or a rival
+/// object at an expected one. The serial walk then decides from authoritative reads.
+fn packed_verdict(
+    mut checker: ReconcileChecker,
+    tail: crate::scope::ScopeEventRef,
+    hops: u64,
+    events: Vec<StoredEvent>,
+) -> Option<ReconcileVerdict> {
+    let mut by_sequence: std::collections::HashMap<u64, StoredEvent> = events
+        .into_iter()
+        .map(|event| (event.decoded.event_ref().sequence(), event))
+        .collect();
+    let mut current_ref = tail;
+    for hop in 0..hops {
+        let stored = by_sequence.remove(&current_ref.sequence())?;
+        if stored.decoded.event_ref() != &current_ref {
+            return None;
+        }
+        match checker.check(hop, &current_ref, &stored.decoded, &stored.bytes) {
+            ReconcileStep::Continue(parent) => current_ref = parent,
+            ReconcileStep::Concluded(verdict) => return Some(verdict),
+        }
+    }
+    None
+}
+
+enum ReconcileVerdict {
+    CommittedSuperseded,
+    ProvenNotCommitted,
+    Unresolved,
+}
+
+enum ReconcileStep {
+    Continue(crate::scope::ScopeEventRef),
+    Concluded(ReconcileVerdict),
+}
+
+/// Per-event reconciliation verdict logic shared by pack-provided and serially read
+/// events: candidate byte and envelope comparison, registered and root payload checks,
+/// the current-head operation check, epoch ordering, the original-parent or genesis
+/// boundary, and the hop and byte limits.
+struct ReconcileChecker {
+    scope: ScopeIdentity,
+    candidate_tail: crate::scope::ScopeEventRef,
+    candidate_operation: String,
+    candidate_bytes: Vec<u8>,
+    candidate_envelope: EventEnvelope,
+    current_operation: String,
+    current_scope_epoch: NonZeroU64,
+    boundary: Option<(crate::scope::ScopeEventRef, NonZeroU64)>,
+    seen: HashSet<String>,
+    total_bytes: usize,
+    found: bool,
+    child_writer_epoch: Option<NonZeroU64>,
+}
+
+impl ReconcileChecker {
+    fn new(
+        transition: &ScopeHeadTransition,
+        current: &ObservedScopeHead,
+        boundary: Option<(crate::scope::ScopeEventRef, NonZeroU64)>,
+    ) -> Self {
+        Self {
+            scope: transition.candidate.scope().clone(),
+            candidate_tail: transition.candidate.tail().clone(),
+            candidate_operation: transition.candidate.operation_id().to_owned(),
+            candidate_bytes: transition.event.canonical_bytes().to_vec(),
+            candidate_envelope: transition.event.envelope().clone(),
+            current_operation: current.head.operation_id().to_owned(),
+            current_scope_epoch: current.head.scope_epoch(),
+            boundary,
+            seen: HashSet::new(),
+            total_bytes: 0,
+            found: false,
+            child_writer_epoch: None,
+        }
+    }
+
+    fn check(
+        &mut self,
+        hop: u64,
+        current_ref: &crate::scope::ScopeEventRef,
+        decoded: &crate::scope::DecodedScopeEvent<ciborium::Value>,
+        bytes: &[u8],
+    ) -> ReconcileStep {
+        let unresolved = ReconcileStep::Concluded(ReconcileVerdict::Unresolved);
+        if !self.seen.insert(current_ref.digest().as_str().to_owned()) {
+            return unresolved;
+        }
+        self.total_bytes = match self.total_bytes.checked_add(bytes.len()) {
             Some(total) if total <= MAX_RECONCILE_BYTES => total,
-            _ => return ScopeHeadCommitOutcome::Unresolved(transition),
+            _ => return unresolved,
         };
         if !payload_registered(decoded.envelope())
             || !root_domain_valid(decoded.envelope())
-            || !root_payload_valid(&decoded, transition.candidate.scope())
+            || !root_payload_valid(decoded, &self.scope)
         {
-            return ScopeHeadCommitOutcome::Unresolved(transition);
+            return unresolved;
         }
-        if hop == 0 && decoded.envelope().operation_id() != current.head.operation_id() {
-            return ScopeHeadCommitOutcome::Unresolved(transition);
+        if hop == 0 && decoded.envelope().operation_id() != self.current_operation {
+            return unresolved;
         }
         let writer_epoch = decoded.envelope().writer_epoch();
-        if writer_epoch > current.head.scope_epoch()
-            || child_writer_epoch.is_some_and(|child| writer_epoch > child)
+        if writer_epoch > self.current_scope_epoch
+            || self
+                .child_writer_epoch
+                .is_some_and(|child| writer_epoch > child)
         {
-            return ScopeHeadCommitOutcome::Unresolved(transition);
+            return unresolved;
         }
-        child_writer_epoch = Some(writer_epoch);
-        if decoded.envelope().operation_id() == transition.candidate.operation_id() {
-            if current_ref != *transition.candidate.tail()
-                || bytes != transition.event.canonical_bytes()
-                || decoded.envelope() != transition.event.envelope()
+        self.child_writer_epoch = Some(writer_epoch);
+        if decoded.envelope().operation_id() == self.candidate_operation {
+            if current_ref != &self.candidate_tail
+                || bytes != self.candidate_bytes
+                || decoded.envelope() != &self.candidate_envelope
             {
-                return ScopeHeadCommitOutcome::Unresolved(transition);
+                return unresolved;
             }
-            found = true;
-        } else if current_ref == *transition.candidate.tail() {
-            return ScopeHeadCommitOutcome::Unresolved(transition);
+            self.found = true;
+        } else if current_ref == &self.candidate_tail {
+            return unresolved;
         }
-        let reached = match &boundary {
+        let reached = match &self.boundary {
             Some((boundary, _)) => decoded.envelope().parent_event() == Some(boundary),
             None => {
                 decoded.envelope().sequence() == 1 && decoded.envelope().parent_event().is_none()
             }
         };
         if reached {
-            if let Some((_, boundary_epoch)) = &boundary
+            if let Some((_, boundary_epoch)) = &self.boundary
                 && writer_epoch < *boundary_epoch
             {
-                return ScopeHeadCommitOutcome::Unresolved(transition);
+                return unresolved;
             }
-            return if found {
-                ScopeHeadCommitOutcome::CommittedSuperseded
+            return ReconcileStep::Concluded(if self.found {
+                ReconcileVerdict::CommittedSuperseded
             } else {
-                ScopeHeadCommitOutcome::ProvenNotCommitted
-            };
+                ReconcileVerdict::ProvenNotCommitted
+            });
         }
         let Some(parent) = decoded.envelope().parent_event() else {
-            return ScopeHeadCommitOutcome::Unresolved(transition);
+            return unresolved;
         };
-        current_ref = parent.clone();
+        ReconcileStep::Continue(parent.clone())
     }
-    ScopeHeadCommitOutcome::Unresolved(transition)
 }
 
 #[cfg(test)]
@@ -1547,6 +1671,7 @@ mod tests {
                 &[("etag", "\"current\"")],
                 encode_head(&later_head).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(
                 200,
                 &[("etag", "\"e3\"")],
@@ -1602,6 +1727,7 @@ mod tests {
                 &[("etag", "\"current\"")],
                 encode_head(&other_head).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(
                 200,
                 &[("etag", "\"e2\"")],
@@ -1618,6 +1744,150 @@ mod tests {
             .await,
             ScopeHeadCommitOutcome::ProvenNotCommitted
         ));
+    }
+
+    /// Pack-backed reconciliation reaches the same verdicts as the serial walk, with no
+    /// per-event GET at all.
+    #[tokio::test]
+    async fn packed_reconciliation_proves_the_same_verdicts_without_event_reads() {
+        use crate::sync::accelerator::{PackEntry, build_pack, encode_catalog, encode_pointer};
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let parent = genesis.head().clone();
+
+        // Superseded: the candidate committed at sequence 2 and a later event tops it.
+        let (candidate_envelope, candidate_encoded) =
+            successor(&scope, genesis.event_ref(), 2, "candidate-op");
+        let candidate_ref = candidate_encoded.event_ref().clone();
+        let candidate_bytes = candidate_encoded.stored_bytes().to_vec();
+        let (_, later_encoded) = successor(&scope, &candidate_ref, 3, "later-op");
+        let later_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            later_encoded.event_ref().clone(),
+            None,
+            "later-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[&candidate_bytes, later_encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 3, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+        let publication = published(&scope, &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            candidate_ref.clone(),
+            None,
+            "candidate-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&later_head).unwrap(),
+            ),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::CommittedSuperseded
+        ));
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|request| {
+            !request
+                .uri()
+                .parse::<http::Uri>()
+                .unwrap()
+                .path()
+                .contains("/events/")
+        }));
+
+        // Not committed: a rival occupies sequence 2 and the pack proves the whole chain.
+        let (_, other_encoded) = successor(&scope, genesis.event_ref(), 2, "other-op");
+        let other_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            other_encoded.event_ref().clone(),
+            None,
+            "other-op".into(),
+        )
+        .unwrap();
+        let other_pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[other_encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 2, other_pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) = encode_catalog(&scope, &[entry], &[]).unwrap();
+        let pointer_bytes = encode_pointer(&scope, &catalog_digest).unwrap();
+        let (absent_envelope, absent_encoded) =
+            successor(&scope, genesis.event_ref(), 2, "absent-op");
+        let publication = published(&scope, &absent_envelope, absent_encoded).await;
+        let candidate_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            publication.event_ref().clone(),
+            None,
+            "absent-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&other_head).unwrap(),
+            ),
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[("etag", "\"pack\"")], other_pack.bytes().to_vec()),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::ProvenNotCommitted
+        ));
+        assert_eq!(client.actual_requests().count(), 5);
     }
 
     #[tokio::test]
@@ -1662,6 +1932,7 @@ mod tests {
                 &[("etag", "\"current\"")],
                 encode_head(&above_head).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(
                 200,
                 &[("etag", "\"e3\"")],
@@ -1733,6 +2004,7 @@ mod tests {
                 &[("etag", "\"current\"")],
                 encode_head(&regressed_head).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(
                 200,
                 &[("etag", "\"e3\"")],
@@ -1792,6 +2064,7 @@ mod tests {
                 &[("etag", "\"current\"")],
                 encode_head(&stale_head).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(
                 200,
                 &[("etag", "\"e2\"")],
@@ -1903,6 +2176,7 @@ mod tests {
                 &[("etag", "\"current\"")],
                 encode_head(&mismatched).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(
                 200,
                 &[("etag", "\"e2\"")],
@@ -1918,7 +2192,7 @@ mod tests {
             .await,
             ScopeHeadCommitOutcome::Unresolved(_)
         ));
-        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(client.actual_requests().count(), 4);
     }
 
     #[tokio::test]
@@ -1957,6 +2231,7 @@ mod tests {
                 &[("etag", "\"current\"")],
                 encode_head(&fake_head).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(200, &[("etag", "\"e1\"")], fake.stored_bytes().to_vec()),
         ]);
         assert!(matches!(
@@ -1972,7 +2247,7 @@ mod tests {
             .unwrap(),
             ScopeHeadCommitOutcome::Unresolved(_)
         ));
-        assert_eq!(client.actual_requests().count(), 4);
+        assert_eq!(client.actual_requests().count(), 5);
     }
 
     #[tokio::test]
@@ -2198,6 +2473,7 @@ mod tests {
                 &[("etag", "\"superseding\"")],
                 encode_head(&superseding).unwrap(),
             ),
+            response(404, &[], SdkBody::empty()),
             response(
                 200,
                 &[("etag", "\"winning-event\"")],
@@ -2213,7 +2489,7 @@ mod tests {
             .await,
             ScopeHeadCommitOutcome::ProvenNotCommitted
         ));
-        assert_eq!(client.actual_requests().count(), 3);
+        assert_eq!(client.actual_requests().count(), 4);
         assert_eq!(winning_envelope.writer_epoch().get(), 5);
     }
 

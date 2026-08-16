@@ -198,6 +198,10 @@ impl ModelProfile {
         })
     }
 
+    pub fn provider(&self) -> ModelProvider {
+        self.provider
+    }
+
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
@@ -410,6 +414,26 @@ pub struct ReportedUse {
 }
 
 impl ReportedUse {
+    /// Rebuilds reported use from durable bytes.
+    ///
+    /// Reported use only ever originates from a provider response, so this exists for the
+    /// records that store one and not for a caller inventing counts.
+    pub(crate) fn from_reported(
+        input_tokens: u32,
+        output_tokens: u32,
+        total_tokens: u32,
+        cache_read_input_tokens: Option<u32>,
+        cache_write_input_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+        }
+    }
+
     pub fn input_tokens(self) -> u32 {
         self.input_tokens
     }

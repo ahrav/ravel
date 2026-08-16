@@ -31,8 +31,8 @@ use crate::{
         work::{WorkId, WorkRef},
     },
     scope::{
-        Digest, EventEnvelope, GrantActivatedPayload, ScopeClaimIdentity, ScopeEventRef, ScopeHead,
-        ScopeIdentity, payload_type_registered,
+        ArtifactReferencePayload, Digest, EventEnvelope, GrantActivatedPayload, ScopeClaimIdentity,
+        ScopeEventRef, ScopeHead, ScopeIdentity, payload_type_registered,
     },
 };
 
@@ -64,6 +64,17 @@ const GRANT_ACTIVATION_PROBE_SQL: &str = "SELECT \
        AND payload_type = 'grant_activated' AND grant_digest = ?3)";
 const DUPLICATE_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
      WHERE scope_id = ?1 AND (digest = ?2 OR operation_id = ?3))";
+/// Resolves one artifact reference against the history that authorized it: the admitted
+/// revision it names, and an activation event in this scope for the grant it names.
+///
+/// Both predicates read only columns no later fold rewrites, unlike `admitted_work`'s grant
+/// columns. Neither is keyed on `operation_id`: the reference is appended under its own
+/// operation, not the activation's, so `GRANT_ACTIVATION_PROBE_SQL`'s shape does not apply.
+const ARTIFACT_REFERENCE_RESOLVABLE_SQL: &str = "SELECT \
+     EXISTS(SELECT 1 FROM admitted_work \
+       WHERE scope_id = ?1 AND work_id = ?2 AND work_revision = ?3) \
+     AND EXISTS(SELECT 1 FROM applied_scope_events \
+       WHERE scope_id = ?1 AND payload_type = 'grant_activated' AND grant_digest = ?4)";
 const SCOPE_UPDATE_SQL: &str = "UPDATE scopes SET sequence = ?1, tail_event_digest = ?2, \
      scope_epoch = ?3 WHERE scope_id = ?4";
 const TAIL_WRITER_EPOCH_SQL: &str = "SELECT writer_epoch FROM applied_scope_events \
@@ -485,6 +496,13 @@ pub(crate) enum ScopeProjectionPayload {
     /// Carries every grant fact the fold writes, so the projection needs no grant-object read.
     GrantActivated {
         payload: GrantActivatedPayload,
+    },
+    /// Carries every artifact fact a rebuild needs, so replay never reads the blob back.
+    ///
+    /// A blob may be deleted by retention while its reference stays in history, so fetching
+    /// it to rebuild would make retention a cause of unreplayable history.
+    ArtifactReference {
+        payload: ArtifactReferencePayload,
     },
     #[cfg(test)]
     TestSuccessor,
@@ -1416,6 +1434,29 @@ fn apply_scope_event_in_transaction(
             ],
         )?;
         if updated != 1 {
+            return Err(ApplyError::Conflict);
+        }
+    }
+
+    // An artifact reference resolves against history rather than writing to it. Both halves
+    // of the predicate are monotone in the applied prefix: an `admitted_work` row's identity
+    // columns never change once inserted, and an activation event's own row is never
+    // rewritten. A predicate over `admitted_work`'s claim or grant columns would not be —
+    // those move to the latest fold, and `claim_fence` is still NULL while a rebuild applies
+    // its suffix, because claim columns are restored only after the suffix commits. Either
+    // mistake would make the same bytes pass or fail by fold order and could brick a rebuild.
+    if let ScopeProjectionPayload::ArtifactReference { payload } = &event.payload {
+        let resolved: bool = transaction.query_row(
+            ARTIFACT_REFERENCE_RESOLVABLE_SQL,
+            params![
+                scope_id,
+                payload.work_id().as_str(),
+                stored_u64(payload.work_revision().get())?,
+                payload.grant_digest().as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        if !resolved {
             return Err(ApplyError::Conflict);
         }
     }
@@ -2666,6 +2707,285 @@ mod tests {
         let (db_path, connection, scope) = genesis_scope(label);
         seed_active_plan(&connection, &scope, 1);
         (db_path, connection, scope)
+    }
+
+    /// Distinct 64-hex event addresses, because the file's shared digest constants overlap
+    /// (`ADMITTING_PLAN_DIGEST` is `DIGEST_2`) and `UNIQUE (scope_id, digest)` refuses a reuse.
+    fn event_digest(seed: u8) -> String {
+        format!("{seed:02x}").repeat(32)
+    }
+
+    /// One grant-activation event for `work`, whose own applied row is what an artifact
+    /// reference resolves its grant against.
+    fn grant_activation_event(
+        scope: &ScopeIdentity,
+        sequence: u64,
+        parent: &str,
+        reference: &str,
+        operation_id: &str,
+        payload: GrantActivatedPayload,
+    ) -> ScopeProjectionEvent {
+        ScopeProjectionEvent::new(
+            scope.clone(),
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(
+                    ScopeEventRef::new(sequence - 1, Digest::new(parent.into()).unwrap()).unwrap(),
+                ),
+                1,
+                operation_id.to_owned(),
+                crate::scope::GRANT_ACTIVATED_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            ScopeEventRef::new(sequence, Digest::new(reference.into()).unwrap()).unwrap(),
+            ScopeProjectionPayload::GrantActivated { payload },
+            1,
+        )
+        .unwrap()
+    }
+
+    /// One activation payload for `work-a@1`, varying only the fence, attempt, and grant.
+    fn activation_payload(fence: u64, attempt: u64, grant: &Digest) -> GrantActivatedPayload {
+        GrantActivatedPayload::new(
+            WorkId::new("work-a".into()).unwrap(),
+            1,
+            fence,
+            grant.clone(),
+            attempt,
+            1,
+            MAX_STORED_INTEGER,
+        )
+        .unwrap()
+    }
+
+    fn artifact_reference_payload(
+        work: &str,
+        revision: u64,
+        grant_digest: &str,
+    ) -> ArtifactReferencePayload {
+        ArtifactReferencePayload::new(
+            crate::scope::ArtifactKind::InvocationTrace,
+            crate::domain::artifact::ArtifactRef::new(
+                DIGEST_3.into(),
+                4_096,
+                "application/vnd.ravel.invocation-trace+cbor".into(),
+                "attempt-1".into(),
+                1_700_000_123_456,
+                None,
+            )
+            .unwrap(),
+            WorkId::new(work.into()).unwrap(),
+            revision,
+            Digest::new(grant_digest.into()).unwrap(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn artifact_event(
+        scope: &ScopeIdentity,
+        sequence: u64,
+        parent: &str,
+        reference: &str,
+        operation: &str,
+        payload: ArtifactReferencePayload,
+    ) -> ScopeProjectionEvent {
+        ScopeProjectionEvent::new(
+            scope.clone(),
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(
+                    ScopeEventRef::new(sequence - 1, Digest::new(parent.into()).unwrap()).unwrap(),
+                ),
+                1,
+                operation.into(),
+                crate::scope::ARTIFACT_REFERENCE_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            ScopeEventRef::new(sequence, Digest::new(reference.into()).unwrap()).unwrap(),
+            ScopeProjectionPayload::ArtifactReference { payload },
+            1,
+        )
+        .unwrap()
+    }
+
+    /// An artifact reference resolves against history and writes nothing. It is admitted only
+    /// when the revision it names was admitted and the grant it names was activated in this
+    /// scope, so a reference minted elsewhere or for work this scope never released is refused
+    /// inside the same transaction that would have moved the cursor.
+    #[test]
+    fn an_artifact_reference_resolves_against_admitted_work_and_an_activated_grant() {
+        let (db_path, mut connection, scope) = admitted_scope("artifact-fold");
+        let target = work("work-a", 1);
+        let fence = NonZeroU64::new(2).unwrap();
+        admit(&mut connection, &scope, &target, &[], epoch(1)).unwrap();
+        record_claim(&connection, &scope, &target, fence, fence, 1).unwrap();
+
+        // The activation event is what the reference resolves its grant against, and its own
+        // row is never rewritten by a later fold.
+        let grant = grant_digest(fence.get(), 1);
+        apply_scope_event(
+            &mut connection,
+            &grant_activation_event(
+                &scope,
+                2,
+                DIGEST_1,
+                &event_digest(0xa2),
+                "grant-op-2",
+                activation_payload(2, 1, &grant),
+            ),
+        )
+        .unwrap();
+
+        // A reference naming that revision and that grant is admitted, and the projection
+        // gains nothing but the event row: the fold writes no columns.
+        let before = snapshot(&connection);
+        apply_scope_event(
+            &mut connection,
+            &artifact_event(
+                &scope,
+                3,
+                &event_digest(0xa2),
+                &event_digest(0xa3),
+                "artifact-op-3",
+                artifact_reference_payload("work-a", 1, grant.as_str()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 3);
+        assert_eq!(
+            stored_plan_digest(&connection, &scope, &target),
+            ADMITTING_PLAN_DIGEST,
+            "the fold writes no work columns"
+        );
+        assert!(before != snapshot(&connection), "the event row is recorded");
+
+        // A revision this scope never admitted is refused, and so is a grant no activation
+        // event in this scope recorded. Both leave the cursor where it was.
+        for (label, payload) in [
+            (
+                "unadmitted revision",
+                artifact_reference_payload("work-a", 2, grant.as_str()),
+            ),
+            (
+                "unknown work id",
+                artifact_reference_payload("work-z", 1, grant.as_str()),
+            ),
+            (
+                "grant no activation recorded",
+                artifact_reference_payload("work-a", 1, DIGEST_1),
+            ),
+        ] {
+            assert_eq!(
+                apply_scope_event(
+                    &mut connection,
+                    &artifact_event(
+                        &scope,
+                        4,
+                        &event_digest(0xa3),
+                        &event_digest(0xa4),
+                        "artifact-op-4",
+                        payload,
+                    ),
+                ),
+                Err(ApplyError::Conflict),
+                "{label}"
+            );
+            assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 3, "{label}");
+        }
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    /// The resolution predicate reads only columns no later fold rewrites. `admitted_work`'s
+    /// grant columns move to the latest activation and its claim columns are still absent
+    /// while a rebuild applies its suffix, so a predicate over either would make the same
+    /// bytes pass or fail by fold order — and on a fresh rebuild would refuse every reference
+    /// and roll the whole suffix back.
+    #[test]
+    fn artifact_resolution_survives_a_later_grant_and_absent_claim_columns() {
+        let (db_path, mut connection, scope) = admitted_scope("artifact-fold-monotone");
+        let target = work("work-a", 1);
+        let first = NonZeroU64::new(2).unwrap();
+        admit(&mut connection, &scope, &target, &[], epoch(1)).unwrap();
+        record_claim(&connection, &scope, &target, first, first, 1).unwrap();
+        let early = grant_digest(first.get(), 1);
+        apply_scope_event(
+            &mut connection,
+            &grant_activation_event(
+                &scope,
+                2,
+                DIGEST_1,
+                &event_digest(0xb2),
+                "grant-op-2",
+                activation_payload(2, 1, &early),
+            ),
+        )
+        .unwrap();
+
+        // A second activation at a higher fence moves `admitted_work.grant_digest` and
+        // `grant_fence` off the first grant entirely.
+        let second = NonZeroU64::new(3).unwrap();
+        let lease = NonZeroU64::new(90_000).unwrap();
+        record_claim(&connection, &scope, &target, second, lease, 30_000).unwrap();
+        let late = grant_digest(second.get(), 1);
+        apply_scope_event(
+            &mut connection,
+            &grant_activation_event(
+                &scope,
+                3,
+                &event_digest(0xb2),
+                &event_digest(0xb3),
+                "grant-op-3",
+                activation_payload(3, 2, &late),
+            ),
+        )
+        .unwrap();
+
+        // The earlier grant is still resolvable, because the predicate reads the activation
+        // event's own row rather than the work row's moving columns.
+        apply_scope_event(
+            &mut connection,
+            &artifact_event(
+                &scope,
+                4,
+                &event_digest(0xb3),
+                &event_digest(0xb4),
+                "artifact-op-4",
+                artifact_reference_payload("work-a", 1, early.as_str()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 4);
+
+        // Claim columns are irrelevant to resolution: clearing them leaves a reference
+        // admissible, which is what keeps a fresh rebuild from refusing its own history.
+        connection
+            .execute(
+                "UPDATE admitted_work SET claim_fence = NULL, claim_lease_until = NULL \
+                 WHERE scope_id = ?1",
+                [scope.scope_id().as_str()],
+            )
+            .unwrap();
+        apply_scope_event(
+            &mut connection,
+            &artifact_event(
+                &scope,
+                5,
+                &event_digest(0xb4),
+                &event_digest(0xb5),
+                "artifact-op-5",
+                artifact_reference_payload("work-a", 1, late.as_str()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(scope_cursor(&connection, &scope).unwrap().0, 5);
+
+        drop(connection);
+        fs::remove_file(db_path).unwrap();
     }
 
     #[test]

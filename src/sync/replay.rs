@@ -18,8 +18,9 @@ use crate::{
     distributed::claims::{MAX_CLAIM_BYTES, ScopeClaimState, decode_claim},
     domain::proposal::{MAX_PLAN_STORED_BYTES, PlanProposal, decode_plan},
     scope::{
-        Digest, GRANT_ACTIVATED_PAYLOAD_TYPE, PLAN_ADMITTED_PAYLOAD_TYPE, ScopeEventRef,
-        ScopeIdentity, grant_activated_from_decoded, plan_admitted_from_decoded, plan_key,
+        ARTIFACT_REFERENCE_PAYLOAD_TYPE, Digest, GRANT_ACTIVATED_PAYLOAD_TYPE,
+        PLAN_ADMITTED_PAYLOAD_TYPE, ScopeEventRef, ScopeIdentity, artifact_reference_from_decoded,
+        grant_activated_from_decoded, plan_admitted_from_decoded, plan_key,
         root_event_from_decoded, scope_claim_key,
     },
     storage::s3::{GetError, GetOutcome, S3Store},
@@ -366,6 +367,16 @@ fn typed_payload(
                 },
             ))
         }
+        ARTIFACT_REFERENCE_PAYLOAD_TYPE => {
+            let event = artifact_reference_from_decoded(prepared.decoded)
+                .map_err(ScopeReplayError::EventInvalid)?;
+            Ok((
+                event.envelope().clone(),
+                ScopeProjectionPayload::ArtifactReference {
+                    payload: event.payload().clone(),
+                },
+            ))
+        }
         #[cfg(test)]
         crate::scope::TEST_SUCCESSOR_PAYLOAD_TYPE => Ok((
             prepared.decoded.envelope().clone(),
@@ -704,6 +715,92 @@ mod tests {
         );
         assert_eq!(row_counts(&path), (1, 2));
         drop((handle, other));
+        fs::remove_file(path).unwrap();
+    }
+
+    /// An artifact-reference event in a replayed suffix reaches its fold rather than being
+    /// refused as an unknown payload type. That distinction is the whole point: the payload
+    /// registry, the publication gate, the projection variant, and this module's conversion
+    /// are four separate registrations, and a missing conversion arm compiles cleanly and
+    /// surfaces only here — as `UnsupportedPayload` instead of the fold's `HistoryConflict`.
+    #[tokio::test]
+    async fn an_artifact_reference_suffix_reaches_its_fold_rather_than_the_unsupported_arm() {
+        use crate::{
+            domain::{artifact::ArtifactRef, work::WorkId},
+            scope::{
+                ARTIFACT_REFERENCE_PAYLOAD_TYPE, ArtifactKind, ArtifactReferenceEvent,
+                ArtifactReferencePayload, encode_artifact_reference_event,
+            },
+        };
+
+        let genesis = genesis();
+        let path = path("artifact-suffix");
+        let handle = DbHandle::spawn(path.clone()).await.unwrap();
+
+        let payload = ArtifactReferencePayload::new(
+            ArtifactKind::InvocationManifest,
+            ArtifactRef::new(
+                "cd".repeat(32),
+                4_096,
+                "application/vnd.ravel.invocation-manifest+cbor".into(),
+                "attempt-1".into(),
+                1_700_000_123_456,
+                None,
+            )
+            .unwrap(),
+            WorkId::new("work-a".into()).unwrap(),
+            1,
+            Digest::new("ab".repeat(32)).unwrap(),
+            1,
+        )
+        .unwrap();
+        let event = ArtifactReferenceEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "artifact-op-2".into(),
+                ARTIFACT_REFERENCE_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let encoded = encode_artifact_reference_event(&event).unwrap();
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            None,
+            "artifact-op-2".into(),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            event_response(encoded.stored_bytes().to_vec()),
+            event_response(genesis.event_bytes().to_vec()),
+        ]);
+
+        // This scope admitted no work and activated no grant, so the reference resolves
+        // against nothing and the fold refuses it. Reaching that refusal is the proof the
+        // conversion arm exists: an absent arm would answer `UnsupportedPayload`.
+        assert!(
+            matches!(
+                refresh(&store, &handle, genesis.identity()).await,
+                ScopeReadiness::NotReady(ScopeReplayError::HistoryConflict)
+            ),
+            "an artifact reference must reach its fold, not the unsupported arm"
+        );
+        assert_eq!(client.actual_requests().count(), 3);
+        // Nothing was applied, so the cursor never left zero.
+        assert_eq!(
+            handle.scope_cursor(genesis.identity()).await.unwrap(),
+            (0, None)
+        );
+
+        drop(handle);
         fs::remove_file(path).unwrap();
     }
 

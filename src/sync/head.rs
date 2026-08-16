@@ -17,13 +17,19 @@ use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 use crate::{
     dispatch::AttemptHistory,
     domain::proposal::AdmissibleProposal,
+    invocation::InvocationBinding,
     scope::{
-        EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent, GrantActivatedPayload,
-        MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PlanAdmittedEvent, ScopeAuthority, ScopeHead,
-        ScopeIdentity, decode_head, decode_plan_admitted_event, encode_grant_activated_event,
-        encode_head, encode_plan_admitted_event, plan_key, scope_event_key, scope_head_key,
+        ARTIFACT_REFERENCE_PAYLOAD_TYPE, ArtifactKind, ArtifactReferenceEvent,
+        ArtifactReferencePayload, EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent,
+        GrantActivatedPayload, MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE, PlanAdmittedEvent,
+        ScopeAuthority, ScopeHead, ScopeIdentity, decode_head, decode_plan_admitted_event,
+        encode_artifact_reference_event, encode_grant_activated_event, encode_head,
+        encode_plan_admitted_event, plan_key, scope_event_key, scope_head_key,
     },
-    storage::s3::{ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+    storage::{
+        artifacts::PublishedArtifact,
+        s3::{ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+    },
 };
 
 use super::{
@@ -433,6 +439,121 @@ pub(crate) async fn append_grant_activated(
     })
 }
 
+/// What one artifact-reference append admits.
+///
+/// The witness is the proof `publish` returned and the binding is the same value the manifest
+/// and trace bodies carry, so an event and the record it admits cannot disagree about which
+/// attempt produced the blob.
+pub(crate) struct ArtifactAdmission<'a> {
+    pub(crate) kind: ArtifactKind,
+    pub(crate) witness: &'a PublishedArtifact,
+    pub(crate) binding: &'a InvocationBinding,
+    pub(crate) operation_id: &'a str,
+}
+
+/// Publishes the artifact-reference event and commits the head that admits one artifact.
+///
+/// This is the only place a reference is minted, and it is where the witness gate lives: the
+/// caller must hand over the [`PublishedArtifact`] that `publish` returned, and its namespace
+/// must be the store this append writes to. A digest key is identical in every bucket, so a
+/// witness from one store proves nothing about another, and without that check a reference
+/// could name bytes this scope's store has never held.
+///
+/// The event's attribution is read out of `binding`, the same value the manifest and trace
+/// bodies carry, so an event and the record it admits cannot disagree about which attempt
+/// produced the blob.
+///
+/// # Errors
+///
+/// Returns [`ScopeAppendError::InvalidInput`] for a witness from another namespace, a missing
+/// parent head, an out-of-range binding, or a sequence past what one refresh replays, and
+/// [`ScopeAppendError::Publication`] when event bytes cannot be published.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the artifact-recording caller lands with the task that owns invocation \
+                  orchestration; `expect` flags this attribute for removal once it exists"
+    )
+)]
+pub(crate) async fn append_artifact_reference(
+    store: &S3Store,
+    parent: ScopeHeadParent,
+    admission: ArtifactAdmission<'_>,
+    event_history: &mut AttemptHistory,
+    head_history: &mut AttemptHistory,
+) -> Result<GrantActivatedAppend, ScopeAppendError> {
+    let ArtifactAdmission {
+        kind,
+        witness,
+        binding,
+        operation_id,
+    } = admission;
+    if witness.namespace() != store.namespace() {
+        return Err(ScopeAppendError::InvalidInput);
+    }
+    let ScopeHeadParent::Existing(observed) = &parent else {
+        // An artifact always succeeds an owned head, so there is a parent to fence against.
+        return Err(ScopeAppendError::InvalidInput);
+    };
+    // The fenced parent already names the scope this append writes to, so taking it separately
+    // would let a caller pass two scopes that disagree.
+    let scope = observed.head().scope().clone();
+    let scope = &scope;
+    let sequence = next_sequence(observed)?;
+    let payload = ArtifactReferencePayload::new(
+        kind,
+        witness.artifact_ref().clone(),
+        binding.work_id().clone(),
+        binding.work_revision().get(),
+        binding.grant_digest().clone(),
+        binding.attempt().get(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let event = ArtifactReferenceEvent::new(
+        EventEnvelope::new(
+            scope.scope_id().clone(),
+            sequence,
+            Some(observed.head().tail().clone()),
+            observed.head().scope_epoch().get(),
+            operation_id.to_owned(),
+            ARTIFACT_REFERENCE_PAYLOAD_TYPE.to_owned(),
+        )
+        .map_err(|_| ScopeAppendError::InvalidInput)?,
+        payload,
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let (authority, scope_epoch) = (
+        observed.head().authority().clone(),
+        observed.head().scope_epoch().get(),
+    );
+    let active_plan = observed.head().active_plan_digest().cloned();
+    let encoded = encode_artifact_reference_event(&event)
+        .map_err(ScopeEventPublicationError::Invalid)
+        .map_err(ScopeAppendError::Publication)?;
+    let publication = publish_encoded(store, scope, event.envelope(), encoded, event_history)
+        .await
+        .map_err(ScopeAppendError::Publication)?;
+    let candidate = ScopeHead::new(
+        scope.clone(),
+        authority,
+        scope_epoch,
+        publication.event_ref().clone(),
+        active_plan,
+        operation_id.to_owned(),
+    )
+    .map_err(|_| ScopeAppendError::InvalidInput)?;
+    let envelope = event.envelope().clone();
+    let reference = publication.event_ref().clone();
+    let transition = ScopeHeadTransition::new(parent, candidate, publication)
+        .map_err(|_| ScopeAppendError::InvalidInput)?;
+    Ok(GrantActivatedAppend {
+        outcome: commit(store, transition, head_history).await,
+        envelope,
+        reference,
+    })
+}
+
 /// The append path validates the next sequence before publishing event bytes, so a scope cannot
 /// commit a head past what one refresh replays.
 fn next_sequence(observed: &ObservedScopeHead) -> Result<u64, ScopeAppendError> {
@@ -767,6 +888,77 @@ mod tests {
             Region::new("us-east-1"),
             test_builder(NeverClient::new()),
         )
+    }
+
+    /// A witness minted against one store and an append aimed at another.
+    ///
+    /// An artifact's key is its digest, and that key is identical in every bucket, so a
+    /// witness proves bytes exist only in the namespace it was minted against.
+    #[tokio::test]
+    async fn an_artifact_witness_from_another_namespace_is_refused_before_any_dispatch() {
+        use crate::{
+            domain::work::WorkId,
+            invocation::InvocationBinding,
+            scope::{ArtifactKind, ScopeId},
+            storage::artifacts::publish,
+        };
+
+        let genesis = genesis();
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis.event_ref().clone(),
+            None,
+            "genesis".into(),
+        )
+        .unwrap();
+        let parent = ScopeHeadParent::existing(Box::new(observed(&head).await));
+
+        // The witness comes from a store that is not the one the append writes to.
+        let (elsewhere, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let witness = publish(
+            &elsewhere,
+            b"a manifest body".to_vec(),
+            "application/vnd.ravel.invocation-manifest+cbor".into(),
+            "attempt-1".into(),
+            1_700_000_123_456,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let binding = InvocationBinding::new(
+            ScopeId::new(genesis.identity().scope_id().as_str().to_owned()).unwrap(),
+            Digest::new("11".repeat(32)).unwrap(),
+            WorkId::new("work-a".into()).unwrap(),
+            1,
+            1,
+            Digest::new("ab".repeat(32)).unwrap(),
+            1,
+        )
+        .unwrap();
+
+        // A store that would panic on any request, so the refusal is proven to precede
+        // dispatch rather than merely to precede a response.
+        let (target, client) = replay_store(vec![]);
+        assert!(matches!(
+            append_artifact_reference(
+                &target,
+                parent,
+                ArtifactAdmission {
+                    kind: ArtifactKind::InvocationManifest,
+                    witness: &witness,
+                    binding: &binding,
+                    operation_id: "artifact-op-2",
+                },
+                &mut AttemptHistory::default(),
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
     }
 
     async fn observed(head: &ScopeHead) -> ObservedScopeHead {

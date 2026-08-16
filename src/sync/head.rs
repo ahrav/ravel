@@ -2221,6 +2221,282 @@ mod tests {
             Err(ScopeAppendError::InvalidInput)
         ));
         assert_eq!(client.actual_requests().count(), 0);
+
+        // A mismatched covered sequence is rejected before publication even when the
+        // covered digest and plan both match.
+        let ahead = ProjectionCheckpointPayload::new(
+            Digest::new("b".repeat(64)).unwrap(),
+            1_024,
+            2,
+            genesis.event_ref().digest().clone(),
+            Some(plan),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![]);
+        assert!(matches!(
+            append_checkpoint(
+                &store,
+                ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+                &scope,
+                &ahead,
+                "checkpoint-plan-op-3",
+                &mut AttemptHistory::default(),
+                &mut AttemptHistory::default(),
+            )
+            .await,
+            Err(ScopeAppendError::InvalidInput)
+        ));
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    /// Reconciliation returns `Unresolved` before any accelerator or event read when
+    /// the current tail has not advanced past the parent boundary.
+    #[tokio::test]
+    async fn reconciliation_requires_the_current_tail_past_the_parent_boundary() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let parent = genesis.head().clone();
+        let (candidate_envelope, candidate_encoded) =
+            successor(&scope, genesis.event_ref(), 2, "candidate-op");
+        let candidate_ref = candidate_encoded.event_ref().clone();
+        let publication = published(&scope, &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            candidate_ref,
+            None,
+            "candidate-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        // A rival current head sits at the same sequence as the parent boundary.
+        let rival_tail = ScopeEventRef::new(1, Digest::new("c".repeat(64)).unwrap()).unwrap();
+        let rival_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            rival_tail,
+            None,
+            "rival-op".into(),
+        )
+        .unwrap();
+        // Surplus scripted failures make any request beyond the expected two visible.
+        let (store, client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&rival_head).unwrap(),
+            ),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::Unresolved(_)
+        ));
+        assert_eq!(client.actual_requests().count(), 2);
+    }
+
+    /// Reconciliation across a deep suffix counts hops as the exact tail-to-boundary
+    /// distance; miscounting either trips the hop cap or stops before the boundary.
+    #[tokio::test]
+    async fn reconciliation_walks_the_exact_boundary_distance_at_high_sequences() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let boundary_ref = ScopeEventRef::new(4_090, Digest::new("d".repeat(64)).unwrap()).unwrap();
+        let parent = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            boundary_ref.clone(),
+            None,
+            "parent-op".into(),
+        )
+        .unwrap();
+        // The candidate at 4091 lost the race to a rival chain reaching 4095.
+        let (candidate_envelope, candidate_encoded) =
+            successor(&scope, &boundary_ref, 4_091, "absent-op");
+        let publication = published(&scope, &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            publication.event_ref().clone(),
+            None,
+            "absent-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let mut rivals = Vec::new();
+        let mut parent_ref = boundary_ref;
+        for sequence in 4_091..=4_095_u64 {
+            let (_, encoded) = successor(
+                &scope,
+                &parent_ref,
+                sequence,
+                &format!("rival-op-{sequence}"),
+            );
+            parent_ref = encoded.event_ref().clone();
+            rivals.push(encoded);
+        }
+        let current_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            parent_ref,
+            None,
+            "rival-op-4095".into(),
+        )
+        .unwrap();
+        let mut responses = vec![
+            response(500, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"current\"")],
+                encode_head(&current_head).unwrap(),
+            ),
+            response(404, &[], SdkBody::empty()),
+        ];
+        responses.extend(rivals.iter().rev().map(|encoded| {
+            response(
+                200,
+                &[("etag", "\"event\"")],
+                encoded.stored_bytes().to_vec(),
+            )
+        }));
+        let (store, client) = replay_store(responses);
+        assert!(matches!(
+            commit(
+                &store,
+                transition.attributed_to(store.namespace()),
+                &mut AttemptHistory::default()
+            )
+            .await,
+            ScopeHeadCommitOutcome::ProvenNotCommitted
+        ));
+        // CAS failure, head reread, pointer miss, and one GET per hop back to the
+        // boundary.
+        assert_eq!(client.actual_requests().count(), 8);
+    }
+
+    /// The per-walk checks conclude unresolved on their own: the byte budget, an
+    /// unregistered payload, and a displaced candidate reference each end the walk
+    /// even when every later check would pass.
+    #[tokio::test]
+    async fn each_reconcile_walk_check_concludes_unresolved_independently() {
+        use crate::scope::{decode_scope_event, encode_scope_event, scope_event_key};
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let parent = genesis.head().clone();
+        let (candidate_envelope, candidate_encoded) =
+            successor(&scope, genesis.event_ref(), 2, "candidate-op");
+        let candidate_ref = candidate_encoded.event_ref().clone();
+        let candidate_bytes = candidate_encoded.stored_bytes().to_vec();
+        let (_, later_encoded) = successor(&scope, &candidate_ref, 3, "later-op");
+        let later_ref = later_encoded.event_ref().clone();
+        let later_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            later_ref.clone(),
+            None,
+            "later-op".into(),
+        )
+        .unwrap();
+        let publication = published(&scope, &candidate_envelope, candidate_encoded).await;
+        let candidate_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            candidate_ref.clone(),
+            None,
+            "candidate-op".into(),
+        )
+        .unwrap();
+        let transition = ScopeHeadTransition::new(
+            ScopeHeadParent::existing(Box::new(observed(&parent).await)),
+            candidate_head,
+            publication,
+        )
+        .unwrap();
+        let current = observed(&later_head).await;
+        let boundary = Some((genesis.event_ref().clone(), NonZeroU64::new(1).unwrap()));
+
+        // Cumulative bytes past the budget conclude unresolved ahead of every later
+        // check.
+        let decoded_later: crate::scope::DecodedScopeEvent<ciborium::Value> = decode_scope_event(
+            later_encoded.stored_bytes(),
+            &scope_event_key(&scope, &later_ref),
+            &scope,
+            None,
+        )
+        .unwrap();
+        let mut checker = ReconcileChecker::new(&transition, &current, boundary.clone());
+        let oversized = vec![0_u8; MAX_RECONCILE_BYTES + 1];
+        assert!(matches!(
+            checker.check(0, &later_ref, &decoded_later, &oversized),
+            ReconcileStep::Concluded(ReconcileVerdict::Unresolved)
+        ));
+
+        // An unregistered payload type alone concludes unresolved.
+        let bogus_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            3,
+            Some(candidate_ref.clone()),
+            1,
+            "later-op".into(),
+            "unregistered_payload".into(),
+        )
+        .unwrap();
+        let bogus = encode_scope_event(&bogus_envelope, &Value::Null).unwrap();
+        let bogus_ref = bogus.event_ref().clone();
+        let decoded_bogus: crate::scope::DecodedScopeEvent<ciborium::Value> = decode_scope_event(
+            bogus.stored_bytes(),
+            &scope_event_key(&scope, &bogus_ref),
+            &scope,
+            None,
+        )
+        .unwrap();
+        let mut checker = ReconcileChecker::new(&transition, &current, boundary.clone());
+        assert!(matches!(
+            checker.check(0, &bogus_ref, &decoded_bogus, bogus.stored_bytes()),
+            ReconcileStep::Concluded(ReconcileVerdict::Unresolved)
+        ));
+
+        // A candidate-operation event whose reference does not name the candidate
+        // tail concludes unresolved even when its bytes and envelope both match.
+        let displaced = ScopeEventRef::new(9, candidate_ref.digest().clone()).unwrap();
+        let decoded_candidate: crate::scope::DecodedScopeEvent<ciborium::Value> =
+            decode_scope_event(
+                &candidate_bytes,
+                &scope_event_key(&scope, &candidate_ref),
+                &scope,
+                None,
+            )
+            .unwrap();
+        let mut checker = ReconcileChecker::new(&transition, &current, boundary);
+        assert!(matches!(
+            checker.check(1, &displaced, &decoded_candidate, &candidate_bytes),
+            ReconcileStep::Concluded(ReconcileVerdict::Unresolved)
+        ));
     }
 
     #[tokio::test]

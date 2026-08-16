@@ -1949,6 +1949,31 @@ mod tests {
         Snapshot { scopes, events }
     }
 
+    /// Snapshot validation rejects a copy above the 64 MiB byte cap even when its
+    /// schema and content are otherwise valid.
+    #[test]
+    fn snapshot_validation_rejects_a_copy_above_the_byte_cap() {
+        let db_path = path("oversized-snapshot");
+        let connection = create(&db_path).unwrap();
+        // Ballast bloats the file past the cap, then leaves the exact schema and an
+        // empty, valid projection behind: only the byte cap can reject it.
+        connection
+            .execute_batch(
+                "CREATE TABLE ballast (payload BLOB);\n                 INSERT INTO ballast VALUES (zeroblob(67108865));\n                 DROP TABLE ballast;",
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            fs::metadata(&db_path).unwrap().len()
+                > crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64
+        );
+        assert_eq!(
+            sanitize_and_validate_snapshot(&db_path),
+            Err(ApplyError::DatabaseOperationFailed)
+        );
+        fs::remove_file(db_path).unwrap();
+    }
+
     #[test]
     fn creates_the_projection_schema_and_rejects_an_unrelated_file() {
         let db_path = path("schema");

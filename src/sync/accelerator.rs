@@ -1080,7 +1080,7 @@ mod tests {
             AdmittedCampaignConfig, CampaignId, EventEnvelope, TEST_SUCCESSOR_PAYLOAD_TYPE,
             encode_scope_event, root_genesis,
         },
-        storage::s3::test_support::{replay_store, response},
+        storage::s3::test_support::{keyed_store, replay_store, response},
     };
 
     use super::*;
@@ -1192,6 +1192,41 @@ mod tests {
         );
     }
 
+    /// The size caps are part of the durable format contract: objects stored under one
+    /// build must keep decoding under the next, so the exact values are pinned rather
+    /// than re-derived from their expressions.
+    #[test]
+    fn size_caps_are_pinned_to_the_durable_format_contract() {
+        assert_eq!(MAX_PACK_EVENT_BYTES, 8_388_608);
+        assert_eq!(MAX_SNAPSHOT_BYTES, 67_108_864);
+        assert_eq!(MAX_PACK_OBJECT_BYTES, 8_454_144);
+        assert_eq!(MAX_POINTER_BYTES, 4_096);
+        assert_eq!(MAX_CATALOG_BYTES, 1_048_576);
+        assert_eq!(MAX_FETCH_BYTES, 67_108_864);
+    }
+
+    /// A wrong-type event section names the expected shape in its decode error.
+    #[test]
+    fn event_section_decoding_names_the_expected_shape() {
+        let mut bytes = Vec::new();
+        into_writer(&Value::Array(Vec::new()), &mut bytes).unwrap();
+        let error = match ciborium::from_reader::<EventSection, _>(bytes.as_slice()) {
+            Err(error) => error,
+            Ok(_) => panic!("an array must not decode as an event section"),
+        };
+        assert!(error.to_string().contains("a byte string"), "{error}");
+    }
+
+    #[test]
+    fn a_pack_above_genesis_exposes_its_exact_parent_reference() {
+        let genesis = genesis();
+        let events = chain(&genesis, 3);
+        let pack = pack_of(&genesis, &events, 1, 2);
+        let decoded = decode_pack(pack.bytes(), pack.digest(), genesis.identity()).unwrap();
+        assert_eq!(decoded.parent_event(), Some(&events[0].0));
+        assert_eq!((decoded.start(), decoded.end()), (2, 3));
+    }
+
     #[test]
     fn pack_build_enforces_parent_binding_count_and_section_limits() {
         let genesis = genesis();
@@ -1226,6 +1261,115 @@ mod tests {
             build_pack(genesis.identity(), None, 1, &slices),
             Err(WireError::InvalidValue)
         );
+    }
+
+    /// A section at exactly the byte cap is accepted by both sides of the codec, and
+    /// one byte past it is refused by the decoder.
+    #[test]
+    fn the_event_section_cap_is_inclusive_on_both_sides_of_the_codec() {
+        let genesis = genesis();
+        let big = vec![7_u8; MAX_PACK_EVENT_BYTES];
+        let pack = build_pack(genesis.identity(), None, 1, &[big.as_slice()]).unwrap();
+        let decoded = decode_pack(pack.bytes(), pack.digest(), genesis.identity()).unwrap();
+        assert_eq!(decoded.event_count(), 1);
+        assert_eq!(decoded.event_bytes(0), big.as_slice());
+
+        // One byte past the cap only exists in a hand-built object; the decoder still
+        // refuses it before hashing the section.
+        let section = vec![7_u8; MAX_PACK_EVENT_BYTES + 1];
+        let wire = WirePack {
+            version: FORMAT_VERSION,
+            scope_id: genesis.identity().scope_id().as_str().to_owned(),
+            start_sequence: 1,
+            end_sequence: 1,
+            parent_event: None,
+            final_event: WireEventRef {
+                sequence: 1,
+                digest: sha256(&section),
+            },
+            event_count: 1,
+            offsets: vec![0, section.len() as u64],
+            events_digest: sha256(&section),
+            events: EventSection(section),
+        };
+        let bytes = encode_cbor(&wire).unwrap();
+        let digest = Digest::new(sha256(&bytes)).unwrap();
+        assert_eq!(
+            decode_pack(&bytes, &digest, genesis.identity()),
+            Err(WireError::LimitExceeded)
+        );
+    }
+
+    /// An object at exactly the read cap reaches decoding; one byte past it does not.
+    #[test]
+    fn the_pack_object_cap_is_inclusive() {
+        let genesis = genesis();
+        let at_cap = vec![7_u8; MAX_PACK_OBJECT_BYTES];
+        let digest = Digest::new(sha256(&at_cap)).unwrap();
+        assert_eq!(
+            decode_pack(&at_cap, &digest, genesis.identity()),
+            Err(WireError::InvalidEncoding)
+        );
+        let over = vec![7_u8; MAX_PACK_OBJECT_BYTES + 1];
+        let digest = Digest::new(sha256(&over)).unwrap();
+        assert_eq!(
+            decode_pack(&over, &digest, genesis.identity()),
+            Err(WireError::LimitExceeded)
+        );
+    }
+
+    /// Each range and binding validation rejects on its own, with every other field of
+    /// the crafted object left consistent.
+    #[test]
+    fn each_pack_range_and_binding_check_rejects_independently() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let events = chain(&genesis, 2);
+        let pack = pack_of(&genesis, &events, 0, 1);
+        let assert_rejected = |wire: &WirePack| {
+            let bytes = encode_cbor(wire).unwrap();
+            let digest = Digest::new(sha256(&bytes)).unwrap();
+            assert_eq!(
+                decode_pack(&bytes, &digest, scope),
+                Err(WireError::InvalidValue)
+            );
+        };
+
+        // An inverted range alone is refused.
+        let section = vec![1_u8];
+        assert_rejected(&WirePack {
+            version: FORMAT_VERSION,
+            scope_id: scope.scope_id().as_str().to_owned(),
+            start_sequence: 2,
+            end_sequence: 1,
+            parent_event: Some(WireEventRef {
+                sequence: 1,
+                digest: "a".repeat(64),
+            }),
+            final_event: WireEventRef {
+                sequence: 1,
+                digest: sha256(&section),
+            },
+            event_count: 1,
+            offsets: vec![0, 1],
+            events_digest: sha256(&section),
+            events: EventSection(section),
+        });
+
+        // A count field disagreeing with the range alone is refused.
+        let mut wire: WirePack = decode_cbor(pack.bytes()).unwrap();
+        wire.event_count = 3;
+        assert_rejected(&wire);
+
+        // A nonzero first offset alone is refused.
+        let mut wire: WirePack = decode_cbor(pack.bytes()).unwrap();
+        wire.offsets[0] = 1;
+        assert_rejected(&wire);
+
+        // A final-event digest disagreeing with the last event alone is refused.
+        let mut wire: WirePack = decode_cbor(pack.bytes()).unwrap();
+        wire.final_event.digest = sha256(b"other");
+        assert_rejected(&wire);
     }
 
     #[test]
@@ -1323,6 +1467,77 @@ mod tests {
         assert!(PackEntry::new(1, MAX_PACK_EVENTS as u64, digest("widest")).is_ok());
     }
 
+    /// Rows sharing one boundary sequence overlap in both directions.
+    #[test]
+    fn pack_rows_sharing_one_boundary_sequence_overlap() {
+        let digest = |seed: &str| Digest::new(sha256(seed.as_bytes())).unwrap();
+        let a = PackEntry::new(1, 4, digest("a")).unwrap();
+        let b = PackEntry::new(4, 6, digest("b")).unwrap();
+        let c = PackEntry::new(5, 6, digest("c")).unwrap();
+        assert!(a.overlaps(&b));
+        assert!(b.overlaps(&a));
+        assert!(!a.overlaps(&c));
+        assert!(!c.overlaps(&a));
+    }
+
+    /// Catalog ordering is strict: rows touching at one sequence and checkpoints
+    /// repeating one sequence are both refused.
+    #[test]
+    fn catalog_rows_touching_at_one_sequence_are_refused() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let digest = |seed: &str| Digest::new(sha256(seed.as_bytes())).unwrap();
+        let touching = vec![
+            PackEntry::new(1, 4, digest("a")).unwrap(),
+            PackEntry::new(4, 6, digest("b")).unwrap(),
+        ];
+        assert_eq!(
+            encode_catalog(scope, &touching, &[]),
+            Err(WireError::InvalidValue)
+        );
+        let duplicate = vec![
+            ScopeEventRef::new(200, digest("x")).unwrap(),
+            ScopeEventRef::new(200, digest("y")).unwrap(),
+        ];
+        assert_eq!(
+            encode_catalog(scope, &[], &duplicate),
+            Err(WireError::InvalidValue)
+        );
+    }
+
+    /// Catalog and pointer byte caps admit exactly-at-cap objects into decoding and
+    /// refuse one byte past, and an empty object is a limit failure, not a hash one.
+    #[test]
+    fn catalog_and_pointer_byte_caps_are_inclusive() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let empty_digest = Digest::new(sha256(&[])).unwrap();
+        assert_eq!(
+            decode_catalog(&[], &empty_digest, scope),
+            Err(WireError::LimitExceeded)
+        );
+        let at_cap = vec![7_u8; MAX_CATALOG_BYTES];
+        let digest = Digest::new(sha256(&at_cap)).unwrap();
+        assert_eq!(
+            decode_catalog(&at_cap, &digest, scope),
+            Err(WireError::InvalidEncoding)
+        );
+        let over = vec![7_u8; MAX_CATALOG_BYTES + 1];
+        let digest = Digest::new(sha256(&over)).unwrap();
+        assert_eq!(
+            decode_catalog(&over, &digest, scope),
+            Err(WireError::LimitExceeded)
+        );
+
+        let at_cap = vec![7_u8; MAX_POINTER_BYTES];
+        assert_eq!(
+            decode_pointer(&at_cap, scope),
+            Err(WireError::InvalidEncoding)
+        );
+        let over = vec![7_u8; MAX_POINTER_BYTES + 1];
+        assert_eq!(decode_pointer(&over, scope), Err(WireError::LimitExceeded));
+    }
+
     #[test]
     fn a_catalog_at_the_row_cap_encodes_and_decodes_under_the_byte_cap() {
         let genesis = genesis();
@@ -1350,6 +1565,22 @@ mod tests {
             encode_catalog(scope, &over, &checkpoints),
             Err(WireError::InvalidValue)
         );
+
+        // Worst-case row width: 16-digit sequences at the representable ceiling still
+        // encode under the byte cap, so the encoder's byte guard is pure defense in
+        // depth and can never fire for row-valid input.
+        let base = 9_999_999_999_999_999_u64 - 2 * MAX_CATALOG_ROWS as u64;
+        let wide: Vec<PackEntry> = (0..MAX_CATALOG_ROWS)
+            .map(|index| {
+                let start = base + index as u64 * 2;
+                PackEntry::new(start, start + 1, digest(index)).unwrap()
+            })
+            .collect();
+        let tall: Vec<ScopeEventRef> = (0..MAX_CATALOG_ROWS)
+            .map(|index| ScopeEventRef::new(base + index as u64, digest(index)).unwrap())
+            .collect();
+        let (bytes, _) = encode_catalog(scope, &wide, &tall).unwrap();
+        assert!(bytes.len() <= MAX_CATALOG_BYTES);
     }
 
     #[test]
@@ -1499,6 +1730,217 @@ mod tests {
         assert_eq!(client.actual_requests().count(), 0);
     }
 
+    /// A span of exactly `MAX_SCOPE_REPLAY_EVENTS` is served, and every wider or
+    /// degenerate interval is refused before any request, even when the catalog
+    /// covers it.
+    #[tokio::test]
+    async fn packed_reads_accept_a_full_replay_span_and_refuse_wider_intervals() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let max = crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS as usize;
+        // One extra pack past the span cap keeps coverage satisfiable for the
+        // wider-interval probes below.
+        let events = chain(&genesis, max + MAX_PACK_EVENTS);
+        let packs: Vec<EncodedPack> = (0..events.len() / MAX_PACK_EVENTS)
+            .map(|index| {
+                pack_of(
+                    &genesis,
+                    &events,
+                    index * MAX_PACK_EVENTS,
+                    (index + 1) * MAX_PACK_EVENTS - 1,
+                )
+            })
+            .collect();
+        let entries: Vec<PackEntry> = packs
+            .iter()
+            .map(|pack| PackEntry::new(pack.start(), pack.end(), pack.digest().clone()).unwrap())
+            .collect();
+        let (catalog_bytes, catalog_digest) = encode_catalog(scope, &entries, &[]).unwrap();
+        let catalog = decode_catalog(&catalog_bytes, &catalog_digest, scope).unwrap();
+
+        let bodies: Vec<(String, Vec<u8>)> = packs
+            .iter()
+            .map(|pack| (format!("/{}", pack.key(scope)), pack.bytes().to_vec()))
+            .collect();
+        let (store, _) = keyed_store(move |uri| {
+            let path = uri.split('?').next().unwrap();
+            match bodies.iter().find(|(key, _)| path == key) {
+                Some((_, bytes)) => response(200, &[("etag", "\"pack\"")], bytes.clone()),
+                None => response(404, &[], SdkBody::empty()),
+            }
+        });
+        let stored = packed_events_from_catalog(&store, scope, &catalog, 1, max as u64)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), max);
+        assert_eq!(stored[max - 1].decoded.event_ref(), &events[max - 1].0);
+
+        // One event wider than a replay, an inverted interval, and a zero start are
+        // all refused before any request.
+        let (store, client) = replay_store(vec![]);
+        assert!(
+            packed_events_from_catalog(&store, scope, &catalog, 1, max as u64 + 1)
+                .await
+                .is_none()
+        );
+        assert!(
+            packed_events_from_catalog(&store, scope, &catalog, 5, 3)
+                .await
+                .is_none()
+        );
+        assert!(
+            packed_events_from_catalog(&store, scope, &catalog, 0, u64::MAX)
+                .await
+                .is_none()
+        );
+        assert_eq!(client.actual_requests().count(), 0);
+    }
+
+    /// A decodable pack whose range disagrees with its catalog row is a miss even when
+    /// the row's digest names the object exactly.
+    #[tokio::test]
+    async fn a_pack_whose_range_disagrees_with_its_catalog_row_is_a_miss() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let events = chain(&genesis, 3);
+        let pack = pack_of(&genesis, &events, 0, 2);
+        // The row narrows the covered range to 2..=3 while naming the same object.
+        let entry = PackEntry::new(2, 3, pack.digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) =
+            encode_catalog(scope, std::slice::from_ref(&entry), &[]).unwrap();
+        let catalog = decode_catalog(&catalog_bytes, &catalog_digest, scope).unwrap();
+        let (store, _) = replay_store(vec![response(
+            200,
+            &[("etag", "\"pack\"")],
+            pack.bytes().to_vec(),
+        )]);
+        assert!(
+            packed_events_from_catalog(&store, scope, &catalog, 2, 3)
+                .await
+                .is_none()
+        );
+    }
+
+    /// Eight 8 MiB bodies land exactly on the 64 MiB pack-fetch budget, so the ninth
+    /// row is still requested before its garbage body fails decoding.
+    #[tokio::test]
+    async fn the_packed_fetch_budget_is_inclusive_at_exactly_the_cap() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        let digest = |seed: usize| Digest::new(sha256(&seed.to_le_bytes())).unwrap();
+        let wide: Vec<PackEntry> = (0..9_u64)
+            .map(|index| {
+                let start = index * MAX_PACK_EVENTS as u64 + 1;
+                PackEntry::new(
+                    start,
+                    start + MAX_PACK_EVENTS as u64 - 1,
+                    digest(index as usize),
+                )
+                .unwrap()
+            })
+            .collect();
+        let (catalog_bytes, catalog_digest) = encode_catalog(scope, &wide, &[]).unwrap();
+        let catalog = decode_catalog(&catalog_bytes, &catalog_digest, scope).unwrap();
+        let responses: Vec<_> = (0..9)
+            .map(|_| {
+                response(
+                    200,
+                    &[("etag", "\"pack\"")],
+                    vec![0_u8; MAX_PACK_EVENT_BYTES],
+                )
+            })
+            .collect();
+        let (store, client) = replay_store(responses);
+        assert!(
+            packed_events_from_catalog(&store, scope, &catalog, 1, 9 * MAX_PACK_EVENTS as u64)
+                .await
+                .is_none()
+        );
+        assert_eq!(client.actual_requests().count(), 9);
+    }
+
+    /// Builds one decodable event whose stored bytes are exactly `MAX_COMPRESSED_BYTES`,
+    /// by sizing an incompressible payload until the compressed frame lands on the cap.
+    fn event_of_exact_stored_size(
+        scope: &ScopeIdentity,
+        sequence: u64,
+    ) -> (ScopeEventRef, Vec<u8>) {
+        let parent = ScopeEventRef::new(
+            sequence - 1,
+            Digest::new(sha256(&sequence.to_le_bytes())).unwrap(),
+        )
+        .unwrap();
+        let encode = |length: usize, seed: u64| {
+            let mut state = seed.wrapping_mul(2 * sequence + 1) | 1;
+            let payload: Vec<u8> = (0..length)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 33) as u8
+                })
+                .collect();
+            let envelope = EventEnvelope::new(
+                scope.scope_id().clone(),
+                sequence,
+                Some(parent.clone()),
+                1,
+                format!("sized-op-{sequence:04}"),
+                TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+            )
+            .unwrap();
+            crate::scope::encode_scope_event(&envelope, &Value::Bytes(payload)).unwrap()
+        };
+        for seed in 1..64_u64 {
+            let probe = encode(MAX_COMPRESSED_BYTES - 1_024, seed);
+            let base =
+                MAX_COMPRESSED_BYTES - 1_024 + (MAX_COMPRESSED_BYTES - probe.stored_bytes().len());
+            for length in base.saturating_sub(4)..=base + 4 {
+                let encoded = encode(length, seed);
+                if encoded.stored_bytes().len() == MAX_COMPRESSED_BYTES {
+                    return (encoded.event_ref().clone(), encoded.stored_bytes().to_vec());
+                }
+            }
+        }
+        panic!("no exact-size event for sequence {sequence}");
+    }
+
+    /// 256 events of exactly `MAX_COMPRESSED_BYTES` land exactly on the 64 MiB event
+    /// fetch budget and are all served.
+    #[tokio::test]
+    async fn the_event_fetch_budget_is_inclusive_at_exactly_the_cap() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        assert_eq!(256 * MAX_COMPRESSED_BYTES, MAX_FETCH_BYTES);
+        let events: Vec<(ScopeEventRef, Vec<u8>)> = (2..258_u64)
+            .map(|sequence| event_of_exact_stored_size(&scope, sequence))
+            .collect();
+        let references: Vec<ScopeEventRef> = events
+            .iter()
+            .map(|(reference, _)| reference.clone())
+            .collect();
+        let bodies: Vec<(String, Vec<u8>)> = events
+            .iter()
+            .map(|(reference, bytes)| {
+                (
+                    format!("/{}", scope_event_key(&scope, reference)),
+                    bytes.clone(),
+                )
+            })
+            .collect();
+        let (store, _) = keyed_store(move |uri| {
+            let path = uri.split('?').next().unwrap();
+            match bodies.iter().find(|(key, _)| path == key) {
+                Some((_, bytes)) => response(200, &[("etag", "\"event\"")], bytes.clone()),
+                None => response(404, &[], SdkBody::empty()),
+            }
+        });
+        let stored = fetch_events(&store, &scope, &references).await.unwrap();
+        assert_eq!(stored.len(), 256);
+        let total: usize = stored.iter().map(|event| event.bytes.len()).sum();
+        assert_eq!(total, MAX_FETCH_BYTES);
+    }
+
     #[test]
     fn segmentation_flushes_at_the_event_count_and_byte_boundaries() {
         let genesis = genesis();
@@ -1541,6 +1983,23 @@ mod tests {
         assert_eq!(packs.len(), 2);
         assert_eq!((packs[0].start(), packs[0].end()), (1, 2));
         assert_eq!((packs[1].start(), packs[1].end()), (3, 3));
+
+        // Two half-cap events land exactly on the byte cap and stay in one pack: the
+        // flush boundary is exclusive at the cap.
+        let half = MAX_PACK_EVENT_BYTES / 2;
+        let exact: Vec<RetainedEvent> = (0..2_u64)
+            .map(|index| RetainedEvent {
+                reference: ScopeEventRef::new(index + 1, digest(index as u8)).unwrap(),
+                parent: index
+                    .checked_sub(1)
+                    .map(|parent| ScopeEventRef::new(parent + 1, digest(parent as u8)).unwrap()),
+                payload_type: TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+                bytes: vec![index as u8; half],
+            })
+            .collect();
+        let packs = segment_packs(genesis.identity(), &exact).unwrap();
+        assert_eq!(packs.len(), 1);
+        assert_eq!((packs[0].start(), packs[0].end()), (1, 2));
     }
 
     #[test]
@@ -1729,6 +2188,55 @@ mod tests {
         drop(handle);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(staging);
+    }
+
+    #[tokio::test]
+    async fn a_projection_behind_the_covered_head_is_a_projection_mismatch() {
+        use crate::sync::head::read;
+
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let db_path = std::env::temp_dir().join(format!(
+            "ravel-accel-checkpoint-{}-mismatch.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let staging = std::env::temp_dir().join(format!(
+            "ravel-accel-checkpoint-{}-mismatch-staging.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&staging);
+        // The projection is empty, so it cannot match the observed genesis head.
+        let handle = DbHandle::spawn(db_path.clone()).await.unwrap();
+        let (store, client) = replay_store(vec![response(
+            200,
+            &[("etag", "\"parent\"")],
+            genesis.head_bytes().to_vec(),
+        )]);
+        let observed = read(&store, &scope).await.unwrap().unwrap();
+        let mut histories = [
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+            AttemptHistory::default(),
+        ];
+        let [a, b, c] = &mut histories;
+        assert_eq!(
+            publish_checkpoint(
+                &store,
+                &handle,
+                ScopeHeadParent::existing(Box::new(observed)),
+                &staging,
+                "checkpoint-op-mismatch",
+                [a, b, c],
+            )
+            .await
+            .err(),
+            Some(CheckpointPublishError::ProjectionMismatch)
+        );
+        assert_eq!(client.actual_requests().count(), 1);
+        drop(handle);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(&staging);
     }
 
     #[tokio::test]

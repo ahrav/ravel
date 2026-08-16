@@ -2849,6 +2849,24 @@ mod tests {
         }
     }
 
+    /// The unseen-event limit is inclusive: a suffix exactly at the limit passes the
+    /// precheck and one past it overflows.
+    #[test]
+    fn precheck_accepts_an_unseen_span_exactly_at_the_event_limit() {
+        let digest = Digest::new("a".repeat(64)).unwrap();
+        let limits = Limits {
+            events: 3,
+            bytes: 64,
+        };
+        let tail = ScopeEventRef::new(3, digest.clone()).unwrap();
+        assert_eq!(precheck(&(0, None), &tail, limits), Ok(3));
+        let tail = ScopeEventRef::new(4, digest).unwrap();
+        assert_eq!(
+            precheck(&(0, None), &tail, limits),
+            Err(ScopeReplayError::Overflow)
+        );
+    }
+
     /// The LIST rung replays exactly what the serial walk replays, at the same cursor.
     #[tokio::test]
     async fn list_replay_is_equivalent_to_the_serial_walk() {
@@ -2896,6 +2914,8 @@ mod tests {
         assert!(recorded[0].contains("/head"));
         assert!(recorded[1].contains("/replay-index/current"));
         assert!(recorded[2].contains("list-type=2"));
+        // A cursor-0 replay lists from the start of the prefix: no start-after key.
+        assert!(!recorded[2].contains("start-after"));
         let mut candidate_gets = vec![recorded[3].clone(), recorded[4].clone()];
         candidate_gets.sort();
         let candidate = |index: usize| {
@@ -3708,6 +3728,71 @@ mod tests {
             drop(handle);
             fs::remove_file(cold_path).unwrap();
         }
+    }
+
+    /// A snapshot whose bytes match the certified length but not the certified digest
+    /// falls through without installation.
+    #[tokio::test]
+    async fn a_snapshot_matching_length_but_not_digest_falls_through() {
+        let genesis = genesis();
+        let fixture = checkpoint_fixture(&genesis, "digest-split").await;
+        let scope = fixture.scope.clone();
+        // The certificate names the exact snapshot length with a digest of other bytes.
+        let payload = ProjectionCheckpointPayload::new(
+            Digest::new(sha256(b"different-bytes")).unwrap(),
+            fixture.snapshot.len() as u64,
+            1,
+            genesis.event_ref().digest().clone(),
+            None,
+        )
+        .unwrap();
+        let certificate = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "digest-split-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let encoded = encode_projection_checkpoint_event(&certificate).unwrap();
+        let head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            encoded.event_ref().clone(),
+            None,
+            "digest-split-op".into(),
+        )
+        .unwrap();
+        let pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[encoded.stored_bytes()],
+        )
+        .unwrap();
+        let entry = PackEntry::new(2, 2, pack.digest().clone()).unwrap();
+        let (catalog, digest) =
+            encode_catalog(&scope, &[entry], std::slice::from_ref(encoded.event_ref())).unwrap();
+        let pointer = encode_pointer(&scope, &digest).unwrap();
+        let cold_path = path("checkpoint-digest-split");
+        let (store, _) = replay_store(vec![
+            head_response(encode_head(&head).unwrap()),
+            response(200, &[("etag", "\"pointer\"")], pointer),
+            response(200, &[("etag", "\"catalog\"")], catalog),
+            event_response(encoded.stored_bytes().to_vec()),
+            response(200, &[("etag", "\"pack\"")], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+        ]);
+        let handle = open_projection(&store, &scope, &cold_path).await.unwrap();
+        assert_eq!(handle.scope_cursor(&scope).await.unwrap(), (0, None));
+        drop(handle);
+        fs::remove_file(cold_path).unwrap();
     }
 
     /// Candidates are attempted newest first; a failing newer candidate falls to an

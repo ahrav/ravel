@@ -1213,6 +1213,35 @@ mod tests {
         .unwrap()
     }
 
+    /// Uses one store because batch publications must share a namespace: every constructed
+    /// store mints a fresh one, and per-event stores would trip the constructor's
+    /// namespace-agreement check before the rule a test actually targets.
+    async fn published_batch(
+        scope: &ScopeIdentity,
+        pairs: Vec<(EventEnvelope, crate::scope::EncodedScopeEvent)>,
+    ) -> Vec<ResolvedScopeEventPublication> {
+        let responses = pairs
+            .iter()
+            .map(|_| response(200, &[], SdkBody::empty()))
+            .collect();
+        let (store, _) = replay_store(responses);
+        let mut publications = Vec::with_capacity(pairs.len());
+        for (envelope, encoded) in pairs {
+            publications.push(
+                publish_encoded(
+                    &store,
+                    scope,
+                    &envelope,
+                    encoded,
+                    &mut AttemptHistory::default(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        publications
+    }
+
     fn successor(
         scope: &ScopeIdentity,
         parent: &ScopeEventRef,
@@ -4008,11 +4037,8 @@ mod tests {
         );
         let (env4, enc4) = successor(&scope, enc3.event_ref(), 4, "drop-op-4");
         let tail_ref = enc4.event_ref().clone();
-        let publications = vec![
-            published(&scope, &env2, enc2).await,
-            published(&scope, &env3, enc3).await,
-            published(&scope, &env4, enc4).await,
-        ];
+        let publications =
+            published_batch(&scope, vec![(env2, enc2), (env3, enc3), (env4, enc4)]).await;
         let candidate = ScopeHead::new(
             scope.clone(),
             ScopeAuthority::Unowned,
@@ -4101,15 +4127,13 @@ mod tests {
         let root =
             crate::scope::decode_root_event(genesis.event_bytes(), genesis.event_key(), &scope)
                 .unwrap();
-        let root_publication = published(
-            &scope,
-            root.envelope(),
+        let root_pair = (
+            root.envelope().clone(),
             crate::scope::encode_root_event(&root).unwrap(),
-        )
-        .await;
+        );
         let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "genesis-batch-2");
         let tail = enc2.event_ref().clone();
-        let publication2 = published(&scope, &env2, enc2).await;
+        let publications = published_batch(&scope, vec![root_pair, (env2, enc2)]).await;
         let candidate = ScopeHead::new(
             scope.clone(),
             ScopeAuthority::Unowned,
@@ -4120,10 +4144,38 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
+            ScopeHeadTransition::new_batch(ScopeHeadParent::Genesis, candidate, publications),
+            Err(WireError::InvalidValue)
+        ));
+    }
+
+    /// Publications witnessed by different stores cannot share one head commit: `commit`
+    /// compares only the stored final publication against its target store, so the
+    /// constructor is where cross-namespace assembly must be refused.
+    #[tokio::test]
+    async fn a_batch_spanning_store_namespaces_is_refused() {
+        let genesis = genesis();
+        let scope = genesis.identity().clone();
+        let (env2, enc2) = successor(&scope, genesis.event_ref(), 2, "ns-op-2");
+        let (env3, enc3) = successor(&scope, enc2.event_ref(), 3, "ns-op-3");
+        let tail = enc3.event_ref().clone();
+        // Per-event stores: each mints its own namespace.
+        let publication2 = published(&scope, &env2, enc2).await;
+        let publication3 = published(&scope, &env3, enc3).await;
+        let candidate = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            tail,
+            None,
+            "ns-op-3".into(),
+        )
+        .unwrap();
+        assert!(matches!(
             ScopeHeadTransition::new_batch(
-                ScopeHeadParent::Genesis,
+                ScopeHeadParent::existing(Box::new(observed(genesis.head()).await)),
                 candidate,
-                vec![root_publication, publication2],
+                vec![publication2, publication3],
             ),
             Err(WireError::InvalidValue)
         ));

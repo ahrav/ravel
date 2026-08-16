@@ -19,6 +19,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
 };
 use ravel::{
+    dispatch::AttemptHistory,
     distributed::{
         identity::{InstanceId, WorkspaceId},
         scope_controller::{
@@ -29,7 +30,7 @@ use ravel::{
         AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeIdentity,
         decode_head, decode_root_event, encode_head, root_genesis, scope_event_key, scope_head_key,
     },
-    storage::s3::{AttemptHistory, GetOutcome, MutationOutcome, S3Store},
+    storage::s3::{GetOutcome, MutationOutcome, S3Store},
     sync::{
         event::publish_root,
         head::{

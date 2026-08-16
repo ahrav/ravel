@@ -11,6 +11,11 @@ name = "ravel"
 path = "src/main.rs"
 
 [dependencies]
+# Model invocations use the official AWS SDK with the Tokio HTTPS client.
+aws-sdk-bedrockruntime = { version = "=1.139.0", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
 # S3 requests use the official AWS SDK with the Tokio HTTPS client.
 aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
   "default-https-client",
@@ -42,6 +47,9 @@ aws-config = { version = "=1.10.1", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
 ] }
+aws-sdk-bedrockruntime = { version = "=1.139.0", default-features = false, features = [
+  "test-util",
+] }
 aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
   "test-util",
 ] }
@@ -56,5 +64,7 @@ tokio = { version = "=1.53.1", default-features = false, features = [
   "macros",
   "rt",
   "rt-multi-thread",
+  # Paused time lets a test observe an enforced attempt timeout without waiting for it.
+  "test-util",
   "time",
 ] }

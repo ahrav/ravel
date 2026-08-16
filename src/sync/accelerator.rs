@@ -463,6 +463,11 @@ impl PackEntry {
     fn overlaps(&self, other: &Self) -> bool {
         self.start <= other.end && other.start <= self.end
     }
+
+    /// Whether this row's range contains all of `other`'s.
+    fn covers(&self, other: &Self) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
 }
 
 /// One validated catalog: sorted non-overlapping pack rows plus checkpoint certificates.
@@ -869,7 +874,20 @@ pub(crate) async fn publish_packs_after_replay(
             return;
         };
         if entries.iter().any(|existing| existing.overlaps(&entry)) {
-            continue;
+            // A row that already covers this range makes the pack redundant, and a partial
+            // overlap cannot be resolved without re-segmenting the publication. Every other
+            // overlap is a wider pack over rows it fully contains — a replay from an earlier
+            // cursor than the one that built them — so the narrower rows are replaced. Dropping
+            // it instead would leave the sequences past the old row's end uncovered until some
+            // node happened to replay from exactly that boundary.
+            if entries.iter().any(|existing| existing.covers(&entry))
+                || entries
+                    .iter()
+                    .any(|existing| existing.overlaps(&entry) && !entry.covers(existing))
+            {
+                continue;
+            }
+            entries.retain(|existing| !entry.covers(existing));
         }
         entries.push(entry);
         changed = true;
@@ -2361,5 +2379,33 @@ mod tests {
         assert_eq!(requests[4].headers().get("if-none-match"), Some("*"));
         assert_eq!(requests[4].body().bytes(), Some(merged_bytes.as_slice()));
         assert_eq!(requests[5].headers().get("if-match"), Some("\"pointer\""));
+
+        // A narrower row the new pack fully covers is replaced, not a reason to drop the
+        // pack: a replay from an earlier cursor builds a wider pack over the same prefix,
+        // and keeping the old row would leave every sequence past its end uncovered.
+        let narrow = PackEntry::new(1, 1, Digest::new(sha256(b"narrow")).unwrap()).unwrap();
+        let (narrow_catalog, narrow_digest) =
+            encode_catalog(scope, std::slice::from_ref(&narrow), &[]).unwrap();
+        let narrow_pointer = encode_pointer(scope, &narrow_digest).unwrap();
+        let (widened_bytes, _) = encode_catalog(
+            scope,
+            std::slice::from_ref(&entry),
+            std::slice::from_ref(&cert_ref),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(412, &[], SdkBody::empty()),
+            response(200, &[], pack.bytes().to_vec()),
+            response(200, &[("etag", "\"pointer\"")], narrow_pointer),
+            response(200, &[("etag", "\"catalog\"")], narrow_catalog),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        publish_packs_after_replay(&store, scope, &retained).await;
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[4].body().bytes(), Some(widened_bytes.as_slice()));
     }
 }

@@ -341,8 +341,8 @@ async fn install_checkpoint(
 /// create-only link from the staged sibling path to `destination` is the commit point:
 /// before it the previous destination is untouched; after it the snapshot is
 /// independently valid at its covered cursor, so interruption before the suffix applies
-/// still leaves a valid replayable projection. `None` lets the caller try the next
-/// candidate.
+/// still leaves a valid replayable projection. A suffix the installed rows cannot carry
+/// discards the destination again. `None` lets the caller try the next candidate.
 async fn install_candidate(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -455,9 +455,17 @@ async fn install_candidate(
         events,
         from_packs: true,
     };
-    // The suffix was proven above; a failure here leaves the snapshot's covered cursor
-    // in place and the next refresh replays the same suffix.
-    let _ = apply_suffix(&handle, scope, prepared).await;
+    // The suffix was proven against the pinned head, so a failure here means the snapshot's
+    // own rows cannot carry it — a row the suffix depends on is missing or disagrees. Keeping
+    // the install would wedge the node: the projection is structurally valid, so later opens
+    // never revisit the checkpoint rung, and every refresh replays the same suffix against
+    // the same rows and fails again. Discarding it lets the next candidate, or a genesis
+    // rebuild, run. A transient failure costs one repeated install.
+    if apply_suffix(&handle, scope, prepared).await.is_err() {
+        drop(handle);
+        rebuild_files(destination).ok()?;
+        return None;
+    }
     Some(handle)
 }
 

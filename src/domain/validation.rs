@@ -5,10 +5,16 @@
 //! hexadecimal bytes, and durable identities are nonempty UTF-8 strings of at most
 //! 128 bytes.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, num::NonZeroU64};
 
 const MAX_SEQUENCE: u64 = 9_999_999_999_999_999;
 const MAX_IDENTITY_BYTES: usize = 128;
+/// Largest integer SQLite stores and returns losslessly through this crate's `i64` columns.
+///
+/// Equal to [`MAX_SEQUENCE`] by coincidence, not by construction: one keeps an event key's
+/// sequence component at 16 digits and the other keeps a projected value inside `i64`. They
+/// stay separate so moving the key format does not silently move the storage bound.
+pub const MAX_STORED_INTEGER: u64 = 9_999_999_999_999_999;
 
 /// Static category for a rejected durable domain value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +43,15 @@ impl fmt::Display for ValidationError {
 }
 
 impl Error for ValidationError {}
+
+/// Accepts a durable positive integer, or `None` for zero or anything past the storage bound.
+///
+/// Returns the option rather than an error so each caller keeps its own rejection category:
+/// the same bound is checked from wire decoders, protocol constructors, and record builders,
+/// which do not share an error type.
+pub(crate) fn bounded_stored(value: u64) -> Option<NonZeroU64> {
+    NonZeroU64::new(value).filter(|value| value.get() <= MAX_STORED_INTEGER)
+}
 
 pub(crate) fn validate_sequence(sequence: u64) -> Result<(), ValidationError> {
     if (1..=MAX_SEQUENCE).contains(&sequence) {

@@ -208,6 +208,16 @@ pub(super) fn validate_registered(
             Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
         };
     }
+    if envelope.payload_type() == crate::scope::ARTIFACT_REFERENCE_PAYLOAD_TYPE {
+        let reference =
+            crate::scope::decode_artifact_reference_event(encoded.stored_bytes(), key, scope)
+                .map_err(ScopeEventPublicationError::Invalid)?;
+        return if reference.envelope() == envelope {
+            Ok(())
+        } else {
+            Err(ScopeEventPublicationError::Invalid(WireError::InvalidValue))
+        };
+    }
     if envelope.payload_type() == crate::scope::PROJECTION_CHECKPOINT_PAYLOAD_TYPE {
         let checkpoint =
             crate::scope::decode_projection_checkpoint_event(encoded.stored_bytes(), key, scope)
@@ -358,6 +368,12 @@ mod tests {
             Err(ScopeEventPublicationError::UnsupportedPayload)
         );
         assert_eq!(client.actual_requests().count(), 0);
+        // `artifact` is the unregistered example above; `artifact_reference` is the registered
+        // type, and the two must not be confused when one of them is added to the registry.
+        assert!(!crate::scope::payload_type_registered("artifact"));
+        assert!(crate::scope::payload_type_registered(
+            crate::scope::ARTIFACT_REFERENCE_PAYLOAD_TYPE
+        ));
 
         let envelope = EventEnvelope::new(
             genesis.identity().scope_id().clone(),

@@ -22,6 +22,8 @@ pub mod dispatch;
 
 pub mod distributed;
 
+pub mod invocation;
+
 pub mod provider;
 
 pub mod storage {

@@ -44,7 +44,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
 /// Ceiling on any profile's own output-token ceiling.
 ///
 /// `InferenceConfiguration::max_tokens` is an `i32`, so a cap above this cannot be sent.
-const MAX_OUTPUT_TOKEN_CEILING: u32 = i32::MAX as u32;
+pub(crate) const MAX_OUTPUT_TOKEN_CEILING: u32 = i32::MAX as u32;
 /// Bound on one prompt or system text, applied before dispatch.
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 /// Bound on the completion text retained from one response.
@@ -198,8 +198,17 @@ impl ModelProfile {
         })
     }
 
+    pub fn provider(&self) -> ModelProvider {
+        self.provider
+    }
+
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// The fixed configuration this profile was registered under.
+    pub fn configuration_id(&self) -> &str {
+        &self.configuration_id
     }
 
     /// Address of this exact configuration, over every field that reaches the provider.
@@ -299,6 +308,14 @@ impl InvocationRequest {
             max_output_tokens,
             operation_id,
         })
+    }
+
+    pub fn profile(&self) -> &ModelProfile {
+        &self.profile
+    }
+
+    pub fn max_output_tokens(&self) -> NonZeroU32 {
+        self.max_output_tokens
     }
 
     pub fn operation_id(&self) -> &str {
@@ -410,6 +427,26 @@ pub struct ReportedUse {
 }
 
 impl ReportedUse {
+    /// Rebuilds reported use from durable bytes.
+    ///
+    /// Reported use only ever originates from a provider response, so this exists for the
+    /// records that store one and not for a caller inventing counts.
+    pub(crate) fn from_reported(
+        input_tokens: u32,
+        output_tokens: u32,
+        total_tokens: u32,
+        cache_read_input_tokens: Option<u32>,
+        cache_write_input_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+        }
+    }
+
     pub fn input_tokens(self) -> u32 {
         self.input_tokens
     }

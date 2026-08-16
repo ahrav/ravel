@@ -15,8 +15,10 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     distributed::identity::{InstanceId, WorkspaceId},
     domain::{
-        proposal::MAX_STORED_INTEGER,
-        validation::{ValidationError, is_digest, validate_key_segment, validate_sequence},
+        artifact::ArtifactRef,
+        validation::{
+            ValidationError, bounded_stored, is_digest, validate_key_segment, validate_sequence,
+        },
         work::{WorkId, WorkRef},
     },
     sync::WireError,
@@ -25,6 +27,11 @@ use crate::{
 pub(crate) const ROOT_GENESIS_PAYLOAD_TYPE: &str = "root_genesis";
 pub(crate) const PLAN_ADMITTED_PAYLOAD_TYPE: &str = "plan_admitted";
 pub(crate) const GRANT_ACTIVATED_PAYLOAD_TYPE: &str = "grant_activated";
+/// The one payload type through which an immutable artifact enters authoritative history.
+///
+/// Named `artifact_reference` rather than `artifact` because `artifact` is the unregistered
+/// payload type two negative tests use to prove an unknown type never reaches storage.
+pub(crate) const ARTIFACT_REFERENCE_PAYLOAD_TYPE: &str = "artifact_reference";
 pub(crate) const PROJECTION_CHECKPOINT_PAYLOAD_TYPE: &str = "projection_checkpoint_published";
 #[cfg(test)]
 pub(crate) const TEST_SUCCESSOR_PAYLOAD_TYPE: &str = "test_successor";
@@ -416,11 +423,7 @@ impl GrantActivatedPayload {
         units: u64,
         deadline_unix_ms: u64,
     ) -> Result<Self, ValidationError> {
-        let bounded = |value: u64| {
-            NonZeroU64::new(value)
-                .filter(|value| value.get() <= MAX_STORED_INTEGER)
-                .ok_or(ValidationError::OutOfRange)
-        };
+        let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
         Ok(Self {
             work_id,
             work_revision: bounded(work_revision)?,
@@ -485,6 +488,189 @@ impl GrantActivatedEvent {
     }
 
     pub fn payload(&self) -> &GrantActivatedPayload {
+        &self.payload
+    }
+}
+
+/// What one artifact-reference event says the referenced blob is.
+///
+/// A closed enum, and an unrecognized wire string is refused rather than carried: a record
+/// kind this crate cannot interpret must not reach history under the one payload type every
+/// later artifact-bearing task extends. Extending means adding a variant here and nothing
+/// else, because the wire struct's field set is frozen once its bytes ship.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactKind {
+    /// The immutable starting manifest of one model invocation.
+    InvocationManifest,
+    /// The terminal trace of one model invocation.
+    InvocationTrace,
+}
+
+impl ArtifactKind {
+    /// The media type a blob of this kind must carry.
+    ///
+    /// The kind and the media type are two records of the same fact, one in the event and one
+    /// in the blob's metadata. They are pinned to each other here so a reader that trusts
+    /// either one is trusting the same claim; a vendor type rather than a generic CBOR type
+    /// because a reader that decodes a trace as a manifest gets a decode error, not a
+    /// mismatch it can report.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::InvocationManifest => "application/vnd.ravel.invocation-manifest+cbor",
+            Self::InvocationTrace => "application/vnd.ravel.invocation-trace+cbor",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvocationManifest => "invocation_manifest",
+            Self::InvocationTrace => "invocation_trace",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "invocation_manifest" => Some(Self::InvocationManifest),
+            "invocation_trace" => Some(Self::InvocationTrace),
+            _ => None,
+        }
+    }
+}
+
+/// Payload of the event that admits one published artifact into authoritative history.
+///
+/// The reference names the attempt that produced the blob: the work revision an admission
+/// released, the grant that authorized the external effect, and the attempt that drew it.
+/// The claim fence is deliberately absent — the grant the digest names is itself fenced, so
+/// carrying the fence again would record the same fact twice in bytes that cannot change.
+///
+/// Anything more the record must bind lives in the published artifact body, not here: this
+/// payload rides in an event bounded at 256 KiB
+/// compressed, while a prompt or completion is bounded at 1 MiB on its own. The one exception
+/// is a trace's manifest address, because replay must prove the pairing after retention may
+/// have deleted the blob whose body carries it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactReferencePayload {
+    kind: ArtifactKind,
+    artifact: ArtifactRef,
+    work_id: WorkId,
+    work_revision: NonZeroU64,
+    grant_digest: Digest,
+    attempt: NonZeroU64,
+    manifest_digest: Option<Digest>,
+}
+
+impl ArtifactReferencePayload {
+    /// Builds a reference from values that may have come from untrusted bytes.
+    ///
+    /// Crate-private and deliberately witness-free: the decode path has only bytes, so no
+    /// constructor here can prove the blob exists. That proof is the append boundary's job,
+    /// which takes a [`crate::storage::artifacts::PublishedArtifact`] and checks its
+    /// namespace. `ArtifactRef::new` is public over plain values, so a payload constructor
+    /// could not make an unwitnessed reference unrepresentable even if it tried.
+    ///
+    /// `manifest_digest` is the address of the manifest a trace terminates, present exactly
+    /// when `kind` is a trace: a manifest starts an invocation and has no predecessor to name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::OutOfRange`] when the revision, attempt, artifact size, or
+    /// creation time is zero or exceeds the stored-integer range. `ArtifactRef` accepts any
+    /// size by design, so this is where an artifact entering durable history is bounded.
+    /// Returns [`ValidationError::InvalidIdentity`] when the artifact's media type is not the
+    /// one `kind` pins, its producer-attempt string names an attempt other than `attempt`, or
+    /// the manifest address is present or absent against the kind's rule: each pair is two
+    /// records of one fact, and both paths into history — the append boundary and the replay
+    /// decoder — route through here, so neither can admit a contradiction.
+    pub(crate) fn new(
+        kind: ArtifactKind,
+        artifact: ArtifactRef,
+        work_id: WorkId,
+        work_revision: u64,
+        grant_digest: Digest,
+        attempt: u64,
+        manifest_digest: Option<Digest>,
+    ) -> Result<Self, ValidationError> {
+        let bounded = |value: u64| bounded_stored(value).ok_or(ValidationError::OutOfRange);
+        bounded(artifact.size())?;
+        bounded(artifact.creation_time_unix_ms())?;
+        let work_revision = bounded(work_revision)?;
+        let attempt_bound = bounded(attempt)?;
+        if artifact.media_type() != kind.media_type()
+            || artifact.producer_attempt() != format!("attempt-{attempt}")
+            || (kind == ArtifactKind::InvocationTrace) != manifest_digest.is_some()
+        {
+            return Err(ValidationError::InvalidIdentity);
+        }
+        Ok(Self {
+            kind,
+            artifact,
+            work_id,
+            work_revision,
+            grant_digest,
+            attempt: attempt_bound,
+            manifest_digest,
+        })
+    }
+
+    pub fn kind(&self) -> ArtifactKind {
+        self.kind
+    }
+
+    pub fn artifact(&self) -> &ArtifactRef {
+        &self.artifact
+    }
+
+    pub fn work_id(&self) -> &WorkId {
+        &self.work_id
+    }
+
+    pub fn work_revision(&self) -> NonZeroU64 {
+        self.work_revision
+    }
+
+    /// The grant that authorized the effect this artifact records.
+    pub fn grant_digest(&self) -> &Digest {
+        &self.grant_digest
+    }
+
+    pub fn attempt(&self) -> NonZeroU64 {
+        self.attempt
+    }
+
+    /// The manifest a trace terminates; `None` exactly when this reference is a manifest.
+    pub fn manifest_digest(&self) -> Option<&Digest> {
+        self.manifest_digest.as_ref()
+    }
+}
+
+/// One validated artifact-reference event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactReferenceEvent {
+    envelope: EventEnvelope,
+    payload: ArtifactReferencePayload,
+}
+
+impl ArtifactReferenceEvent {
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidValue`] unless the envelope carries the
+    /// `artifact_reference` payload type at a sequence above genesis.
+    pub fn new(
+        envelope: EventEnvelope,
+        payload: ArtifactReferencePayload,
+    ) -> Result<Self, WireError> {
+        if envelope.payload_type() != ARTIFACT_REFERENCE_PAYLOAD_TYPE || envelope.sequence() < 2 {
+            return Err(WireError::InvalidValue);
+        }
+        Ok(Self { envelope, payload })
+    }
+
+    pub fn envelope(&self) -> &EventEnvelope {
+        &self.envelope
+    }
+
+    pub fn payload(&self) -> &ArtifactReferencePayload {
         &self.payload
     }
 }
@@ -990,6 +1176,31 @@ struct WireGrantActivatedPayload {
     deadline_unix_ms: u64,
 }
 
+/// Frozen field set and declaration order of one artifact-reference payload.
+///
+/// CBOR writes these keys in declaration order, so both the order and the set are part of
+/// this record's address. A later artifact-bearing task extends [`ArtifactKind`], never this
+/// struct: adding a field here would move the bytes of every artifact reference already
+/// published.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireArtifactReferencePayload {
+    kind: String,
+    digest: String,
+    size: u64,
+    media_type: String,
+    producer_attempt: String,
+    creation_time_unix_ms: u64,
+    retention_class: Option<String>,
+    work_id: String,
+    work_revision: u64,
+    grant_digest: String,
+    attempt: u64,
+    /// The manifest a trace terminates, present exactly for traces: replay proves the pairing
+    /// from event bytes because retention may delete the blob whose body also carries it.
+    manifest_digest: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireProjectionCheckpointPayload {
@@ -1361,6 +1572,106 @@ pub fn decode_grant_activated_event(
     grant_activated_from_decoded(decoded)
 }
 
+/// Encodes one validated artifact-reference event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for serialization, compression, or size-limit failures.
+pub fn encode_artifact_reference_event(
+    event: &ArtifactReferenceEvent,
+) -> Result<EncodedScopeEvent, WireError> {
+    let payload = event.payload();
+    let artifact = payload.artifact();
+    encode_scope_event(
+        event.envelope(),
+        &WireArtifactReferencePayload {
+            kind: payload.kind().as_str().to_owned(),
+            digest: artifact.digest().to_owned(),
+            size: artifact.size(),
+            media_type: artifact.media_type().to_owned(),
+            producer_attempt: artifact.producer_attempt().to_owned(),
+            creation_time_unix_ms: artifact.creation_time_unix_ms(),
+            retention_class: artifact.retention_class().map(str::to_owned),
+            work_id: payload.work_id().as_str().to_owned(),
+            work_revision: payload.work_revision().get(),
+            grant_digest: payload.grant_digest().as_str().to_owned(),
+            attempt: payload.attempt().get(),
+            manifest_digest: payload
+                .manifest_digest()
+                .map(|digest| digest.as_str().to_owned()),
+        },
+    )
+}
+
+/// Converts one opaque decoded event into an artifact-reference event.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for a payload type other than `artifact_reference`, noncanonical
+/// payload bytes, a record kind this crate does not model, or an out-of-range binding.
+pub(crate) fn artifact_reference_from_decoded(
+    decoded: DecodedScopeEvent<ciborium::Value>,
+) -> Result<ArtifactReferenceEvent, WireError> {
+    if decoded.envelope.payload_type() != ARTIFACT_REFERENCE_PAYLOAD_TYPE {
+        return Err(WireError::InvalidValue);
+    }
+    let mut original = Vec::new();
+    into_writer(&decoded.payload, &mut original).map_err(|_| WireError::InvalidEncoding)?;
+    let payload: WireArtifactReferencePayload = decoded
+        .payload
+        .deserialized()
+        .map_err(|_| WireError::InvalidEncoding)?;
+    let mut canonical = Vec::new();
+    into_writer(&payload, &mut canonical).map_err(|_| WireError::InvalidEncoding)?;
+    if original != canonical {
+        return Err(WireError::NonCanonical);
+    }
+    let kind = ArtifactKind::parse(&payload.kind).ok_or(WireError::InvalidValue)?;
+    let artifact = ArtifactRef::new(
+        payload.digest,
+        payload.size,
+        payload.media_type,
+        payload.producer_attempt,
+        payload.creation_time_unix_ms,
+        payload.retention_class,
+    )
+    .map_err(|_| WireError::InvalidValue)?;
+    let payload = ArtifactReferencePayload::new(
+        kind,
+        artifact,
+        WorkId::new(payload.work_id).map_err(|_| WireError::InvalidValue)?,
+        payload.work_revision,
+        Digest::new(payload.grant_digest).map_err(|_| WireError::InvalidValue)?,
+        payload.attempt,
+        payload
+            .manifest_digest
+            .map(Digest::new)
+            .transpose()
+            .map_err(|_| WireError::InvalidValue)?,
+    )
+    .map_err(|_| WireError::InvalidValue)?;
+    ArtifactReferenceEvent::new(decoded.envelope, payload)
+}
+
+/// Decodes only the exact artifact-reference event for `expected_scope` at `expected_key`.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for framing, size, canonicality, identity, or key failures.
+pub fn decode_artifact_reference_event(
+    stored_bytes: &[u8],
+    expected_key: &str,
+    expected_scope: &ScopeIdentity,
+) -> Result<ArtifactReferenceEvent, WireError> {
+    let decoded = decode_scope_event::<ciborium::Value>(
+        stored_bytes,
+        expected_key,
+        expected_scope,
+        Some(ARTIFACT_REFERENCE_PAYLOAD_TYPE),
+    )?;
+    artifact_reference_from_decoded(decoded)
+}
+
 /// Converts one opaque decoded event into a plan-admission event.
 ///
 /// # Errors
@@ -1439,6 +1750,7 @@ pub(crate) fn payload_type_registered(payload_type: &str) -> bool {
     if payload_type == ROOT_GENESIS_PAYLOAD_TYPE
         || payload_type == PLAN_ADMITTED_PAYLOAD_TYPE
         || payload_type == GRANT_ACTIVATED_PAYLOAD_TYPE
+        || payload_type == ARTIFACT_REFERENCE_PAYLOAD_TYPE
         || payload_type == PROJECTION_CHECKPOINT_PAYLOAD_TYPE
     {
         return true;
@@ -1664,9 +1976,18 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
 mod codec_tests {
     use ciborium::Value;
 
+    use crate::domain::validation::MAX_STORED_INTEGER;
+
     use crate::distributed::identity::WorkspaceId;
 
     use super::*;
+
+    /// Stored-byte address of the artifact-reference event
+    /// `artifact_reference_events_round_trip_and_pin_their_address` builds. The preimage is the
+    /// compressed CBOR, so both the `ciborium` and `zstd-sys` lockfile pins are byte-affecting
+    /// for this value, as is any change to the wire struct's field set or declaration order.
+    const ARTIFACT_REFERENCE_EVENT_DIGEST: &str =
+        "96f6bc7d738e56fe818440dea8bf4fd76f9d04329dc57bd5a1b5dd238187920f";
 
     /// Stored-byte address of the activation event
     /// `grant_activated_events_round_trip_and_reject_corruption` builds. The preimage is the
@@ -1692,6 +2013,25 @@ mod codec_tests {
             Value::Map(entries) => entries,
             _ => panic!("expected map"),
         }
+    }
+
+    fn repacked(
+        stored: &[u8],
+        scope: &ScopeIdentity,
+        mutate: impl FnOnce(&mut Value),
+    ) -> (Vec<u8>, String) {
+        let cbor = zstd::bulk::decompress(stored, MAX_DECOMPRESSED_BYTES).unwrap();
+        let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+        let payload = map(&mut value)
+            .iter_mut()
+            .find_map(|(key, value)| (key == &Value::Text("payload".into())).then_some(value))
+            .unwrap();
+        mutate(payload);
+        let mut rewritten = Vec::new();
+        into_writer(&value, &mut rewritten).unwrap();
+        let rewritten = compress(&rewritten).unwrap();
+        let reference = ScopeEventRef::new(2, Digest::new(sha256(&rewritten)).unwrap()).unwrap();
+        (rewritten.clone(), scope_event_key(scope, &reference))
     }
 
     fn reordered(genesis: &RootGenesis, field: &str) -> Vec<u8> {
@@ -1812,25 +2152,6 @@ mod codec_tests {
         // Rewriting the payload and re-keying the result is the only way to reach the decoder's own
         // rejections: the encoder cannot produce these bytes, and a stale key would be refused for
         // its address before its payload was interpreted.
-        fn repacked(
-            stored: &[u8],
-            scope: &ScopeIdentity,
-            mutate: impl FnOnce(&mut Value),
-        ) -> (Vec<u8>, String) {
-            let cbor = zstd::bulk::decompress(stored, MAX_DECOMPRESSED_BYTES).unwrap();
-            let mut value: Value = ciborium::from_reader(cbor.as_slice()).unwrap();
-            let payload = map(&mut value)
-                .iter_mut()
-                .find_map(|(key, value)| (key == &Value::Text("payload".into())).then_some(value))
-                .unwrap();
-            mutate(payload);
-            let mut rewritten = Vec::new();
-            into_writer(&value, &mut rewritten).unwrap();
-            let rewritten = compress(&rewritten).unwrap();
-            let reference =
-                ScopeEventRef::new(2, Digest::new(sha256(&rewritten)).unwrap()).unwrap();
-            (rewritten.clone(), scope_event_key(scope, &reference))
-        }
 
         // Unknown payload fields are rejected.
         let (extended, extended_key) =
@@ -1873,7 +2194,7 @@ mod codec_tests {
         // Every integer binding is bounded by the stored-integer range and must be nonzero.
         let work_id = || WorkId::new("work-17".into()).unwrap();
         let digest = || Digest::new("ab".repeat(32)).unwrap();
-        let max = crate::domain::proposal::MAX_STORED_INTEGER;
+        let max = MAX_STORED_INTEGER;
         assert!(GrantActivatedPayload::new(work_id(), max, max, digest(), max, max, max).is_ok());
         for (revision, fence, attempt, units, deadline) in [
             (0, 1, 1, 1, 1),
@@ -1898,6 +2219,236 @@ mod codec_tests {
                     deadline
                 ),
                 Err(crate::domain::validation::ValidationError::OutOfRange)
+            );
+        }
+    }
+
+    /// Pairwise-distinct values for every field a transposition could reach: six same-typed
+    /// strings and four same-typed integers, any two of which the wire layout could swap. A
+    /// swapped pair would otherwise round-trip and pass canonicality unnoticed.
+    fn artifact_reference() -> ArtifactReferencePayload {
+        use crate::domain::work::WorkId;
+
+        ArtifactReferencePayload::new(
+            ArtifactKind::InvocationTrace,
+            crate::domain::artifact::ArtifactRef::new(
+                "cd".repeat(32),
+                4_096,
+                "application/vnd.ravel.invocation-trace+cbor".into(),
+                "attempt-7".into(),
+                1_700_000_123_456,
+                Some("pilot".into()),
+            )
+            .unwrap(),
+            WorkId::new("work-a".into()).unwrap(),
+            3,
+            Digest::new("ab".repeat(32)).unwrap(),
+            7,
+            Some(Digest::new("ef".repeat(32)).unwrap()),
+        )
+        .unwrap()
+    }
+
+    fn artifact_event(genesis: &RootGenesis) -> ArtifactReferenceEvent {
+        ArtifactReferenceEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "artifact-op-1".into(),
+                ARTIFACT_REFERENCE_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            artifact_reference(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn artifact_reference_events_round_trip_and_pin_their_address() {
+        let genesis = fixture();
+        let event = artifact_event(&genesis);
+
+        let encoded = encode_artifact_reference_event(&event).unwrap();
+        // Pins the compressed stored bytes. Both the field set and the declaration order of
+        // `WireArtifactReferencePayload` are part of this address, so a reordered or extended
+        // wire struct moves every artifact reference already published.
+        assert_eq!(
+            encoded.event_ref().digest().as_str(),
+            ARTIFACT_REFERENCE_EVENT_DIGEST
+        );
+        let key = scope_event_key(genesis.identity(), encoded.event_ref());
+        assert_eq!(
+            decode_artifact_reference_event(encoded.stored_bytes(), &key, genesis.identity())
+                .unwrap(),
+            event
+        );
+
+        // Every field survives the round trip in its own position, which is what makes the
+        // transposable pairs above worth distinct values.
+        let payload = event.payload();
+        assert_eq!(payload.kind(), ArtifactKind::InvocationTrace);
+        assert_eq!(payload.artifact().digest(), "cd".repeat(32));
+        assert_eq!(payload.artifact().size(), 4_096);
+        assert_eq!(
+            payload.artifact().media_type(),
+            "application/vnd.ravel.invocation-trace+cbor"
+        );
+        assert_eq!(payload.artifact().producer_attempt(), "attempt-7");
+        assert_eq!(
+            payload.artifact().creation_time_unix_ms(),
+            1_700_000_123_456
+        );
+        assert_eq!(payload.artifact().retention_class(), Some("pilot"));
+        assert_eq!(payload.work_id().as_str(), "work-a");
+        assert_eq!(payload.work_revision().get(), 3);
+        assert_eq!(payload.grant_digest().as_str(), "ab".repeat(32));
+        assert_eq!(payload.attempt().get(), 7);
+        assert_eq!(
+            payload.manifest_digest().map(Digest::as_str),
+            Some("ef".repeat(32)).as_deref()
+        );
+
+        // Genesis bytes are a registered event, but not this payload type.
+        assert_eq!(
+            decode_artifact_reference_event(
+                genesis.event_bytes(),
+                genesis.event_key(),
+                genesis.identity()
+            ),
+            Err(WireError::InvalidValue)
+        );
+        // An artifact reference cannot occupy the genesis sequence.
+        assert_eq!(
+            ArtifactReferenceEvent::new(
+                EventEnvelope::new(
+                    genesis.identity().scope_id().clone(),
+                    1,
+                    None,
+                    1,
+                    "artifact-op-1".into(),
+                    ARTIFACT_REFERENCE_PAYLOAD_TYPE.to_owned(),
+                )
+                .unwrap(),
+                artifact_reference(),
+            ),
+            Err(WireError::InvalidValue)
+        );
+    }
+
+    /// A record kind this crate does not model is refused rather than carried. The kind is the
+    /// one axis a later artifact-bearing task extends, so an unknown string reaching history
+    /// would be a record no reader can interpret under a payload type they all share.
+    #[test]
+    fn an_unmodelled_record_kind_is_refused_by_the_decoder() {
+        let genesis = fixture();
+        let encoded = encode_artifact_reference_event(&artifact_event(&genesis)).unwrap();
+
+        for kind in [
+            Value::Text(String::new()),
+            Value::Text("invocation_manifest_v2".into()),
+            Value::Text("candidate_bundle".into()),
+        ] {
+            let (bytes, key) = repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
+                let slot = map(payload)
+                    .iter_mut()
+                    .find_map(|(key, value)| (key == &Value::Text("kind".into())).then_some(value))
+                    .unwrap();
+                *slot = kind.clone();
+            });
+            assert_eq!(
+                decode_artifact_reference_event(&bytes, &key, genesis.identity()),
+                Err(WireError::InvalidValue),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The kind/media-type and attempt/producer pins hold on the decode path, not just at the
+    /// append boundary: canonical stored bytes whose two records of one fact disagree are
+    /// refused on replay exactly as publication would have refused them.
+    #[test]
+    fn a_stored_reference_whose_pinned_fields_disagree_is_refused_by_the_decoder() {
+        let genesis = fixture();
+        let encoded = encode_artifact_reference_event(&artifact_event(&genesis)).unwrap();
+
+        // The fixture is a trace at attempt 7, so each mutation contradicts exactly one pin.
+        for (label, field, value) in [
+            (
+                "the other kind's media type",
+                "media_type",
+                Value::Text("application/vnd.ravel.invocation-manifest+cbor".into()),
+            ),
+            (
+                "a producer string naming another attempt",
+                "producer_attempt",
+                Value::Text("attempt-8".into()),
+            ),
+            (
+                "a trace with no manifest address",
+                "manifest_digest",
+                Value::Null,
+            ),
+        ] {
+            let (bytes, key) = repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
+                let slot = map(payload)
+                    .iter_mut()
+                    .find_map(|(key, target)| (key == &Value::Text(field.into())).then_some(target))
+                    .unwrap();
+                *slot = value.clone();
+            });
+            assert_eq!(
+                decode_artifact_reference_event(&bytes, &key, genesis.identity()),
+                Err(WireError::InvalidValue),
+                "{label}"
+            );
+        }
+    }
+
+    /// Every integer an artifact reference carries is bounded where the reference is built,
+    /// including the two `ArtifactRef` accepts unbounded by design.
+    #[test]
+    fn artifact_reference_integer_bindings_are_bounded_and_nonzero() {
+        use crate::domain::work::WorkId;
+
+        let max = MAX_STORED_INTEGER;
+        let build = |size: u64, creation: u64, revision: u64, attempt: u64| {
+            let kind = ArtifactKind::InvocationManifest;
+            ArtifactReferencePayload::new(
+                kind,
+                crate::domain::artifact::ArtifactRef::new(
+                    "cd".repeat(32),
+                    size,
+                    kind.media_type().into(),
+                    format!("attempt-{attempt}"),
+                    creation,
+                    None,
+                )
+                .unwrap(),
+                WorkId::new("work-a".into()).unwrap(),
+                revision,
+                Digest::new("ab".repeat(32)).unwrap(),
+                attempt,
+                None,
+            )
+        };
+
+        assert!(build(max, max, max, max).is_ok());
+        for (size, creation, revision, attempt) in [
+            (0, 1, 1, 1),
+            (1, 0, 1, 1),
+            (1, 1, 0, 1),
+            (1, 1, 1, 0),
+            (max + 1, 1, 1, 1),
+            (1, max + 1, 1, 1),
+            (1, 1, max + 1, 1),
+            (1, 1, 1, max + 1),
+        ] {
+            assert_eq!(
+                build(size, creation, revision, attempt),
+                Err(ValidationError::OutOfRange),
+                "{size} {creation} {revision} {attempt}"
             );
         }
     }

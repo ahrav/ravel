@@ -25,7 +25,7 @@ use ravel::{
             AcquireOutcome, ReleaseOutcome, RenewOutcome, STOP_MARGIN_MS, acquire, release, renew,
         },
     },
-    domain::work::{WorkId, WorkRef},
+    domain::work::WorkId,
     scope::{
         AdmittedCampaignConfig, CampaignId, Digest, EncodedScopeEvent, EventEnvelope,
         GrantActivatedEvent, GrantActivatedPayload, RootGenesis, ScopeAuthority, ScopeHead,
@@ -141,10 +141,8 @@ fn grant_batch(
     for (index, fill) in fills.iter().enumerate() {
         let sequence = parent_head.tail().sequence() + 1 + index as u64;
         let payload = GrantActivatedPayload::new(
-            WorkRef::new(
-                WorkId::new(format!("live-batch-work-{index}")).expect("work id is valid"),
-                1,
-            ),
+            WorkId::new(format!("live-batch-work-{index}")).expect("work id is valid"),
+            1,
             1,
             Digest::new(fill.repeat(64)).expect("grant digest is valid"),
             1,

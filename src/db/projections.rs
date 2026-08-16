@@ -613,6 +613,19 @@ pub(crate) fn scope_active_plan(
         .transpose()
 }
 
+/// Counts the scopes a projection holds.
+///
+/// A checkpoint snapshot is certified for one scope, so an installer uses this to refuse a
+/// copy that carries rows it has no ancestry to prove.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
+pub(crate) fn scope_count(connection: &rusqlite::Connection) -> Result<u64, ApplyError> {
+    let count: i64 = connection.query_row("SELECT COUNT(*) FROM scopes", [], |row| row.get(0))?;
+    u64::try_from(count).map_err(|_| ApplyError::DatabaseOperationFailed)
+}
+
 pub(crate) fn scope_matches_head(
     connection: &rusqlite::Connection,
     head: &ScopeHead,
@@ -679,17 +692,24 @@ pub(crate) fn snapshot_to(
         return Err(ApplyError::Conflict);
     }
     connection.execute("VACUUM INTO ?1", [destination_str])?;
-    let sanitized = sanitize_and_validate_snapshot(destination);
+    let sanitized = sanitize_and_validate_snapshot(destination, head.scope().scope_id().as_str());
     if sanitized.is_err() {
         let _ = std::fs::remove_file(destination);
     }
     sanitized
 }
 
-fn sanitize_and_validate_snapshot(destination: &Path) -> Result<(), ApplyError> {
+fn sanitize_and_validate_snapshot(destination: &Path, scope_id: &str) -> Result<(), ApplyError> {
     {
         let copy = rusqlite::Connection::open(destination)?;
         set_rollback_journal(&copy)?;
+        // `VACUUM INTO` copies the whole file, and one projection may host several scopes.
+        // Only this scope's rows are covered by the certificate the snapshot is published
+        // under, so the others are dropped here rather than shipped uncertified — an
+        // installer has no ancestry to prove them against. `ON DELETE CASCADE` from
+        // `scopes` clears the dependent rows, which needs foreign keys enforced.
+        copy.pragma_update(None, "foreign_keys", true)?;
+        copy.execute("DELETE FROM scopes WHERE scope_id <> ?1", [scope_id])?;
         copy.execute_batch(
             "BEGIN;\n             UPDATE scopes SET claims_restored = 0;\n             UPDATE admitted_work\n             SET claim_fence = NULL,\n                 claim_lease_until = NULL,\n                 terminal_result_digest = NULL;\n             COMMIT;",
         )?;
@@ -1968,7 +1988,7 @@ mod tests {
                 > crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64
         );
         assert_eq!(
-            sanitize_and_validate_snapshot(&db_path),
+            sanitize_and_validate_snapshot(&db_path, &"0".repeat(64)),
             Err(ApplyError::DatabaseOperationFailed)
         );
         fs::remove_file(db_path).unwrap();
@@ -1992,7 +2012,10 @@ mod tests {
         }
         drop(connection);
         assert_eq!(fs::metadata(&db_path).unwrap().len(), target);
-        assert_eq!(sanitize_and_validate_snapshot(&db_path), Ok(()));
+        assert_eq!(
+            sanitize_and_validate_snapshot(&db_path, &"0".repeat(64)),
+            Ok(())
+        );
         fs::remove_file(db_path).unwrap();
     }
 

@@ -268,11 +268,13 @@ impl S3Store {
                 .bucket(&self.bucket)
                 .prefix(prefix)
                 .max_keys(page);
-            if let Some(start_after) = start_after {
-                request = request.start_after(start_after);
-            }
+            // `StartAfter` is defined only for the first page; once a continuation token
+            // exists it carries the position, and some S3-compatible endpoints reject or
+            // mishandle a request that sends both.
             if let Some(token) = &token {
                 request = request.continuation_token(token);
+            } else if let Some(start_after) = start_after {
+                request = request.start_after(start_after);
             }
             let output = request.send().await.map_err(|_| ListError::Transport)?;
             for object in output.contents() {

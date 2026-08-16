@@ -46,6 +46,14 @@ const LIMITS: Limits = Limits {
 /// this bound is unreachable from genesis; [`crate::sync::head`] refuses to append past it.
 pub(crate) const MAX_SCOPE_REPLAY_EVENTS: u64 = 4_096;
 
+/// Checkpoint candidates one cold open may prove.
+///
+/// A catalog retains thousands of certificates, and every candidate fetches and validates
+/// its own packed suffix before its snapshot GET can fail. Trying them all turns the
+/// fallback into a quadratic download; a genesis replay is the cheaper answer once the
+/// newest few candidates are unusable.
+const MAX_CHECKPOINT_CANDIDATES: usize = 4;
+
 #[derive(Clone, Copy)]
 struct Limits {
     events: u64,
@@ -263,11 +271,18 @@ pub async fn open_projection(
                 return Err(ScopeReplayError::DatabaseUnavailable);
             }
         }
-        // The invalid file is removed before the checkpoint rung so its stale sidecars
-        // can never bleed into an installed snapshot.
-        rebuild_files(path)?;
     }
+    // Every path that reaches the checkpoint rung removes the destination and its sidecars
+    // first. A stale `-journal`, `-wal`, or `-shm` left by a crash outlives a missing main
+    // file, and SQLite would recover the freshly installed snapshot through it.
+    rebuild_files(path)?;
     if let Some(handle) = install_checkpoint(store, scope, path).await {
+        return Ok(handle);
+    }
+    // A concurrent install may have committed the destination while this rung ran; its
+    // snapshot is complete and validated before the commit link appears, so adopting it is
+    // preferable to creating an empty projection over it.
+    if let Ok(handle) = DbHandle::open_existing(path.to_path_buf()).await {
         return Ok(handle);
     }
     DbHandle::spawn(path.to_path_buf())
@@ -280,6 +295,8 @@ pub async fn open_projection(
 /// `None` is a rung miss: the empty projection is created as before and later refreshes
 /// replay from genesis. Every accelerator object consulted here is a hint; the pinned
 /// head and the exact `events/` ancestry are the only authority the install trusts.
+/// At most [`MAX_CHECKPOINT_CANDIDATES`] in-range candidates are proven, because each
+/// attempt fetches and validates its own suffix.
 async fn install_checkpoint(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -291,10 +308,15 @@ async fn install_checkpoint(
     else {
         return None;
     };
+    let mut attempts = 0;
     for certificate_ref in catalog.checkpoints().iter().rev() {
         if certificate_ref.sequence() > observed.head().tail().sequence() {
             continue;
         }
+        if attempts == MAX_CHECKPOINT_CANDIDATES {
+            return None;
+        }
+        attempts += 1;
         if let Some(handle) = install_candidate(
             store,
             scope,
@@ -316,10 +338,11 @@ async fn install_checkpoint(
 /// Proof precedes download: the certificate's covered cursor must reach the pinned tail
 /// through packed events and the common chain validator before the snapshot GET is
 /// issued at its certified byte length and checked against its certified digest. The
-/// rename from the staged sibling path to `destination` is the commit point: before it
-/// the previous destination is untouched; after it the snapshot is independently valid
-/// at its covered cursor, so interruption before the suffix applies still leaves a valid
-/// replayable projection. `None` lets the caller try the next candidate.
+/// create-only link from the staged sibling path to `destination` is the commit point:
+/// before it the previous destination is untouched; after it the snapshot is
+/// independently valid at its covered cursor, so interruption before the suffix applies
+/// still leaves a valid replayable projection. `None` lets the caller try the next
+/// candidate.
 async fn install_candidate(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -359,6 +382,17 @@ async fn install_candidate(
     )
     .await
     .ok()?;
+    // `prepare_chain` re-derives the ancestry downward from the pinned tail and pushes it
+    // newest first, so the last element is the committed event at `covered_sequence + 1` —
+    // this certificate's own sequence, which `precheck` proved is at or below the tail.
+    // Requiring the two to name the same object is what makes the certificate authoritative
+    // instead of merely self-consistent at its content-addressed key: an event published by
+    // a head-CAS loser or a fenced writer is a valid object that the pinned head never
+    // commits, and its payload chooses the snapshot digest, cursor, and active plan that
+    // every later check here compares against.
+    if events.last()?.decoded.event_ref() != certificate_ref {
+        return None;
+    }
 
     let length = usize::try_from(certificate.payload().snapshot_length()).ok()?;
     let key = accelerator::scope_checkpoint_key(
@@ -394,10 +428,12 @@ async fn install_candidate(
             }
             let installed = std::fs::write(&staging, &bytes).is_ok()
                 && staged_snapshot_valid(&staging, &scope, &certificate)
-                && std::fs::rename(&staging, &destination).is_ok();
-            if !installed {
-                let _ = rebuild_files(&staging);
-            }
+                // The commit is a create-only link, not a rename: a rename would replace a
+                // destination another install already committed and opened, leaving that
+                // worker writing an unlinked inode while everyone else reads the
+                // replacement. Losing this link means someone else committed first.
+                && std::fs::hard_link(&staging, &destination).is_ok();
+            let _ = rebuild_files(&staging);
             installed
         })
         .await
@@ -426,7 +462,7 @@ async fn install_candidate(
 }
 
 /// Validates the staged snapshot file: full open-time projection validation plus the
-/// certified scope, covered cursor, and active-plan bindings.
+/// certified scope as the copy's only scope, its covered cursor, and its active plan.
 fn staged_snapshot_valid(
     staging: &Path,
     scope: &ScopeIdentity,
@@ -439,6 +475,13 @@ fn staged_snapshot_valid(
     let Ok(connection) = crate::db::projections::open_existing(staging) else {
         return false;
     };
+    // The snapshot is a whole-file copy of the publisher's projection, which may host other
+    // scopes. Only this scope's rows are covered by the certificate, and the install has no
+    // ancestry to prove the rest against, so a copy naming any other scope is refused rather
+    // than installed with uncertified admission, grant, and budget rows in it.
+    if crate::db::projections::scope_count(&connection) != Ok(1) {
+        return false;
+    }
     let Ok(cursor) = crate::db::projections::scope_cursor(&connection, scope) else {
         return false;
     };
@@ -3570,8 +3613,8 @@ mod tests {
         ]
     }
 
-    /// Uncertified, wrong-digest, invalid-SQLite, wrong-plan, wrong-scope, and
-    /// wrong-cursor checkpoints all fall through to the empty projection.
+    /// Uncertified, wrong-digest, invalid-SQLite, wrong-plan, wrong-scope, wrong-cursor,
+    /// and off-chain-certificate checkpoints all fall through to the empty projection.
     #[tokio::test]
     async fn bad_checkpoints_fall_through_to_an_empty_projection() {
         let genesis = genesis();
@@ -3696,6 +3739,83 @@ mod tests {
         fs::remove_file(&two_snap).unwrap();
         let wrong_cursor = certified_responses(&genesis, two_snapshot, None, "wrong-cursor-op");
 
+        // Off-chain certificate: a valid checkpoint event at a sequence the pinned head's
+        // ancestry commits to a different object. A head-CAS loser or a fenced writer leaves
+        // exactly this — an event whose key is fresh, whose parent is genuine, and whose
+        // payload names a snapshot of its own choosing. The chain walk proves the ancestry
+        // but must refuse the certificate that is not part of it.
+        let committed_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "committed-rival-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let committed = encode_scope_event(&committed_envelope, &Value::Null).unwrap();
+        let committed_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            committed.event_ref().clone(),
+            None,
+            "committed-rival-op".into(),
+        )
+        .unwrap();
+        let orphan = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "orphan-checkpoint-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            ProjectionCheckpointPayload::new(
+                Digest::new(sha256(&fixture.snapshot)).unwrap(),
+                fixture.snapshot.len() as u64,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let orphan_encoded = encode_projection_checkpoint_event(&orphan).unwrap();
+        assert_ne!(orphan_encoded.event_ref(), committed.event_ref());
+        let committed_pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[committed.stored_bytes()],
+        )
+        .unwrap();
+        let committed_entry = PackEntry::new(2, 2, committed_pack.digest().clone()).unwrap();
+        let (orphan_catalog, orphan_catalog_digest) = encode_catalog(
+            &scope,
+            &[committed_entry],
+            std::slice::from_ref(orphan_encoded.event_ref()),
+        )
+        .unwrap();
+        let off_chain_certificate = vec![
+            head_response(encode_head(&committed_head).unwrap()),
+            response(
+                200,
+                &[("etag", "\"pointer\"")],
+                encode_pointer(&scope, &orphan_catalog_digest).unwrap(),
+            ),
+            response(200, &[("etag", "\"catalog\"")], orphan_catalog),
+            event_response(orphan_encoded.stored_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"pack\"")],
+                committed_pack.bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+        ];
+
         for responses in [
             uncertified,
             wrong_digest,
@@ -3703,6 +3823,7 @@ mod tests {
             wrong_plan,
             wrong_scope,
             wrong_cursor,
+            off_chain_certificate,
         ] {
             let cold_path = path("checkpoint-fallback");
             let _ = fs::remove_file(&cold_path);

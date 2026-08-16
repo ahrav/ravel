@@ -311,6 +311,15 @@ async fn install_checkpoint(
     None
 }
 
+/// Proves one checkpoint candidate against the pinned head, then installs its snapshot.
+///
+/// Proof precedes download: the certificate's covered cursor must reach the pinned tail
+/// through packed events and the common chain validator before the snapshot GET is
+/// issued at its certified byte length and checked against its certified digest. The
+/// rename from the staged sibling path to `destination` is the commit point: before it
+/// the previous destination is untouched; after it the snapshot is independently valid
+/// at its covered cursor, so interruption before the suffix applies still leaves a valid
+/// replayable projection. `None` lets the caller try the next candidate.
 async fn install_candidate(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -330,8 +339,6 @@ async fn install_candidate(
     // `precheck` bounds the covered-to-tail interval before any pack fetch.
     precheck(&covered, observed.head().tail(), LIMITS).ok()?;
 
-    // The certificate and suffix must reach the pinned head through packed events and
-    // the common chain validator before any snapshot byte is trusted.
     let stored = accelerator::packed_events_from_catalog(
         store,
         scope,
@@ -353,7 +360,6 @@ async fn install_candidate(
     .await
     .ok()?;
 
-    // Only after that proof is the snapshot downloaded, at its certified byte length.
     let length = usize::try_from(certificate.payload().snapshot_length()).ok()?;
     let key = accelerator::scope_checkpoint_key(
         scope,
@@ -379,7 +385,6 @@ async fn install_candidate(
         STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let staging = std::path::PathBuf::from(staging);
-    // Before rename, the previous destination remains untouched.
     let installed = {
         let scope = scope.clone();
         let destination = destination.to_path_buf();

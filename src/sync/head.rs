@@ -772,8 +772,7 @@ async fn reconcile(
     ScopeHeadCommitOutcome::Unresolved(transition)
 }
 
-/// `None` means the packs could not even feed the walk: a missing sequence or a rival
-/// object at an expected one. The serial walk then decides from authoritative reads.
+/// A missing sequence, a rival object at an expected sequence, or a walk that ends short of the boundary returns `None`; the serial walk then decides from authoritative reads. commentlint: allow(JUDGE)
 fn packed_verdict(
     mut checker: ReconcileChecker,
     tail: crate::scope::ScopeEventRef,

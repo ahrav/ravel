@@ -1,12 +1,29 @@
-//! Shared replay-accelerator objects: packs, catalogs, and the current pointer.
+//! Shared replay-accelerator objects: packs, catalogs, the current pointer, and
+//! checkpoint snapshots.
 //!
-//! Every object here is a hint. `head` and the exact `events/` ancestry remain the only
-//! commitment authority: a missing, stale, malformed, corrupt, or conflicting accelerator
-//! object makes a reader fall through to slower rungs without changing any projection.
-//! Packs embed the exact stored `.cbor.zst` event bytes; each embedded event is re-hashed,
-//! assigned its synthesized event key, and re-decoded before anything trusts it.
-//! Immutable packs and catalogs publish create-only; only `replay-index/current` is
-//! CAS-replaced, and a CAS loser stops publishing without affecting replay.
+//! Replay climbs a fail-closed ladder: a cold open may install a certified checkpoint
+//! plus its packed suffix, and a refresh tries packed events, then LIST-assisted reads,
+//! then the serial event walk. Every object here is a hint. `head` and the exact
+//! `events/` ancestry remain the only commitment authority: a missing, stale, malformed,
+//! corrupt, or conflicting accelerator object makes a reader fall through to a slower
+//! rung without changing any projection.
+//!
+//! Three canonical-CBOR formats — a pack of at most 256 events and an 8 MiB event
+//! section, a catalog of sorted non-overlapping pack rows plus checkpoint-certificate
+//! references, and the current pointer naming one catalog digest — reject unknown fields
+//! and require exact re-encoding; a raw SQLite snapshot is certified separately by a
+//! `projection_checkpoint_published` event. Packs embed the exact stored `.cbor.zst`
+//! event bytes, never re-encodings, so each embedded event re-hashes to its stored
+//! reference, synthesizes its exact event key, and passes the canonical event decoder
+//! unchanged: a pack cannot smuggle bytes that differ from `events/`.
+//!
+//! Packs, catalogs, and snapshots are content-addressed and publish create-only
+//! (`If-None-Match: *`), so duplicate publication is idempotent. `replay-index/current`
+//! is the one mutable object: created with `put_if_absent`, CAS-replaced with
+//! `put_if_match` on its GET ETag. Publication is best effort because read-side
+//! validation is the correctness boundary: a publisher that fails, races, or loses the
+//! pointer CAS leaves at worst a stale pointer or orphaned immutable objects, never a
+//! wrong replay.
 
 use std::{error::Error, fmt, io::Cursor, num::NonZeroUsize, path::Path};
 
@@ -38,7 +55,7 @@ const MAX_POINTER_BYTES: usize = 4 * 1024;
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 /// Caps lifetime catalog rows (one appended batch per advancing refresh), not sequences; a catalog at the cap refuses new rows while replay stays correct. commentlint: allow(JUDGE)
 const MAX_CATALOG_ROWS: usize = crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS as usize;
-/// Accumulated pack bytes one read may fetch; matches the replay byte budget.
+/// Accumulated bytes one accelerator read may fetch; matches the replay byte budget. commentlint: allow(JUDGE)
 const MAX_FETCH_BYTES: usize = 64 * 1024 * 1024;
 const CBOR_RECURSION_LIMIT: usize = 16;
 const FORMAT_VERSION: u64 = 1;
@@ -692,6 +709,10 @@ pub(crate) async fn packed_events(
 
 /// Reads packed events through an already validated `catalog`, sparing a reread of the
 /// pointer when the caller holds one.
+///
+/// The range guards run before any request: `first == 0`, an inverted interval, or a
+/// span wider than one replay (4,096 events) is a miss. The 64 MiB pack budget is
+/// enforced while fetching, so a lying catalog cannot buffer unbounded bytes.
 pub(crate) async fn packed_events_from_catalog(
     store: &S3Store,
     scope: &ScopeIdentity,

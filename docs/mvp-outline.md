@@ -1245,16 +1245,18 @@ The sync engine:
 2. Traverses that scope's immutable parent chain without treating `LIST` as a
    publication snapshot.
 3. Validates payload type, scope binding, sequence, parent digest, `writer_epoch`,
-   operation identity, and canonical bytes before apply.
-4. Applies one event and advances that scope's cursor atomically.
+   operation identity, and canonical bytes before apply; cross-history duplicate
+   detection completes inside the apply transaction.
+4. Applies the whole validated suffix and the head comparison in one transaction; the
+   cursor advances only when the committed state matches the observed `ScopeHead`.
 5. Reports readiness only when the verified cursor matches the freshly read
    `ScopeHead`.
 
 A gap, wrong-scope event, unregistered payload type, digest conflict, or conversion
 failure detected before the first projection write leaves the affected scope projection
-and cursor unchanged and fails that scope's readiness closed. A database failure while
-applying an already-validated suffix may retain a transactionally valid committed prefix;
-that scope remains not ready until replay completes. Neither failure invalidates an
+and cursor unchanged and fails that scope's readiness closed. A database failure or conflict
+while applying an already-validated suffix rolls back the entire suffix; the scope projection
+and cursor are unchanged and the scope remains not ready. Neither failure invalidates an
 independent scope.
 
 Scoped projections support:

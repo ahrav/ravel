@@ -55,8 +55,6 @@ const SCOPE_HEAD_MATCH_SQL: &str = "SELECT scope.campaign_id, scope.sequence, \
      WHERE scope.scope_id = ?1";
 const EVENT_AT_SEQUENCE_SQL: &str =
     "SELECT digest FROM applied_scope_events WHERE scope_id = ?1 AND sequence = ?2";
-const OPERATION_CONFLICT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM applied_scope_events \
-     WHERE scope_id = ?1 AND operation_id = ?2 AND (sequence <> ?3 OR digest <> ?4))";
 /// `issue()`'s pre-append probe. One id namespace holds every payload type, so the second column
 /// asks the narrower question: did the event applied under this id name this exact grant? The
 /// answer comes from the activation event's own row, which no later fold rewrites.
@@ -587,28 +585,6 @@ pub(crate) fn scope_cursor(
             ))
         }
     }
-}
-
-pub(crate) fn scope_conflicting_operation(
-    connection: &rusqlite::Connection,
-    scope: &ScopeIdentity,
-    operation_id: &str,
-    reference: &ScopeEventRef,
-) -> Result<bool, ApplyError> {
-    let sequence =
-        i64::try_from(reference.sequence()).map_err(|_| ApplyError::DatabaseOperationFailed)?;
-    connection
-        .query_row(
-            OPERATION_CONFLICT_SQL,
-            params![
-                scope.scope_id().as_str(),
-                operation_id,
-                sequence,
-                reference.digest().as_str()
-            ],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
 }
 
 pub(crate) fn scope_matches_head(
@@ -1291,11 +1267,21 @@ pub(crate) fn mark_claims_restored(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_scope_event(
     connection: &mut rusqlite::Connection,
     event: &ScopeProjectionEvent,
 ) -> Result<ApplyOutcome, ApplyError> {
     let transaction = connection.transaction()?;
+    let outcome = apply_scope_event_in_transaction(&transaction, event)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn apply_scope_event_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &ScopeProjectionEvent,
+) -> Result<ApplyOutcome, ApplyError> {
     let scope_id = event.scope.scope_id().as_str();
     let sequence = event.envelope.sequence();
     let stored_sequence =
@@ -1410,7 +1396,7 @@ pub(crate) fn apply_scope_event(
         proposal,
     } = &event.payload
     {
-        admit_plan(&transaction, event, plan_digest, proposal)?;
+        admit_plan(transaction, event, plan_digest, proposal)?;
     }
 
     // A committed activation event is fact (I2): rowcount 0 means the history names a revision
@@ -1467,8 +1453,40 @@ pub(crate) fn apply_scope_event(
             },
         ],
     )?;
-    transaction.commit()?;
     Ok(ApplyOutcome::Applied)
+}
+
+/// Applies one validated suffix and the observed-head comparison in a single transaction.
+///
+/// `Applied` and `AlreadyApplied` per-event outcomes both continue; any error — including a
+/// final head mismatch — rolls back every event in the suffix and leaves the cursor unchanged.
+/// This deliberately supersedes the earlier committed-prefix behavior: the projection is
+/// disposable and rebuilds from durable facts, so all-or-nothing is the simpler contract.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::Conflict`] when any event fails its chain, duplicate, plan-admission,
+/// or grant-fold checks, or when the state after the last event does not match `head`.
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
+///
+/// Every event must name `head.scope()`; an empty suffix performs the head check only. Callers
+/// bound the suffix — replay enforces 4,096 events / 64 MiB before the worker command and the
+/// grant fold passes exactly one event — so this function imposes no internal cap.
+pub(crate) fn apply_scope_suffix(
+    connection: &mut rusqlite::Connection,
+    events: &[ScopeProjectionEvent],
+    head: &ScopeHead,
+) -> Result<(), ApplyError> {
+    let transaction = connection.transaction()?;
+    for event in events {
+        // `AlreadyApplied` is an idempotent skip; only errors abort the suffix.
+        apply_scope_event_in_transaction(&transaction, event)?;
+    }
+    if !scope_matches_head(&transaction, head)? {
+        return Err(ApplyError::Conflict);
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn initialize(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
@@ -1989,11 +2007,6 @@ mod tests {
             query_plan(&connection, EVENT_AT_SEQUENCE_SQL, &[&scope_id, &sequence]),
             query_plan(
                 &connection,
-                OPERATION_CONFLICT_SQL,
-                &[&scope_id, &operation, &sequence, &digest],
-            ),
-            query_plan(
-                &connection,
                 DUPLICATE_EXISTS_SQL,
                 &[&scope_id, &digest, &operation],
             ),
@@ -2156,6 +2169,110 @@ mod tests {
             Ok(ApplyOutcome::Applied)
         );
         assert_eq!(scope_cursor(&connection, &multibyte).unwrap().0, 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_conflict_mid_suffix_rolls_back_every_event() {
+        let path = path("suffix-conflict-rollback");
+        let mut connection = create(&path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        let genesis = mutation(&scope, 1, DIGEST_1, None);
+        apply_scope_event(&mut connection, &genesis).unwrap();
+        let before = snapshot(&connection);
+        let second = mutation(&scope, 2, DIGEST_2, Some(DIGEST_1));
+        let third = mutation_with_operation(
+            &scope,
+            3,
+            DIGEST_3,
+            Some(DIGEST_2),
+            second.envelope.operation_id(),
+        );
+        let head = ScopeHead::new(
+            scope.clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            third.reference.clone(),
+            None,
+            third.envelope.operation_id().to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_scope_suffix(&mut connection, &[second, third], &head),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(snapshot(&connection), before);
+
+        // A divergent digest at an already-applied sequence enters the suffix conflict path
+        // instead of returning `AlreadyApplied`. `current_head` matches the projection state,
+        // so the divergent digest reaches the suffix conflict check.
+        let current_head = ScopeHead::new(
+            scope.clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            genesis.reference.clone(),
+            None,
+            genesis.envelope.operation_id().to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_scope_suffix(
+                &mut connection,
+                &[mutation(&scope, 1, DIGEST_2, None)],
+                &current_head
+            ),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(snapshot(&connection), before);
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_head_mismatch_rolls_back_the_suffix() {
+        let path = path("suffix-head-mismatch");
+        let mut connection = create(&path).unwrap();
+        let scope = scope("workspace-a", "campaign-a");
+        let genesis = mutation(&scope, 1, DIGEST_1, None);
+        apply_scope_event(&mut connection, &genesis).unwrap();
+        let before = snapshot(&connection);
+        let second = mutation(&scope, 2, DIGEST_2, Some(DIGEST_1));
+        let mismatched = ScopeHead::new(
+            scope.clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            second.reference.clone(),
+            None,
+            "wrong-operation".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_scope_suffix(&mut connection, std::slice::from_ref(&second), &mismatched),
+            Err(ApplyError::Conflict)
+        );
+        assert_eq!(snapshot(&connection), before);
+
+        let matching = ScopeHead::new(
+            scope.clone(),
+            crate::scope::ScopeAuthority::Unowned,
+            1,
+            second.reference.clone(),
+            None,
+            second.envelope.operation_id().to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_scope_suffix(&mut connection, &[second], &matching),
+            Ok(())
+        );
+        assert_eq!(
+            scope_cursor(&connection, &scope).unwrap(),
+            (2, Some(Digest::new(DIGEST_2.into()).unwrap()))
+        );
+        assert_eq!(snapshot(&connection).events.len(), 2);
+        drop(connection);
         fs::remove_file(path).unwrap();
     }
 

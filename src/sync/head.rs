@@ -15,7 +15,7 @@
 use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 
 use crate::{
-    domain::proposal::AdmissibleProposal,
+    domain::proposal::{AdmissibleProposal, MAX_PLAN_STORED_BYTES, decode_plan},
     scope::{
         Digest, EncodedScopeEvent, EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE,
         GrantActivatedEvent, GrantActivatedPayload, MAX_HEAD_BYTES, PLAN_ADMITTED_PAYLOAD_TYPE,
@@ -182,6 +182,14 @@ impl ScopeHeadTransition {
                 .collect();
             validate_batch_chain(&parent, &views)?
         };
+        // All members must be witnessed in one store namespace: `commit` compares only the stored final publication against its target store, so agreement across the batch is proven here. commentlint: allow(JUDGE)
+        if let Some(last) = events.last()
+            && events
+                .iter()
+                .any(|event| event.namespace() != last.namespace())
+        {
+            return Err(WireError::InvalidValue);
+        }
         let event = events
             .into_iter()
             .next_back()
@@ -637,6 +645,10 @@ pub async fn append_batch(
         let key = scope_event_key(scope, encoded.event_ref());
         validate_registered(scope, envelope, encoded, &key)
             .map_err(ScopeAppendError::Publication)?;
+        // A checkpoint certificate presumes its covered snapshot object is already published, and a batch caller holds no snapshot bytes to publish (`append_checkpoint` does), so checkpoint members are refused before any request. commentlint: allow(JUDGE)
+        if envelope.payload_type() == PROJECTION_CHECKPOINT_PAYLOAD_TYPE {
+            return Err(ScopeAppendError::InvalidInput);
+        }
     }
     let active_plan = {
         let views: Vec<BatchEventView<'_>> = events
@@ -649,6 +661,24 @@ pub async fn append_batch(
             .collect();
         validate_batch_chain(&parent, &views).map_err(|_| ScopeAppendError::InvalidInput)?
     };
+    // A plan-admission member must name a readable plan object before the first event PUT: an event that names an address must never win the head race while that address is unreadable (`append_plan_admitted`'s ordering rule). The proof is the same bounded, digest-checked read replay performs. commentlint: allow(JUDGE)
+    for (envelope, encoded) in &events {
+        if envelope.payload_type() != PLAN_ADMITTED_PAYLOAD_TYPE {
+            continue;
+        }
+        let key = scope_event_key(scope, encoded.event_ref());
+        let admitted = decode_plan_admitted_event(encoded.stored_bytes(), &key, scope)
+            .map_err(|_| ScopeAppendError::InvalidInput)?;
+        let digest = admitted.payload().plan_digest();
+        let key = plan_key(scope.workspace_id(), scope.campaign_id(), digest);
+        let bytes = match store.get_object(&key, MAX_PLAN_STORED_BYTES).await {
+            Ok(GetOutcome::Found { bytes, .. }) => bytes,
+            Ok(GetOutcome::NotFound) | Err(_) => return Err(ScopeAppendError::InvalidInput),
+        };
+        if decode_plan(&bytes, digest).is_err() {
+            return Err(ScopeAppendError::InvalidInput);
+        }
+    }
     let (authority, scope_epoch) = (
         observed.head().authority().clone(),
         observed.head().scope_epoch().get(),

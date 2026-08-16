@@ -7,12 +7,13 @@ use std::{error::Error, fmt};
 use ciborium::Value;
 
 use crate::{
+    dispatch::AttemptHistory,
     scope::{
         DecodedScopeEvent, EncodedScopeEvent, EventEnvelope, MAX_COMPRESSED_BYTES,
         ROOT_GENESIS_PAYLOAD_TYPE, RootEvent, ScopeEventRef, ScopeIdentity, decode_scope_event,
         encode_root_event, scope_event_key,
     },
-    storage::s3::{AttemptHistory, GetError, GetOutcome, PublicationError, S3Store},
+    storage::s3::{GetError, GetOutcome, PublicationError, S3Store},
 };
 
 use super::WireError;

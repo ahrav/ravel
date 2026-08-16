@@ -2205,7 +2205,7 @@ mod tests {
         grant: &crate::distributed::grants::EffectGrant,
         now_ms: u64,
     ) -> crate::distributed::scope_controller::ControllerAuthority {
-        use crate::storage::s3::AttemptHistory;
+        use crate::dispatch::AttemptHistory;
         let [mut object, mut event, mut head] = [
             AttemptHistory::default(),
             AttemptHistory::default(),

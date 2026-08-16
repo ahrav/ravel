@@ -32,12 +32,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     db::{projections::ApplyError, worker::DbHandle},
+    dispatch::AttemptHistory,
     distributed::claims::bounded_map,
     scope::{
         DecodedScopeEvent, Digest, MAX_COMPRESSED_BYTES, ProjectionCheckpointPayload,
         ScopeEventRef, ScopeIdentity, decode_scope_event, scope_event_key, sha256,
     },
-    storage::s3::{AttemptHistory, ETag, GetOutcome, MutationOutcome, S3Store},
+    storage::s3::{ETag, GetOutcome, MutationOutcome, S3Store},
     sync::WireError,
 };
 

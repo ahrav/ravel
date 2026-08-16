@@ -711,7 +711,8 @@ impl BedrockTransport {
     /// The authority is taken by value: a grant is authority for one external operation and
     /// binds one attempt, and behind a shared reference neither `#[must_use]` nor the absent
     /// `Clone` would stop one accepted intake from driving a loop of paid calls. Consuming it
-    /// costs the caller nothing it needs afterwards, because an [`InvocationBinding`] derived
+    /// costs the caller nothing it needs afterwards, because a
+    /// [`crate::invocation::InvocationBinding`] derived
     /// before dispatch outlives it and is what the manifest and the terminal trace are written
     /// under.
     ///
@@ -793,15 +794,20 @@ impl BedrockTransport {
         // orchestrator merges an override's unset fields from the client config, so
         // `ATTEMPT_TIMEOUT`, disabled retries, and stalled-stream protection all survive.
         //
-        // This bounds time to response headers, which is what the fixed timeout bounds too. A
-        // body that streams slowly without stalling is bounded by neither, exactly as
-        // `configured` already documents; requiring authority does not change that.
+        // `Converse` is not a streaming operation, so its deserializer reads the whole body
+        // inside the orchestrator's timeout scope: this bound covers serialization, transmit,
+        // body read, and deserialization rather than only time to headers. A call therefore
+        // cannot outlive the authority that permitted it.
+        //
+        // The override only ever tightens. It is not capped at `OPERATION_TIMEOUT` because that
+        // would change nothing: retries are disabled, so exactly one attempt runs under
+        // `ATTEMPT_TIMEOUT`, which is the lower of the two and survives this override.
         let bounded = call
             .customize()
             .config_override(
                 aws_sdk_bedrockruntime::config::Config::builder().timeout_config(
                     TimeoutConfig::builder()
-                        .operation_timeout(authorized_for.min(OPERATION_TIMEOUT))
+                        .operation_timeout(authorized_for)
                         .build(),
                 ),
             )
@@ -1110,7 +1116,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::distributed::grants::test_support::model_authority;
+    use crate::distributed::grants::{GRANT_ACTION_MODEL_INVOKE, test_support::model_authority};
 
     /// Fixed clock for the tests, so an authority's term is stated rather than sampled.
     const NOW_MS: u64 = 1_700_000_000_000;
@@ -1126,7 +1132,9 @@ mod tests {
     /// minted for one profile refuses a call to any other.
     fn authority_for(request: &InvocationRequest) -> EffectAuthority {
         model_authority(
+            GRANT_ACTION_MODEL_INVOKE.to_owned(),
             request.profile().configuration_digest(),
+            request.operation_id().to_owned(),
             NOW_MS + 60_000,
             NOW_MS + 25_000,
         )
@@ -2973,36 +2981,65 @@ mod tests {
     /// Every way an authority can fail to permit a call, refused before anything is dispatched
     /// and before the attempt history records a possible send.
     ///
-    /// `NeverClient` answers nothing, so a call that reached dispatch would hang rather than
-    /// return: each case returning promptly is itself the proof that no request left. A clean
-    /// history afterwards is the second half — a refused call must not leave a later attempt
+    /// Under a paused clock a dispatched call against `NeverClient` returns `TimedOut` rather
+    /// than hanging, so it is the `Err` equality that proves no request left, and the clean
+    /// history that proves no trace was recorded: a refused call must not leave a later attempt
     /// claiming dispatch uncertainty it never earned.
     #[tokio::test(start_paused = true)]
     async fn an_authority_that_does_not_permit_the_call_refuses_before_dispatch() {
-        use crate::distributed::grants::{
-            GRANT_ACTION_MODEL_INVOKE, GrantRejection, test_support::model_authority,
-        };
+        use crate::distributed::grants::GrantRejection;
 
         let transport =
             BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+        let action = GRANT_ACTION_MODEL_INVOKE.to_owned();
         let scope = profile().configuration_digest();
+        let operation = OPERATION_ID.to_owned();
+        let deadline = NOW_MS + 60_000;
+        let stop = NOW_MS + 25_000;
 
-        for (case, authority, now_ms, expected) in [
+        for (case, action, scope, operation, deadline, stop, expected) in [
+            (
+                "an action this boundary does not accept",
+                "git-push".to_owned(),
+                scope.clone(),
+                operation.clone(),
+                deadline,
+                stop,
+                GrantRejection::IdentityMismatch,
+            ),
             (
                 "another profile's configuration",
-                model_authority("cd".repeat(32), NOW_MS + 60_000, NOW_MS + 25_000),
-                NOW_MS,
+                action.clone(),
+                "cd".repeat(32),
+                operation.clone(),
+                deadline,
+                stop,
+                GrantRejection::IdentityMismatch,
+            ),
+            (
+                "another operation",
+                action.clone(),
+                scope.clone(),
+                "invoke-op-elsewhere".to_owned(),
+                deadline,
+                stop,
                 GrantRejection::IdentityMismatch,
             ),
             (
                 "the grant deadline has passed",
-                model_authority(scope.clone(), NOW_MS, NOW_MS + 25_000),
+                action.clone(),
+                scope.clone(),
+                operation.clone(),
                 NOW_MS,
+                stop,
                 GrantRejection::Expired,
             ),
             (
                 "the proving lease has stopped",
-                model_authority(scope.clone(), NOW_MS + 60_000, NOW_MS),
+                action,
+                scope,
+                operation,
+                deadline,
                 NOW_MS,
                 GrantRejection::StaleAuthority,
             ),
@@ -3010,78 +3047,84 @@ mod tests {
             let mut history = AttemptHistory::default();
             assert_eq!(
                 transport
-                    .invoke(authority, &request(), &mut history, now_ms)
+                    .invoke(
+                        model_authority(action, scope, operation, deadline, stop),
+                        &request(),
+                        &mut history,
+                        NOW_MS,
+                    )
                     .await,
                 Err(expected),
                 "{case}"
             );
             assert!(!history.may_have_been_sent(), "{case}");
         }
-
-        // An action other than a model invocation is refused for the same reason, built here
-        // because `model_authority` names the one action this boundary accepts.
-        let wrong_action = {
-            let permitted = model_authority(scope.clone(), NOW_MS + 60_000, NOW_MS + 25_000);
-            let grant = crate::distributed::grants::EffectGrant::new(
-                permitted.grant().identity().clone(),
-                "git-push".into(),
-                scope,
-                permitted.grant().attempt().get(),
-                permitted.grant().limit_units().get(),
-                permitted.grant().deadline_unix_ms().get(),
-                permitted.grant().operation_id().to_owned(),
-            )
-            .expect("a key segment other than the model action");
-            assert_ne!(grant.action(), GRANT_ACTION_MODEL_INVOKE);
-            crate::distributed::grants::test_support::authority(
-                grant,
-                permitted.grant_digest().clone(),
-                NOW_MS + 25_000,
-            )
-        };
-        let mut history = AttemptHistory::default();
-        assert_eq!(
-            transport
-                .invoke(wrong_action, &request(), &mut history, NOW_MS)
-                .await,
-            Err(GrantRejection::IdentityMismatch)
-        );
-        assert!(!history.may_have_been_sent());
     }
 
-    /// The call is bounded by the authority's own term, not by the fixed policy.
+    /// The call is bounded by whichever clock runs out first.
     ///
-    /// The authority here has 3 s of lease term left while `OPERATION_TIMEOUT` is 120 s, so a
-    /// dispatch bounded by the fixed policy would still be running long after the lease that
-    /// proved current ownership stopped, in the window where a successor could legitimately
-    /// have taken the claim.
+    /// One case per side of the bound's `min`, because either alone would let a dispatch outlive
+    /// the thing that permitted it: past the lease, a successor could legitimately have taken the
+    /// claim and be dispatching too; past the grant deadline, the call runs on budget reserved
+    /// until that instant and no longer.
+    ///
+    /// The third case is the fixed ceiling, which a longer term must not raise.
     #[tokio::test(start_paused = true)]
-    async fn the_authorized_term_bounds_the_call_when_it_is_shorter_than_the_fixed_policy() {
-        use crate::distributed::grants::test_support::model_authority;
-
+    async fn the_call_is_bounded_by_the_shortest_of_lease_grant_and_fixed_policy() {
         let transport =
             BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
-        let short = model_authority(
-            profile().configuration_digest(),
-            NOW_MS + 60_000,
-            NOW_MS + 3_000,
-        );
-        let mut history = AttemptHistory::default();
 
-        // Well under `OPERATION_TIMEOUT`, so a call still running here was bounded by the term.
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(30),
-            transport.invoke(short, &request(), &mut history, NOW_MS),
-        )
-        .await
-        .expect("the authorized term bounds the call inside 30s");
-        assert_eq!(
-            outcome,
-            Ok(InvocationOutcome::TimedOut {
-                provider_request_id: None
-            })
-        );
-        // The request was dispatched, so the attempt is uncertain rather than proven unsent.
-        assert!(history.may_have_been_sent());
+        for (case, deadline, stop, outer) in [
+            (
+                "the lease is the shorter clock",
+                NOW_MS + 60_000,
+                NOW_MS + 3_000,
+                30,
+            ),
+            (
+                "the grant is the shorter clock",
+                NOW_MS + 3_000,
+                NOW_MS + 60_000,
+                30,
+            ),
+            // A term far past the fixed policy. The override sets only the operation timeout,
+            // so the client's attempt timeout must survive the merge and bound this call: with
+            // retries disabled one attempt runs, and resolving inside 91 s proves `ATTEMPT_TIMEOUT`
+            // still applies where the term alone would have allowed 600 s.
+            (
+                "the fixed policy outlives the override",
+                NOW_MS + 900_000,
+                NOW_MS + 600_000,
+                91,
+            ),
+        ] {
+            let mut history = AttemptHistory::default();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(outer),
+                transport.invoke(
+                    model_authority(
+                        GRANT_ACTION_MODEL_INVOKE.to_owned(),
+                        profile().configuration_digest(),
+                        OPERATION_ID.to_owned(),
+                        deadline,
+                        stop,
+                    ),
+                    &request(),
+                    &mut history,
+                    NOW_MS,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the bound fires inside {outer}s"));
+            assert_eq!(
+                outcome,
+                Ok(InvocationOutcome::TimedOut {
+                    provider_request_id: None
+                }),
+                "{case}"
+            );
+            // The request was dispatched, so the attempt is uncertain rather than proven unsent.
+            assert!(history.may_have_been_sent(), "{case}");
+        }
     }
 }

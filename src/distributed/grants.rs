@@ -234,8 +234,18 @@ impl EffectAuthority {
         request: &crate::provider::InvocationRequest,
         now_ms: u64,
     ) -> Result<Duration, GrantRejection> {
+        // The operation identity is what makes this authority specific to one call. Without it
+        // a grant issued for one operation would authorize any request against the same
+        // profile, so a second dispatch under the same grant would be indistinguishable from
+        // the first — the replay AC4 names. `intake` pins the grant's own operation id against
+        // the caller's expectation; this pins it against the request actually being sent.
+        //
+        // `limit_units` is deliberately not compared against the output-token cap. The grant's
+        // units have no denomination anywhere in this crate, so treating them as tokens would
+        // invent a contract rather than enforce one.
         if self.grant.action != GRANT_ACTION_MODEL_INVOKE
             || self.grant.resource_scope != request.profile().configuration_digest()
+            || self.grant.operation_id != request.operation_id()
         {
             return Err(GrantRejection::IdentityMismatch);
         }
@@ -259,10 +269,7 @@ impl EffectAuthority {
 /// place outside [`intake`] where the fields are assembled.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{
-        Digest, EffectAuthority, EffectGrant, GRANT_ACTION_MODEL_INVOKE, ScopeClaimIdentity,
-        ScopeIdentity, WorkRef,
-    };
+    use super::{Digest, EffectAuthority, EffectGrant, ScopeClaimIdentity, ScopeIdentity, WorkRef};
     use crate::{distributed::identity::WorkspaceId, domain::work::WorkId, scope::CampaignId};
 
     pub(crate) fn authority(
@@ -277,12 +284,16 @@ pub(crate) mod test_support {
         }
     }
 
-    /// An authority that permits a model invocation of `resource_scope`.
+    /// An authority for `action` over `resource_scope`, under `operation_id`.
     ///
-    /// `resource_scope` is a profile's configuration digest, which is what the effect boundary
-    /// compares against, so a caller passes the digest of the profile it means to invoke.
+    /// `resource_scope` is a profile's configuration digest and `operation_id` is the request's,
+    /// because those are what the effect boundary compares against. `action` is a parameter so a
+    /// refusal case can name an action the boundary does not accept without rebuilding a grant
+    /// field by field.
     pub(crate) fn model_authority(
+        action: String,
         resource_scope: String,
+        operation_id: String,
         deadline_unix_ms: u64,
         authority_stop_unix_ms: u64,
     ) -> EffectAuthority {
@@ -300,12 +311,12 @@ pub(crate) mod test_support {
         authority(
             EffectGrant::new(
                 identity,
-                GRANT_ACTION_MODEL_INVOKE.to_owned(),
+                action,
                 resource_scope,
                 1,
                 1_000,
                 deadline_unix_ms,
-                "invoke-op-1".to_owned(),
+                operation_id,
             )
             .unwrap(),
             Digest::new("ab".repeat(32)).unwrap(),
@@ -1756,6 +1767,13 @@ mod tests {
         assert_eq!(
             accepted.grant_digest().as_str(),
             format!("{:x}", Sha256::digest(encode_grant(&grant).unwrap()))
+        );
+        // The stop instant comes from the proving lease, not from the grant. Reading the private
+        // field is what this test is for: every other test hands the field a literal, so without
+        // this the whole lease-stop bound could be minted as `u64::MAX` unnoticed.
+        assert_eq!(
+            accepted.authority_stop_unix_ms,
+            reader.lease_until().get() - STOP_MARGIN_MS
         );
 
         // A grant with matching bindings must equal the projection's recorded grant.

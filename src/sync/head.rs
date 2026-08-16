@@ -15,6 +15,7 @@
 use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 
 use crate::{
+    dispatch::AttemptHistory,
     domain::proposal::{AdmissibleProposal, MAX_PLAN_STORED_BYTES, decode_plan},
     scope::{
         Digest, EncodedScopeEvent, EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE,
@@ -25,7 +26,7 @@ use crate::{
         encode_plan_admitted_event, encode_projection_checkpoint_event, plan_key, scope_event_key,
         scope_head_key,
     },
-    storage::s3::{AttemptHistory, ETag, GetError, GetOutcome, MutationOutcome, S3Store},
+    storage::s3::{ETag, GetError, GetOutcome, MutationOutcome, S3Store},
 };
 
 use super::{

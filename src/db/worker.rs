@@ -935,7 +935,10 @@ mod tests {
     }
 
     fn test_mutation() -> ScopeProjectionEvent {
-        let genesis = genesis();
+        mutation_for(&genesis())
+    }
+
+    fn mutation_for(genesis: &RootGenesis) -> ScopeProjectionEvent {
         let root = crate::scope::decode_root_event(
             genesis.event_bytes(),
             genesis.event_key(),
@@ -1409,6 +1412,63 @@ mod tests {
                 .await,
             Err(ApplyError::Conflict)
         );
+
+        drop(handle);
+        fs::remove_file(live_path).unwrap();
+        fs::remove_file(destination).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_only_the_certified_scope() {
+        let live_path = path("snapshot-multi-scope-live");
+        let _ = fs::remove_file(&live_path);
+        let destination = path("snapshot-multi-scope-copy");
+        let _ = fs::remove_file(&destination);
+        let genesis = genesis();
+        let other = root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-b".into()).unwrap(),
+                CampaignId::new("campaign-b".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let handle = DbHandle::spawn(live_path.clone()).await.unwrap();
+        handle.apply(test_mutation()).await.unwrap();
+        handle.apply(mutation_for(&other)).await.unwrap();
+
+        handle
+            .snapshot_to(genesis.head(), destination.clone())
+            .await
+            .unwrap();
+
+        // `VACUUM INTO` copies the whole projection, but only the certified scope is covered
+        // by the certificate the snapshot is published under, so the other scope's rows —
+        // which an installer has no ancestry to prove — must not travel with it.
+        let copy = rusqlite::Connection::open(&destination).unwrap();
+        let scopes: Vec<String> = copy
+            .prepare("SELECT scope_id FROM scopes")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            scopes,
+            vec![genesis.identity().scope_id().as_str().to_owned()]
+        );
+        let events: i64 = copy
+            .query_row(
+                "SELECT COUNT(*) FROM applied_scope_events WHERE scope_id = ?1",
+                [other.identity().scope_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "cascade must clear the dropped scope's events");
+        drop(copy);
+        // The pruned copy still passes the full open-time validation on its own.
+        drop(projections::open_existing(&destination).unwrap());
 
         drop(handle);
         fs::remove_file(live_path).unwrap();

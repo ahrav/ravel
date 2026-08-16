@@ -46,6 +46,14 @@ const LIMITS: Limits = Limits {
 /// this bound is unreachable from genesis; [`crate::sync::head`] refuses to append past it.
 pub(crate) const MAX_SCOPE_REPLAY_EVENTS: u64 = 4_096;
 
+/// Checkpoint candidates one cold open may prove.
+///
+/// A catalog retains thousands of certificates, and every candidate fetches and validates
+/// its own packed suffix before its snapshot GET can fail. Trying them all turns the
+/// fallback into a quadratic download; a genesis replay is the cheaper answer once the
+/// newest few candidates are unusable.
+const MAX_CHECKPOINT_CANDIDATES: usize = 4;
+
 #[derive(Clone, Copy)]
 struct Limits {
     events: u64,
@@ -248,25 +256,28 @@ pub async fn open_projection(
     if is_sqlite_uri(path) {
         return Err(ScopeReplayError::DatabaseUnavailable);
     }
-    let exists = path
-        .try_exists()
-        .map_err(|_| ScopeReplayError::DatabaseUnavailable)?;
-    if exists {
-        match DbHandle::open_existing(path.to_path_buf()).await {
-            Ok(handle) => return Ok(handle),
-            Err(OpenExistingError::Validation(
-                ValidateError::IntegrityCheckFailed
-                | ValidateError::InvalidSchema
-                | ValidateError::InvalidHistory,
-            )) => {}
-            Err(OpenExistingError::DatabaseOperationFailed | OpenExistingError::Validation(_)) => {
-                return Err(ScopeReplayError::DatabaseUnavailable);
-            }
-        }
-        // The invalid file is removed before the checkpoint rung so its stale sidecars
-        // can never bleed into an installed snapshot.
-        rebuild_files(path)?;
+    match classify_destination(path).await? {
+        Destination::Opened(handle) => return Ok(handle),
+        Destination::Missing | Destination::Rebuildable => {}
     }
+    // Cleanup deletes the destination, so it cannot race installation: a contender that
+    // observed a rebuildable path could otherwise delete a projection another contender had
+    // already installed and opened, leaving that worker writing an unlinked inode while
+    // everyone else uses a new file at the same pathname. The lock covers the whole
+    // recheck-delete-install-open region.
+    let _install = install_lock(path).await?;
+    // The classification runs again under the lock, in full: a contender may have finished
+    // while this one waited, and an unrelated database may have appeared at the pathname. The
+    // second case is still a refusal — treating every failed open as rebuildable here would
+    // unlink a foreign file this function promises never to touch.
+    match classify_destination(path).await? {
+        Destination::Opened(handle) => return Ok(handle),
+        Destination::Missing | Destination::Rebuildable => {}
+    }
+    // Every path that reaches the checkpoint rung removes the destination and its sidecars
+    // first. A stale `-journal`, `-wal`, or `-shm` left by a crash outlives a missing main
+    // file, and SQLite would recover the freshly installed snapshot through it.
+    rebuild_files(path)?;
     if let Some(handle) = install_checkpoint(store, scope, path).await {
         return Ok(handle);
     }
@@ -275,11 +286,85 @@ pub async fn open_projection(
         .map_err(|_| ScopeReplayError::DatabaseUnavailable)
 }
 
+/// What one destination pathname currently holds.
+enum Destination {
+    /// A valid projection, already open.
+    Opened(DbHandle),
+    /// Nothing at the pathname.
+    Missing,
+    /// This application's projection, damaged past repair, so replaceable.
+    Rebuildable,
+}
+
+/// Classifies a destination without modifying it.
+///
+/// A foreign application id is a refusal rather than a rebuild: the file can belong to
+/// unrelated local data, so the error leaves it in place. Damage this application owns —
+/// failed integrity check, unreadable schema, inconsistent history — is replaceable.
+///
+/// # Errors
+///
+/// Returns [`ScopeReplayError::DatabaseUnavailable`] for a file this function must not
+/// replace, and for I/O or SQLite failures that leave the pathname unclassified.
+async fn classify_destination(path: &Path) -> Result<Destination, ScopeReplayError> {
+    if !path
+        .try_exists()
+        .map_err(|_| ScopeReplayError::DatabaseUnavailable)?
+    {
+        return Ok(Destination::Missing);
+    }
+    match DbHandle::open_existing(path.to_path_buf()).await {
+        Ok(handle) => Ok(Destination::Opened(handle)),
+        Err(OpenExistingError::Validation(
+            ValidateError::IntegrityCheckFailed
+            | ValidateError::InvalidSchema
+            | ValidateError::InvalidHistory,
+        )) => Ok(Destination::Rebuildable),
+        Err(OpenExistingError::DatabaseOperationFailed | OpenExistingError::Validation(_)) => {
+            Err(ScopeReplayError::DatabaseUnavailable)
+        }
+    }
+}
+
+/// Takes the exclusive install lock for one projection pathname.
+///
+/// The lock is a file lock, not a process-local mutex, because the region it guards begins by
+/// unlinking the destination: a process-local gate leaves a second process free to delete a
+/// projection this one already installed and opened, and the create-only commit link cannot
+/// help because the deletion happens first. The advisory lock is held by the open file
+/// description, so two tasks in one process contend on it exactly as two processes do.
+///
+/// The lock file sits beside the projection under its own suffix, so destination cleanup never
+/// removes it. It is deliberately never unlinked: the lock lives on the inode, so removing the
+/// pathname would let a later caller create and lock a different inode while a holder still
+/// believes it owns the region. The kernel releases the lock when the file closes, including on
+/// a crash.
+async fn install_lock(path: &Path) -> Result<std::fs::File, ScopeReplayError> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".install-lock");
+    let lock_path = std::path::PathBuf::from(lock_path);
+    crate::db::worker::run_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        file.lock().ok()?;
+        Some(file)
+    })
+    .await
+    .flatten()
+    .ok_or(ScopeReplayError::DatabaseUnavailable)
+}
+
 /// Installs the newest provable certified checkpoint at `destination`.
 ///
 /// `None` is a rung miss: the empty projection is created as before and later refreshes
 /// replay from genesis. Every accelerator object consulted here is a hint; the pinned
 /// head and the exact `events/` ancestry are the only authority the install trusts.
+/// At most [`MAX_CHECKPOINT_CANDIDATES`] in-range candidates are proven, because each
+/// attempt fetches and validates its own suffix.
 async fn install_checkpoint(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -291,10 +376,15 @@ async fn install_checkpoint(
     else {
         return None;
     };
+    let mut attempts = 0;
     for certificate_ref in catalog.checkpoints().iter().rev() {
         if certificate_ref.sequence() > observed.head().tail().sequence() {
             continue;
         }
+        if attempts == MAX_CHECKPOINT_CANDIDATES {
+            return None;
+        }
+        attempts += 1;
         if let Some(handle) = install_candidate(
             store,
             scope,
@@ -316,10 +406,11 @@ async fn install_checkpoint(
 /// Proof precedes download: the certificate's covered cursor must reach the pinned tail
 /// through packed events and the common chain validator before the snapshot GET is
 /// issued at its certified byte length and checked against its certified digest. The
-/// rename from the staged sibling path to `destination` is the commit point: before it
-/// the previous destination is untouched; after it the snapshot is independently valid
-/// at its covered cursor, so interruption before the suffix applies still leaves a valid
-/// replayable projection. `None` lets the caller try the next candidate.
+/// create-only link from the staged sibling path to `destination` is the commit point:
+/// before it the previous destination is untouched; after it the snapshot is
+/// independently valid at its covered cursor, so interruption before the suffix applies
+/// still leaves a valid replayable projection. A suffix the installed rows cannot carry
+/// discards the destination again. `None` lets the caller try the next candidate.
 async fn install_candidate(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -359,6 +450,17 @@ async fn install_candidate(
     )
     .await
     .ok()?;
+    // `prepare_chain` re-derives the ancestry downward from the pinned tail and pushes it
+    // newest first, so the last element is the committed event at `covered_sequence + 1` —
+    // this certificate's own sequence, which `precheck` proved is at or below the tail.
+    // Requiring the two to name the same object is what makes the certificate authoritative
+    // instead of merely self-consistent at its content-addressed key: an event published by
+    // a head-CAS loser or a fenced writer is a valid object that the pinned head never
+    // commits, and its payload chooses the snapshot digest, cursor, and active plan that
+    // every later check here compares against.
+    if events.last()?.decoded.event_ref() != certificate_ref {
+        return None;
+    }
 
     let length = usize::try_from(certificate.payload().snapshot_length()).ok()?;
     let key = accelerator::scope_checkpoint_key(
@@ -385,30 +487,37 @@ async fn install_candidate(
         STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let staging = std::path::PathBuf::from(staging);
-    let installed = {
+    let staged = {
         let scope = scope.clone();
-        let destination = destination.to_path_buf();
+        let staging = staging.clone();
         crate::db::worker::run_blocking(move || {
             if rebuild_files(&staging).is_err() {
                 return false;
             }
-            let installed = std::fs::write(&staging, &bytes).is_ok()
+            std::fs::write(&staging, &bytes).is_ok()
                 && staged_snapshot_valid(&staging, &scope, &certificate)
-                && std::fs::rename(&staging, &destination).is_ok();
-            if !installed {
-                let _ = rebuild_files(&staging);
-            }
-            installed
         })
         .await
         .unwrap_or(false)
     };
-    if !installed {
+    if !staged {
+        discard(&staging).await;
         return None;
     }
-    let handle = DbHandle::open_existing(destination.to_path_buf())
-        .await
-        .ok()?;
+
+    // The suffix applies to the staging file, before the destination pathname exists. The
+    // snapshot was proven against the pinned head, so a failure here means the snapshot's own
+    // rows cannot carry it — a row the suffix depends on is missing or disagrees. Publishing
+    // first and repairing after would expose that state: a concurrent open could take the
+    // pathname and keep the rejected inode alive after this candidate unlinked it, replaying
+    // the same failing suffix forever. Nothing is published until it is at the pinned head.
+    let staged_handle = match DbHandle::open_existing(staging.clone()).await {
+        Ok(handle) => handle,
+        Err(_) => {
+            discard(&staging).await;
+            return None;
+        }
+    };
     let prepared = PreparedSuffix {
         observed: ObservedScopeHead::proven(
             observed.head().clone(),
@@ -419,14 +528,43 @@ async fn install_candidate(
         events,
         from_packs: true,
     };
-    // The suffix was proven above; a failure here leaves the snapshot's covered cursor
-    // in place and the next refresh replays the same suffix.
-    let _ = apply_suffix(&handle, scope, prepared).await;
-    Some(handle)
+    let applied = apply_suffix(&staged_handle, scope, prepared).await.is_ok();
+    drop(staged_handle);
+    if !applied {
+        discard(&staging).await;
+        return None;
+    }
+
+    let published = {
+        let staging = staging.clone();
+        let destination = destination.to_path_buf();
+        crate::db::worker::run_blocking(move || {
+            // The commit is a create-only link, not a rename: a rename would replace a
+            // destination another install already committed and opened, leaving that worker
+            // writing an unlinked inode while everyone else reads the replacement. Losing this
+            // link means someone else committed first.
+            std::fs::hard_link(&staging, &destination).is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    };
+    discard(&staging).await;
+    if !published {
+        return None;
+    }
+    DbHandle::open_existing(destination.to_path_buf())
+        .await
+        .ok()
+}
+
+/// Removes a staging database and its sidecars off the async runtime.
+async fn discard(staging: &Path) {
+    let staging = staging.to_path_buf();
+    let _ = crate::db::worker::run_blocking(move || rebuild_files(&staging)).await;
 }
 
 /// Validates the staged snapshot file: full open-time projection validation plus the
-/// certified scope, covered cursor, and active-plan bindings.
+/// certified scope as the copy's only scope, its covered cursor, and its active plan.
 fn staged_snapshot_valid(
     staging: &Path,
     scope: &ScopeIdentity,
@@ -439,6 +577,13 @@ fn staged_snapshot_valid(
     let Ok(connection) = crate::db::projections::open_existing(staging) else {
         return false;
     };
+    // The snapshot is a whole-file copy of the publisher's projection, which may host other
+    // scopes. Only this scope's rows are covered by the certificate, and the install has no
+    // ancestry to prove the rest against, so a copy naming any other scope is refused rather
+    // than installed with uncertified admission, grant, and budget rows in it.
+    if crate::db::projections::scope_count(&connection) != Ok(1) {
+        return false;
+    }
     let Ok(cursor) = crate::db::projections::scope_cursor(&connection, scope) else {
         return false;
     };
@@ -1932,6 +2077,8 @@ mod tests {
                     admissible.stored_bytes().to_vec(),
                 ),
                 event_response(genesis.event_bytes().to_vec()),
+                // Publication reads the pointer, then attempts the pack write.
+                accel_miss(),
                 accel_miss(),
                 response(404, &[], Vec::new()),
                 response(404, &[], Vec::new()),
@@ -2205,7 +2352,7 @@ mod tests {
         grant: &crate::distributed::grants::EffectGrant,
         now_ms: u64,
     ) -> crate::distributed::scope_controller::ControllerAuthority {
-        use crate::storage::s3::AttemptHistory;
+        use crate::dispatch::AttemptHistory;
         let [mut object, mut event, mut head] = [
             AttemptHistory::default(),
             AttemptHistory::default(),
@@ -2331,6 +2478,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(404, &[], Vec::new()),
             response(404, &[], Vec::new()),
@@ -2463,6 +2612,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2553,6 +2704,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2594,7 +2747,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(client.actual_requests().count(), 10);
         assert!(
             client
                 .actual_requests()
@@ -2647,6 +2800,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2691,7 +2846,7 @@ mod tests {
             ScopeReadiness::Ready { .. }
         ));
         assert!(handle.claims_restored(&scope).await.unwrap());
-        assert_eq!(client.actual_requests().count(), 12);
+        assert_eq!(client.actual_requests().count(), 13);
 
         handle.drain().await.unwrap();
         drop(handle);
@@ -2730,6 +2885,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2752,7 +2909,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(client.actual_requests().count(), 10);
         assert!(handle.claims_restored(&scope).await.unwrap());
 
         handle.drain().await.unwrap();
@@ -2911,11 +3068,11 @@ mod tests {
             projection_content(&listed_path),
             projection_content(&serial_path)
         );
-        // Head, pointer miss, LIST, one bounded GET per candidate, and the failed pack
-        // publication PUT; the keyed route records every request, so a surplus request
-        // would raise the count.
+        // Head, pointer miss, LIST, one bounded GET per candidate, and publication's own
+        // pointer read plus its failed pack PUT; the keyed route records every request, so a
+        // surplus request would raise the count.
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 7);
+        assert_eq!(recorded.len(), 8);
         assert!(recorded[0].contains("/head"));
         assert!(recorded[1].contains("/replay-index/current"));
         assert!(recorded[2].contains("list-type=2"));
@@ -2930,9 +3087,10 @@ mod tests {
             )
         };
         assert_eq!(candidate_gets, vec![candidate(0), candidate(1)]);
-        // The failed pack PUT and its ambiguity probe end publication.
-        assert!(recorded[5].starts_with("PUT ") && recorded[5].contains("/replay-packs/"));
-        assert!(recorded[6].starts_with("GET ") && recorded[6].contains("/replay-packs/"));
+        // Publication reads the pointer, then its failed pack PUT and ambiguity probe end it.
+        assert!(recorded[5].starts_with("GET ") && recorded[5].contains("/replay-index/current"));
+        assert!(recorded[6].starts_with("PUT ") && recorded[6].contains("/replay-packs/"));
+        assert!(recorded[7].starts_with("GET ") && recorded[7].contains("/replay-packs/"));
         drop(listed);
         fs::remove_file(serial_path).unwrap();
         fs::remove_file(listed_path).unwrap();
@@ -2978,7 +3136,7 @@ mod tests {
                 head::ScopeHeadParent::existing(Box::new(parent)),
                 &scope,
                 batch,
-                &mut crate::storage::s3::AttemptHistory::default(),
+                &mut crate::dispatch::AttemptHistory::default(),
             )
             .await
             .unwrap(),
@@ -3168,10 +3326,10 @@ mod tests {
             ScopeReadiness::Ready { .. }
         ));
         assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 2);
-        // Head, pointer miss, LIST, two candidate GETs, and the failed publication PUT
-        // plus its ambiguity probe: the beyond-tail candidate is never fetched.
+        // Head, pointer miss, LIST, two candidate GETs, and publication's own pointer read
+        // plus its failed PUT and ambiguity probe: the beyond-tail candidate is never fetched.
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 7);
+        assert_eq!(recorded.len(), 8);
         assert!(recorded.iter().all(|line| !line.contains(&format!(
             "/{}",
             crate::scope::scope_event_key(&scope, &events[2].0)
@@ -3394,9 +3552,9 @@ mod tests {
             list_response(&key_refs, false, None),
             event_response(events[0].1.clone()),
             event_response(events[1].1.clone()),
-            // Publication: pack PUT, pointer probe, catalog PUT, pointer create.
-            response(200, &[], SdkBody::empty()),
+            // Publication: pointer probe, pack PUT, catalog PUT, pointer create.
             response(404, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
         ]);
@@ -3406,7 +3564,7 @@ mod tests {
         ));
         let requests: Vec<_> = client.actual_requests().collect();
         assert_eq!(requests.len(), 9);
-        assert_eq!(requests[5].body().bytes(), Some(expected_pack.bytes()));
+        assert_eq!(requests[6].body().bytes(), Some(expected_pack.bytes()));
         assert_eq!(requests[7].body().bytes(), Some(catalog_bytes.as_slice()));
         assert_eq!(requests[8].body().bytes(), Some(pointer_bytes.as_slice()));
         drop(first);
@@ -3692,8 +3850,8 @@ mod tests {
         ]
     }
 
-    /// Uncertified, wrong-digest, invalid-SQLite, wrong-plan, wrong-scope, and
-    /// wrong-cursor checkpoints all fall through to the empty projection.
+    /// Uncertified, wrong-digest, invalid-SQLite, wrong-plan, wrong-scope, wrong-cursor,
+    /// and off-chain-certificate checkpoints all fall through to the empty projection.
     #[tokio::test]
     async fn bad_checkpoints_fall_through_to_an_empty_projection() {
         let genesis = genesis();
@@ -3818,6 +3976,83 @@ mod tests {
         fs::remove_file(&two_snap).unwrap();
         let wrong_cursor = certified_responses(&genesis, two_snapshot, None, "wrong-cursor-op");
 
+        // Off-chain certificate: a valid checkpoint event at a sequence the pinned head's
+        // ancestry commits to a different object. A head-CAS loser or a fenced writer leaves
+        // exactly this — an event whose key is fresh, whose parent is genuine, and whose
+        // payload names a snapshot of its own choosing. The chain walk proves the ancestry
+        // but must refuse the certificate that is not part of it.
+        let committed_envelope = EventEnvelope::new(
+            scope.scope_id().clone(),
+            2,
+            Some(genesis.event_ref().clone()),
+            1,
+            "committed-rival-op".into(),
+            TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+        )
+        .unwrap();
+        let committed = encode_scope_event(&committed_envelope, &Value::Null).unwrap();
+        let committed_head = ScopeHead::new(
+            scope.clone(),
+            ScopeAuthority::Unowned,
+            1,
+            committed.event_ref().clone(),
+            None,
+            "committed-rival-op".into(),
+        )
+        .unwrap();
+        let orphan = ProjectionCheckpointEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "orphan-checkpoint-op".into(),
+                PROJECTION_CHECKPOINT_PAYLOAD_TYPE.to_owned(),
+            )
+            .unwrap(),
+            ProjectionCheckpointPayload::new(
+                Digest::new(sha256(&fixture.snapshot)).unwrap(),
+                fixture.snapshot.len() as u64,
+                1,
+                genesis.event_ref().digest().clone(),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let orphan_encoded = encode_projection_checkpoint_event(&orphan).unwrap();
+        assert_ne!(orphan_encoded.event_ref(), committed.event_ref());
+        let committed_pack = build_pack(
+            &scope,
+            Some(genesis.event_ref()),
+            2,
+            &[committed.stored_bytes()],
+        )
+        .unwrap();
+        let committed_entry = PackEntry::new(2, 2, committed_pack.digest().clone()).unwrap();
+        let (orphan_catalog, orphan_catalog_digest) = encode_catalog(
+            &scope,
+            &[committed_entry],
+            std::slice::from_ref(orphan_encoded.event_ref()),
+        )
+        .unwrap();
+        let off_chain_certificate = vec![
+            head_response(encode_head(&committed_head).unwrap()),
+            response(
+                200,
+                &[("etag", "\"pointer\"")],
+                encode_pointer(&scope, &orphan_catalog_digest).unwrap(),
+            ),
+            response(200, &[("etag", "\"catalog\"")], orphan_catalog),
+            event_response(orphan_encoded.stored_bytes().to_vec()),
+            response(
+                200,
+                &[("etag", "\"pack\"")],
+                committed_pack.bytes().to_vec(),
+            ),
+            response(200, &[("etag", "\"snapshot\"")], fixture.snapshot.clone()),
+        ];
+
         for responses in [
             uncertified,
             wrong_digest,
@@ -3825,6 +4060,7 @@ mod tests {
             wrong_plan,
             wrong_scope,
             wrong_cursor,
+            off_chain_certificate,
         ] {
             let cold_path = path("checkpoint-fallback");
             let _ = fs::remove_file(&cold_path);
@@ -4107,7 +4343,7 @@ mod tests {
         ));
         assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 3);
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 7);
+        assert_eq!(recorded.len(), 8);
         assert!(recorded[2].contains("list-type=2"));
         assert!(
             recorded[2].contains("start-after=") && recorded[2].contains("0000000000000001."),
@@ -4319,7 +4555,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
-            response(500, &[], SdkBody::empty()),
+            // Publication's pointer read fails, which ends it before any write.
             response(500, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
@@ -4397,7 +4633,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
-            response(500, &[], SdkBody::empty()),
+            // Publication's pointer read fails, which ends it before any write.
             response(500, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),

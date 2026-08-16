@@ -19,12 +19,13 @@
 use std::num::NonZeroU64;
 
 use crate::{
+    dispatch::AttemptHistory,
     distributed::identity::InstanceId,
     scope::{
         EventEnvelope, GrantActivatedPayload, ScopeAuthority, ScopeEventRef, ScopeHead,
         ScopeIdentity, encode_head, scope_head_key,
     },
-    storage::s3::{AttemptHistory, MutationOutcome, S3Store},
+    storage::s3::{MutationOutcome, S3Store},
     sync::head::{
         self as head, ObservedScopeHead, ScopeHeadCommitOutcome, ScopeHeadParent,
         ScopeHeadReadError,

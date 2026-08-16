@@ -32,12 +32,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     db::{projections::ApplyError, worker::DbHandle},
+    dispatch::AttemptHistory,
     distributed::claims::bounded_map,
     scope::{
         DecodedScopeEvent, Digest, MAX_COMPRESSED_BYTES, ProjectionCheckpointPayload,
         ScopeEventRef, ScopeIdentity, decode_scope_event, scope_event_key, sha256,
     },
-    storage::s3::{AttemptHistory, ETag, GetOutcome, MutationOutcome, S3Store},
+    storage::s3::{ETag, GetOutcome, MutationOutcome, S3Store},
     sync::WireError,
 };
 
@@ -57,6 +58,12 @@ const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 const MAX_CATALOG_ROWS: usize = crate::sync::replay::MAX_SCOPE_REPLAY_EVENTS as usize;
 /// Accumulated bytes one accelerator read may fetch; matches the replay byte budget. commentlint: allow(JUDGE)
 const MAX_FETCH_BYTES: usize = 64 * 1024 * 1024;
+/// Packs one replay may publish.
+///
+/// Publication is awaited on the readiness path, so the batch is bounded rather than sized to
+/// the replay: a full-limit replay would otherwise issue sixteen sequential object writes
+/// before its scope could report ready.
+const MAX_PUBLISHED_PACKS_PER_REPLAY: usize = 4;
 const CBOR_RECURSION_LIMIT: usize = 16;
 const FORMAT_VERSION: u64 = 1;
 /// Fixed remote-read concurrency, matching the repository's bounded-read policy.
@@ -458,10 +465,6 @@ impl PackEntry {
     pub fn digest(&self) -> &Digest {
         &self.digest
     }
-
-    fn overlaps(&self, other: &Self) -> bool {
-        self.start <= other.end && other.start <= self.end
-    }
 }
 
 /// One validated catalog: sorted non-overlapping pack rows plus checkpoint certificates.
@@ -666,6 +669,36 @@ pub(crate) enum CurrentCatalog {
     Present(ReplayCatalog, ETag),
 }
 
+/// Sequence ranges inside `first..=last` that no catalog row covers, ascending.
+///
+/// Publication segments inside these rather than over the whole retained span, so a pack always
+/// begins and ends on a boundary the catalog leaves open. A pack that straddles an existing row
+/// can never be published — it overlaps a row it does not contain — and dropping it would leave
+/// the range between that row's end and the next pack's start permanently uncovered, because
+/// packed replay needs contiguous rows and every later replay from the same cursor segments the
+/// same way.
+fn uncovered_ranges(entries: &[PackEntry], first: u64, last: u64) -> Vec<(u64, u64)> {
+    let mut covered: Vec<(u64, u64)> = entries
+        .iter()
+        .filter(|entry| entry.end() >= first && entry.start() <= last)
+        .map(|entry| (entry.start(), entry.end()))
+        .collect();
+    covered.sort_unstable();
+    let mut ranges = Vec::new();
+    let mut next = first;
+    for (start, end) in covered {
+        if start > next {
+            ranges.push((next, start - 1));
+        }
+        next = next.max(end.saturating_add(1));
+        if next > last {
+            return ranges;
+        }
+    }
+    ranges.push((next, last));
+    ranges
+}
+
 /// Chooses contiguous catalog rows whose union covers `first..=last`.
 fn coverage(catalog: &ReplayCatalog, first: u64, last: u64) -> Option<Vec<&PackEntry>> {
     let mut chosen: Vec<&PackEntry> = Vec::new();
@@ -829,6 +862,14 @@ pub(crate) struct RetainedEvent {
 /// `events` are the verified suffix in chain order. Any storage failure, malformed
 /// existing accelerator state, or pointer CAS loss stops publication silently: the replay
 /// that produced these events already succeeded and its result must not change.
+///
+/// At most [`MAX_PUBLISHED_PACKS_PER_REPLAY`] packs are written per call, chosen from the
+/// lowest sequences the current catalog does not already cover, so repeated replays extend
+/// coverage instead of re-offering one fixed prefix. A caller awaits this before it can report
+/// readiness, and a full-limit replay segments into sixteen packs whose PUTs each carry the
+/// store's operation timeout, so an unbounded batch lets slow or write-denied storage hold a
+/// correctly rebuilt scope unready. Sequences past the bound stay unpacked until a later replay
+/// publishes them, which costs event reads, never correctness.
 pub(crate) async fn publish_packs_after_replay(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -837,10 +878,44 @@ pub(crate) async fn publish_packs_after_replay(
     if events.is_empty() {
         return;
     }
-    let Some(packs) = segment_packs(scope, events) else {
-        return;
+    let existing = match read_current_catalog(store, scope).await {
+        CurrentCatalog::Absent => None,
+        CurrentCatalog::Unusable => return,
+        CurrentCatalog::Present(catalog, etag) => Some((catalog, etag)),
     };
-    for pack in &packs {
+    let (mut entries, mut checkpoints) = match &existing {
+        Some((catalog, _)) => (catalog.entries().to_vec(), catalog.checkpoints().to_vec()),
+        None => (Vec::new(), Vec::new()),
+    };
+    // Segmentation runs inside the ranges the catalog does not already cover, so a pack never
+    // straddles an existing row boundary. Segmenting the whole retained span first and then
+    // filtering cannot work: a pack that partially overlaps a row is unpublishable, so a replay
+    // starting mid-row would drop its first pack and leave a hole between the row's end and the
+    // next pack's start, and every later replay from that cursor would segment the same way and
+    // reproduce it. Reading the catalog before applying the bound matters for the same reason —
+    // bounding the segmentation would pin every replay to one low prefix that is already
+    // covered, so the merge would find nothing new and coverage would never advance.
+    let first = events[0].reference.sequence();
+    let last = events[events.len() - 1].reference.sequence();
+    let mut pending: Vec<(EncodedPack, PackEntry)> =
+        Vec::with_capacity(MAX_PUBLISHED_PACKS_PER_REPLAY);
+    'ranges: for (range_start, range_end) in uncovered_ranges(&entries, first, last) {
+        let start = events.partition_point(|event| event.reference.sequence() < range_start);
+        let end = events.partition_point(|event| event.reference.sequence() <= range_end);
+        let Some(packs) = segment_packs(scope, &events[start..end]) else {
+            return;
+        };
+        for pack in packs {
+            let Ok(entry) = PackEntry::new(pack.start(), pack.end(), pack.digest().clone()) else {
+                return;
+            };
+            pending.push((pack, entry));
+            if pending.len() == MAX_PUBLISHED_PACKS_PER_REPLAY {
+                break 'ranges;
+            }
+        }
+    }
+    for (pack, _) in &pending {
         if store
             .publish_immutable(
                 &pack.key(scope),
@@ -853,23 +928,9 @@ pub(crate) async fn publish_packs_after_replay(
             return;
         }
     }
-    let existing = match read_current_catalog(store, scope).await {
-        CurrentCatalog::Absent => None,
-        CurrentCatalog::Unusable => return,
-        CurrentCatalog::Present(catalog, etag) => Some((catalog, etag)),
-    };
-    let (mut entries, mut checkpoints) = match &existing {
-        Some((catalog, _)) => (catalog.entries().to_vec(), catalog.checkpoints().to_vec()),
-        None => (Vec::new(), Vec::new()),
-    };
+    // Every pending row came from an uncovered range, so it overlaps no existing row.
     let mut changed = false;
-    for pack in &packs {
-        let Ok(entry) = PackEntry::new(pack.start(), pack.end(), pack.digest().clone()) else {
-            return;
-        };
-        if entries.iter().any(|existing| existing.overlaps(&entry)) {
-            continue;
-        }
+    for (_, entry) in pending {
         entries.push(entry);
         changed = true;
     }
@@ -1479,17 +1540,42 @@ mod tests {
         assert!(PackEntry::new(1, MAX_PACK_EVENTS as u64, digest("widest")).is_ok());
     }
 
-    /// Rows sharing one boundary sequence overlap in both directions.
+    /// Uncovered ranges split a retained span at every existing row boundary, including a row
+    /// that starts before the span and one that ends after it.
     #[test]
-    fn pack_rows_sharing_one_boundary_sequence_overlap() {
+    fn uncovered_ranges_split_the_span_at_existing_row_boundaries() {
         let digest = |seed: &str| Digest::new(sha256(seed.as_bytes())).unwrap();
-        let a = PackEntry::new(1, 4, digest("a")).unwrap();
-        let b = PackEntry::new(4, 6, digest("b")).unwrap();
-        let c = PackEntry::new(5, 6, digest("c")).unwrap();
-        assert!(a.overlaps(&b));
-        assert!(b.overlaps(&a));
-        assert!(!a.overlaps(&c));
-        assert!(!c.overlaps(&a));
+        let row =
+            |start: u64, end: u64, seed: &str| PackEntry::new(start, end, digest(seed)).unwrap();
+
+        // No rows: the whole span is open.
+        assert_eq!(uncovered_ranges(&[], 5, 9), vec![(5, 9)]);
+
+        // A row overlapping the span's start leaves only the remainder, which is the shape a
+        // replay from a cursor inside an existing row produces.
+        assert_eq!(
+            uncovered_ranges(&[row(1, 200, "a")], 101, 500),
+            vec![(201, 500)]
+        );
+
+        // An interior row splits the span in two.
+        assert_eq!(
+            uncovered_ranges(&[row(20, 29, "b")], 10, 40),
+            vec![(10, 19), (30, 40)]
+        );
+
+        // Rows covering the span leave nothing, and rows outside it are ignored.
+        assert!(uncovered_ranges(&[row(1, 50, "c")], 10, 40).is_empty());
+        assert_eq!(
+            uncovered_ranges(&[row(100, 200, "d")], 10, 40),
+            vec![(10, 40)]
+        );
+
+        // Adjacent rows are one covered run, not a gap at their boundary.
+        assert_eq!(
+            uncovered_ranges(&[row(10, 19, "e"), row(20, 29, "f")], 10, 40),
+            vec![(30, 40)]
+        );
     }
 
     /// Catalog ordering is strict: rows touching at one sequence and checkpoints
@@ -2054,6 +2140,112 @@ mod tests {
         );
     }
 
+    /// A replay whose retained span starts inside an existing catalog row publishes from that
+    /// row's end, leaving contiguous coverage rather than a hole no later replay can repair.
+    #[tokio::test]
+    async fn publication_leaves_no_hole_when_a_replay_starts_inside_a_row() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        // Two packs' worth of events, so segmenting the whole span would split at 256 and the
+        // first piece would straddle the existing row's boundary.
+        let events = chain(&genesis, MAX_PACK_EVENTS + 40);
+        let retained: Vec<RetainedEvent> = events
+            .iter()
+            .enumerate()
+            .map(|(index, (reference, bytes))| RetainedEvent {
+                reference: reference.clone(),
+                parent: (index > 0).then(|| events[index - 1].0.clone()),
+                payload_type: TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+                bytes: bytes.clone(),
+            })
+            .collect();
+        // The replay starts at sequence 20, inside a row covering 1..=30.
+        let retained = &retained[19..];
+        let covered = PackEntry::new(1, 30, Digest::new(sha256(b"covered")).unwrap()).unwrap();
+        let (catalog_bytes, catalog_digest) =
+            encode_catalog(scope, std::slice::from_ref(&covered), &[]).unwrap();
+        let pointer_bytes = encode_pointer(scope, &catalog_digest).unwrap();
+
+        let (store, client) = replay_store(vec![
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        publish_packs_after_replay(&store, scope, retained).await;
+
+        let requests: Vec<_> = client.actual_requests().collect();
+        let written = requests[requests.len() - 2].body().bytes().unwrap();
+        let digest = Digest::new(sha256(written)).unwrap();
+        let catalog = decode_catalog(written, &digest, scope).unwrap();
+        let last = retained.last().unwrap().reference.sequence();
+        // Contiguous from the existing row's start through the retained tail: the first
+        // published row must begin at 31, not at the segmentation boundary.
+        assert_eq!(catalog.entries()[1].start(), 31);
+        assert!(coverage(&catalog, 1, last).is_some());
+    }
+
+    /// Publication skips the packs a catalog already covers before applying its own bound, so
+    /// repeated replays extend coverage instead of re-offering one fixed prefix.
+    #[tokio::test]
+    async fn publication_advances_past_already_catalogued_packs() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        // One event past four full packs, so the batch bound and the covered prefix cannot both
+        // fit: applying the bound before the skip would stop one pack short, every later replay
+        // would re-offer the same prefix, and coverage would never reach the tail.
+        let events = chain(&genesis, MAX_PACK_EVENTS * 4 + 1);
+        let retained: Vec<RetainedEvent> = events
+            .iter()
+            .enumerate()
+            .map(|(index, (reference, bytes))| RetainedEvent {
+                reference: reference.clone(),
+                parent: (index > 0).then(|| events[index - 1].0.clone()),
+                payload_type: TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+                bytes: bytes.clone(),
+            })
+            .collect();
+        let packs = segment_packs(scope, &retained).unwrap();
+        assert_eq!(packs.len(), MAX_PUBLISHED_PACKS_PER_REPLAY + 1);
+        let tail = packs.last().unwrap().end();
+
+        // The catalog already holds the first pack.
+        let covered =
+            PackEntry::new(packs[0].start(), packs[0].end(), packs[0].digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) =
+            encode_catalog(scope, std::slice::from_ref(&covered), &[]).unwrap();
+        let pointer_bytes = encode_pointer(scope, &catalog_digest).unwrap();
+
+        let mut script = vec![
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+        ];
+        // One PUT per published pack, then the catalog and pointer writes.
+        for _ in 0..MAX_PUBLISHED_PACKS_PER_REPLAY + 2 {
+            script.push(response(200, &[], SdkBody::empty()));
+        }
+        script.push(response(500, &[], SdkBody::empty()));
+        let (store, client) = replay_store(script);
+        publish_packs_after_replay(&store, scope, &retained).await;
+
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), MAX_PUBLISHED_PACKS_PER_REPLAY + 4);
+        let published = requests
+            .iter()
+            .filter(|request| request.uri().contains("/replay-packs/"))
+            .count();
+        assert_eq!(published, MAX_PUBLISHED_PACKS_PER_REPLAY);
+        // The catalog write is the second-to-last request; its rows must reach the tail.
+        let written = requests[requests.len() - 2].body().bytes().unwrap();
+        let digest = Digest::new(sha256(written)).unwrap();
+        let catalog = decode_catalog(written, &digest, scope).unwrap();
+        assert_eq!(catalog.entries().last().unwrap().end(), tail);
+        assert!(coverage(&catalog, 1, tail).is_some());
+    }
+
     #[tokio::test]
     async fn checkpoint_publication_snapshots_then_appends_through_the_head_cas() {
         use crate::sync::head::read;
@@ -2288,11 +2480,12 @@ mod tests {
         .unwrap();
         let pointer_bytes = encode_pointer(scope, &catalog_digest).unwrap();
 
-        // An absent pointer is created with a create-only PUT. Two surplus scripted
-        // failures make any request beyond the expected four visible in the count.
+        // The catalog is read first, so the pack write is chosen against what the catalog
+        // already covers. An absent pointer is created with a create-only PUT. Two surplus
+        // scripted failures make any request beyond the expected four visible in the count.
         let (store, client) = replay_store(vec![
-            response(200, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),
@@ -2309,10 +2502,10 @@ mod tests {
                 .path()
                 .to_owned()
         };
-        assert!(path(0).contains("/replay-packs/"));
-        assert_eq!(requests[0].headers().get("if-none-match"), Some("*"));
-        assert_eq!(requests[0].body().bytes(), Some(pack.bytes()));
-        assert!(path(1).ends_with("/replay-index/current"));
+        assert!(path(0).ends_with("/replay-index/current"));
+        assert!(path(1).contains("/replay-packs/"));
+        assert_eq!(requests[1].headers().get("if-none-match"), Some("*"));
+        assert_eq!(requests[1].body().bytes(), Some(pack.bytes()));
         assert!(path(2).ends_with(&format!("/replay-index/{}", catalog_digest.as_str())));
         assert_eq!(requests[2].headers().get("if-none-match"), Some("*"));
         assert_eq!(requests[2].body().bytes(), Some(catalog_bytes.as_slice()));
@@ -2320,17 +2513,16 @@ mod tests {
         assert_eq!(requests[3].headers().get("if-none-match"), Some("*"));
         assert_eq!(requests[3].body().bytes(), Some(pointer_bytes.as_slice()));
 
-        // A rerun over identical bytes reconciles the duplicate pack and publishes nothing new.
+        // A rerun finds the catalog already covering this pack, so it writes no object at all:
+        // reading the catalog first is what turns a redundant republish into two reads.
         let (store, client) = replay_store(vec![
-            response(412, &[], SdkBody::empty()),
-            response(200, &[], pack.bytes().to_vec()),
             response(200, &[("etag", "\"pointer\"")], pointer_bytes.clone()),
             response(200, &[("etag", "\"catalog\"")], catalog_bytes.clone()),
             response(500, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),
         ]);
         publish_packs_after_replay(&store, scope, &retained).await;
-        assert_eq!(client.actual_requests().count(), 4);
+        assert_eq!(client.actual_requests().count(), 2);
 
         // A pointer CAS loss is silent: publication simply stops. The merged catalog
         // must keep the existing disjoint row and carry the certificate reference.
@@ -2345,10 +2537,10 @@ mod tests {
         )
         .unwrap();
         let (store, client) = replay_store(vec![
-            response(412, &[], SdkBody::empty()),
-            response(200, &[], pack.bytes().to_vec()),
             response(200, &[("etag", "\"pointer\"")], other_pointer),
             response(200, &[("etag", "\"catalog\"")], other_catalog),
+            response(412, &[], SdkBody::empty()),
+            response(200, &[], pack.bytes().to_vec()),
             response(200, &[], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),
@@ -2360,5 +2552,36 @@ mod tests {
         assert_eq!(requests[4].headers().get("if-none-match"), Some("*"));
         assert_eq!(requests[4].body().bytes(), Some(merged_bytes.as_slice()));
         assert_eq!(requests[5].headers().get("if-match"), Some("\"pointer\""));
+
+        // A row covering part of the retained span does not block the rest: segmentation runs
+        // inside the range the row leaves open, so the published pack starts at the row's end
+        // plus one and the two rows are adjacent rather than overlapping. Extending the covered
+        // prefix by re-publishing a wider pack over it would rewrite bytes already stored.
+        let narrow = PackEntry::new(1, 1, Digest::new(sha256(b"narrow")).unwrap()).unwrap();
+        let (narrow_catalog, narrow_digest) =
+            encode_catalog(scope, std::slice::from_ref(&narrow), &[]).unwrap();
+        let narrow_pointer = encode_pointer(scope, &narrow_digest).unwrap();
+        let tail_pack = pack_of(&genesis, &events, 1, 1);
+        let tail_entry = PackEntry::new(2, 2, tail_pack.digest().clone()).unwrap();
+        let (extended_bytes, _) = encode_catalog(
+            scope,
+            &[narrow.clone(), tail_entry],
+            std::slice::from_ref(&cert_ref),
+        )
+        .unwrap();
+        let (store, client) = replay_store(vec![
+            response(200, &[("etag", "\"pointer\"")], narrow_pointer),
+            response(200, &[("etag", "\"catalog\"")], narrow_catalog),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        publish_packs_after_replay(&store, scope, &retained).await;
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[2].body().bytes(), Some(tail_pack.bytes()));
+        assert_eq!(requests[3].body().bytes(), Some(extended_bytes.as_slice()));
     }
 }

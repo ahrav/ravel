@@ -23,6 +23,7 @@ use crate::{
         },
         worker::DbHandle,
     },
+    dispatch::AttemptHistory,
     distributed::scope_controller::{self, ControllerAuthority, GrantAppend, STOP_MARGIN_MS},
     domain::{
         proposal::MAX_STORED_INTEGER,
@@ -30,7 +31,7 @@ use crate::{
         work::WorkRef,
     },
     scope::{Digest, GrantActivatedPayload, ScopeClaimIdentity, ScopeIdentity, scope_grant_key},
-    storage::s3::{AttemptHistory, GetError, GetOutcome, PublicationError, S3Store},
+    storage::s3::{GetError, GetOutcome, PublicationError, S3Store},
     sync::WireError,
 };
 

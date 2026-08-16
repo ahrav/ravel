@@ -613,6 +613,19 @@ pub(crate) fn scope_active_plan(
         .transpose()
 }
 
+/// Counts the scopes a projection holds.
+///
+/// A checkpoint snapshot is certified for one scope, so an installer uses this to refuse a
+/// copy that carries rows it has no ancestry to prove.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::DatabaseOperationFailed`] when SQLite fails.
+pub(crate) fn scope_count(connection: &rusqlite::Connection) -> Result<u64, ApplyError> {
+    let count: i64 = connection.query_row("SELECT COUNT(*) FROM scopes", [], |row| row.get(0))?;
+    u64::try_from(count).map_err(|_| ApplyError::DatabaseOperationFailed)
+}
+
 pub(crate) fn scope_matches_head(
     connection: &rusqlite::Connection,
     head: &ScopeHead,
@@ -679,20 +692,31 @@ pub(crate) fn snapshot_to(
         return Err(ApplyError::Conflict);
     }
     connection.execute("VACUUM INTO ?1", [destination_str])?;
-    let sanitized = sanitize_and_validate_snapshot(destination);
+    let sanitized = sanitize_and_validate_snapshot(destination, head.scope().scope_id().as_str());
     if sanitized.is_err() {
         let _ = std::fs::remove_file(destination);
     }
     sanitized
 }
 
-fn sanitize_and_validate_snapshot(destination: &Path) -> Result<(), ApplyError> {
+fn sanitize_and_validate_snapshot(destination: &Path, scope_id: &str) -> Result<(), ApplyError> {
     {
         let copy = rusqlite::Connection::open(destination)?;
         set_rollback_journal(&copy)?;
+        // `VACUUM INTO` copies the whole file, and one projection may host several scopes.
+        // Only this scope's rows are covered by the certificate the snapshot is published
+        // under, so the others are dropped here rather than shipped uncertified — an
+        // installer has no ancestry to prove them against. `ON DELETE CASCADE` from
+        // `scopes` clears the dependent rows, which needs foreign keys enforced.
+        copy.pragma_update(None, "foreign_keys", true)?;
+        copy.execute("DELETE FROM scopes WHERE scope_id <> ?1", [scope_id])?;
         copy.execute_batch(
             "BEGIN;\n             UPDATE scopes SET claims_restored = 0;\n             UPDATE admitted_work\n             SET claim_fence = NULL,\n                 claim_lease_until = NULL,\n                 terminal_result_digest = NULL;\n             COMMIT;",
         )?;
+        // Deleting rows only moves their pages to the freelist, so the copy keeps the whole
+        // projection's size. Without this the byte cap below would reject a checkpoint whose
+        // own scope is far under it, purely because other scopes share the live file.
+        copy.execute_batch("VACUUM")?;
     }
     let metadata =
         std::fs::metadata(destination).map_err(|_| ApplyError::DatabaseOperationFailed)?;
@@ -1950,13 +1974,37 @@ mod tests {
     }
 
     /// Snapshot validation rejects a copy above the 64 MiB byte cap even when its
-    /// schema and content are otherwise valid.
+    /// schema and content are otherwise valid, and measures it after compaction so freed
+    /// pages never count against the cap.
     #[test]
     fn snapshot_validation_rejects_a_copy_above_the_byte_cap() {
         let db_path = path("oversized-snapshot");
         let connection = create(&db_path).unwrap();
-        // Ballast bloats the file past the cap, then leaves the exact schema and an
-        // empty, valid projection behind: only the byte cap can reject it.
+        // Live ballast holds the file past the cap: the sanitize step compacts the copy, so
+        // only resident data — not freelist pages — can carry it over. The cap is measured
+        // before the schema check, so the extra table is not what rejects this.
+        connection
+            .execute_batch(
+                "CREATE TABLE ballast (payload BLOB);\n                 INSERT INTO ballast VALUES (zeroblob(67108865));",
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            fs::metadata(&db_path).unwrap().len()
+                > crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64
+        );
+        assert_eq!(
+            sanitize_and_validate_snapshot(&db_path, &"0".repeat(64)),
+            Err(ApplyError::DatabaseOperationFailed)
+        );
+        fs::remove_file(db_path).unwrap();
+
+        // Pages freed inside the copy are reclaimed before the cap is measured. Pruning the
+        // uncertified scopes only moves their pages to the freelist, so without compaction a
+        // shared projection above the cap would make per-scope publication impossible even
+        // when the certified scope alone is far under it.
+        let db_path = path("cap-snapshot");
+        let connection = create(&db_path).unwrap();
         connection
             .execute_batch(
                 "CREATE TABLE ballast (payload BLOB);\n                 INSERT INTO ballast VALUES (zeroblob(67108865));\n                 DROP TABLE ballast;",
@@ -1968,31 +2016,13 @@ mod tests {
                 > crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64
         );
         assert_eq!(
-            sanitize_and_validate_snapshot(&db_path),
-            Err(ApplyError::DatabaseOperationFailed)
+            sanitize_and_validate_snapshot(&db_path, &"0".repeat(64)),
+            Ok(())
         );
-        fs::remove_file(db_path).unwrap();
-
-        // The byte cap is exclusive: a snapshot whose file length equals
-        // `MAX_SNAPSHOT_BYTES` validates. Incremental vacuum trims the bloated file
-        // page by page onto the cap.
-        let db_path = path("cap-snapshot");
-        drop(create(&db_path).unwrap());
-        let connection = rusqlite::Connection::open(&db_path).unwrap();
-        connection
-            .execute_batch(
-                "PRAGMA auto_vacuum = INCREMENTAL;\n                 VACUUM;\n                 CREATE TABLE ballast (payload BLOB);\n                 INSERT INTO ballast VALUES (zeroblob(67300000));\n                 DROP TABLE ballast;",
-            )
-            .unwrap();
-        let target = crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64;
-        while fs::metadata(&db_path).unwrap().len() > target {
-            connection
-                .execute_batch("PRAGMA incremental_vacuum(1)")
-                .unwrap();
-        }
-        drop(connection);
-        assert_eq!(fs::metadata(&db_path).unwrap().len(), target);
-        assert_eq!(sanitize_and_validate_snapshot(&db_path), Ok(()));
+        assert!(
+            fs::metadata(&db_path).unwrap().len()
+                < crate::sync::accelerator::MAX_SNAPSHOT_BYTES as u64
+        );
         fs::remove_file(db_path).unwrap();
     }
 

@@ -193,7 +193,7 @@ struct WirePointer {
 }
 
 /// Canonical pack bytes beside the digest and range that address them.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct EncodedPack {
     bytes: Vec<u8>,
     digest: Digest,
@@ -370,14 +370,9 @@ pub fn decode_pack(
         return Err(WireError::LimitExceeded);
     }
     let mut offsets = Vec::with_capacity(count + 1);
-    for pair in wire.offsets.windows(2) {
-        if pair[1] <= pair[0] {
-            return Err(WireError::InvalidValue);
-        }
-    }
     for offset in &wire.offsets {
         let offset = usize::try_from(*offset).map_err(|_| WireError::InvalidValue)?;
-        if offset > section.len() {
+        if offsets.last().is_some_and(|prev| offset <= *prev) || offset > section.len() {
             return Err(WireError::InvalidValue);
         }
         offsets.push(offset);
@@ -453,7 +448,7 @@ impl PackEntry {
 }
 
 /// One validated catalog: sorted non-overlapping pack rows plus checkpoint certificates.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ReplayCatalog {
     entries: Vec<PackEntry>,
     checkpoints: Vec<ScopeEventRef>,
@@ -825,13 +820,11 @@ pub(crate) async fn publish_packs_after_replay(
         return;
     };
     for pack in &packs {
-        let mut history = AttemptHistory::default();
         if store
-            .publish_with_history(
+            .publish_immutable(
                 &pack.key(scope),
                 pack.bytes().to_vec(),
                 pack.digest().as_str(),
-                &mut history,
             )
             .await
             .is_err()
@@ -875,13 +868,11 @@ pub(crate) async fn publish_packs_after_replay(
     let Ok((catalog_bytes, catalog_digest)) = encode_catalog(scope, &entries, &checkpoints) else {
         return;
     };
-    let mut history = AttemptHistory::default();
     if store
-        .publish_with_history(
+        .publish_immutable(
             &replay_catalog_key(scope, &catalog_digest),
             catalog_bytes,
             catalog_digest.as_str(),
-            &mut history,
         )
         .await
         .is_err()

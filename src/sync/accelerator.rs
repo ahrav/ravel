@@ -842,12 +842,13 @@ pub(crate) struct RetainedEvent {
 /// existing accelerator state, or pointer CAS loss stops publication silently: the replay
 /// that produced these events already succeeded and its result must not change.
 ///
-/// At most [`MAX_PUBLISHED_PACKS_PER_REPLAY`] packs are written, from the lowest sequences up.
-/// A caller awaits this before it can report readiness, and a full-limit replay segments into
-/// sixteen packs whose PUTs each carry the store's operation timeout, so an unbounded batch
-/// lets slow or write-denied storage hold a correctly rebuilt scope unready. Sequences past the
-/// bound stay unpacked until a later replay covers them, which costs event reads, never
-/// correctness.
+/// At most [`MAX_PUBLISHED_PACKS_PER_REPLAY`] packs are written per call, chosen from the
+/// lowest sequences the current catalog does not already cover, so repeated replays extend
+/// coverage instead of re-offering one fixed prefix. A caller awaits this before it can report
+/// readiness, and a full-limit replay segments into sixteen packs whose PUTs each carry the
+/// store's operation timeout, so an unbounded batch lets slow or write-denied storage hold a
+/// correctly rebuilt scope unready. Sequences past the bound stay unpacked until a later replay
+/// publishes them, which costs event reads, never correctness.
 pub(crate) async fn publish_packs_after_replay(
     store: &S3Store,
     scope: &ScopeIdentity,
@@ -859,8 +860,41 @@ pub(crate) async fn publish_packs_after_replay(
     let Some(packs) = segment_packs(scope, events) else {
         return;
     };
-    let packs = &packs[..packs.len().min(MAX_PUBLISHED_PACKS_PER_REPLAY)];
-    for pack in packs {
+    let existing = match read_current_catalog(store, scope).await {
+        CurrentCatalog::Absent => None,
+        CurrentCatalog::Unusable => return,
+        CurrentCatalog::Present(catalog, etag) => Some((catalog, etag)),
+    };
+    let (mut entries, mut checkpoints) = match &existing {
+        Some((catalog, _)) => (catalog.entries().to_vec(), catalog.checkpoints().to_vec()),
+        None => (Vec::new(), Vec::new()),
+    };
+    // The catalog is read before the bound is applied, so the batch is the first
+    // `MAX_PUBLISHED_PACKS_PER_REPLAY` packs this catalog does not already have. Bounding the
+    // segmentation instead would pin every replay to the same low prefix: a partial catalog
+    // fails to cover the requested suffix, the next replay reads events again and segments the
+    // same packs, the merge finds nothing new, and coverage would never pass the bound.
+    let mut pending = Vec::with_capacity(MAX_PUBLISHED_PACKS_PER_REPLAY);
+    for pack in &packs {
+        let Ok(entry) = PackEntry::new(pack.start(), pack.end(), pack.digest().clone()) else {
+            return;
+        };
+        if entries.iter().any(|existing| existing.covers(&entry)) {
+            continue;
+        }
+        // A partial overlap cannot be resolved without re-segmenting the publication.
+        if entries
+            .iter()
+            .any(|existing| existing.overlaps(&entry) && !entry.covers(existing))
+        {
+            continue;
+        }
+        pending.push((pack, entry));
+        if pending.len() == MAX_PUBLISHED_PACKS_PER_REPLAY {
+            break;
+        }
+    }
+    for (pack, _) in &pending {
         if store
             .publish_immutable(
                 &pack.key(scope),
@@ -873,36 +907,13 @@ pub(crate) async fn publish_packs_after_replay(
             return;
         }
     }
-    let existing = match read_current_catalog(store, scope).await {
-        CurrentCatalog::Absent => None,
-        CurrentCatalog::Unusable => return,
-        CurrentCatalog::Present(catalog, etag) => Some((catalog, etag)),
-    };
-    let (mut entries, mut checkpoints) = match &existing {
-        Some((catalog, _)) => (catalog.entries().to_vec(), catalog.checkpoints().to_vec()),
-        None => (Vec::new(), Vec::new()),
-    };
     let mut changed = false;
-    for pack in packs {
-        let Ok(entry) = PackEntry::new(pack.start(), pack.end(), pack.digest().clone()) else {
-            return;
-        };
-        if entries.iter().any(|existing| existing.overlaps(&entry)) {
-            // A row that already covers this range makes the pack redundant, and a partial
-            // overlap cannot be resolved without re-segmenting the publication. Every other
-            // overlap is a wider pack over rows it fully contains — a replay from an earlier
-            // cursor than the one that built them — so the narrower rows are replaced. Dropping
-            // it instead would leave the sequences past the old row's end uncovered until some
-            // node happened to replay from exactly that boundary.
-            if entries.iter().any(|existing| existing.covers(&entry))
-                || entries
-                    .iter()
-                    .any(|existing| existing.overlaps(&entry) && !entry.covers(existing))
-            {
-                continue;
-            }
-            entries.retain(|existing| !entry.covers(existing));
-        }
+    for (_, entry) in pending {
+        // An overlap here is a wider pack over rows it fully contains — a replay from an
+        // earlier cursor than the one that built them — so the narrower rows are replaced.
+        // Dropping it instead would leave the sequences past the old row's end uncovered until
+        // some node happened to replay from exactly that boundary.
+        entries.retain(|existing| !entry.covers(existing));
         entries.push(entry);
         changed = true;
     }
@@ -2087,6 +2098,64 @@ mod tests {
         );
     }
 
+    /// Publication skips the packs a catalog already covers before applying its own bound, so
+    /// repeated replays extend coverage instead of re-offering one fixed prefix.
+    #[tokio::test]
+    async fn publication_advances_past_already_catalogued_packs() {
+        let genesis = genesis();
+        let scope = genesis.identity();
+        // One event past four full packs, so the batch bound and the covered prefix cannot both
+        // fit: applying the bound before the skip would stop one pack short, every later replay
+        // would re-offer the same prefix, and coverage would never reach the tail.
+        let events = chain(&genesis, MAX_PACK_EVENTS * 4 + 1);
+        let retained: Vec<RetainedEvent> = events
+            .iter()
+            .enumerate()
+            .map(|(index, (reference, bytes))| RetainedEvent {
+                reference: reference.clone(),
+                parent: (index > 0).then(|| events[index - 1].0.clone()),
+                payload_type: TEST_SUCCESSOR_PAYLOAD_TYPE.into(),
+                bytes: bytes.clone(),
+            })
+            .collect();
+        let packs = segment_packs(scope, &retained).unwrap();
+        assert_eq!(packs.len(), MAX_PUBLISHED_PACKS_PER_REPLAY + 1);
+        let tail = packs.last().unwrap().end();
+
+        // The catalog already holds the first pack.
+        let covered =
+            PackEntry::new(packs[0].start(), packs[0].end(), packs[0].digest().clone()).unwrap();
+        let (catalog_bytes, catalog_digest) =
+            encode_catalog(scope, std::slice::from_ref(&covered), &[]).unwrap();
+        let pointer_bytes = encode_pointer(scope, &catalog_digest).unwrap();
+
+        let mut script = vec![
+            response(200, &[("etag", "\"pointer\"")], pointer_bytes),
+            response(200, &[("etag", "\"catalog\"")], catalog_bytes),
+        ];
+        // One PUT per published pack, then the catalog and pointer writes.
+        for _ in 0..MAX_PUBLISHED_PACKS_PER_REPLAY + 2 {
+            script.push(response(200, &[], SdkBody::empty()));
+        }
+        script.push(response(500, &[], SdkBody::empty()));
+        let (store, client) = replay_store(script);
+        publish_packs_after_replay(&store, scope, &retained).await;
+
+        let requests: Vec<_> = client.actual_requests().collect();
+        assert_eq!(requests.len(), MAX_PUBLISHED_PACKS_PER_REPLAY + 4);
+        let published = requests
+            .iter()
+            .filter(|request| request.uri().contains("/replay-packs/"))
+            .count();
+        assert_eq!(published, MAX_PUBLISHED_PACKS_PER_REPLAY);
+        // The catalog write is the second-to-last request; its rows must reach the tail.
+        let written = requests[requests.len() - 2].body().bytes().unwrap();
+        let digest = Digest::new(sha256(written)).unwrap();
+        let catalog = decode_catalog(written, &digest, scope).unwrap();
+        assert_eq!(catalog.entries().last().unwrap().end(), tail);
+        assert!(coverage(&catalog, 1, tail).is_some());
+    }
+
     #[tokio::test]
     async fn checkpoint_publication_snapshots_then_appends_through_the_head_cas() {
         use crate::sync::head::read;
@@ -2321,11 +2390,12 @@ mod tests {
         .unwrap();
         let pointer_bytes = encode_pointer(scope, &catalog_digest).unwrap();
 
-        // An absent pointer is created with a create-only PUT. Two surplus scripted
-        // failures make any request beyond the expected four visible in the count.
+        // The catalog is read first, so the pack write is chosen against what the catalog
+        // already covers. An absent pointer is created with a create-only PUT. Two surplus
+        // scripted failures make any request beyond the expected four visible in the count.
         let (store, client) = replay_store(vec![
-            response(200, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),
@@ -2342,10 +2412,10 @@ mod tests {
                 .path()
                 .to_owned()
         };
-        assert!(path(0).contains("/replay-packs/"));
-        assert_eq!(requests[0].headers().get("if-none-match"), Some("*"));
-        assert_eq!(requests[0].body().bytes(), Some(pack.bytes()));
-        assert!(path(1).ends_with("/replay-index/current"));
+        assert!(path(0).ends_with("/replay-index/current"));
+        assert!(path(1).contains("/replay-packs/"));
+        assert_eq!(requests[1].headers().get("if-none-match"), Some("*"));
+        assert_eq!(requests[1].body().bytes(), Some(pack.bytes()));
         assert!(path(2).ends_with(&format!("/replay-index/{}", catalog_digest.as_str())));
         assert_eq!(requests[2].headers().get("if-none-match"), Some("*"));
         assert_eq!(requests[2].body().bytes(), Some(catalog_bytes.as_slice()));
@@ -2353,17 +2423,16 @@ mod tests {
         assert_eq!(requests[3].headers().get("if-none-match"), Some("*"));
         assert_eq!(requests[3].body().bytes(), Some(pointer_bytes.as_slice()));
 
-        // A rerun over identical bytes reconciles the duplicate pack and publishes nothing new.
+        // A rerun finds the catalog already covering this pack, so it writes no object at all:
+        // reading the catalog first is what turns a redundant republish into two reads.
         let (store, client) = replay_store(vec![
-            response(412, &[], SdkBody::empty()),
-            response(200, &[], pack.bytes().to_vec()),
             response(200, &[("etag", "\"pointer\"")], pointer_bytes.clone()),
             response(200, &[("etag", "\"catalog\"")], catalog_bytes.clone()),
             response(500, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),
         ]);
         publish_packs_after_replay(&store, scope, &retained).await;
-        assert_eq!(client.actual_requests().count(), 4);
+        assert_eq!(client.actual_requests().count(), 2);
 
         // A pointer CAS loss is silent: publication simply stops. The merged catalog
         // must keep the existing disjoint row and carry the certificate reference.
@@ -2378,10 +2447,10 @@ mod tests {
         )
         .unwrap();
         let (store, client) = replay_store(vec![
-            response(412, &[], SdkBody::empty()),
-            response(200, &[], pack.bytes().to_vec()),
             response(200, &[("etag", "\"pointer\"")], other_pointer),
             response(200, &[("etag", "\"catalog\"")], other_catalog),
+            response(412, &[], SdkBody::empty()),
+            response(200, &[], pack.bytes().to_vec()),
             response(200, &[], SdkBody::empty()),
             response(412, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),
@@ -2408,10 +2477,10 @@ mod tests {
         )
         .unwrap();
         let (store, client) = replay_store(vec![
-            response(412, &[], SdkBody::empty()),
-            response(200, &[], pack.bytes().to_vec()),
             response(200, &[("etag", "\"pointer\"")], narrow_pointer),
             response(200, &[("etag", "\"catalog\"")], narrow_catalog),
+            response(412, &[], SdkBody::empty()),
+            response(200, &[], pack.bytes().to_vec()),
             response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(500, &[], SdkBody::empty()),

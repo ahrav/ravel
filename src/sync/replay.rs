@@ -256,21 +256,9 @@ pub async fn open_projection(
     if is_sqlite_uri(path) {
         return Err(ScopeReplayError::DatabaseUnavailable);
     }
-    let exists = path
-        .try_exists()
-        .map_err(|_| ScopeReplayError::DatabaseUnavailable)?;
-    if exists {
-        match DbHandle::open_existing(path.to_path_buf()).await {
-            Ok(handle) => return Ok(handle),
-            Err(OpenExistingError::Validation(
-                ValidateError::IntegrityCheckFailed
-                | ValidateError::InvalidSchema
-                | ValidateError::InvalidHistory,
-            )) => {}
-            Err(OpenExistingError::DatabaseOperationFailed | OpenExistingError::Validation(_)) => {
-                return Err(ScopeReplayError::DatabaseUnavailable);
-            }
-        }
+    match classify_destination(path).await? {
+        Destination::Opened(handle) => return Ok(handle),
+        Destination::Missing | Destination::Rebuildable => {}
     }
     // Cleanup deletes the destination, so it cannot race installation: a contender that
     // observed a rebuildable path could otherwise delete a projection another contender had
@@ -278,10 +266,13 @@ pub async fn open_projection(
     // everyone else uses a new file at the same pathname. The lock covers the whole
     // recheck-delete-install-open region.
     let _install = install_lock(path).await?;
-    // A contender may have finished while this one waited. Its projection is complete and at
-    // the pinned head before its pathname exists, so adopting it beats deleting it.
-    if let Ok(handle) = DbHandle::open_existing(path.to_path_buf()).await {
-        return Ok(handle);
+    // The classification runs again under the lock, in full: a contender may have finished
+    // while this one waited, and an unrelated database may have appeared at the pathname. The
+    // second case is still a refusal — treating every failed open as rebuildable here would
+    // unlink a foreign file this function promises never to touch.
+    match classify_destination(path).await? {
+        Destination::Opened(handle) => return Ok(handle),
+        Destination::Missing | Destination::Rebuildable => {}
     }
     // Every path that reaches the checkpoint rung removes the destination and its sidecars
     // first. A stale `-journal`, `-wal`, or `-shm` left by a crash outlives a missing main
@@ -293,6 +284,46 @@ pub async fn open_projection(
     DbHandle::spawn(path.to_path_buf())
         .await
         .map_err(|_| ScopeReplayError::DatabaseUnavailable)
+}
+
+/// What one destination pathname currently holds.
+enum Destination {
+    /// A valid projection, already open.
+    Opened(DbHandle),
+    /// Nothing at the pathname.
+    Missing,
+    /// This application's projection, damaged past repair, so replaceable.
+    Rebuildable,
+}
+
+/// Classifies a destination without modifying it.
+///
+/// A foreign application id is a refusal rather than a rebuild: the file can belong to
+/// unrelated local data, so the error leaves it in place. Damage this application owns —
+/// failed integrity check, unreadable schema, inconsistent history — is replaceable.
+///
+/// # Errors
+///
+/// Returns [`ScopeReplayError::DatabaseUnavailable`] for a file this function must not
+/// replace, and for I/O or SQLite failures that leave the pathname unclassified.
+async fn classify_destination(path: &Path) -> Result<Destination, ScopeReplayError> {
+    if !path
+        .try_exists()
+        .map_err(|_| ScopeReplayError::DatabaseUnavailable)?
+    {
+        return Ok(Destination::Missing);
+    }
+    match DbHandle::open_existing(path.to_path_buf()).await {
+        Ok(handle) => Ok(Destination::Opened(handle)),
+        Err(OpenExistingError::Validation(
+            ValidateError::IntegrityCheckFailed
+            | ValidateError::InvalidSchema
+            | ValidateError::InvalidHistory,
+        )) => Ok(Destination::Rebuildable),
+        Err(OpenExistingError::DatabaseOperationFailed | OpenExistingError::Validation(_)) => {
+            Err(ScopeReplayError::DatabaseUnavailable)
+        }
+    }
 }
 
 /// Takes the exclusive install lock for one projection pathname.
@@ -2046,6 +2077,8 @@ mod tests {
                     admissible.stored_bytes().to_vec(),
                 ),
                 event_response(genesis.event_bytes().to_vec()),
+                // Publication reads the pointer, then attempts the pack write.
+                accel_miss(),
                 accel_miss(),
                 response(404, &[], Vec::new()),
                 response(404, &[], Vec::new()),
@@ -2445,6 +2478,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(404, &[], Vec::new()),
             response(404, &[], Vec::new()),
@@ -2577,6 +2612,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2667,6 +2704,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2708,7 +2747,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(client.actual_requests().count(), 10);
         assert!(
             client
                 .actual_requests()
@@ -2761,6 +2800,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2805,7 +2846,7 @@ mod tests {
             ScopeReadiness::Ready { .. }
         ));
         assert!(handle.claims_restored(&scope).await.unwrap());
-        assert_eq!(client.actual_requests().count(), 12);
+        assert_eq!(client.actual_requests().count(), 13);
 
         handle.drain().await.unwrap();
         drop(handle);
@@ -2844,6 +2885,8 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
+            // Publication reads the pointer, then attempts the pack write.
+            accel_miss(),
             accel_miss(),
             response(
                 200,
@@ -2866,7 +2909,7 @@ mod tests {
             refresh(&store, &handle, &scope).await,
             ScopeReadiness::Ready { .. }
         ));
-        assert_eq!(client.actual_requests().count(), 9);
+        assert_eq!(client.actual_requests().count(), 10);
         assert!(handle.claims_restored(&scope).await.unwrap());
 
         handle.drain().await.unwrap();
@@ -3025,11 +3068,11 @@ mod tests {
             projection_content(&listed_path),
             projection_content(&serial_path)
         );
-        // Head, pointer miss, LIST, one bounded GET per candidate, and the failed pack
-        // publication PUT; the keyed route records every request, so a surplus request
-        // would raise the count.
+        // Head, pointer miss, LIST, one bounded GET per candidate, and publication's own
+        // pointer read plus its failed pack PUT; the keyed route records every request, so a
+        // surplus request would raise the count.
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 7);
+        assert_eq!(recorded.len(), 8);
         assert!(recorded[0].contains("/head"));
         assert!(recorded[1].contains("/replay-index/current"));
         assert!(recorded[2].contains("list-type=2"));
@@ -3044,9 +3087,10 @@ mod tests {
             )
         };
         assert_eq!(candidate_gets, vec![candidate(0), candidate(1)]);
-        // The failed pack PUT and its ambiguity probe end publication.
-        assert!(recorded[5].starts_with("PUT ") && recorded[5].contains("/replay-packs/"));
-        assert!(recorded[6].starts_with("GET ") && recorded[6].contains("/replay-packs/"));
+        // Publication reads the pointer, then its failed pack PUT and ambiguity probe end it.
+        assert!(recorded[5].starts_with("GET ") && recorded[5].contains("/replay-index/current"));
+        assert!(recorded[6].starts_with("PUT ") && recorded[6].contains("/replay-packs/"));
+        assert!(recorded[7].starts_with("GET ") && recorded[7].contains("/replay-packs/"));
         drop(listed);
         fs::remove_file(serial_path).unwrap();
         fs::remove_file(listed_path).unwrap();
@@ -3160,10 +3204,10 @@ mod tests {
             ScopeReadiness::Ready { .. }
         ));
         assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 2);
-        // Head, pointer miss, LIST, two candidate GETs, and the failed publication PUT
-        // plus its ambiguity probe: the beyond-tail candidate is never fetched.
+        // Head, pointer miss, LIST, two candidate GETs, and publication's own pointer read
+        // plus its failed PUT and ambiguity probe: the beyond-tail candidate is never fetched.
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 7);
+        assert_eq!(recorded.len(), 8);
         assert!(recorded.iter().all(|line| !line.contains(&format!(
             "/{}",
             crate::scope::scope_event_key(&scope, &events[2].0)
@@ -3386,9 +3430,9 @@ mod tests {
             list_response(&key_refs, false, None),
             event_response(events[0].1.clone()),
             event_response(events[1].1.clone()),
-            // Publication: pack PUT, pointer probe, catalog PUT, pointer create.
-            response(200, &[], SdkBody::empty()),
+            // Publication: pointer probe, pack PUT, catalog PUT, pointer create.
             response(404, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
             response(200, &[], SdkBody::empty()),
         ]);
@@ -3398,7 +3442,7 @@ mod tests {
         ));
         let requests: Vec<_> = client.actual_requests().collect();
         assert_eq!(requests.len(), 9);
-        assert_eq!(requests[5].body().bytes(), Some(expected_pack.bytes()));
+        assert_eq!(requests[6].body().bytes(), Some(expected_pack.bytes()));
         assert_eq!(requests[7].body().bytes(), Some(catalog_bytes.as_slice()));
         assert_eq!(requests[8].body().bytes(), Some(pointer_bytes.as_slice()));
         drop(first);
@@ -4177,7 +4221,7 @@ mod tests {
         ));
         assert_eq!(handle.scope_cursor(&scope).await.unwrap().0, 3);
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 7);
+        assert_eq!(recorded.len(), 8);
         assert!(recorded[2].contains("list-type=2"));
         assert!(
             recorded[2].contains("start-after=") && recorded[2].contains("0000000000000001."),
@@ -4389,7 +4433,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
-            response(500, &[], SdkBody::empty()),
+            // Publication's pointer read fails, which ends it before any write.
             response(500, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
@@ -4467,7 +4511,7 @@ mod tests {
                 fixture.admissible_bytes.clone(),
             ),
             event_response(genesis.event_bytes().to_vec()),
-            response(500, &[], SdkBody::empty()),
+            // Publication's pointer read fails, which ends it before any write.
             response(500, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),
             response(404, &[], SdkBody::empty()),

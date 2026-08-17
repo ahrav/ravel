@@ -20,7 +20,7 @@
 //! by hand over lengths and digests, so a caller that formats one cannot leak what a
 //! derived implementation would have exposed.
 
-use std::{error::Error, fmt, num::NonZeroU32, time::Duration};
+use std::{error::Error, fmt, num::NonZeroU32, sync::Arc, time::Duration};
 
 use aws_sdk_bedrockruntime::{
     config::{
@@ -37,7 +37,11 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     dispatch::AttemptHistory,
-    distributed::grants::{EffectAuthority, GrantRejection},
+    distributed::{
+        grants::{EffectAuthority, GrantRejection},
+        identity::InstanceId,
+    },
+    storage::s3::S3Store,
 };
 
 /// Whole-operation bound, including every byte of the completion.
@@ -693,20 +697,32 @@ impl fmt::Debug for InvocationOutcome {
 /// Narrow Bedrock client with enforced retry and timeout policy.
 pub struct BedrockTransport {
     client: aws_sdk_bedrockruntime::Client,
+    store: Arc<S3Store>,
+    instance: InstanceId,
 }
 
 impl BedrockTransport {
     /// Builds a client after overriding caller retry, timeout, and behavior policy.
     ///
-    /// Caller-provided credentials, HTTP clients, and interceptors remain installed.
-    pub fn new(region: Region, builder: Builder) -> Self {
+    /// `store` and `instance` are fixed here so an invocation cannot choose where its decision
+    /// is recorded or choose the subject against which its authority is verified. `store` must be
+    /// the same [`S3Store`] passed to [`crate::distributed::grants::intake`]: its namespace names
+    /// one constructed store, not merely an endpoint. Caller-provided credentials, HTTP clients,
+    /// and interceptors remain installed.
+    pub fn new(
+        region: Region,
+        builder: Builder,
+        store: Arc<S3Store>,
+        instance: InstanceId,
+    ) -> Self {
         Self {
             client: aws_sdk_bedrockruntime::Client::from_conf(configured(region, builder)),
+            store,
+            instance,
         }
     }
 
-    /// Dispatches one invocation under proven authority, recording possible dispatch before
-    /// awaiting the SDK.
+    /// Dispatches one invocation under proven authority, recording its gate decision first.
     ///
     /// The authority is taken by value: a grant is authority for one external operation and
     /// binds one attempt, and behind a shared reference neither `#[must_use]` nor the absent
@@ -716,14 +732,14 @@ impl BedrockTransport {
     /// before dispatch outlives it and is what the manifest and the terminal trace are written
     /// under.
     ///
-    /// The refusal returns before the request is built and before this attempt is marked as
-    /// possibly sent, so an unauthorized call cannot make a later attempt on the same history
-    /// report dispatch uncertainty it did not earn.
+    /// The durable decision is written before the request is built and before this attempt is
+    /// marked as possibly sent. [`GrantRejection::Unrecorded`] means recording was not proven and
+    /// no provider dispatch occurred.
     ///
     /// # Errors
     ///
-    /// Returns the [`GrantRejection`] that refused the authority. The call itself never
-    /// produces one: every provider result is an [`InvocationOutcome`].
+    /// Returns the [`GrantRejection`] that refused the authority or prevented its decision from
+    /// being recorded. The provider call itself produces only an [`InvocationOutcome`].
     pub async fn invoke(
         &self,
         authority: EffectAuthority,
@@ -731,9 +747,11 @@ impl BedrockTransport {
         history: &mut AttemptHistory,
         now_ms: u64,
     ) -> Result<InvocationOutcome, GrantRejection> {
-        // Before anything else, including before the request is built: an unauthorized call
-        // must leave no trace on the attempt history.
-        let authorized_for = authority.authorizes_model(request, now_ms)?;
+        // Before anything else, including before the request is built: an unauthorized or
+        // unrecorded call must leave no trace on the attempt history.
+        let authorized_for = authority
+            .authorize_model(&self.store, &self.instance, request, now_ms)
+            .await?;
         // Dispatching to Bedrock is a decision about the request's provider, so this site
         // names it: a second `ModelProvider` variant cannot compile until the decision is
         // made here, rather than being sent to Bedrock under another provider's identity.
@@ -773,9 +791,9 @@ impl BedrockTransport {
 
         // The digest covers every immutable request field, so an operation id reused after
         // a changed prompt, profile, or cap is caught rather than silently sharing one
-        // attempt history across two distinct provider calls. Computed only where the check
-        // runs: hashing a prompt on every dispatch to feed a debug assertion is not a cost
-        // this boundary should pay in release.
+        // attempt history across two distinct provider calls. The gate already hashed the
+        // request for its record; this second hash stays debug-only because the binding check
+        // itself is debug-only.
         #[cfg(debug_assertions)]
         history.bind(&format!(
             "{}|{}",
@@ -1118,21 +1136,27 @@ mod tests {
     };
 
     use super::*;
-    use crate::distributed::grants::{GRANT_ACTION_MODEL_INVOKE, test_support::model_authority};
+    use crate::{
+        distributed::grants::{
+            GRANT_ACTION_MODEL_INVOKE,
+            test_support::{ModelAuthorityContext, decode_model_record, model_authority},
+        },
+        storage::s3::test_support::{replay_store, response as s3_response},
+    };
 
     /// Fixed clock for the tests, so an authority's term is stated rather than sampled.
     const NOW_MS: u64 = 1_700_000_000_000;
 
     /// An authority that permits the fixture request: it names a model invocation of the
     /// fixture profile, and both its grant and its proving lease have term left at `NOW_MS`.
-    fn authority() -> EffectAuthority {
-        authority_for(&request())
+    fn authority(transport: &BedrockTransport) -> EffectAuthority {
+        authority_for(transport, &request())
     }
 
     /// An authority that permits one specific request, for tests whose profile is not the
     /// fixture's: the resource scope is the profile's configuration digest, so an authority
     /// minted for one profile refuses a call to any other.
-    fn authority_for(request: &InvocationRequest) -> EffectAuthority {
+    fn authority_for(transport: &BedrockTransport, request: &InvocationRequest) -> EffectAuthority {
         model_authority(
             GRANT_ACTION_MODEL_INVOKE.to_owned(),
             request.profile().configuration_digest(),
@@ -1140,6 +1164,10 @@ mod tests {
             u64::from(request.max_output_tokens().get()),
             NOW_MS + 60_000,
             NOW_MS + 25_000,
+            ModelAuthorityContext {
+                subject: transport.instance.clone(),
+                namespace: transport.store.namespace().to_owned(),
+            },
         )
     }
 
@@ -1194,14 +1222,43 @@ mod tests {
         builder.body(body.into()).expect("valid test response")
     }
 
+    fn transport_with_decisions(
+        builder: Builder,
+        responses: Vec<http::Response<SdkBody>>,
+    ) -> (BedrockTransport, StaticReplayClient) {
+        let (store, client) = replay_store(responses);
+        (
+            BedrockTransport::new(
+                Region::new("us-east-1"),
+                builder,
+                Arc::new(store),
+                InstanceId::new("instance-a".into()).unwrap(),
+            ),
+            client,
+        )
+    }
+
+    fn transport(builder: Builder, decision_puts: usize) -> BedrockTransport {
+        transport_with_decisions(
+            builder,
+            (0..decision_puts)
+                .map(|_| s3_response(200, &[], SdkBody::empty()))
+                .collect(),
+        )
+        .0
+    }
+
     fn replay(responses: Vec<http::Response<SdkBody>>) -> (BedrockTransport, StaticReplayClient) {
+        // Retries are disabled; callers provide one response per invocation, and each invocation
+        // writes one gate decision before consuming that response.
+        let decision_puts = responses.len();
         let client = StaticReplayClient::new(
             responses
                 .into_iter()
                 .map(|response| ReplayEvent::new(http::Request::new(SdkBody::empty()), response))
                 .collect(),
         );
-        let transport = BedrockTransport::new(Region::new("us-east-1"), builder(client.clone()));
+        let transport = transport(builder(client.clone()), decision_puts);
         (transport, client)
     }
 
@@ -1241,7 +1298,7 @@ mod tests {
     async fn invoke(transport: &BedrockTransport) -> InvocationOutcome {
         let mut history = AttemptHistory::default();
         transport
-            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .invoke(authority(transport), &request(), &mut history, NOW_MS)
             .await
             .expect("the fixture authority permits the fixture request")
     }
@@ -1585,12 +1642,11 @@ mod tests {
     /// unknown rather than a refusal: the request may well have reached the provider.
     #[tokio::test(start_paused = true)]
     async fn a_transport_that_never_answers_times_out_without_asserting_no_work() {
-        let transport =
-            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+        let transport = transport(builder(NeverClient::new()), 1);
         let mut history = AttemptHistory::default();
 
         let outcome = transport
-            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .invoke(authority(&transport), &request(), &mut history, NOW_MS)
             .await
             .expect("the fixture authority permits the fixture request");
         assert_eq!(
@@ -1643,7 +1699,7 @@ mod tests {
             let (transport, _) = replay(vec![frame]);
             let mut history = AttemptHistory::default();
             let outcome = transport
-                .invoke(authority(), &request(), &mut history, NOW_MS)
+                .invoke(authority(&transport), &request(), &mut history, NOW_MS)
                 .await
                 .expect("the fixture authority permits the fixture request");
             assert_eq!(
@@ -1660,7 +1716,7 @@ mod tests {
             let mut history = AttemptHistory::default();
             history.mark_possible_send();
             let outcome = transport
-                .invoke(authority(), &request(), &mut history, NOW_MS)
+                .invoke(authority(&transport), &request(), &mut history, NOW_MS)
                 .await
                 .expect("the fixture authority permits the fixture request");
             assert!(
@@ -1684,7 +1740,7 @@ mod tests {
         history.bind("some-other-operation");
 
         let _ = transport
-            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .invoke(authority(&transport), &request(), &mut history, NOW_MS)
             .await
             .expect("the fixture authority permits the fixture request");
     }
@@ -1699,17 +1755,17 @@ mod tests {
     /// that timed out instead would fail this test rather than pass it.
     #[tokio::test]
     async fn a_connector_failure_is_unknown_and_keeps_possible_send_evidence() {
-        let transport = BedrockTransport::new(
-            Region::new("us-east-1"),
+        let transport = transport(
             aws_sdk_bedrockruntime::Config::builder()
                 .credentials_provider(Credentials::for_tests())
                 .endpoint_url("http://127.0.0.1:1"),
+            1,
         );
         let mut history = AttemptHistory::default();
 
         assert_eq!(
             transport
-                .invoke(authority(), &request(), &mut history, NOW_MS)
+                .invoke(authority(&transport), &request(), &mut history, NOW_MS)
                 .await
                 .expect("the fixture authority permits the fixture request"),
             InvocationOutcome::Unknown {
@@ -1860,7 +1916,7 @@ mod tests {
 
             assert_eq!(
                 transport
-                    .invoke(authority(), &request(), &mut history, NOW_MS)
+                    .invoke(authority(&transport), &request(), &mut history, NOW_MS)
                     .await
                     .expect("the fixture authority permits the fixture request"),
                 expected,
@@ -1945,7 +2001,7 @@ mod tests {
         let mut history = AttemptHistory::default();
 
         let outcome = transport
-            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .invoke(authority(&transport), &request(), &mut history, NOW_MS)
             .await
             .expect("the fixture authority permits the fixture request");
         let InvocationOutcome::Refused {
@@ -2137,7 +2193,7 @@ mod tests {
         let mut history = AttemptHistory::default();
 
         let outcome = transport
-            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .invoke(authority(&transport), &request(), &mut history, NOW_MS)
             .await
             .expect("the fixture authority permits the fixture request");
         let InvocationOutcome::Completed { text, reason, .. } = &outcome else {
@@ -2170,11 +2226,16 @@ mod tests {
         .unwrap();
 
         transport
-            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .invoke(authority(&transport), &request(), &mut history, NOW_MS)
             .await
             .expect("the fixture authority permits the fixture request");
         transport
-            .invoke(authority_for(&changed), &changed, &mut history, NOW_MS)
+            .invoke(
+                authority_for(&transport, &changed),
+                &changed,
+                &mut history,
+                NOW_MS,
+            )
             .await
             .expect("the authority names this request's profile and operation");
     }
@@ -2326,7 +2387,7 @@ mod tests {
         ))]);
         let _ = transport
             .invoke(
-                authority_for(&request),
+                authority_for(&transport, &request),
                 &request,
                 &mut AttemptHistory::default(),
                 NOW_MS,
@@ -2380,8 +2441,7 @@ mod tests {
     /// invocation must not read as proof the provider did no work.
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_invocation_still_records_possible_dispatch() {
-        let transport =
-            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+        let transport = transport(builder(NeverClient::new()), 1);
         let mut history = AttemptHistory::default();
 
         // One second is far inside the enforced attempt bound, so the future is dropped
@@ -2389,7 +2449,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(1),
-                transport.invoke(authority(), &request(), &mut history, NOW_MS),
+                transport.invoke(authority(&transport), &request(), &mut history, NOW_MS),
             )
             .await
             .is_err()
@@ -2452,7 +2512,7 @@ mod tests {
         ))]);
         let outcome = transport
             .invoke(
-                authority(),
+                authority(&transport),
                 &request,
                 &mut AttemptHistory::default(),
                 NOW_MS,
@@ -2901,11 +2961,11 @@ mod tests {
                 json(converse_body("end_turn", Some((1, 1, 2)), "answer")),
             ),
         ]);
-        let transport = BedrockTransport::new(
-            Region::new("us-east-1"),
+        let transport = transport(
             builder(client.clone()).retry_config(
                 aws_sdk_bedrockruntime::config::retry::RetryConfig::standard().with_max_attempts(5),
             ),
+            1,
         );
 
         assert_eq!(
@@ -2920,16 +2980,16 @@ mod tests {
     /// Timeouts are enforced even when the caller asks for none.
     #[tokio::test(start_paused = true)]
     async fn a_caller_supplied_timeout_policy_cannot_remove_the_bounds() {
-        let transport = BedrockTransport::new(
-            Region::new("us-east-1"),
+        let transport = transport(
             builder(NeverClient::new())
                 .timeout_config(aws_sdk_bedrockruntime::config::timeout::TimeoutConfig::disabled()),
+            1,
         );
         let mut history = AttemptHistory::default();
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(600),
-            transport.invoke(authority(), &request(), &mut history, NOW_MS),
+            transport.invoke(authority(&transport), &request(), &mut history, NOW_MS),
         )
         .await
         .expect("the enforced bound fires before this one");
@@ -2950,8 +3010,12 @@ mod tests {
     /// claiming dispatch uncertainty it never earned.
     #[tokio::test(start_paused = true)]
     async fn an_authority_that_does_not_permit_the_call_refuses_before_dispatch() {
-        let transport =
-            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+        let (transport, decision_client) = transport_with_decisions(
+            builder(NeverClient::new()),
+            (0..7)
+                .map(|_| s3_response(200, &[], SdkBody::empty()))
+                .collect(),
+        );
         let action = GRANT_ACTION_MODEL_INVOKE.to_owned();
         let scope = profile().configuration_digest();
         let operation = OPERATION_ID.to_owned();
@@ -2959,9 +3023,21 @@ mod tests {
         let deadline = NOW_MS + 60_000;
         let stop = NOW_MS + 25_000;
 
-        for (case, action, scope, operation, units, deadline, stop, expected) in [
+        for (index, (case, subject, action, scope, operation, units, deadline, stop, expected)) in [
+            (
+                "authority minted under another instance's lease",
+                "instance-b",
+                action.clone(),
+                scope.clone(),
+                operation.clone(),
+                units,
+                deadline,
+                stop,
+                GrantRejection::SubjectMismatch,
+            ),
             (
                 "an action this boundary does not accept",
+                "instance-a",
                 "git-push".to_owned(),
                 scope.clone(),
                 operation.clone(),
@@ -2972,6 +3048,7 @@ mod tests {
             ),
             (
                 "another profile's configuration",
+                "instance-a",
                 action.clone(),
                 "cd".repeat(32),
                 operation.clone(),
@@ -2982,6 +3059,7 @@ mod tests {
             ),
             (
                 "another operation",
+                "instance-a",
                 action.clone(),
                 scope.clone(),
                 "invoke-op-elsewhere".to_owned(),
@@ -2992,6 +3070,7 @@ mod tests {
             ),
             (
                 "fewer authorized units than the request could draw",
+                "instance-a",
                 action.clone(),
                 scope.clone(),
                 operation.clone(),
@@ -3001,17 +3080,19 @@ mod tests {
                 GrantRejection::NarrowerThanRequest,
             ),
             (
-                "the grant deadline has passed",
+                "the grant deadline was the tighter clock before both elapsed",
+                "instance-a",
                 action.clone(),
                 scope.clone(),
                 operation.clone(),
                 units,
+                NOW_MS - 1,
                 NOW_MS,
-                stop,
                 GrantRejection::Expired,
             ),
             (
                 "the proving lease has stopped",
+                "instance-a",
                 action,
                 scope,
                 operation,
@@ -3020,12 +3101,26 @@ mod tests {
                 NOW_MS,
                 GrantRejection::StaleAuthority,
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut history = AttemptHistory::default();
             assert_eq!(
                 transport
                     .invoke(
-                        model_authority(action, scope, operation, units, deadline, stop),
+                        model_authority(
+                            action,
+                            scope,
+                            operation,
+                            units,
+                            deadline,
+                            stop,
+                            ModelAuthorityContext {
+                                subject: InstanceId::new(subject.into()).unwrap(),
+                                namespace: transport.store.namespace().to_owned(),
+                            },
+                        ),
                         &request(),
                         &mut history,
                         NOW_MS,
@@ -3035,25 +3130,19 @@ mod tests {
                 "{case}"
             );
             assert!(!history.may_have_been_sent(), "{case}");
+            assert_eq!(
+                decision_client.actual_requests().count(),
+                index + 1,
+                "{case}"
+            );
+            let sent = decision_client
+                .actual_requests()
+                .last()
+                .expect("decision PUT");
+            let record =
+                decode_model_record(sent.uri(), sent.body().bytes().expect("in-memory decision"));
+            assert_eq!(record.decision().as_str(), expected.as_str(), "{case}");
         }
-    }
-
-    /// A grant may authorize more output tokens than a call will draw, and that slack is
-    /// permitted here: only intake bounds a grant from above, against the caller's own
-    /// expectation. Without this the comparison could be an equality and every dispatch under an
-    /// over-provisioned reservation would be refused.
-    #[test]
-    fn a_grant_wider_than_the_request_still_authorizes_it() {
-        let request = request();
-        let wider = model_authority(
-            GRANT_ACTION_MODEL_INVOKE.to_owned(),
-            request.profile().configuration_digest(),
-            request.operation_id().to_owned(),
-            u64::from(request.max_output_tokens().get()) + 1,
-            NOW_MS + 60_000,
-            NOW_MS + 25_000,
-        );
-        assert!(wider.authorizes_model(&request, NOW_MS).is_ok());
     }
 
     /// The call is bounded by whichever clock runs out first.
@@ -3067,8 +3156,7 @@ mod tests {
     /// policy must not raise: the override sets only the operation timeout.
     #[tokio::test(start_paused = true)]
     async fn the_call_is_bounded_by_the_shortest_of_lease_grant_and_fixed_policy() {
-        let transport =
-            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+        let transport = transport(builder(NeverClient::new()), 3);
 
         for (case, deadline, stop, outer) in [
             (
@@ -3104,6 +3192,10 @@ mod tests {
                         u64::from(request().max_output_tokens().get()),
                         deadline,
                         stop,
+                        ModelAuthorityContext {
+                            subject: transport.instance.clone(),
+                            namespace: transport.store.namespace().to_owned(),
+                        },
                     ),
                     &request(),
                     &mut history,

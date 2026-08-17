@@ -1035,6 +1035,27 @@ pub(crate) fn scope_grant_key(
     )
 }
 
+/// The key places the digest after the attempt so `list_keys` can enumerate attempt keys without a decision address.
+pub(crate) fn scope_gate_decision_key(
+    scope: &ScopeIdentity,
+    work: &WorkRef,
+    claim_fence: NonZeroU64,
+    attempt: NonZeroU64,
+    decision_digest: &str,
+) -> String {
+    format!(
+        "workspace/{}/campaigns/{}/scopes/{}/gate-decisions/{}/{}/{}/{}/{}",
+        scope.workspace_id().as_str(),
+        scope.campaign_id().as_str(),
+        scope.scope_id().as_str(),
+        work.id().as_str(),
+        work.revision(),
+        claim_fence,
+        attempt,
+        decision_digest
+    )
+}
+
 /// Builds the full campaign plan key.
 pub fn plan_key(workspace: &WorkspaceId, campaign: &CampaignId, digest: &Digest) -> String {
     format!(
@@ -2483,6 +2504,16 @@ mod codec_tests {
         assert_eq!(
             scope_grant_key(claim.scope(), claim.work(), claim.claim_fence()),
             format!("{prefix}/grants/work-17/4/9")
+        );
+        assert_eq!(
+            scope_gate_decision_key(
+                claim.scope(),
+                claim.work(),
+                claim.claim_fence(),
+                NonZeroU64::new(3).unwrap(),
+                digest.as_str(),
+            ),
+            format!("{prefix}/gate-decisions/work-17/4/9/3/{}", digest.as_str())
         );
         assert_eq!(claim.plan_digest(), &digest);
         assert_eq!(claim.claim_fence().get(), 9);

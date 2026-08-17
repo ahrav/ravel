@@ -24,12 +24,19 @@ use crate::{
         worker::DbHandle,
     },
     dispatch::AttemptHistory,
-    distributed::scope_controller::{self, ControllerAuthority, GrantAppend, STOP_MARGIN_MS},
+    distributed::{
+        identity::InstanceId,
+        scope_controller::{self, ControllerAuthority, GrantAppend, STOP_MARGIN_MS},
+    },
     domain::{
         validation::{ValidationError, bounded_stored, validate_key_segment},
         work::WorkRef,
     },
-    scope::{Digest, GrantActivatedPayload, ScopeClaimIdentity, ScopeIdentity, scope_grant_key},
+    invocation::{GateDecision, GateDecisionRecord, InvocationBinding},
+    scope::{
+        Digest, GrantActivatedPayload, ScopeClaimIdentity, ScopeIdentity, scope_gate_decision_key,
+        scope_grant_key,
+    },
     storage::s3::{GetError, GetOutcome, PublicationError, S3Store},
     sync::WireError,
 };
@@ -161,7 +168,7 @@ impl ExpectedGrant {
     }
 }
 
-/// Data-free category for one refused grant.
+/// Data-free category for one refused grant, or for a gate decision that was not recorded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GrantRejection {
     /// No object exists at the claim generation's grant key.
@@ -170,6 +177,10 @@ pub enum GrantRejection {
     StaleFence,
     /// `IdentityMismatch` covers a grant whose binding differs from the expected binding.
     IdentityMismatch,
+    /// Authority was minted under another instance's lease.
+    ///
+    /// This proves only a lease-holder mismatch; it says nothing about claim ownership.
+    SubjectMismatch,
     Expired,
     /// The grant authorizes more than the caller asked for, refused at intake so an over-wide
     /// grant cannot be taken up at all.
@@ -184,10 +195,33 @@ pub enum GrantRejection {
     NarrowerThanRequest,
     /// The projection does not continue, or no longer continues, the caller's claim generation.
     Revoked,
-    /// The caller's authority is stopped or the projection outran its epoch; nothing it decides
-    /// under that authority stands.
+    /// The caller's authority is stopped, the projection outran its epoch, or the authority was
+    /// minted against a different object store; nothing it decides under that authority stands.
     StaleAuthority,
     Malformed,
+    /// The gate could not prove its decision durable. Retry may succeed.
+    Unrecorded,
+}
+
+impl GrantRejection {
+    /// Stable, data-free gate-decision value.
+    ///
+    /// [`Self::Unrecorded`] is the one value a durable record cannot carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::StaleFence => "stale_fence",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::SubjectMismatch => "subject_mismatch",
+            Self::Expired => "expired",
+            Self::WiderThanRequested => "wider_than_requested",
+            Self::NarrowerThanRequest => "narrower_than_request",
+            Self::Revoked => "revoked",
+            Self::StaleAuthority => "stale_authority",
+            Self::Malformed => "malformed",
+            Self::Unrecorded => "unrecorded",
+        }
+    }
 }
 
 /// Proof that a claim and a grant were both checked against durable state.
@@ -208,33 +242,86 @@ pub enum GrantRejection {
 /// claim survives controller takeover. A call bounded only by the grant, or by only one
 /// of the leases, could outlive the other one, and a successor that legitimately took the
 /// claim could be dispatching at the same time.
+///
+/// `subject` is the lease holder proved by [`intake`]. Claim ownership remains assumed rather
+/// than proven because admitted work carries no owner identity. `namespace` pins that proof to
+/// the exact constructed object store from which it was obtained, not merely its endpoint.
+/// Neither field is exposed to callers.
 #[must_use]
 pub struct EffectAuthority {
     grant: EffectGrant,
+    subject: InstanceId,
+    namespace: String,
     /// Instant past which the proving authority must stop: the shorter of the controller
     /// lease and the work-claim lease, less [`STOP_MARGIN_MS`].
     authority_stop_unix_ms: u64,
 }
 
 impl EffectAuthority {
-    /// Decides this authority against the request it would authorize, returning how long the
-    /// call may run.
+    /// Verifies, decides, and durably records one model gate before any provider effect.
     ///
-    /// The bound is the shorter of the grant's deadline and the proving lease's stop instant.
-    /// Both are retested here rather than trusted from intake, because intake decided at its own
-    /// `now_ms` and either term can elapse before a call is dispatched.
+    /// `expected_subject` is the caller's independently held process identity. A namespace
+    /// mismatch is refused without a record: a record written to the wrong store records nothing
+    /// about this dispatch. Every other gate decision, a subject mismatch included, is recorded
+    /// before it is returned. The record holds that decision, not the post-write bound correction:
+    /// an `allowed` record can still return `Expired` or `StaleAuthority` when its write consumed
+    /// the remaining window.
     ///
-    /// The request is the argument rather than an action and a scope, because the only source
-    /// for those would be the caller handing the authority its own values back.
+    /// A second effect entry must route its decision through [`Self::record_decision`] before its
+    /// effect. Module privacy prevents outside callers from reaching [`Self::decide_model`], but
+    /// cannot stop a sibling decision function here from skipping the record.
     ///
     /// # Errors
     ///
-    /// Returns [`GrantRejection::IdentityMismatch`] when the grant does not name a model
-    /// invocation of this request's profile and operation,
-    /// [`GrantRejection::NarrowerThanRequest`] when the request could draw more output tokens
-    /// than the grant authorized, [`GrantRejection::Expired`] for a grant past its deadline, and
-    /// [`GrantRejection::StaleAuthority`] when the proving lease has stopped.
-    pub fn authorizes_model(
+    /// Returns [`GrantRejection::SubjectMismatch`] for authority minted under another instance,
+    /// [`GrantRejection::IdentityMismatch`] for an action, resource, or operation mismatch,
+    /// [`GrantRejection::NarrowerThanRequest`] when the request exceeds the grant's units,
+    /// [`GrantRejection::Expired`] when the grant deadline is the tighter elapsed clock,
+    /// [`GrantRejection::StaleAuthority`] for a store mismatch or tighter elapsed authority stop,
+    /// and [`GrantRejection::Unrecorded`] when building or persisting the record failed or elapsed.
+    pub async fn authorize_model(
+        &self,
+        store: &S3Store,
+        expected_subject: &InstanceId,
+        request: &crate::provider::InvocationRequest,
+        now_ms: u64,
+    ) -> Result<Duration, GrantRejection> {
+        if self.namespace != store.namespace() {
+            return Err(GrantRejection::StaleAuthority);
+        }
+        // The comparand is the caller's own process identity. No accessor exposes `subject`, so
+        // callers cannot turn this into self-verification.
+        let decision = if self.subject != *expected_subject {
+            Err(GrantRejection::SubjectMismatch)
+        } else {
+            self.decide_model(request, now_ms)
+        };
+        let request_digest =
+            Digest::new(request.request_digest()).map_err(|_| GrantRejection::Unrecorded)?;
+        let started = tokio::time::Instant::now();
+        let (recorded, record_deadline) = match decision {
+            // An allowed write is bounded by the authority window it is buying.
+            Ok(authorized_for) => (GateDecision::Allowed, started + authorized_for),
+            // A refused write buys no dispatch, so bound only caller delay by the existing margin.
+            Err(reason) => (
+                GateDecision::Refused(reason),
+                started + Duration::from_millis(STOP_MARGIN_MS),
+            ),
+        };
+        tokio::time::timeout_at(
+            record_deadline,
+            self.record_decision(store, request_digest, recorded),
+        )
+        .await
+        .map_err(|_| GrantRejection::Unrecorded)??;
+        // A refusal returns its category only after the record is durable; an allowed call is
+        // then re-bounded by what that write cost.
+        decision?;
+
+        self.remaining_window(now_ms.saturating_add(elapsed_ms(started)))
+    }
+
+    fn decide_model(
         &self,
         request: &crate::provider::InvocationRequest,
         now_ms: u64,
@@ -262,16 +349,76 @@ impl EffectAuthority {
         if u64::from(request.max_output_tokens().get()) > self.grant.limit_units.get() {
             return Err(GrantRejection::NarrowerThanRequest);
         }
-        if self.authority_stop_unix_ms <= now_ms {
-            return Err(GrantRejection::StaleAuthority);
-        }
+        self.remaining_window(now_ms)
+    }
+
+    /// Returns `min(grant deadline, authority stop) - now_ms`, retested because either clock can
+    /// elapse after intake. The tighter clock names a refusal when both have elapsed.
+    fn remaining_window(&self, now_ms: u64) -> Result<Duration, GrantRejection> {
         let deadline = self.grant.deadline_unix_ms.get();
-        if deadline <= now_ms {
-            return Err(GrantRejection::Expired);
-        }
-        Ok(Duration::from_millis(
-            deadline.min(self.authority_stop_unix_ms) - now_ms,
+        let (cutoff, rejection) = if self.authority_stop_unix_ms <= deadline {
+            (self.authority_stop_unix_ms, GrantRejection::StaleAuthority)
+        } else {
+            (deadline, GrantRejection::Expired)
+        };
+        cutoff
+            .checked_sub(now_ms)
+            .filter(|remaining| *remaining > 0)
+            .map(Duration::from_millis)
+            .ok_or(rejection)
+    }
+
+    /// Publishes one immutable, secret-free decision record before its effect can occur.
+    ///
+    /// Grant fields plus an effect-specific request digest make this seam reusable by sibling
+    /// effect entries. Every failure becomes [`GrantRejection::Unrecorded`].
+    async fn record_decision(
+        &self,
+        store: &S3Store,
+        request_digest: Digest,
+        decision: GateDecision,
+    ) -> Result<(), GrantRejection> {
+        let grant_digest = Digest::new(format!(
+            "{:x}",
+            Sha256::digest(encode_grant(&self.grant).map_err(|_| GrantRejection::Unrecorded)?)
         ))
+        .map_err(|_| GrantRejection::Unrecorded)?;
+        let identity = self.grant.identity();
+        let binding = InvocationBinding::new(
+            identity.scope().scope_id().clone(),
+            identity.plan_digest().clone(),
+            identity.work().id().clone(),
+            identity.work().revision(),
+            identity.claim_fence().get(),
+            grant_digest,
+            self.grant.attempt().get(),
+        )
+        .map_err(|_| GrantRejection::Unrecorded)?;
+        let record = GateDecisionRecord::new(
+            binding,
+            self.grant.action().to_owned(),
+            self.grant.resource_scope().to_owned(),
+            self.grant.operation_id().to_owned(),
+            request_digest,
+            decision,
+        )
+        .map_err(|_| GrantRejection::Unrecorded)?;
+        let (bytes, digest) = record
+            .stored_bytes()
+            .map_err(|_| GrantRejection::Unrecorded)?;
+        let key = scope_gate_decision_key(
+            identity.scope(),
+            identity.work(),
+            identity.claim_fence(),
+            self.grant.attempt(),
+            &digest,
+        );
+        // Effect-gate taxonomy entry (4) excludes this create-only, content-verified decision
+        // write; routing the record through another gate would recurse.
+        store
+            .publish_immutable(&key, bytes, &digest)
+            .await
+            .map_err(|_| GrantRejection::Unrecorded)
     }
 }
 
@@ -281,8 +428,22 @@ impl EffectAuthority {
 /// only mint path outside [`intake`].
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{Digest, EffectAuthority, EffectGrant, ScopeClaimIdentity, ScopeIdentity, WorkRef};
-    use crate::{distributed::identity::WorkspaceId, domain::work::WorkId, scope::CampaignId};
+    use super::{
+        Digest, EffectAuthority, EffectGrant, InstanceId, ScopeClaimIdentity, ScopeIdentity,
+        WorkRef,
+    };
+    use crate::{
+        distributed::identity::WorkspaceId,
+        domain::work::WorkId,
+        invocation::{GateDecisionRecord, decode_gate_decision},
+        scope::CampaignId,
+    };
+
+    /// Test-only provenance grouped to keep [`model_authority`] within the parameter limit.
+    pub(crate) struct ModelAuthorityContext {
+        pub(crate) subject: InstanceId,
+        pub(crate) namespace: String,
+    }
 
     /// An authority for `action` over `resource_scope`, under `operation_id`, authorizing
     /// `limit_units` output tokens.
@@ -290,8 +451,8 @@ pub(crate) mod test_support {
     /// Every value the effect boundary compares against is a parameter, so a refusal case can
     /// vary exactly one of them: the resource scope is a profile's configuration digest, the
     /// operation id is the request's, and `limit_units` is the output-token budget a request's
-    /// cap is checked against. `action` is a parameter too, so a case can name an action the
-    /// boundary does not accept without rebuilding a grant field by field.
+    /// cap is checked against. `action`, subject, and namespace are parameters too, so a case can
+    /// vary any compared value without rebuilding a grant field by field.
     pub(crate) fn model_authority(
         action: String,
         resource_scope: String,
@@ -299,6 +460,7 @@ pub(crate) mod test_support {
         limit_units: u64,
         deadline_unix_ms: u64,
         authority_stop_unix_ms: u64,
+        context: ModelAuthorityContext,
     ) -> EffectAuthority {
         let identity = ScopeClaimIdentity::new(
             ScopeIdentity::root(
@@ -322,8 +484,31 @@ pub(crate) mod test_support {
                 operation_id,
             )
             .unwrap(),
+            subject: context.subject,
+            namespace: context.namespace,
             authority_stop_unix_ms,
         }
+    }
+
+    pub(crate) fn decision_key(uri: &str) -> &str {
+        uri.split_once(".invalid/")
+            .map(|(_, key)| key)
+            .expect("test endpoint path")
+            .split('?')
+            .next()
+            .expect("object key")
+    }
+
+    pub(crate) fn decode_model_record(uri: &str, bytes: &[u8]) -> GateDecisionRecord {
+        let key = decision_key(uri);
+        let digest = key.rsplit('/').next().expect("digest suffix");
+        let scope = ScopeIdentity::root(
+            WorkspaceId::new("workspace-a".into()).unwrap(),
+            CampaignId::new("campaign-a".into()).unwrap(),
+        )
+        .unwrap();
+        let work = WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1);
+        decode_gate_decision(bytes, key, &scope, &work, digest).unwrap()
     }
 }
 
@@ -650,6 +835,8 @@ pub async fn intake(
                         // stop instant takes the shorter of the two.
                         GrantIntake::Accepted(Box::new(EffectAuthority {
                             grant,
+                            subject: authority.instance().clone(),
+                            namespace: store.namespace().to_owned(),
                             authority_stop_unix_ms: authority
                                 .lease_until()
                                 .get()
@@ -768,11 +955,21 @@ pub(crate) fn decode_grant(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::{
+        num::{NonZeroU32, NonZeroU64},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use crate::domain::validation::MAX_STORED_INTEGER;
 
+    use aws_sdk_bedrockruntime::config::{Credentials, HttpClient, Region};
     use aws_sdk_s3::primitives::SdkBody;
+    use aws_smithy_runtime::client::http::test_util::{
+        NeverClient, ReplayEvent, StaticReplayClient,
+    };
 
     use crate::{
         distributed::{
@@ -780,15 +977,20 @@ mod tests {
             scope_controller::{AcquireOutcome, acquire},
         },
         domain::work::WorkId,
+        invocation::GateDecision,
+        provider::{BedrockTransport, InvocationRequest, ModelProfile, ModelProvider},
         scope::{
             AdmittedCampaignConfig, CampaignId, RootGenesis, ScopeAuthority, ScopeHead,
             encode_head, root_genesis,
         },
-        storage::s3::test_support::{replay_store, response},
+        storage::s3::test_support::{replay_store, response, test_builder},
         sync::WireError,
     };
 
-    use super::*;
+    use super::{
+        test_support::{decision_key, decode_model_record},
+        *,
+    };
 
     const NOW_MS: u64 = 1_700_000_000_000;
 
@@ -879,6 +1081,79 @@ mod tests {
             "grant-op-1".into(),
         )
         .unwrap()
+    }
+
+    fn model_request() -> InvocationRequest {
+        InvocationRequest::new(
+            ModelProfile::new(
+                ModelProvider::Bedrock,
+                "anthropic.claude-fixture-v1:0".into(),
+                "profile-a".into(),
+                NonZeroU32::new(4_096).unwrap(),
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+            "secret system text".into(),
+            "secret fixture prompt".into(),
+            NonZeroU32::new(512).unwrap(),
+            "invoke-op-1".into(),
+        )
+        .unwrap()
+    }
+
+    fn model_authority_for(
+        namespace: &str,
+        subject: &str,
+        deadline_unix_ms: u64,
+        authority_stop_unix_ms: u64,
+    ) -> EffectAuthority {
+        let request = model_request();
+        test_support::model_authority(
+            GRANT_ACTION_MODEL_INVOKE.to_owned(),
+            request.profile().configuration_digest(),
+            request.operation_id().to_owned(),
+            u64::from(request.max_output_tokens().get()),
+            deadline_unix_ms,
+            authority_stop_unix_ms,
+            test_support::ModelAuthorityContext {
+                subject: InstanceId::new(subject.into()).unwrap(),
+                namespace: namespace.to_owned(),
+            },
+        )
+    }
+
+    fn bedrock_transport(
+        store: Arc<S3Store>,
+        instance: &str,
+        client: impl HttpClient + 'static,
+    ) -> BedrockTransport {
+        BedrockTransport::new(
+            Region::new("us-east-1"),
+            aws_sdk_bedrockruntime::Config::builder()
+                .credentials_provider(Credentials::for_tests())
+                .endpoint_url("https://bedrock.test.invalid")
+                .http_client(client),
+            store,
+            InstanceId::new(instance.into()).unwrap(),
+        )
+    }
+
+    fn bedrock_replay(
+        store: Arc<S3Store>,
+        responses: Vec<http::Response<SdkBody>>,
+    ) -> (BedrockTransport, StaticReplayClient) {
+        let client = StaticReplayClient::new(
+            responses
+                .into_iter()
+                .map(|response| ReplayEvent::new(http::Request::new(SdkBody::empty()), response))
+                .collect(),
+        );
+        (
+            bedrock_transport(store, "instance-a", client.clone()),
+            client,
+        )
     }
 
     /// The returned store retains replay responses after `acquire` consumes its head read and
@@ -1101,6 +1376,369 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    /// A grant may authorize more output tokens than a call will draw. Without this check, the
+    /// one-sided comparison could become equality and reject every over-provisioned reservation.
+    #[test]
+    fn a_grant_wider_than_the_request_still_authorizes_it() {
+        let request = model_request();
+        let authority = test_support::model_authority(
+            GRANT_ACTION_MODEL_INVOKE.to_owned(),
+            request.profile().configuration_digest(),
+            request.operation_id().to_owned(),
+            u64::from(request.max_output_tokens().get()) + 1,
+            NOW_MS + 60_000,
+            NOW_MS + 25_000,
+            test_support::ModelAuthorityContext {
+                subject: InstanceId::new("instance-a".into()).unwrap(),
+                namespace: "namespace-a".into(),
+            },
+        );
+        assert!(authority.decide_model(&request, NOW_MS).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_refused_dispatch_records_its_reason_before_returning_it() {
+        let (store, decision_client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let store = Arc::new(store);
+        let (transport, bedrock_client) = bedrock_replay(
+            Arc::clone(&store),
+            vec![response(200, &[], SdkBody::empty())],
+        );
+        let authority =
+            model_authority_for(store.namespace(), "instance-a", NOW_MS, NOW_MS + 25_000);
+        let grant_digest = Digest::new(format!(
+            "{:x}",
+            Sha256::digest(encode_grant(&authority.grant).unwrap())
+        ))
+        .unwrap();
+        let request = model_request();
+        let identity = authority.grant.identity();
+        let expected = GateDecisionRecord::new(
+            InvocationBinding::new(
+                identity.scope().scope_id().clone(),
+                identity.plan_digest().clone(),
+                identity.work().id().clone(),
+                identity.work().revision(),
+                identity.claim_fence().get(),
+                grant_digest,
+                authority.grant.attempt().get(),
+            )
+            .unwrap(),
+            authority.grant.action().to_owned(),
+            authority.grant.resource_scope().to_owned(),
+            authority.grant.operation_id().to_owned(),
+            Digest::new(request.request_digest()).unwrap(),
+            GateDecision::Refused(GrantRejection::Expired),
+        )
+        .unwrap();
+        let mut history = AttemptHistory::default();
+
+        assert_eq!(
+            transport
+                .invoke(authority, &request, &mut history, NOW_MS)
+                .await,
+            Err(GrantRejection::Expired)
+        );
+        assert!(!history.may_have_been_sent());
+        assert_eq!(bedrock_client.actual_requests().count(), 0);
+        let sent = decision_client
+            .actual_requests()
+            .next()
+            .expect("decision PUT");
+        assert_eq!(
+            decode_model_record(sent.uri(), sent.body().bytes().expect("in-memory decision")),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_decision_refuses_the_dispatch() {
+        let (store, decision_client) = replay_store(vec![
+            response(500, &[], SdkBody::empty()),
+            response(500, &[], SdkBody::empty()),
+        ]);
+        let store = Arc::new(store);
+        let (transport, bedrock_client) = bedrock_replay(
+            Arc::clone(&store),
+            vec![response(200, &[], SdkBody::empty())],
+        );
+        let authority = model_authority_for(
+            store.namespace(),
+            "instance-a",
+            NOW_MS + 60_000,
+            NOW_MS + 25_000,
+        );
+        let mut history = AttemptHistory::default();
+
+        assert_eq!(
+            transport
+                .invoke(authority, &model_request(), &mut history, NOW_MS)
+                .await,
+            Err(GrantRejection::Unrecorded)
+        );
+        assert_eq!(decision_client.actual_requests().count(), 2);
+        assert_eq!(bedrock_client.actual_requests().count(), 0);
+        assert!(!history.may_have_been_sent());
+    }
+
+    #[tokio::test]
+    async fn a_refused_decision_record_carries_no_request_text() {
+        let (store, decision_client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let authority =
+            model_authority_for(store.namespace(), "instance-a", NOW_MS, NOW_MS + 25_000);
+
+        assert_eq!(
+            authority
+                .authorize_model(
+                    &store,
+                    &InstanceId::new("instance-a".into()).unwrap(),
+                    &model_request(),
+                    NOW_MS,
+                )
+                .await,
+            Err(GrantRejection::Expired)
+        );
+        let sent = decision_client
+            .actual_requests()
+            .next()
+            .expect("decision PUT");
+        let stored = sent.body().bytes().expect("in-memory decision");
+        assert!(
+            !stored
+                .windows(b"secret fixture prompt".len())
+                .any(|bytes| { bytes == b"secret fixture prompt" })
+        );
+        assert!(
+            !stored
+                .windows(b"secret system text".len())
+                .any(|bytes| { bytes == b"secret system text" })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identical_refusal_reconciles_at_one_key() {
+        let (first_store, first_client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let first = model_authority_for(
+            first_store.namespace(),
+            "instance-a",
+            NOW_MS,
+            NOW_MS + 25_000,
+        );
+        assert_eq!(
+            first
+                .authorize_model(
+                    &first_store,
+                    &InstanceId::new("instance-a".into()).unwrap(),
+                    &model_request(),
+                    NOW_MS,
+                )
+                .await,
+            Err(GrantRejection::Expired)
+        );
+        let first_request = first_client.actual_requests().next().expect("first PUT");
+        let bytes = first_request
+            .body()
+            .bytes()
+            .expect("in-memory decision")
+            .to_vec();
+        let first_uri = first_request.uri().to_owned();
+
+        let (store, client) = replay_store(vec![
+            response(409, &[], SdkBody::empty()),
+            response(200, &[], bytes),
+        ]);
+        let authority =
+            model_authority_for(store.namespace(), "instance-a", NOW_MS, NOW_MS + 25_000);
+        assert_eq!(
+            authority
+                .authorize_model(
+                    &store,
+                    &InstanceId::new("instance-a".into()).unwrap(),
+                    &model_request(),
+                    NOW_MS,
+                )
+                .await,
+            Err(GrantRejection::Expired)
+        );
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(decision_key(requests[0].uri()), decision_key(&first_uri));
+        assert_eq!(decision_key(requests[1].uri()), decision_key(&first_uri));
+    }
+
+    #[tokio::test]
+    async fn a_namespace_mismatch_refuses_before_recording() {
+        let (store, decision_client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let (foreign, _) = replay_store(Vec::new());
+        let store = Arc::new(store);
+        let (transport, bedrock_client) = bedrock_replay(
+            Arc::clone(&store),
+            vec![response(200, &[], SdkBody::empty())],
+        );
+        let authority = model_authority_for(
+            foreign.namespace(),
+            "instance-a",
+            NOW_MS + 60_000,
+            NOW_MS + 25_000,
+        );
+        let mut history = AttemptHistory::default();
+
+        assert_eq!(
+            transport
+                .invoke(authority, &model_request(), &mut history, NOW_MS)
+                .await,
+            Err(GrantRejection::StaleAuthority)
+        );
+        assert_eq!(decision_client.actual_requests().count(), 0);
+        assert_eq!(bedrock_client.actual_requests().count(), 0);
+        assert!(!history.may_have_been_sent());
+    }
+
+    #[tokio::test]
+    async fn an_allowed_dispatch_records_before_it_sends() {
+        let (store, decision_client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let store = Arc::new(store);
+        let observed_send = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_send);
+        let decisions = decision_client.clone();
+        let bedrock_client = aws_smithy_http_client::test_util::infallible_client_fn(move |_| {
+            assert_eq!(decisions.actual_requests().count(), 1);
+            observed.store(true, Ordering::SeqCst);
+            response(
+                200,
+                &[("content-type", "application/json")],
+                r#"{"output":{"message":{"role":"assistant","content":[{"text":"answer"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}"#,
+            )
+        });
+        let transport = bedrock_transport(Arc::clone(&store), "instance-a", bedrock_client);
+        let authority = model_authority_for(
+            store.namespace(),
+            "instance-a",
+            NOW_MS + 60_000,
+            NOW_MS + 25_000,
+        );
+        let mut history = AttemptHistory::default();
+
+        assert!(
+            transport
+                .invoke(authority, &model_request(), &mut history, NOW_MS)
+                .await
+                .is_ok()
+        );
+        assert!(observed_send.load(Ordering::SeqCst));
+        let sent = decision_client
+            .actual_requests()
+            .next()
+            .expect("decision PUT");
+        let record =
+            decode_model_record(sent.uri(), sent.body().bytes().expect("in-memory decision"));
+        assert_eq!(record.decision().as_str(), "allowed");
+    }
+
+    #[tokio::test]
+    async fn an_allowed_record_can_precede_a_charged_window_refusal() {
+        // This connector does not yield, so Tokio polls its successful response before noticing
+        // the timeout deadline. The post-write charge must still stop dispatch.
+        let captured = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&captured);
+        let client = aws_smithy_http_client::test_util::infallible_client_fn(move |request| {
+            std::thread::sleep(Duration::from_millis(1_200));
+            *observed.lock().unwrap() = Some((
+                request.uri().to_string(),
+                request.body().bytes().unwrap().to_vec(),
+            ));
+            response(200, &[], SdkBody::empty())
+        });
+        let store = S3Store::new(
+            "test-bucket",
+            aws_sdk_s3::config::Region::new("us-east-1"),
+            test_builder(client),
+        );
+        let authority = model_authority_for(
+            store.namespace(),
+            "instance-a",
+            NOW_MS + 60_000,
+            NOW_MS + 1_000,
+        );
+
+        assert_eq!(
+            authority
+                .authorize_model(
+                    &store,
+                    &InstanceId::new("instance-a".into()).unwrap(),
+                    &model_request(),
+                    NOW_MS,
+                )
+                .await,
+            Err(GrantRejection::StaleAuthority)
+        );
+        let (uri, bytes) = captured.lock().unwrap().take().expect("decision PUT");
+        assert_eq!(
+            decode_model_record(&uri, &bytes).decision(),
+            GateDecision::Allowed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_decision_write_has_a_bounded_record_budget() {
+        let never_store = NeverClient::new();
+        let store = S3Store::new(
+            "test-bucket",
+            aws_sdk_s3::config::Region::new("us-east-1"),
+            test_builder(never_store.clone()),
+        );
+        let authority =
+            model_authority_for(store.namespace(), "instance-a", NOW_MS, NOW_MS + 25_000);
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            authority
+                .authorize_model(
+                    &store,
+                    &InstanceId::new("instance-a".into()).unwrap(),
+                    &model_request(),
+                    NOW_MS,
+                )
+                .await,
+            Err(GrantRejection::Unrecorded)
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(STOP_MARGIN_MS));
+        assert_eq!(never_store.num_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_elapsed_decision_write_refuses_the_dispatch() {
+        let never_store = NeverClient::new();
+        let store = Arc::new(S3Store::new(
+            "test-bucket",
+            aws_sdk_s3::config::Region::new("us-east-1"),
+            test_builder(never_store.clone()),
+        ));
+        let (transport, bedrock_client) = bedrock_replay(
+            Arc::clone(&store),
+            vec![response(200, &[], SdkBody::empty())],
+        );
+        let authority = model_authority_for(
+            store.namespace(),
+            "instance-a",
+            NOW_MS + 60_000,
+            NOW_MS + 3_000,
+        );
+        let mut history = AttemptHistory::default();
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            transport
+                .invoke(authority, &model_request(), &mut history, NOW_MS)
+                .await,
+            Err(GrantRejection::Unrecorded)
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(3_000));
+        assert_eq!(never_store.num_calls(), 1);
+        assert_eq!(bedrock_client.actual_requests().count(), 0);
+        assert!(!history.may_have_been_sent());
     }
 
     #[tokio::test]
@@ -1777,9 +2415,12 @@ mod tests {
         let GrantIntake::Accepted(accepted) = accepted else {
             panic!("expected acceptance");
         };
-        // Reading the private fields is what this test is for: every other test hands them
-        // literals, so without this the stop instant could be minted as `u64::MAX` unnoticed.
+        // Reading private fields is this test's purpose: every other test hands them literals,
+        // so a stop minted as `u64::MAX`, or provenance minted from something other than the
+        // proving authority and its store, would otherwise pass unnoticed.
         assert_eq!(accepted.grant, grant);
+        assert_eq!(accepted.subject, *later_reader.instance());
+        assert_eq!(accepted.namespace, later_store.namespace());
         // The claim lease (seeded at NOW_MS + 30_000) ends before this reader's term, so it
         // is the clock that must set the stop instant; a stop minted from the controller
         // lease alone would end STOP_MARGIN_MS short of that later term instead.

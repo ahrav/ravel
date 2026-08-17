@@ -38,6 +38,11 @@ use crate::{
 pub const MAX_GRANT_BYTES: usize = 4 * 1024;
 
 const GRANT_RECORD: &str = "effect_grant";
+/// The action a grant must name to authorize a model invocation.
+///
+/// A `&str` rather than an enum because the comparison is an equality against the grant's own
+/// free-form action, which [`EffectGrant::new`] validates as one key segment.
+pub const GRANT_ACTION_MODEL_INVOKE: &str = "model_invoke";
 
 /// Bounded authority for one external operation under one claim generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,10 +180,136 @@ pub enum GrantRejection {
     Malformed,
 }
 
+/// Proof that a claim and a grant were both checked against durable state.
+///
+/// Only [`intake`] constructs this, the way only `publish` constructs
+/// [`crate::storage::artifacts::PublishedArtifact`]: the fields are private to this module, so
+/// rustc refuses construction from every other module in the crate, including the transports
+/// that require one. That is the whole guarantee and its whole extent — this module and its
+/// children can still build one, and the crate boundary contributes nothing because every
+/// caller is in-crate.
+///
+/// It carries a stop instant as well as the grant, because either can run out first and
+/// nothing at issuance bounds the grant's deadline by a lease: issuance refuses only a
+/// grant already expired. The stop instant is the shorter of the two leases that prove
+/// current ownership — the controller's term and the work claim's lease — each less
+/// [`STOP_MARGIN_MS`], because they expire independently: the controller renews its own
+/// term while a claim lease is not renewed by anything in this crate, and an unexpired
+/// claim survives controller takeover. A call bounded only by the grant, or by only one
+/// of the leases, could outlive the other one, and a successor that legitimately took the
+/// claim could be dispatching at the same time.
+#[must_use]
+pub struct EffectAuthority {
+    grant: EffectGrant,
+    /// Instant past which the proving authority must stop: the shorter of the controller
+    /// lease and the work-claim lease, less [`STOP_MARGIN_MS`].
+    authority_stop_unix_ms: u64,
+}
+
+impl EffectAuthority {
+    /// Decides this authority against the request it would authorize, returning how long the
+    /// call may run.
+    ///
+    /// The bound is the shorter of the grant's deadline and the proving lease's stop instant.
+    /// Both are retested here rather than trusted from intake, because intake decided at its own
+    /// `now_ms` and either term can elapse before a call is dispatched.
+    ///
+    /// The request is the argument rather than an action and a scope, because the only source
+    /// for those would be the caller handing the authority its own values back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrantRejection::IdentityMismatch`] when the grant does not name a model
+    /// invocation of this request's profile and operation, [`GrantRejection::Expired`] for a
+    /// grant past its deadline, and [`GrantRejection::StaleAuthority`] when the proving lease
+    /// has stopped.
+    pub fn authorizes_model(
+        &self,
+        request: &crate::provider::InvocationRequest,
+        now_ms: u64,
+    ) -> Result<Duration, GrantRejection> {
+        // The operation identity is what makes this authority specific to one call. Without it
+        // a grant issued for one operation would authorize any request against the same
+        // profile, so the same operation could be paid for twice under one grant with nothing
+        // able to tell the second dispatch from the first. `intake` pins the grant's own
+        // operation id against the caller's expectation; this pins it against the request
+        // actually being sent.
+        //
+        // `limit_units` is deliberately not compared against the output-token cap. The grant's
+        // units have no denomination anywhere in this crate, so treating them as tokens would
+        // invent a contract rather than enforce one.
+        if self.grant.action != GRANT_ACTION_MODEL_INVOKE
+            || self.grant.resource_scope != request.profile().configuration_digest()
+            || self.grant.operation_id != request.operation_id()
+        {
+            return Err(GrantRejection::IdentityMismatch);
+        }
+        if self.authority_stop_unix_ms <= now_ms {
+            return Err(GrantRejection::StaleAuthority);
+        }
+        let deadline = self.grant.deadline_unix_ms.get();
+        if deadline <= now_ms {
+            return Err(GrantRejection::Expired);
+        }
+        Ok(Duration::from_millis(
+            deadline.min(self.authority_stop_unix_ms) - now_ms,
+        ))
+    }
+}
+
+/// Mints an [`EffectAuthority`] without an object store or a projection.
+///
+/// The fields are private to this module, so a test elsewhere cannot assemble one. This is the
+/// only mint path outside [`intake`].
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{Digest, EffectAuthority, EffectGrant, ScopeClaimIdentity, ScopeIdentity, WorkRef};
+    use crate::{distributed::identity::WorkspaceId, domain::work::WorkId, scope::CampaignId};
+
+    /// An authority for `action` over `resource_scope`, under `operation_id`.
+    ///
+    /// `resource_scope` is a profile's configuration digest and `operation_id` is the request's,
+    /// because those are what the effect boundary compares against. `action` is a parameter so a
+    /// refusal case can name an action the boundary does not accept without rebuilding a grant
+    /// field by field.
+    pub(crate) fn model_authority(
+        action: String,
+        resource_scope: String,
+        operation_id: String,
+        deadline_unix_ms: u64,
+        authority_stop_unix_ms: u64,
+    ) -> EffectAuthority {
+        let identity = ScopeClaimIdentity::new(
+            ScopeIdentity::root(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-a".into()).unwrap(),
+            )
+            .unwrap(),
+            Digest::new("11".repeat(32)).unwrap(),
+            WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1),
+            2,
+        )
+        .unwrap();
+        EffectAuthority {
+            grant: EffectGrant::new(
+                identity,
+                action,
+                resource_scope,
+                1,
+                1_000,
+                deadline_unix_ms,
+                operation_id,
+            )
+            .unwrap(),
+            authority_stop_unix_ms,
+        }
+    }
+}
+
 /// Outcome of reading one grant back for use.
 #[must_use]
 pub enum GrantIntake {
-    Accepted(Box<EffectGrant>),
+    Accepted(Box<EffectAuthority>),
     Rejected(GrantRejection),
     /// Storage or projection transport failed; retry may succeed.
     Unavailable,
@@ -491,7 +622,19 @@ pub async fn intake(
                 }
                 Some(row) if row.claim_fence() == expected.identity.claim_fence() => {
                     if row.grant_digest().as_str() == format!("{:x}", Sha256::digest(&bytes)) {
-                        GrantIntake::Accepted(Box::new(grant))
+                        // The controller lease and the work-claim lease expire independently:
+                        // the controller renews its own term, while nothing renews a claim
+                        // lease, and a claim survives controller takeover. Whichever ends
+                        // first is when a successor can legitimately be dispatching, so the
+                        // stop instant takes the shorter of the two.
+                        GrantIntake::Accepted(Box::new(EffectAuthority {
+                            grant,
+                            authority_stop_unix_ms: authority
+                                .lease_until()
+                                .get()
+                                .min(row.claim_lease_until().get())
+                                .saturating_sub(STOP_MARGIN_MS),
+                        }))
                     } else {
                         GrantIntake::Rejected(GrantRejection::IdentityMismatch)
                     }
@@ -1561,11 +1704,7 @@ mod tests {
         // Each intake consumes one GET from the store used to acquire its authority.
         let (reader, store, _) = authority_with_plan(
             Some(plan()),
-            vec![
-                found(bytes.clone()),
-                found(bytes.clone()),
-                found(encode_grant(&rival).unwrap()),
-            ],
+            vec![found(bytes.clone()), found(encode_grant(&rival).unwrap())],
         )
         .await;
 
@@ -1593,18 +1732,41 @@ mod tests {
         )
         .await;
         let _ = issued(issue_once(&publish, &handle, issuer, &grant, NOW_MS).await);
+        // Acquired later than the seeding, so this reader's term outlives the claim lease
+        // and the two clocks in the minted stop instant are distinguishable.
+        let later_head = ScopeHead::new(
+            genesis().identity().clone(),
+            ScopeAuthority::Unowned,
+            1,
+            genesis().event_ref().clone(),
+            Some(plan()),
+            "op-authority".into(),
+        )
+        .unwrap();
+        let (later_reader, later_store, _) =
+            authority_from_head(later_head, vec![found(bytes.clone())], NOW_MS + 10_000).await;
         let accepted = intake(
-            &store,
+            &later_store,
             &handle,
             &expected(2, 5, NOW_MS + 60_000),
-            &reader,
-            NOW_MS,
+            &later_reader,
+            NOW_MS + 10_000,
         )
         .await;
         let GrantIntake::Accepted(accepted) = accepted else {
             panic!("expected acceptance");
         };
-        assert_eq!(*accepted, grant);
+        // Reading the private fields is what this test is for: every other test hands them
+        // literals, so without this the stop instant could be minted as `u64::MAX` unnoticed.
+        assert_eq!(accepted.grant, grant);
+        // The claim lease (seeded at NOW_MS + 30_000) ends before this reader's term, so it
+        // is the clock that must set the stop instant; a stop minted from the controller
+        // lease alone would end STOP_MARGIN_MS short of that later term instead.
+        assert!(later_reader.lease_until().get() > NOW_MS + 30_000);
+        assert_eq!(
+            accepted.authority_stop_unix_ms,
+            NOW_MS + 30_000 - STOP_MARGIN_MS
+        );
 
         // A grant with matching bindings must equal the projection's recorded grant.
         assert!(matches!(

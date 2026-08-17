@@ -35,7 +35,10 @@ use aws_sdk_bedrockruntime::{
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::dispatch::AttemptHistory;
+use crate::{
+    dispatch::AttemptHistory,
+    distributed::grants::{EffectAuthority, GrantRejection},
+};
 
 /// Whole-operation bound, including every byte of the completion.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -702,15 +705,35 @@ impl BedrockTransport {
         }
     }
 
-    /// Dispatches one invocation, recording possible dispatch before awaiting the SDK.
+    /// Dispatches one invocation under proven authority, recording possible dispatch before
+    /// awaiting the SDK.
     ///
-    /// The cap was validated against the profile ceiling when the request was built, so
-    /// the only pre-dispatch refusal left here is a request the SDK cannot construct.
+    /// The authority is taken by value: a grant is authority for one external operation and
+    /// binds one attempt, and behind a shared reference neither `#[must_use]` nor the absent
+    /// `Clone` would stop one accepted intake from driving a loop of paid calls. Consuming it
+    /// costs the caller nothing it needs afterwards, because a
+    /// [`crate::invocation::InvocationBinding`] derived
+    /// before dispatch outlives it and is what the manifest and the terminal trace are written
+    /// under.
+    ///
+    /// The refusal returns before the request is built and before this attempt is marked as
+    /// possibly sent, so an unauthorized call cannot make a later attempt on the same history
+    /// report dispatch uncertainty it did not earn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`GrantRejection`] that refused the authority. The call itself never
+    /// produces one: every provider result is an [`InvocationOutcome`].
     pub async fn invoke(
         &self,
+        authority: EffectAuthority,
         request: &InvocationRequest,
         history: &mut AttemptHistory,
-    ) -> InvocationOutcome {
+        now_ms: u64,
+    ) -> Result<InvocationOutcome, GrantRejection> {
+        // Before anything else, including before the request is built: an unauthorized call
+        // must leave no trace on the attempt history.
+        let authorized_for = authority.authorizes_model(request, now_ms)?;
         // Dispatching to Bedrock is a decision about the request's provider, so this site
         // names it: a second `ModelProvider` variant cannot compile until the decision is
         // made here, rather than being sent to Bedrock under another provider's identity.
@@ -732,11 +755,11 @@ impl BedrockTransport {
             // and no later attempt retires that, so the stronger claim is reserved for a
             // clean history.
             Err(_) if history.may_have_been_sent() => {
-                return InvocationOutcome::Unknown {
+                return Ok(InvocationOutcome::Unknown {
                     provider_request_id: None,
-                };
+                });
             }
-            Err(_) => return InvocationOutcome::ProvenNotSent,
+            Err(_) => return Ok(InvocationOutcome::ProvenNotSent),
         };
         let mut call = self
             .client
@@ -762,7 +785,36 @@ impl BedrockTransport {
         #[cfg(not(debug_assertions))]
         history.bind(request.operation_id());
         let prior_unknown = history.mark_possible_send();
-        let outcome = classify(call.send().await, request.max_output_tokens, prior_unknown);
+        // The authorized term, not the fixed policy, bounds this call. `OPERATION_TIMEOUT` is
+        // 120 s while a lease term is 30 s, so the fixed bound alone would let a dispatch run
+        // long past the authority that proved current ownership, in a window where a successor
+        // could legitimately have taken the claim and be dispatching too.
+        //
+        // Overriding only `operation_timeout` leaves the rest of the policy in place: the
+        // orchestrator merges an override's unset fields from the client config, so
+        // `ATTEMPT_TIMEOUT`, disabled retries, and stalled-stream protection all survive.
+        //
+        // `Converse` is not a streaming operation, so its deserializer reads the whole body
+        // inside the orchestrator's timeout scope: this bound covers serialization, transmit,
+        // body read, and deserialization rather than only time to headers.
+        //
+        // The term is not capped at `OPERATION_TIMEOUT`, so a long term does raise this
+        // operation's own timeout above the fixed policy. Capping it would change no outcome:
+        // retries are disabled, so exactly one attempt runs, and the client's `ATTEMPT_TIMEOUT`
+        // is the lower of the two and survives an override that sets only the operation
+        // timeout.
+        let bounded = call
+            .customize()
+            .config_override(
+                aws_sdk_bedrockruntime::config::Config::builder().timeout_config(
+                    TimeoutConfig::builder()
+                        .operation_timeout(authorized_for)
+                        .build(),
+                ),
+            )
+            .send()
+            .await;
+        let outcome = classify(bounded, request.max_output_tokens, prior_unknown);
         // A verdict about this attempt is not a verdict about an earlier one. An invocation
         // has no remote state to reconcile, so nothing retires the possibility that a prior
         // attempt already reached the provider and was billed; the prior value therefore
@@ -777,7 +829,7 @@ impl BedrockTransport {
                         | InvocationOutcome::Unknown { .. }
                 ),
         );
-        outcome
+        Ok(outcome)
     }
 }
 
@@ -786,9 +838,10 @@ fn configured(region: Region, builder: Builder) -> aws_sdk_bedrockruntime::Confi
         .operation_timeout(OPERATION_TIMEOUT)
         .operation_attempt_timeout(ATTEMPT_TIMEOUT)
         .build();
-    // Operation and attempt timeouts stop applying once response headers arrive, so a
-    // trickling body is bounded by stalled-stream protection instead. Setting every policy
-    // after the caller's builder keeps a supplied configuration from disabling it.
+    // A streaming response body is read after these timeouts stop applying, so stalled-stream
+    // protection is what bounds a trickling one. This client's only operation is not streaming,
+    // so its body read falls inside the timeouts. Setting every policy after the caller's
+    // builder keeps a supplied configuration from disabling it.
     builder
         .region(region)
         .retry_config(RetryConfig::disabled())
@@ -1065,6 +1118,29 @@ mod tests {
     };
 
     use super::*;
+    use crate::distributed::grants::{GRANT_ACTION_MODEL_INVOKE, test_support::model_authority};
+
+    /// Fixed clock for the tests, so an authority's term is stated rather than sampled.
+    const NOW_MS: u64 = 1_700_000_000_000;
+
+    /// An authority that permits the fixture request: it names a model invocation of the
+    /// fixture profile, and both its grant and its proving lease have term left at `NOW_MS`.
+    fn authority() -> EffectAuthority {
+        authority_for(&request())
+    }
+
+    /// An authority that permits one specific request, for tests whose profile is not the
+    /// fixture's: the resource scope is the profile's configuration digest, so an authority
+    /// minted for one profile refuses a call to any other.
+    fn authority_for(request: &InvocationRequest) -> EffectAuthority {
+        model_authority(
+            GRANT_ACTION_MODEL_INVOKE.to_owned(),
+            request.profile().configuration_digest(),
+            request.operation_id().to_owned(),
+            NOW_MS + 60_000,
+            NOW_MS + 25_000,
+        )
+    }
 
     const MODEL_ID: &str = "anthropic.claude-fixture-v1:0";
     const PROVIDER_REQUEST_ID: &str = "req-fixture-1";
@@ -1163,7 +1239,10 @@ mod tests {
 
     async fn invoke(transport: &BedrockTransport) -> InvocationOutcome {
         let mut history = AttemptHistory::default();
-        transport.invoke(&request(), &mut history).await
+        transport
+            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .await
+            .expect("the fixture authority permits the fixture request")
     }
 
     #[tokio::test]
@@ -1477,9 +1556,7 @@ mod tests {
         // A frame the deserializer rejects yields no usage, but the call stays correlatable:
         // the request id comes off the raw response, not the decoded body.
         let (undecodable, _) = replay(vec![json(String::from("not json"))]);
-        let outcome = undecodable
-            .invoke(&request(), &mut AttemptHistory::default())
-            .await;
+        let outcome = invoke(&undecodable).await;
         let InvocationOutcome::MalformedResponse {
             reported_use,
             provider_request_id,
@@ -1511,7 +1588,10 @@ mod tests {
             BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
         let mut history = AttemptHistory::default();
 
-        let outcome = transport.invoke(&request(), &mut history).await;
+        let outcome = transport
+            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .await
+            .expect("the fixture authority permits the fixture request");
         assert_eq!(
             outcome,
             InvocationOutcome::TimedOut {
@@ -1561,7 +1641,10 @@ mod tests {
         ] {
             let (transport, _) = replay(vec![frame]);
             let mut history = AttemptHistory::default();
-            let outcome = transport.invoke(&request(), &mut history).await;
+            let outcome = transport
+                .invoke(authority(), &request(), &mut history, NOW_MS)
+                .await
+                .expect("the fixture authority permits the fixture request");
             assert_eq!(
                 !history.may_have_been_sent(),
                 expected_clean,
@@ -1575,7 +1658,10 @@ mod tests {
             let (transport, _) = replay(vec![frame]);
             let mut history = AttemptHistory::default();
             history.mark_possible_send();
-            let outcome = transport.invoke(&request(), &mut history).await;
+            let outcome = transport
+                .invoke(authority(), &request(), &mut history, NOW_MS)
+                .await
+                .expect("the fixture authority permits the fixture request");
             assert!(
                 history.may_have_been_sent(),
                 "{outcome:?} discarded a prior attempt's evidence"
@@ -1596,7 +1682,10 @@ mod tests {
         let mut history = AttemptHistory::default();
         history.bind("some-other-operation");
 
-        let _ = transport.invoke(&request(), &mut history).await;
+        let _ = transport
+            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .await
+            .expect("the fixture authority permits the fixture request");
     }
 
     /// A connector that cannot reach the service is the one failure that never produced a
@@ -1618,7 +1707,10 @@ mod tests {
         let mut history = AttemptHistory::default();
 
         assert_eq!(
-            transport.invoke(&request(), &mut history).await,
+            transport
+                .invoke(authority(), &request(), &mut history, NOW_MS)
+                .await
+                .expect("the fixture authority permits the fixture request"),
             InvocationOutcome::Unknown {
                 provider_request_id: None
             }
@@ -1653,9 +1745,7 @@ mod tests {
                  \"totalTokens\":900000}}}}"
             ))]);
 
-            let outcome = transport
-                .invoke(&request(), &mut AttemptHistory::default())
-                .await;
+            let outcome = invoke(&transport).await;
             let InvocationOutcome::Refused {
                 reason,
                 reported_use,
@@ -1768,7 +1858,10 @@ mod tests {
             let mut history = AttemptHistory::default();
 
             assert_eq!(
-                transport.invoke(&request(), &mut history).await,
+                transport
+                    .invoke(authority(), &request(), &mut history, NOW_MS)
+                    .await
+                    .expect("the fixture authority permits the fixture request"),
                 expected,
                 "{error_type}"
             );
@@ -1850,7 +1943,10 @@ mod tests {
         ))]);
         let mut history = AttemptHistory::default();
 
-        let outcome = transport.invoke(&request(), &mut history).await;
+        let outcome = transport
+            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .await
+            .expect("the fixture authority permits the fixture request");
         let InvocationOutcome::Refused {
             reason,
             reported_use,
@@ -2039,7 +2135,10 @@ mod tests {
         ))]);
         let mut history = AttemptHistory::default();
 
-        let outcome = transport.invoke(&request(), &mut history).await;
+        let outcome = transport
+            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .await
+            .expect("the fixture authority permits the fixture request");
         let InvocationOutcome::Completed { text, reason, .. } = &outcome else {
             panic!("expected a completion, got {outcome:?}");
         };
@@ -2069,8 +2168,14 @@ mod tests {
         )
         .unwrap();
 
-        transport.invoke(&request(), &mut history).await;
-        transport.invoke(&changed, &mut history).await;
+        transport
+            .invoke(authority(), &request(), &mut history, NOW_MS)
+            .await
+            .expect("the fixture authority permits the fixture request");
+        transport
+            .invoke(authority_for(&changed), &changed, &mut history, NOW_MS)
+            .await
+            .expect("the authority names this request's profile and operation");
     }
 
     /// A construction failure proves this attempt sent nothing, never that the operation
@@ -2123,9 +2228,7 @@ mod tests {
             ("max_tokens", TerminalReason::CapReached),
         ] {
             let (transport, _) = replay(vec![json(converse_body(wire, Some((1, 1, 2)), "text"))]);
-            let outcome = transport
-                .invoke(&request(), &mut AttemptHistory::default())
-                .await;
+            let outcome = invoke(&transport).await;
             let InvocationOutcome::Completed { reason, .. } = outcome else {
                 panic!("expected a completion for {wire}, got {outcome:?}");
             };
@@ -2145,9 +2248,7 @@ mod tests {
             &"x".repeat(MAX_COMPLETION_BYTES),
         ))]);
         assert!(matches!(
-            at_bound
-                .invoke(&request(), &mut AttemptHistory::default())
-                .await,
+            invoke(&at_bound).await,
             InvocationOutcome::Completed { .. }
         ));
 
@@ -2158,9 +2259,7 @@ mod tests {
             &oversized,
         ))]);
 
-        let outcome = transport
-            .invoke(&request(), &mut AttemptHistory::default())
-            .await;
+        let outcome = invoke(&transport).await;
         assert!(
             matches!(outcome, InvocationOutcome::MalformedResponse { .. }),
             "{outcome:?}"
@@ -2225,8 +2324,14 @@ mod tests {
             "answer",
         ))]);
         let _ = transport
-            .invoke(&request, &mut AttemptHistory::default())
-            .await;
+            .invoke(
+                authority_for(&request),
+                &request,
+                &mut AttemptHistory::default(),
+                NOW_MS,
+            )
+            .await
+            .expect("the authority names this request's profile");
 
         let sent = client.actual_requests().next().expect("one request");
         let body = std::str::from_utf8(sent.body().bytes().expect("in-memory body"))
@@ -2283,7 +2388,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(1),
-                transport.invoke(&request(), &mut history),
+                transport.invoke(authority(), &request(), &mut history, NOW_MS),
             )
             .await
             .is_err()
@@ -2345,8 +2450,14 @@ mod tests {
             SECRET_COMPLETION,
         ))]);
         let outcome = transport
-            .invoke(&request, &mut AttemptHistory::default())
-            .await;
+            .invoke(
+                authority(),
+                &request,
+                &mut AttemptHistory::default(),
+                NOW_MS,
+            )
+            .await
+            .expect("the fixture authority permits the fixture request");
         assert!(
             matches!(outcome, InvocationOutcome::Completed { .. }),
             "{outcome:?}"
@@ -2817,15 +2928,163 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(600),
-            transport.invoke(&request(), &mut history),
+            transport.invoke(authority(), &request(), &mut history, NOW_MS),
         )
         .await
         .expect("the enforced bound fires before this one");
         assert_eq!(
             outcome,
-            InvocationOutcome::TimedOut {
+            Ok(InvocationOutcome::TimedOut {
                 provider_request_id: None
-            }
+            })
         );
+    }
+
+    /// Every way an authority can fail to permit a call, refused before anything is dispatched
+    /// and before the attempt history records a possible send.
+    ///
+    /// Under a paused clock a dispatched call against `NeverClient` returns `TimedOut` rather
+    /// than hanging, so it is the `Err` equality that proves no request left, and the clean
+    /// history that proves no trace was recorded: a refused call must not leave a later attempt
+    /// claiming dispatch uncertainty it never earned.
+    #[tokio::test(start_paused = true)]
+    async fn an_authority_that_does_not_permit_the_call_refuses_before_dispatch() {
+        let transport =
+            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+        let action = GRANT_ACTION_MODEL_INVOKE.to_owned();
+        let scope = profile().configuration_digest();
+        let operation = OPERATION_ID.to_owned();
+        let deadline = NOW_MS + 60_000;
+        let stop = NOW_MS + 25_000;
+
+        for (case, action, scope, operation, deadline, stop, expected) in [
+            (
+                "an action this boundary does not accept",
+                "git-push".to_owned(),
+                scope.clone(),
+                operation.clone(),
+                deadline,
+                stop,
+                GrantRejection::IdentityMismatch,
+            ),
+            (
+                "another profile's configuration",
+                action.clone(),
+                "cd".repeat(32),
+                operation.clone(),
+                deadline,
+                stop,
+                GrantRejection::IdentityMismatch,
+            ),
+            (
+                "another operation",
+                action.clone(),
+                scope.clone(),
+                "invoke-op-elsewhere".to_owned(),
+                deadline,
+                stop,
+                GrantRejection::IdentityMismatch,
+            ),
+            (
+                "the grant deadline has passed",
+                action.clone(),
+                scope.clone(),
+                operation.clone(),
+                NOW_MS,
+                stop,
+                GrantRejection::Expired,
+            ),
+            (
+                "the proving lease has stopped",
+                action,
+                scope,
+                operation,
+                deadline,
+                NOW_MS,
+                GrantRejection::StaleAuthority,
+            ),
+        ] {
+            let mut history = AttemptHistory::default();
+            assert_eq!(
+                transport
+                    .invoke(
+                        model_authority(action, scope, operation, deadline, stop),
+                        &request(),
+                        &mut history,
+                        NOW_MS,
+                    )
+                    .await,
+                Err(expected),
+                "{case}"
+            );
+            assert!(!history.may_have_been_sent(), "{case}");
+        }
+    }
+
+    /// The call is bounded by whichever clock runs out first.
+    ///
+    /// One case per side of the bound's `min`, because either alone would let a dispatch outlive
+    /// the thing that permitted it: past the lease, a successor could legitimately have taken the
+    /// claim and be dispatching too; past the grant deadline, the call runs on budget reserved
+    /// until that instant and no longer.
+    ///
+    /// The third case is the client's attempt timeout, which a term longer than the fixed
+    /// policy must not raise: the override sets only the operation timeout.
+    #[tokio::test(start_paused = true)]
+    async fn the_call_is_bounded_by_the_shortest_of_lease_grant_and_fixed_policy() {
+        let transport =
+            BedrockTransport::new(Region::new("us-east-1"), builder(NeverClient::new()));
+
+        for (case, deadline, stop, outer) in [
+            (
+                "the lease is the shorter clock",
+                NOW_MS + 60_000,
+                NOW_MS + 3_000,
+                30,
+            ),
+            (
+                "the grant is the shorter clock",
+                NOW_MS + 3_000,
+                NOW_MS + 60_000,
+                30,
+            ),
+            // A term far past the fixed policy, which raises this operation's own timeout to
+            // 600 s. Resolving inside 91 s proves the client's `ATTEMPT_TIMEOUT` survived the
+            // override and bounded the single attempt retries are disabled down to.
+            (
+                "the attempt timeout outlives the override",
+                NOW_MS + 900_000,
+                NOW_MS + 600_000,
+                91,
+            ),
+        ] {
+            let mut history = AttemptHistory::default();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(outer),
+                transport.invoke(
+                    model_authority(
+                        GRANT_ACTION_MODEL_INVOKE.to_owned(),
+                        profile().configuration_digest(),
+                        OPERATION_ID.to_owned(),
+                        deadline,
+                        stop,
+                    ),
+                    &request(),
+                    &mut history,
+                    NOW_MS,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the bound fires inside {outer}s"));
+            assert_eq!(
+                outcome,
+                Ok(InvocationOutcome::TimedOut {
+                    provider_request_id: None
+                }),
+                "{case}"
+            );
+            // The request was dispatched, so the attempt is uncertain rather than proven unsent.
+            assert!(history.may_have_been_sent(), "{case}");
+        }
     }
 }

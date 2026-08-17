@@ -11,7 +11,7 @@ const MAX_SEQUENCE: u64 = 9_999_999_999_999_999;
 const MAX_IDENTITY_BYTES: usize = 128;
 /// Largest integer SQLite stores and returns losslessly through this crate's `i64` columns.
 ///
-/// Equal to [`MAX_SEQUENCE`] by coincidence, not by construction: one keeps an event key's
+/// Equal to `MAX_SEQUENCE` by coincidence, not by construction: one keeps an event key's
 /// sequence component at 16 digits and the other keeps a projected value inside `i64`. They
 /// stay separate so moving the key format does not silently move the storage bound.
 pub const MAX_STORED_INTEGER: u64 = 9_999_999_999_999_999;

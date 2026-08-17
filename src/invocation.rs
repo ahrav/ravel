@@ -1,4 +1,4 @@
-//! Immutable invocation manifests and terminal traces, and the bytes they publish as.
+//! Immutable invocation manifests, terminal traces, effect-gate decisions, and their stored bytes.
 //!
 //! A manifest is the starting record of one model invocation and a trace is its terminal
 //! record. They are separate objects because the manifest must be durable before provider
@@ -10,11 +10,10 @@
 //! any blob, and a decoder re-encodes what it read and refuses bytes that do not reproduce
 //! themselves — so publication and replay cannot disagree about what a record says.
 //!
-//! Neither record carries the prompt, and neither carries a completion in full. A manifest
-//! names the request by digest,
-//! and a trace retains a bounded prefix of the output beside that output's full length and
-//! address. Text a caller must not find in durable history is therefore absent by
-//! construction rather than by redaction after the fact.
+//! None of these records carries the prompt, and no trace carries a completion in full. A
+//! manifest and gate decision name the request by digest, while a trace retains a bounded prefix
+//! of the output beside that output's full length and address. Text a caller must not find in
+//! durable history is therefore absent by construction rather than by redaction after the fact.
 
 use std::{error::Error, fmt, io::Cursor, num::NonZeroU64};
 
@@ -23,19 +22,24 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    domain::{validation::bounded_stored, work::WorkId},
+    distributed::grants::GrantRejection,
+    domain::{
+        validation::bounded_stored,
+        work::{WorkId, WorkRef},
+    },
     provider::{
         InvocationRequest, MAX_IDENTIFIER_BYTES, MAX_OUTPUT_TOKEN_CEILING, ModelProvider,
         ReportedUse,
     },
-    scope::{Digest, ScopeId},
+    scope::{Digest, ScopeId, ScopeIdentity, scope_gate_decision_key},
 };
 
 const MANIFEST_DOMAIN: &[u8] = b"ravel.invocation.manifest\0";
 const TRACE_DOMAIN: &[u8] = b"ravel.invocation.trace\0";
+const GATE_DECISION_DOMAIN: &[u8] = b"ravel.effect.gate.decision\0";
 const CBOR_RECURSION_LIMIT: usize = 16;
 
-/// Cap on the CBOR body of one manifest or trace object.
+/// Cap on the CBOR body of one manifest, trace, or gate-decision object.
 pub const MAX_RECORD_CANONICAL_BYTES: usize = 64 * 1024;
 /// Cap on the output prefix one trace retains.
 ///
@@ -52,6 +56,7 @@ pub enum RecordError {
     RecordTooLarge,
     InvalidEncoding,
     DigestMismatch,
+    ReferenceMismatch,
 }
 
 impl fmt::Display for RecordError {
@@ -63,11 +68,115 @@ impl fmt::Display for RecordError {
             Self::RecordTooLarge => "invocation record exceeds the canonical size cap",
             Self::InvalidEncoding => "invocation record cannot be canonically encoded",
             Self::DigestMismatch => "invocation record does not match its expected address",
+            Self::ReferenceMismatch => "invocation record does not match its expected key",
         })
     }
 }
 
 impl Error for RecordError {}
+
+/// Decision made before one external effect can occur.
+///
+/// This module depends on the grant rejection vocabulary while the grant gate depends on this
+/// record type. The module cycle is deliberate: it keeps one binding and one canonical codec.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateDecision {
+    Allowed,
+    Refused(GrantRejection),
+}
+
+impl GateDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Refused(reason) => reason.as_str(),
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let reason = match value {
+            "allowed" => return Some(Self::Allowed),
+            "absent" => GrantRejection::Absent,
+            "stale_fence" => GrantRejection::StaleFence,
+            "identity_mismatch" => GrantRejection::IdentityMismatch,
+            "subject_mismatch" => GrantRejection::SubjectMismatch,
+            "expired" => GrantRejection::Expired,
+            "wider_than_requested" => GrantRejection::WiderThanRequested,
+            "narrower_than_request" => GrantRejection::NarrowerThanRequest,
+            "revoked" => GrantRejection::Revoked,
+            "stale_authority" => GrantRejection::StaleAuthority,
+            "malformed" => GrantRejection::Malformed,
+            // Recording failure cannot truthfully be the content of a durable record.
+            _ => return None,
+        };
+        Some(Self::Refused(reason))
+    }
+}
+
+/// Immutable, secret-free account of one effect-gate decision.
+///
+/// `allowed` proves this node authorized the exact binding and request before constructing the
+/// provider request; it does not prove anything was built, sent, or billed. `refused` proves no
+/// external effect occurred under that decision, and absence proves no effect passed this gate.
+/// Timestamp-free bytes collapse identical decisions and leave distinct records for one attempt
+/// deliberately unordered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateDecisionRecord {
+    binding: InvocationBinding,
+    action: String,
+    resource_scope: String,
+    operation_id: String,
+    request_digest: Digest,
+    decision: GateDecision,
+}
+
+impl GateDecisionRecord {
+    /// Builds a record only from bounded identifiers and closed decision categories.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError`] for an empty or oversized identifier, or for
+    /// [`GateDecision::Refused`] with [`GrantRejection::Unrecorded`]. Grant-sourced identifiers
+    /// are already bounded more tightly; these checks keep construction total and are the
+    /// decoder's only bound on wire-sourced identifiers.
+    pub fn new(
+        binding: InvocationBinding,
+        action: String,
+        resource_scope: String,
+        operation_id: String,
+        request_digest: Digest,
+        decision: GateDecision,
+    ) -> Result<Self, RecordError> {
+        identifier(&action)?;
+        identifier(&resource_scope)?;
+        identifier(&operation_id)?;
+        if decision == GateDecision::Refused(GrantRejection::Unrecorded) {
+            return Err(RecordError::InvalidEncoding);
+        }
+        Ok(Self {
+            binding,
+            action,
+            resource_scope,
+            operation_id,
+            request_digest,
+            decision,
+        })
+    }
+
+    /// Exact bytes to publish and their SHA-256 address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::RecordTooLarge`] above [`MAX_RECORD_CANONICAL_BYTES`] of CBOR,
+    /// and [`RecordError::InvalidEncoding`] on serialization failure.
+    pub fn stored_bytes(&self) -> Result<(Vec<u8>, String), RecordError> {
+        encode(GATE_DECISION_DOMAIN, &WireGateDecision::from(self))
+    }
+
+    pub fn decision(&self) -> GateDecision {
+        self.decision
+    }
+}
 
 /// How one invocation ended, in the vocabulary durable history uses.
 ///
@@ -513,6 +622,44 @@ pub fn decode_manifest(
     Ok(manifest)
 }
 
+/// Rebuilds a gate decision, proving both its content address and expected key binding.
+///
+/// # Errors
+///
+/// Returns the same encoding and digest categories as [`decode_manifest`], plus
+/// [`RecordError::ReferenceMismatch`] when the decoded binding does not reproduce
+/// `expected_key` under `expected_scope` and `expected_work`.
+pub fn decode_gate_decision(
+    stored_bytes: &[u8],
+    expected_key: &str,
+    expected_scope: &ScopeIdentity,
+    expected_work: &WorkRef,
+    expected_digest: &str,
+) -> Result<GateDecisionRecord, RecordError> {
+    let wire: WireGateDecision = decode(GATE_DECISION_DOMAIN, stored_bytes)?;
+    let record = wire.into_domain()?;
+    verify(
+        GATE_DECISION_DOMAIN,
+        &WireGateDecision::from(&record),
+        stored_bytes,
+        expected_digest,
+    )?;
+    if record.binding.scope_id != *expected_scope.scope_id()
+        || record.binding.work_id != *expected_work.id()
+        || record.binding.work_revision.get() != expected_work.revision()
+        || scope_gate_decision_key(
+            expected_scope,
+            expected_work,
+            record.binding.claim_fence,
+            record.binding.attempt,
+            expected_digest,
+        ) != expected_key
+    {
+        return Err(RecordError::ReferenceMismatch);
+    }
+    Ok(record)
+}
+
 /// Rebuilds a trace from stored bytes and proves they address `expected_digest`.
 ///
 /// # Errors
@@ -601,6 +748,17 @@ struct WireManifest {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct WireGateDecision {
+    binding: WireBinding,
+    action: String,
+    resource_scope: String,
+    operation_id: String,
+    request_digest: String,
+    decision: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct WireReportedUse {
     input_tokens: u32,
     output_tokens: u32,
@@ -656,6 +814,32 @@ impl WireBinding {
             self.claim_fence,
             digest(self.grant_digest)?,
             self.attempt,
+        )
+    }
+}
+
+impl From<&GateDecisionRecord> for WireGateDecision {
+    fn from(record: &GateDecisionRecord) -> Self {
+        Self {
+            binding: WireBinding::from(&record.binding),
+            action: record.action.clone(),
+            resource_scope: record.resource_scope.clone(),
+            operation_id: record.operation_id.clone(),
+            request_digest: record.request_digest.as_str().to_owned(),
+            decision: record.decision.as_str().to_owned(),
+        }
+    }
+}
+
+impl WireGateDecision {
+    fn into_domain(self) -> Result<GateDecisionRecord, RecordError> {
+        GateDecisionRecord::new(
+            self.binding.into_domain()?,
+            self.action,
+            self.resource_scope,
+            self.operation_id,
+            Digest::new(self.request_digest).map_err(|_| RecordError::InvalidEncoding)?,
+            GateDecision::parse(&self.decision).ok_or(RecordError::InvalidEncoding)?,
         )
     }
 }
@@ -771,7 +955,7 @@ mod tests {
     use crate::domain::validation::MAX_STORED_INTEGER;
 
     use super::*;
-    use crate::provider::ModelProfile;
+    use crate::{distributed::identity::WorkspaceId, provider::ModelProfile, scope::CampaignId};
 
     fn digest(seed: u8) -> Digest {
         Digest::new(format!("{seed:02x}").repeat(32)).unwrap()
@@ -880,6 +1064,141 @@ mod tests {
             decode_trace(&stored, &address),
             Err(RecordError::InvalidEncoding)
         );
+    }
+
+    #[test]
+    fn a_gate_decision_round_trips_and_rejects_each_keyed_binding_axis() {
+        let scope = ScopeIdentity::root(
+            WorkspaceId::new("workspace-a".into()).unwrap(),
+            CampaignId::new("campaign-a".into()).unwrap(),
+        )
+        .unwrap();
+        let work = WorkRef::new(WorkId::new("work-a".into()).unwrap(), 3);
+        let gate_binding = InvocationBinding::new(
+            scope.scope_id().clone(),
+            digest(0x11),
+            work.id().clone(),
+            work.revision(),
+            2,
+            digest(0x22),
+            7,
+        )
+        .unwrap();
+        let record = GateDecisionRecord::new(
+            gate_binding,
+            "sandbox_run".into(),
+            "repo-a".into(),
+            "run-op-1".into(),
+            digest(0x33),
+            GateDecision::Refused(GrantRejection::Expired),
+        )
+        .unwrap();
+        let (stored, address) = record.stored_bytes().unwrap();
+        let key = scope_gate_decision_key(
+            &scope,
+            &work,
+            NonZeroU64::new(2).unwrap(),
+            NonZeroU64::new(7).unwrap(),
+            &address,
+        );
+
+        assert!(stored.starts_with(GATE_DECISION_DOMAIN));
+        assert_eq!(
+            decode_gate_decision(&stored, &key, &scope, &work, &address).unwrap(),
+            record
+        );
+        assert_eq!(
+            decode_gate_decision(&stored, &key, &scope, &work, digest(0x99).as_str()),
+            Err(RecordError::DigestMismatch)
+        );
+        assert_eq!(
+            decode_gate_decision(&stored, "wrong-key", &scope, &work, &address),
+            Err(RecordError::ReferenceMismatch)
+        );
+
+        // Plan and grant digests are content-addressed but are not segments of this key.
+        let rejects_binding =
+            |expected_scope: &ScopeIdentity, expected_work: &WorkRef, fence, attempt| {
+                let expected_key = scope_gate_decision_key(
+                    expected_scope,
+                    expected_work,
+                    NonZeroU64::new(fence).unwrap(),
+                    NonZeroU64::new(attempt).unwrap(),
+                    &address,
+                );
+                assert_eq!(
+                    decode_gate_decision(
+                        &stored,
+                        &expected_key,
+                        expected_scope,
+                        expected_work,
+                        &address,
+                    ),
+                    Err(RecordError::ReferenceMismatch)
+                );
+            };
+
+        rejects_binding(
+            &scope,
+            &WorkRef::new(WorkId::new("work-b".into()).unwrap(), work.revision()),
+            2,
+            7,
+        );
+        rejects_binding(
+            &scope,
+            &WorkRef::new(work.id().clone(), work.revision() + 1),
+            2,
+            7,
+        );
+        rejects_binding(
+            &ScopeIdentity::root(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-b".into()).unwrap(),
+            )
+            .unwrap(),
+            &work,
+            2,
+            7,
+        );
+        rejects_binding(&scope, &work, 3, 7);
+        rejects_binding(&scope, &work, 2, 8);
+
+        assert_eq!(
+            GateDecisionRecord::new(
+                binding(),
+                "model_invoke".into(),
+                "repo-a".into(),
+                "invoke-op-1".into(),
+                digest(0x44),
+                GateDecision::Refused(GrantRejection::Unrecorded),
+            ),
+            Err(RecordError::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn every_gate_decision_value_is_stable_and_parses_back() {
+        for (rejection, value) in [
+            (GrantRejection::Absent, "absent"),
+            (GrantRejection::StaleFence, "stale_fence"),
+            (GrantRejection::IdentityMismatch, "identity_mismatch"),
+            (GrantRejection::SubjectMismatch, "subject_mismatch"),
+            (GrantRejection::Expired, "expired"),
+            (GrantRejection::WiderThanRequested, "wider_than_requested"),
+            (GrantRejection::NarrowerThanRequest, "narrower_than_request"),
+            (GrantRejection::Revoked, "revoked"),
+            (GrantRejection::StaleAuthority, "stale_authority"),
+            (GrantRejection::Malformed, "malformed"),
+        ] {
+            assert_eq!(rejection.as_str(), value);
+            assert_eq!(
+                GateDecision::parse(value),
+                Some(GateDecision::Refused(rejection))
+            );
+        }
+        assert_eq!(GateDecision::parse("allowed"), Some(GateDecision::Allowed));
+        assert_eq!(GrantRejection::Unrecorded.as_str(), "unrecorded");
+        assert_eq!(GateDecision::parse("unrecorded"), None);
     }
 
     #[test]

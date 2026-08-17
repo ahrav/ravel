@@ -67,6 +67,13 @@ impl ControllerAuthority {
         self.lease_until
     }
 
+    /// The instance this authority's observed head proved as owner.
+    ///
+    /// `proven_authority` refuses to mint authority for a different observed owner.
+    pub(crate) fn instance(&self) -> &InstanceId {
+        &self.instance
+    }
+
     /// A mutation against any store other than this one proves nothing about ownership there.
     pub(crate) fn namespace(&self) -> &str {
         self.observed.namespace()

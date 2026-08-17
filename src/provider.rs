@@ -1137,6 +1137,7 @@ mod tests {
             GRANT_ACTION_MODEL_INVOKE.to_owned(),
             request.profile().configuration_digest(),
             request.operation_id().to_owned(),
+            u64::from(request.max_output_tokens().get()),
             NOW_MS + 60_000,
             NOW_MS + 25_000,
         )
@@ -2954,15 +2955,17 @@ mod tests {
         let action = GRANT_ACTION_MODEL_INVOKE.to_owned();
         let scope = profile().configuration_digest();
         let operation = OPERATION_ID.to_owned();
+        let units = u64::from(request().max_output_tokens().get());
         let deadline = NOW_MS + 60_000;
         let stop = NOW_MS + 25_000;
 
-        for (case, action, scope, operation, deadline, stop, expected) in [
+        for (case, action, scope, operation, units, deadline, stop, expected) in [
             (
                 "an action this boundary does not accept",
                 "git-push".to_owned(),
                 scope.clone(),
                 operation.clone(),
+                units,
                 deadline,
                 stop,
                 GrantRejection::IdentityMismatch,
@@ -2972,6 +2975,7 @@ mod tests {
                 action.clone(),
                 "cd".repeat(32),
                 operation.clone(),
+                units,
                 deadline,
                 stop,
                 GrantRejection::IdentityMismatch,
@@ -2981,15 +2985,27 @@ mod tests {
                 action.clone(),
                 scope.clone(),
                 "invoke-op-elsewhere".to_owned(),
+                units,
                 deadline,
                 stop,
                 GrantRejection::IdentityMismatch,
+            ),
+            (
+                "fewer authorized units than the request could draw",
+                action.clone(),
+                scope.clone(),
+                operation.clone(),
+                units - 1,
+                deadline,
+                stop,
+                GrantRejection::NarrowerThanRequest,
             ),
             (
                 "the grant deadline has passed",
                 action.clone(),
                 scope.clone(),
                 operation.clone(),
+                units,
                 NOW_MS,
                 stop,
                 GrantRejection::Expired,
@@ -2999,6 +3015,7 @@ mod tests {
                 action,
                 scope,
                 operation,
+                units,
                 deadline,
                 NOW_MS,
                 GrantRejection::StaleAuthority,
@@ -3008,7 +3025,7 @@ mod tests {
             assert_eq!(
                 transport
                     .invoke(
-                        model_authority(action, scope, operation, deadline, stop),
+                        model_authority(action, scope, operation, units, deadline, stop),
                         &request(),
                         &mut history,
                         NOW_MS,
@@ -3019,6 +3036,24 @@ mod tests {
             );
             assert!(!history.may_have_been_sent(), "{case}");
         }
+    }
+
+    /// A grant may authorize more output tokens than a call will draw, and that slack is
+    /// permitted here: only intake bounds a grant from above, against the caller's own
+    /// expectation. Without this the comparison could be an equality and every dispatch under an
+    /// over-provisioned reservation would be refused.
+    #[test]
+    fn a_grant_wider_than_the_request_still_authorizes_it() {
+        let request = request();
+        let wider = model_authority(
+            GRANT_ACTION_MODEL_INVOKE.to_owned(),
+            request.profile().configuration_digest(),
+            request.operation_id().to_owned(),
+            u64::from(request.max_output_tokens().get()) + 1,
+            NOW_MS + 60_000,
+            NOW_MS + 25_000,
+        );
+        assert!(wider.authorizes_model(&request, NOW_MS).is_ok());
     }
 
     /// The call is bounded by whichever clock runs out first.
@@ -3066,6 +3101,7 @@ mod tests {
                         GRANT_ACTION_MODEL_INVOKE.to_owned(),
                         profile().configuration_digest(),
                         OPERATION_ID.to_owned(),
+                        u64::from(request().max_output_tokens().get()),
                         deadline,
                         stop,
                     ),

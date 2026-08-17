@@ -50,6 +50,8 @@ const GRANT_RECORD: &str = "effect_grant";
 /// A `&str` rather than an enum because the comparison is an equality against the grant's own
 /// free-form action, which [`EffectGrant::new`] validates as one key segment.
 pub const GRANT_ACTION_MODEL_INVOKE: &str = "model_invoke";
+/// The action a grant must name to authorize one E01 sandbox launch.
+pub const GRANT_ACTION_SANDBOX_RUN: &str = "sandbox_run_e01_v1";
 
 /// Bounded authority for one external operation under one claim generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,15 +291,69 @@ impl EffectAuthority {
         if self.namespace != store.namespace() {
             return Err(GrantRejection::StaleAuthority);
         }
+        let request_digest =
+            Digest::new(request.request_digest()).map_err(|_| GrantRejection::Unrecorded)?;
+        self.gate(
+            store,
+            expected_subject,
+            request_digest,
+            || self.decide_model(request, now_ms),
+            now_ms,
+        )
+        .await
+    }
+
+    /// Verifies and records authority to begin one sandbox launch.
+    ///
+    /// Issuance uses the policy digest as `resource_scope`. commentlint: allow(JUDGE)
+    /// Expected intake units are one. One claim fence admits one grant, so model and sandbox
+    /// actions cannot be combined. commentlint: allow(JUDGE)
+    ///
+    /// Unlike the model gate, `expected_operation` has no third comparand inside the launch. It
+    /// prevents reuse across independently supplied dispatch operations; the decision record binds
+    /// the operation and full launch digest. The returned duration bounds spawn-decision freshness,
+    /// not child lifetime. In-sandbox timeout and CPU limits bound the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`GrantRejection`] after recording every decision except a store-namespace
+    /// mismatch. A malformed operation is refused as [`GrantRejection::IdentityMismatch`].
+    pub async fn authorize_sandbox(
+        &self,
+        store: &S3Store,
+        expected_subject: &InstanceId,
+        expected_operation: &str,
+        binding: &crate::sandbox::SandboxLaunchBinding,
+        now_ms: u64,
+    ) -> Result<Duration, GrantRejection> {
+        if self.namespace != store.namespace() {
+            return Err(GrantRejection::StaleAuthority);
+        }
+        self.gate(
+            store,
+            expected_subject,
+            binding.request_digest().clone(),
+            || self.decide_sandbox(expected_operation, binding, now_ms),
+            now_ms,
+        )
+        .await
+    }
+
+    async fn gate(
+        &self,
+        store: &S3Store,
+        expected_subject: &InstanceId,
+        request_digest: Digest,
+        decide: impl FnOnce() -> Result<Duration, GrantRejection>,
+        now_ms: u64,
+    ) -> Result<Duration, GrantRejection> {
         // The comparand is the caller's own process identity. No accessor exposes `subject`, so
         // callers cannot turn this into self-verification.
         let decision = if self.subject != *expected_subject {
             Err(GrantRejection::SubjectMismatch)
         } else {
-            self.decide_model(request, now_ms)
+            decide()
         };
-        let request_digest =
-            Digest::new(request.request_digest()).map_err(|_| GrantRejection::Unrecorded)?;
         let started = tokio::time::Instant::now();
         let (recorded, record_deadline) = match decision {
             // An allowed write is bounded by the authority window it is buying.
@@ -348,6 +404,22 @@ impl EffectAuthority {
         // at issuance, and nothing anywhere debits what a call actually reported.
         if u64::from(request.max_output_tokens().get()) > self.grant.limit_units.get() {
             return Err(GrantRejection::NarrowerThanRequest);
+        }
+        self.remaining_window(now_ms)
+    }
+
+    fn decide_sandbox(
+        &self,
+        expected_operation: &str,
+        binding: &crate::sandbox::SandboxLaunchBinding,
+        now_ms: u64,
+    ) -> Result<Duration, GrantRejection> {
+        if validate_key_segment(expected_operation).is_err()
+            || self.grant.action != GRANT_ACTION_SANDBOX_RUN
+            || self.grant.resource_scope != binding.policy_digest().as_str()
+            || self.grant.operation_id != expected_operation
+        {
+            return Err(GrantRejection::IdentityMismatch);
         }
         self.remaining_window(now_ms)
     }
@@ -988,7 +1060,7 @@ mod tests {
     };
 
     use super::{
-        test_support::{decision_key, decode_model_record},
+        test_support::{ModelAuthorityContext, decision_key, decode_model_record},
         *,
     };
 
@@ -1122,6 +1194,37 @@ mod tests {
                 namespace: namespace.to_owned(),
             },
         )
+    }
+
+    fn expected_gate_record(
+        authority: &EffectAuthority,
+        request_digest: Digest,
+        decision: GateDecision,
+    ) -> GateDecisionRecord {
+        let identity = authority.grant.identity();
+        let grant_digest = Digest::new(format!(
+            "{:x}",
+            Sha256::digest(encode_grant(&authority.grant).unwrap())
+        ))
+        .unwrap();
+        GateDecisionRecord::new(
+            InvocationBinding::new(
+                identity.scope().scope_id().clone(),
+                identity.plan_digest().clone(),
+                identity.work().id().clone(),
+                identity.work().revision(),
+                identity.claim_fence().get(),
+                grant_digest,
+                authority.grant.attempt().get(),
+            )
+            .unwrap(),
+            authority.grant.action().to_owned(),
+            authority.grant.resource_scope().to_owned(),
+            authority.grant.operation_id().to_owned(),
+            request_digest,
+            decision,
+        )
+        .unwrap()
     }
 
     fn bedrock_transport(
@@ -1408,31 +1511,12 @@ mod tests {
         );
         let authority =
             model_authority_for(store.namespace(), "instance-a", NOW_MS, NOW_MS + 25_000);
-        let grant_digest = Digest::new(format!(
-            "{:x}",
-            Sha256::digest(encode_grant(&authority.grant).unwrap())
-        ))
-        .unwrap();
         let request = model_request();
-        let identity = authority.grant.identity();
-        let expected = GateDecisionRecord::new(
-            InvocationBinding::new(
-                identity.scope().scope_id().clone(),
-                identity.plan_digest().clone(),
-                identity.work().id().clone(),
-                identity.work().revision(),
-                identity.claim_fence().get(),
-                grant_digest,
-                authority.grant.attempt().get(),
-            )
-            .unwrap(),
-            authority.grant.action().to_owned(),
-            authority.grant.resource_scope().to_owned(),
-            authority.grant.operation_id().to_owned(),
+        let expected = expected_gate_record(
+            &authority,
             Digest::new(request.request_digest()).unwrap(),
             GateDecision::Refused(GrantRejection::Expired),
-        )
-        .unwrap();
+        );
         let mut history = AttemptHistory::default();
 
         assert_eq!(
@@ -2511,5 +2595,105 @@ mod tests {
         handle.drain().await.unwrap();
         drop(handle);
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn sandbox_gate_records_kind_mismatch_and_acceptance() {
+        let trusted = crate::sandbox::test_binding(false, crate::sandbox::EvaluatorCommand::Build);
+        let candidate = crate::sandbox::test_binding(true, crate::sandbox::EvaluatorCommand::Build);
+        let subject = InstanceId::new("instance-a".into()).unwrap();
+        let authority = |action: &str, resource: &str, operation: &str, namespace: &str| {
+            test_support::model_authority(
+                action.into(),
+                resource.into(),
+                operation.into(),
+                1,
+                NOW_MS + 60_000,
+                NOW_MS + 25_000,
+                ModelAuthorityContext {
+                    subject: subject.clone(),
+                    namespace: namespace.into(),
+                },
+            )
+        };
+        let mut comparisons = authority(
+            GRANT_ACTION_SANDBOX_RUN,
+            trusted.policy_digest().as_str(),
+            "sandbox-op",
+            "namespace-a",
+        );
+        let rejected = |authority: &EffectAuthority,
+                        operation: &str,
+                        binding: &crate::sandbox::SandboxLaunchBinding| {
+            assert_eq!(
+                authority.decide_sandbox(operation, binding, NOW_MS),
+                Err(GrantRejection::IdentityMismatch)
+            );
+        };
+        comparisons.grant.action = GRANT_ACTION_MODEL_INVOKE.into();
+        rejected(&comparisons, "sandbox-op", &trusted);
+        comparisons.grant.action = GRANT_ACTION_SANDBOX_RUN.into();
+        rejected(&comparisons, "sandbox-op", &candidate);
+        comparisons.grant.resource_scope = candidate.policy_digest().as_str().into();
+        rejected(&comparisons, "sandbox-op", &trusted);
+        comparisons.grant.resource_scope = trusted.policy_digest().as_str().into();
+        comparisons.grant.operation_id = "other-op".into();
+        rejected(&comparisons, "sandbox-op", &trusted);
+        comparisons.grant.operation_id = "sandbox-op".into();
+        rejected(&comparisons, "bad/op", &trusted);
+
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let refused = authority(
+            GRANT_ACTION_SANDBOX_RUN,
+            trusted.policy_digest().as_str(),
+            "sandbox-op",
+            store.namespace(),
+        );
+        let expected = expected_gate_record(
+            &refused,
+            candidate.request_digest().clone(),
+            GateDecision::Refused(GrantRejection::IdentityMismatch),
+        );
+        assert_eq!(
+            refused
+                .authorize_sandbox(&store, &subject, "sandbox-op", &candidate, NOW_MS)
+                .await,
+            Err(GrantRejection::IdentityMismatch)
+        );
+        let request = client.actual_requests().next().expect("decision PUT");
+        assert_eq!(
+            decode_model_record(
+                request.uri(),
+                request.body().bytes().expect("in-memory decision")
+            ),
+            expected
+        );
+
+        let (store, client) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+        let accepted = authority(
+            GRANT_ACTION_SANDBOX_RUN,
+            trusted.policy_digest().as_str(),
+            "sandbox-op",
+            store.namespace(),
+        );
+        let expected = expected_gate_record(
+            &accepted,
+            trusted.request_digest().clone(),
+            GateDecision::Allowed,
+        );
+        assert!(
+            accepted
+                .authorize_sandbox(&store, &subject, "sandbox-op", &trusted, NOW_MS)
+                .await
+                .is_ok()
+        );
+        let request = client.actual_requests().next().expect("decision PUT");
+        assert_eq!(
+            decode_model_record(
+                request.uri(),
+                request.body().bytes().expect("in-memory decision")
+            ),
+            expected
+        );
     }
 }

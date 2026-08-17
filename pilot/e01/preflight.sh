@@ -322,6 +322,113 @@ else
 	check "sandbox user namespace differs from host" 1 "host=$HOST_USERNS sandbox=${smoke_out:-<empty>}"
 fi
 
+# runtime.md §3.1 requires a runner-mounted capped tmpfs; the shape smoke above
+# binds a plain directory and therefore cannot prove that capability.
+overlay_out=$(python3 - <<'PY' 2>&1
+import ctypes, os, shutil, subprocess, tempfile
+
+CLONE_NEWNS, CLONE_NEWUSER, MNT_DETACH = 0x00020000, 0x10000000, 2
+FROZEN, SMALL = 8589934592, 1048576
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
+libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
+root, mounted = tempfile.mkdtemp(prefix="e01-overlay."), []
+
+def call(name, rc):
+    if rc:
+        value = ctypes.get_errno()
+        raise OSError(value, "%s: %s" % (name, os.strerror(value)))
+
+def mount(path, options):
+    os.mkdir(path)
+    call("mount", libc.mount(b"tmpfs", os.fsencode(path), b"tmpfs", 0, ctypes.c_char_p(options.encode())))
+    mounted.append(path)
+
+def unmount(path):
+    call("umount2", libc.umount2(os.fsencode(path), 0))
+    mounted.remove(path)
+    os.rmdir(path)
+
+def tmpfs(path):
+    needle = " %s " % path.replace(" ", "\\040")
+    return any(needle in line and " - tmpfs " in line for line in open("/proc/self/mountinfo"))
+
+try:
+    uid, gid = os.getuid(), os.getgid()
+    call("unshare", libc.unshare(CLONE_NEWUSER | CLONE_NEWNS))
+    open("/proc/self/setgroups", "w").write("deny")
+    open("/proc/self/uid_map", "w").write("%d %d 1\n" % (uid, uid))
+    open("/proc/self/gid_map", "w").write("%d %d 1\n" % (gid, gid))
+
+    frozen = os.path.join(root, "frozen")
+    mount(frozen, "size=8589934592,nr_inodes=262144,mode=0700")
+    stats = os.statvfs(frozen)
+    observed = stats.f_frsize * stats.f_blocks
+    s1 = observed == FROZEN and tmpfs(frozen)
+    unmount(frozen)
+
+    default = os.path.join(root, "default")
+    mount(default, "size=1048576,mode=0700")
+    default_inodes = os.statvfs(default).f_files
+    unmount(default)
+
+    small, source, toolchain = [os.path.join(root, name) for name in ("small", "src", "toolchain")]
+    os.mkdir(source); os.mkdir(toolchain)
+    mount(small, "size=1048576,nr_inodes=262144,mode=0700")
+    command = [
+        "bwrap", "--unshare-all", "--unshare-user", "--unshare-cgroup", "--die-with-parent",
+        "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/sbin", "/sbin",
+        "--ro-bind", source, "/work/src", "--ro-bind", toolchain, "/opt/toolchain",
+        "--bind", small, "/work/out", "--size", "2147483648", "--tmpfs", "/tmp",
+        "--proc", "/proc", "--dev", "/dev", "--chdir", "/work/src", "--new-session", "--clearenv",
+        "--setenv", "PATH", "/opt/toolchain/bin:/usr/bin", "--setenv", "HOME", "/work/out",
+        "--setenv", "TMPDIR", "/tmp", "--", "timeout", "--kill-after=60", "30",
+        "prlimit", "--as=8589934592", "--nproc=512", "--cpu=900", "--nofile=4096", "--",
+        "dd", "if=/dev/zero", "of=/work/out/big", "bs=64k", "count=64",
+    ]
+    child = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+    stats = os.statvfs(small)
+    used = stats.f_frsize * (stats.f_blocks - stats.f_bfree)
+    enospc = child.returncode != 0
+    s2 = enospc and used == SMALL
+    readback = len(open(os.path.join(small, "big"), "rb").read(1))
+    s3 = readback > 0
+    unmount(small)
+
+    values = {}
+    for line in open("/proc/meminfo"):
+        key, value = line.split(":", 1)
+        values[key] = int(value.split()[0]) * 1024
+    print("S1=%d observed=%d" % (s1, observed))
+    print("S2=%d used=%d rc=%d" % (s2, used, child.returncode))
+    print("S3=%d bytes=%d" % (s3, readback))
+    for key in ("MemTotal", "MemAvailable", "SwapTotal"):
+        print("%s=%d" % (key.upper(), values[key]))
+    print("DEFAULT_INODES=%d" % default_inodes)
+    if not (s1 and s2 and s3): raise SystemExit(1)
+finally:
+    for path in reversed(mounted): libc.umount2(os.fsencode(path), MNT_DETACH)
+    shutil.rmtree(root, ignore_errors=True)
+PY
+)
+s1=$(printf '%s\n' "$overlay_out" | sed -n 's/^S1=\([01]\).*/\1/p')
+s2=$(printf '%s\n' "$overlay_out" | sed -n 's/^S2=\([01]\).*/\1/p')
+s3=$(printf '%s\n' "$overlay_out" | sed -n 's/^S3=\([01]\).*/\1/p')
+check "attempt overlay: mounter-process capped tmpfs" "$([ "$s1" = 1 ] && echo 0 || echo 1)" "$(printf '%s\n' "$overlay_out" | grep '^S1=' || printf '%s' "$overlay_out" | tr '\n' ';')"
+check "attempt overlay: cap enforced inside the frozen shape (ENOSPC)" "$([ "$s2" = 1 ] && echo 0 || echo 1)" "$(printf '%s\n' "$overlay_out" | grep '^S2=' || true)"
+check "attempt overlay: post-reap read-back by the mounter" "$([ "$s3" = 1 ] && echo 0 || echo 1)" "$(printf '%s\n' "$overlay_out" | grep '^S3=' || true)"
+mem_total=$(printf '%s\n' "$overlay_out" | sed -n 's/^MEMTOTAL=//p')
+mem_available=$(printf '%s\n' "$overlay_out" | sed -n 's/^MEMAVAILABLE=//p')
+swap_total=$(printf '%s\n' "$overlay_out" | sed -n 's/^SWAPTOTAL=//p')
+default_inodes=$(printf '%s\n' "$overlay_out" | sed -n 's/^DEFAULT_INODES=//p')
+# experiments.md:228,292 freeze four concurrent attempts, each with the 8 GiB
+# overlay and 2 GiB /tmp caps.
+memory_need=$((4 * (8589934592 + 2147483648)))
+memory_have=$((${mem_total:-0} + ${swap_total:-0}))
+check "host memory covers frozen concurrency" "$((memory_have < memory_need))" "need=$memory_need have=$memory_have"
+echo "overlay accounting: MemTotal=${mem_total:-unknown} MemAvailable=${mem_available:-unknown} SwapTotal=${swap_total:-unknown} default_nr_inodes=${default_inodes:-unknown} runner_nr_inodes=262144"
+
 # Evaluators execute code from the tree; do not run them after any preflight
 # check fails.
 if [ "$FAILURES" -ne 0 ]; then
@@ -352,6 +459,10 @@ run_eval cargo build --locked
 run_eval cargo test --locked
 run_eval cargo fmt --check
 run_eval cargo clippy --all-targets --locked
+
+target_bytes=$(du -sb "$EVAL_TARGET_DIR" | awk '{print $1}')
+target_files=$(find "$EVAL_TARGET_DIR" -type f | wc -l)
+echo "evaluator target tree: bytes=$target_bytes files=$target_files"
 
 echo "== result: $([ "$FAILURES" -eq 0 ] && echo PREFLIGHT-PASS || echo "PREFLIGHT-FAIL ($FAILURES)") =="
 exit "$((FAILURES > 0))"

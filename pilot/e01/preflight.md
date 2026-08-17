@@ -371,4 +371,104 @@ The amended `pilot/e01/` Git revision and content digest
 (`git ls-files -z pilot/e01 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum`)
 are recorded in the **ravel-j4t** bd comment, outside the hashed directory —
 same convention as ravel-q3w.4. Results measured under the earlier digest and
-under this one are never pooled (`budgets.yaml` `amendment_rule`).
+under this one are never pooled (`budgets.yaml` `amendment_rule`). Its receipt-line set is
+superseded by the ravel-amn.1 amendment below.
+
+## Amendment ravel-amn.1 smoke
+
+Live re-verification of the amended containment gate ran on 2026-08-17 UTC on
+Linux 6.12.95-124.187.amzn2023.aarch64, bubblewrap 0.10.0 (not setuid),
+rustc/cargo 1.94.1, and Python 3.9.25. The overlay checks use `statvfs`
+`f_frsize * f_blocks`; on this page-aligned 8 GiB value it equals the runner's
+`statfs` `f_bsize * f_blocks` check. The runner behavioural receipt also
+observed exactly the three frozen environment values plus `PWD=/work/src`,
+which bubblewrap 0.10.0 synthesizes from the frozen `--chdir /work/src`;
+ambient and credential-shaped canaries were absent.
+
+```text
+== E01 preflight receipt ==
+date: 2026-08-17T07:57:17Z
+host: Linux 6.12.95-124.187.amzn2023.aarch64
+rustc: rustc 1.94.1 (e408947bf 2026-03-25)
+cargo: cargo 1.94.1 (29ea6fb6a 2026-03-24)
+PASS  frozen revision — f12f3d9f86f3643b3b7deace5e160b1f0f44d2b7
+PASS  clean worktree (incl. ignored files)
+PASS  no submodules — count=0
+PASS  no symlinks — count=0
+PASS  no special modes — count=0
+PASS  no setuid/setgid/world-writable on disk — count=0
+PASS  no LFS pointers — count=0
+PASS  no special files on disk — count=0
+PASS  no hardlinks (tracked files) — count=0
+PASS  no case collisions — count=0
+PASS  no unicode-normalization collisions — count=0
+PASS  file count <= 2000 — count=66
+PASS  total bytes <= 33554432 — bytes=474732
+PASS  max file bytes <= 1048576 — largest=88282
+PASS  max path length <= 180 — longest=41
+PASS  max path depth <= 10 — deepest=3
+PASS  trust roots disjoint from change targets — overlaps=0
+PASS  change targets >= 36 — count=40
+unicodedata: 13.0.0 (runtime.md §4 reference: 13.0.0)
+PASS  path collision golden vectors (19 rows, 8 reason categories, 3 collision pairs)
+PASS  containment tool present: bwrap
+PASS  containment tool present: prlimit
+PASS  prlimit frozen limits apply
+PASS  bwrap frozen-shape smoke (runtime.md §3.1)
+PASS  max_user_namespaces > 0 — max_user_namespaces=505718
+PASS  sandbox user namespace differs from host — host=user:[4026531837] sandbox=user:[4026532718]
+PASS  attempt overlay: mounter-process capped tmpfs — S1=1 observed=8589934592
+PASS  attempt overlay: cap enforced inside the frozen shape (ENOSPC) — S2=1 used=1048576 rc=1
+PASS  attempt overlay: post-reap read-back by the mounter — S3=1 bytes=1
+PASS  host memory covers frozen concurrency — need=42949672960 have=132654538752
+overlay accounting: MemTotal=132654538752 MemAvailable=50672218112 SwapTotal=0 default_nr_inodes=16193181 runner_nr_inodes=262144
+PASS  evaluator: cargo build --locked — expected=PASS got=PASS
+PASS  evaluator: cargo test --locked — expected=PASS got=PASS
+PASS  evaluator: cargo fmt --check — expected=PASS got=PASS
+PASS  evaluator: cargo clippy --all-targets --locked — expected=PASS got=PASS
+evaluator target tree: bytes=670140495 files=2421
+== result: PREFLIGHT-PASS ==
+```
+
+### Adversarial checks on the new blocks
+
+Each mutation ran against the same clean frozen checkout and failed before the
+trusted evaluator sweep:
+
+```text
+frozen S1 size changed 8589934592 -> 8589934593:
+  FAIL  attempt overlay: mounter-process capped tmpfs — S1=0 observed=8589938688
+  == result: PREFLIGHT-FAIL (1) ==
+mount(2) for S1 replaced by a plain mkdir:
+  FAIL  attempt overlay: mounter-process capped tmpfs — S1=0 observed=66327269376
+  == result: PREFLIGHT-FAIL (1) ==
+S2 small cap changed 1048576 -> 8589934592:
+  FAIL  attempt overlay: cap enforced inside the frozen shape (ENOSPC) — S2=0 used=4194304 rc=0
+  == result: PREFLIGHT-FAIL (1) ==
+S2 ENOSPC assignment deleted:
+  NameError: name 'enospc' is not defined
+  FAIL  attempt overlay: cap enforced inside the frozen shape (ENOSPC)
+  == result: PREFLIGHT-FAIL (4) ==
+umount moved before S3 read-back:
+  FileNotFoundError: .../small/big
+  FAIL  attempt overlay: post-reap read-back by the mounter
+  == result: PREFLIGHT-FAIL (4) ==
+frozen concurrency changed 4 -> 400:
+  FAIL  host memory covers frozen concurrency — need=4294967296000 have=132654538752
+  == result: PREFLIGHT-FAIL (1) ==
+bwrap shadowed by a stub exiting 1:
+  FAIL  bwrap frozen-shape smoke (runtime.md §3.1) — rc=1:
+  FAIL  sandbox user namespace differs from host — frozen-shape smoke did not run
+  FAIL  attempt overlay: cap enforced inside the frozen shape (ENOSPC)
+  FAIL  attempt overlay: post-reap read-back by the mounter
+  == result: PREFLIGHT-FAIL (6) ==
+```
+
+### Amended identity
+
+This section supersedes the ravel-j4t receipt-line identity. The amended
+`pilot/e01/` Git revision and content digest
+(`git ls-files -z pilot/e01 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum`)
+are recorded in the **ravel-amn.1** bd comment outside this hashed directory.
+Results measured under the ravel-j4t digest and this digest are never pooled,
+per `budgets.yaml` `amendment_rule`.

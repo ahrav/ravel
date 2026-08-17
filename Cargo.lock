@@ -1694,6 +1694,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http 1.4.2",
  "http-body 1.1.0",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

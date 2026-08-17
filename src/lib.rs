@@ -26,6 +26,8 @@ pub mod invocation;
 
 pub mod provider;
 
+pub mod sandbox;
+
 pub mod storage {
     pub mod artifacts;
     pub mod s3;

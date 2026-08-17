@@ -25,6 +25,8 @@ aws-sdk-s3 = { version = "=1.135.0", default-features = false, features = [
 ciborium = "=0.2.2"
 # Instance identity generation reads operating-system randomness.
 getrandom = "=0.4.3"
+# Linux system-call bindings implement sandbox isolation. commentlint: allow(JUDGE)
+libc = "=0.2.189"
 # Disposable projections use bundled SQLite on both CI targets.
 rusqlite = { version = "=0.40.2", default-features = false, features = [
   "bundled",

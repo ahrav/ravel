@@ -1234,7 +1234,7 @@ pub enum PreflightBehavior {
 
 /// Runs one fixed trusted probe, returning no attempt result and writing no durable record. commentlint: allow(JUDGE)
 ///
-/// This and [`preflight`] are the sole exceptions to launch-policy authorization: neither can construct [`TrustedEvaluatorLaunch`] or [`CandidateLaunch`], while both launch-policy entries consume an [`EffectAuthority`]. commentlint: allow(JUDGE)
+/// This and [`preflight`] are the two fixed probes outside the launch policies: neither takes a launch value, reaches `bind`, or calls `authorize_sandbox`, and `probe_launch` accepts only [`contain::FabricatedFixture`] content, which rustc does enforce because that type's field is private to `contain`. This module and its children can still construct either launch type; both launch-policy entries consume an [`EffectAuthority`]. commentlint: allow(JUDGE)
 ///
 /// # Errors
 ///
@@ -1602,7 +1602,9 @@ while True:
             return Err(UnsupportedHost::SandboxNotIsolated);
         }
         let descendant_alive = fs::read_dir("/proc")
-            .map_err(|_| UnsupportedHost::NamespaceEntry)?
+            // A scan that cannot run fails the check instead of reporting an unsupported host,
+            // whose exit band tests/sandbox_host.rs treats as a skip. commentlint: allow(JUDGE)
+            .map_err(|_| UnsupportedHost::SandboxNotIsolated)?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().as_bytes().iter().all(u8::is_ascii_digit))
             .filter_map(|entry| fs::read(entry.path().join("cmdline")).ok())
@@ -1854,8 +1856,7 @@ pub fn preflight(
 }
 
 fn memory_receipt() -> Result<(u64, u64, u64), UnsupportedHost> {
-    let meminfo =
-        fs::read_to_string("/proc/meminfo").map_err(|_| UnsupportedHost::NamespaceEntry)?;
+    let meminfo = fs::read_to_string("/proc/meminfo").map_err(|_| UnsupportedHost::LaunchFailed)?;
     let value = |name: &str| -> Option<u64> {
         meminfo.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -1866,9 +1867,9 @@ fn memory_receipt() -> Result<(u64, u64, u64), UnsupportedHost> {
         })
     };
     Ok((
-        value("MemTotal").ok_or(UnsupportedHost::NamespaceEntry)?,
-        value("MemAvailable").ok_or(UnsupportedHost::NamespaceEntry)?,
-        value("SwapTotal").ok_or(UnsupportedHost::NamespaceEntry)?,
+        value("MemTotal").ok_or(UnsupportedHost::LaunchFailed)?,
+        value("MemAvailable").ok_or(UnsupportedHost::LaunchFailed)?,
+        value("SwapTotal").ok_or(UnsupportedHost::LaunchFailed)?,
     ))
 }
 
@@ -1876,7 +1877,10 @@ fn default_tmpfs_inodes(root: &Path) -> Result<u64, UnsupportedHost> {
     let path = root.join("default-inodes");
     let overlay =
         contain::AttemptOverlay::mount_with_options(&path, "size=1048576,mode=0700", 1_048_576)?;
-    let inodes = overlay.stats()?.used_inodes + overlay.stats()?.free_inodes;
+    let inodes = {
+        let stats = overlay.stats()?;
+        stats.used_inodes + stats.free_inodes
+    };
     drop(overlay);
     Ok(inodes)
 }
@@ -2144,8 +2148,14 @@ mod tests {
                 .count(),
             2
         );
+        // Split so this assertion's own source does not self-match.
         let spawn = ["let mut child = command", ".spawn()"].concat();
         assert_eq!(source.matches(&spawn).count(), 1);
+        // The `Command` constructor count detects command creation that bypasses the `spawn`
+        // pattern. Splitting the literal prevents `source.matches` from counting this test's own
+        // constructor text.
+        let construct = ["Command", "::new("].concat();
+        assert_eq!(source.matches(&construct).count(), 3);
     }
 
     #[test]

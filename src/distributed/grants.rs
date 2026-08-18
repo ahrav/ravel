@@ -452,6 +452,25 @@ impl EffectAuthority {
             .ok_or(rejection)
     }
 
+    pub(crate) fn binding(&self) -> Result<InvocationBinding, GrantRejection> {
+        let grant_digest = Digest::new(format!(
+            "{:x}",
+            Sha256::digest(encode_grant(&self.grant).map_err(|_| GrantRejection::Unrecorded)?)
+        ))
+        .map_err(|_| GrantRejection::Unrecorded)?;
+        let identity = self.grant.identity();
+        InvocationBinding::new(
+            identity.scope().scope_id().clone(),
+            identity.plan_digest().clone(),
+            identity.work().id().clone(),
+            identity.work().revision(),
+            identity.claim_fence().get(),
+            grant_digest,
+            self.grant.attempt().get(),
+        )
+        .map_err(|_| GrantRejection::Unrecorded)
+    }
+
     /// Publishes one immutable, secret-free decision record before its effect can occur.
     ///
     /// Grant fields plus an effect-specific request digest make this seam reusable by sibling
@@ -462,22 +481,8 @@ impl EffectAuthority {
         request_digest: Digest,
         decision: GateDecision,
     ) -> Result<(), GrantRejection> {
-        let grant_digest = Digest::new(format!(
-            "{:x}",
-            Sha256::digest(encode_grant(&self.grant).map_err(|_| GrantRejection::Unrecorded)?)
-        ))
-        .map_err(|_| GrantRejection::Unrecorded)?;
+        let binding = self.binding()?;
         let identity = self.grant.identity();
-        let binding = InvocationBinding::new(
-            identity.scope().scope_id().clone(),
-            identity.plan_digest().clone(),
-            identity.work().id().clone(),
-            identity.work().revision(),
-            identity.claim_fence().get(),
-            grant_digest,
-            self.grant.attempt().get(),
-        )
-        .map_err(|_| GrantRejection::Unrecorded)?;
         let record = GateDecisionRecord::new(
             binding,
             self.grant.action().to_owned(),
@@ -514,7 +519,7 @@ impl EffectAuthority {
 pub(crate) mod test_support {
     use super::{
         Digest, EffectAuthority, EffectGrant, InstanceId, ScopeClaimIdentity, ScopeIdentity,
-        WorkRef,
+        WorkRef, encode_grant,
     };
     use crate::{
         distributed::identity::WorkspaceId,
@@ -572,6 +577,16 @@ pub(crate) mod test_support {
             namespace: context.namespace,
             authority_stop_unix_ms,
         }
+    }
+
+    pub(crate) fn encoded_grant(grant: &EffectGrant) -> (Vec<u8>, Digest) {
+        let bytes = encode_grant(grant).expect("test grant encodes");
+        let digest = Digest::new(format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+        ))
+        .expect("SHA-256 is a digest");
+        (bytes, digest)
     }
 
     pub(crate) fn decision_key(uri: &str) -> &str {

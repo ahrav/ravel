@@ -102,32 +102,26 @@ impl EvaluatorCommand {
     }
 }
 
-/// Absolute host paths occupying the three variable mount slots.
-pub struct LaunchPaths {
+struct LaunchPaths {
     source_snapshot: PathBuf,
     toolchain_root: PathBuf,
     attempt_overlay: PathBuf,
 }
 
 impl LaunchPaths {
-    /// Validates absolute UTF-8 path values.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LaunchError::InvalidPath`] for a relative or non-UTF-8 path.
-    pub fn new(
-        source: &crate::materialize::MaterializedBase,
+    fn new(
+        source_snapshot: &Path,
         toolchain_root: PathBuf,
         attempt_overlay: PathBuf,
     ) -> Result<Self, LaunchError> {
-        if [&toolchain_root, &attempt_overlay]
+        if [source_snapshot, &toolchain_root, &attempt_overlay]
             .iter()
             .any(|path| !path.is_absolute() || path.to_str().is_none())
         {
             return Err(LaunchError::InvalidPath);
         }
         Ok(Self {
-            source_snapshot: source.snapshot_path().to_path_buf(),
+            source_snapshot: source_snapshot.to_path_buf(),
             toolchain_root,
             attempt_overlay,
         })
@@ -147,8 +141,21 @@ pub struct TrustedEvaluatorLaunch {
 }
 
 impl TrustedEvaluatorLaunch {
-    pub fn new(command: EvaluatorCommand, paths: LaunchPaths) -> Self {
-        Self { command, paths }
+    /// Constructs a trusted evaluator launch from a verified base snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaunchError::InvalidPath`] for a relative or non-UTF-8 path.
+    pub fn new(
+        command: EvaluatorCommand,
+        source: &crate::materialize::MaterializedBase,
+        toolchain_root: PathBuf,
+        attempt_overlay: PathBuf,
+    ) -> Result<Self, LaunchError> {
+        Ok(Self {
+            command,
+            paths: LaunchPaths::new(source.snapshot_path(), toolchain_root, attempt_overlay)?,
+        })
     }
 }
 
@@ -171,8 +178,16 @@ impl CandidateLaunch {
     /// still requires an [`EffectAuthority`] whose policy digest names the candidate launch kind;
     /// this module and its children can still call this constructor. commentlint: allow(JUDGE)
     #[allow(dead_code, reason = "reserved for the in-crate candidate dispatcher")]
-    pub(crate) fn new(command: EvaluatorCommand, paths: LaunchPaths) -> Self {
-        Self { command, paths }
+    pub(crate) fn new(
+        command: EvaluatorCommand,
+        source: &crate::materialize::ConstructedCandidate,
+        toolchain_root: PathBuf,
+        attempt_overlay: PathBuf,
+    ) -> Result<Self, LaunchError> {
+        Ok(Self {
+            command,
+            paths: LaunchPaths::new(source.snapshot_path(), toolchain_root, attempt_overlay)?,
+        })
     }
 }
 
@@ -278,32 +293,31 @@ fn bind(launch: Launch<'_>) -> SandboxLaunchBinding {
 
 #[cfg(test)]
 pub(crate) fn test_binding(candidate: bool, command: EvaluatorCommand) -> SandboxLaunchBinding {
-    let source = crate::materialize::MaterializedBase::for_test(PathBuf::from("/source"));
-    let paths = LaunchPaths::new(
-        &source,
-        PathBuf::from("/toolchain"),
-        PathBuf::from("/overlay"),
-    )
-    .expect("fixed absolute paths");
+    let toolchain = PathBuf::from("/toolchain");
+    let overlay = PathBuf::from("/overlay");
     if candidate {
-        let launch = CandidateLaunch::new(command, paths);
+        let source = crate::materialize::ConstructedCandidate::for_test(PathBuf::from("/source"));
+        let launch = CandidateLaunch::new(command, &source, toolchain, overlay)
+            .expect("fixed absolute paths");
         bind(Launch::Candidate(&launch))
     } else {
-        let launch = TrustedEvaluatorLaunch::new(command, paths);
+        let source = crate::materialize::MaterializedBase::for_test(PathBuf::from("/source"));
+        let launch = TrustedEvaluatorLaunch::new(command, &source, toolchain, overlay)
+            .expect("fixed absolute paths");
         bind(Launch::Trusted(&launch))
     }
 }
 
-fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+pub(crate) fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(value);
 }
 
-fn hash_number(hasher: &mut Sha256, value: u64) {
+pub(crate) fn hash_number(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_be_bytes());
 }
 
-fn digest(hasher: Sha256) -> Digest {
+pub(crate) fn digest(hasher: Sha256) -> Digest {
     Digest::new(format!("{:x}", hasher.finalize()))
         .expect("SHA-256 formatting is always 64 lowercase hexadecimal bytes")
 }
@@ -1927,10 +1941,33 @@ mod tests {
     use super::*;
 
     fn paths(suffix: &str) -> LaunchPaths {
+        LaunchPaths::new(
+            Path::new(&format!("/source/{suffix}")),
+            PathBuf::from("/toolchain"),
+            PathBuf::from("/workspace/overlay"),
+        )
+        .unwrap()
+    }
+
+    fn trusted(command: EvaluatorCommand, suffix: &str) -> TrustedEvaluatorLaunch {
         let source = crate::materialize::MaterializedBase::for_test(PathBuf::from(format!(
             "/source/{suffix}"
         )));
-        LaunchPaths::new(
+        TrustedEvaluatorLaunch::new(
+            command,
+            &source,
+            PathBuf::from("/toolchain"),
+            PathBuf::from("/workspace/overlay"),
+        )
+        .unwrap()
+    }
+
+    fn candidate(command: EvaluatorCommand, suffix: &str) -> CandidateLaunch {
+        let source = crate::materialize::ConstructedCandidate::for_test(PathBuf::from(format!(
+            "/source/{suffix}"
+        )));
+        CandidateLaunch::new(
+            command,
             &source,
             PathBuf::from("/toolchain"),
             PathBuf::from("/workspace/overlay"),
@@ -2036,9 +2073,9 @@ mod tests {
 
     #[test]
     fn launch_kinds_have_distinct_policy_digests_without_command_tags() {
-        let trusted_build = TrustedEvaluatorLaunch::new(EvaluatorCommand::Build, paths("a"));
-        let trusted_test = TrustedEvaluatorLaunch::new(EvaluatorCommand::Test, paths("a"));
-        let candidate = CandidateLaunch::new(EvaluatorCommand::Build, paths("a"));
+        let trusted_build = trusted(EvaluatorCommand::Build, "a");
+        let trusted_test = trusted(EvaluatorCommand::Test, "a");
+        let candidate = candidate(EvaluatorCommand::Build, "a");
         let trusted_build = bind(Launch::Trusted(&trusted_build));
         let trusted_test = bind(Launch::Trusted(&trusted_test));
         let candidate = bind(Launch::Candidate(&candidate));
@@ -2054,9 +2091,11 @@ mod tests {
             let source = crate::materialize::MaterializedBase::for_test(PathBuf::from(source));
             TrustedEvaluatorLaunch::new(
                 command,
-                LaunchPaths::new(&source, PathBuf::from(toolchain), PathBuf::from(overlay))
-                    .unwrap(),
+                &source,
+                PathBuf::from(toolchain),
+                PathBuf::from(overlay),
             )
+            .unwrap()
         };
         let base = launch(EvaluatorCommand::Build, "/source", "/toolchain", "/overlay");
         let base = bind(Launch::Trusted(&base)).request_digest;
@@ -2083,7 +2122,7 @@ mod tests {
         ] {
             assert_ne!(base, bind(Launch::Trusted(&changed)).request_digest);
         }
-        let candidate = CandidateLaunch::new(EvaluatorCommand::Build, paths("a"));
+        let candidate = candidate(EvaluatorCommand::Build, "a");
         assert_ne!(base, bind(Launch::Candidate(&candidate)).request_digest);
     }
 
@@ -2139,14 +2178,12 @@ mod tests {
         )));
         let launch = TrustedEvaluatorLaunch::new(
             EvaluatorCommand::Build,
-            LaunchPaths::new(
-                &source,
-                PathBuf::from(format!("{secret}/toolchain")),
-                PathBuf::from(format!("{secret}/overlay")),
-            )
-            .unwrap(),
-        );
-        let candidate = CandidateLaunch::new(EvaluatorCommand::Test, paths("candidate"));
+            &source,
+            PathBuf::from(format!("{secret}/toolchain")),
+            PathBuf::from(format!("{secret}/overlay")),
+        )
+        .unwrap();
+        let candidate = candidate(EvaluatorCommand::Test, "candidate");
         let launch_paths = paths("paths");
         let roots =
             PreflightRoots::new(PathBuf::from("/toolchain"), PathBuf::from("/workspace")).unwrap();

@@ -2,10 +2,12 @@
 
 use std::{
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
 };
+
+use ravel::materialize::materialize;
 
 struct TempDir(PathBuf);
 
@@ -80,15 +82,48 @@ fn linked_toolchain(root: &Path) -> PathBuf {
         .status()
         .unwrap();
     assert!(copied.success());
-    symlink("/usr/bin/ld.bfd", toolchain.join("bin/ld")).unwrap();
+    fs::create_dir(toolchain.join("vendor")).unwrap();
+
+    let linker_source = Path::new("/usr/bin/ld.bfd");
+    assert!(fs::symlink_metadata(linker_source).unwrap().is_file());
+    let linker = toolchain.join("bin/ld");
+    fs::copy(linker_source, &linker).unwrap();
+    assert!(fs::symlink_metadata(&linker).unwrap().is_file());
+    fs::set_permissions(&linker, fs::Permissions::from_mode(0o755)).unwrap();
     toolchain
 }
 
 #[test]
-#[ignore = "requires Linux user namespaces, tmpfs mounts, and bubblewrap"]
+#[ignore = "requires network access, Linux user namespaces, tmpfs mounts, and bubblewrap"]
 fn runner_preflight_passes_and_hermetic_negatives_fail_typed() {
+    const TRUSTED_CARGO_CONFIG: &[u8] = b"[build]\ntarget-dir = \"/work/out/target\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"/opt/toolchain/vendor\"\n";
+
     let temp = TempDir::new("preflight");
     let toolchain = linked_toolchain(&temp.0);
+    let base_destination = temp.0.join("base");
+    let _base = materialize(&base_destination).expect("materialize frozen base");
+    let manifest = base_destination.join("src/Cargo.toml");
+    assert_eq!(
+        fs::read(base_destination.join("src/.cargo/config.toml")).unwrap(),
+        TRUSTED_CARGO_CONFIG
+    );
+    assert!(materialize(&base_destination).is_err());
+
+    // Cargo discovers configuration from cwd upward. Stay outside the snapshot so its
+    // in-sandbox target and vendor paths do not affect this host-side vendor operation.
+    let vendored = Command::new("cargo")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_CONFIG_FILE", "/dev/null")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+        .current_dir(&temp.0)
+        .args(["vendor", "--locked", "--versioned-dirs"])
+        .arg(toolchain.join("vendor"))
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .status()
+        .unwrap();
+    assert!(vendored.success());
+
     let missing = run(&["sandbox-preflight"], &toolchain, &temp.0.join("missing"));
     assert_eq!(missing.status.code(), Some(29));
     assert_eq!(missing.stderr, b"sandbox roots are unreadable\n");
@@ -109,6 +144,7 @@ fn runner_preflight_passes_and_hermetic_negatives_fail_typed() {
 
     let empty = temp.0.join("empty-toolchain");
     fs::create_dir(&empty).unwrap();
+    fs::create_dir(empty.join("vendor")).unwrap();
     let unresolved = run(&["sandbox-preflight"], &empty, &temp.0);
     assert_eq!(unresolved.status.code(), Some(30));
     assert_eq!(unresolved.stderr, b"sandbox toolchain is not resolvable\n");

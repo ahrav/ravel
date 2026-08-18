@@ -24,6 +24,8 @@ pub mod distributed;
 
 pub mod invocation;
 
+pub mod materialize;
+
 pub mod provider;
 
 pub mod sandbox;

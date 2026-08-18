@@ -12,12 +12,18 @@
 //! Only a plan-admission event changes a head's active plan digest.
 //! Retained walks stop at 4,096 events or 64 MiB of stored event bytes.
 
-use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
+use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64, time::Duration};
 
 use crate::{
+    db::worker::DbHandle,
     dispatch::AttemptHistory,
+    distributed::{
+        grants::{self, EffectAuthority, ExpectedGrant, GRANT_ACTION_SANDBOX_RUN, GrantIntake},
+        scope_controller::{ControllerAuthority, STOP_MARGIN_MS},
+    },
     domain::proposal::{AdmissibleProposal, MAX_PLAN_STORED_BYTES, decode_plan},
     invocation::{InvocationBinding, decode_manifest, decode_trace},
+    materialize::{ConstructedCandidate, decode_candidate_bundle},
     scope::{
         ARTIFACT_REFERENCE_PAYLOAD_TYPE, ArtifactKind, ArtifactReferenceEvent,
         ArtifactReferencePayload, Digest, EncodedScopeEvent, EventEnvelope,
@@ -30,7 +36,7 @@ use crate::{
         scope_head_key,
     },
     storage::{
-        artifacts::PublishedArtifact,
+        artifacts::{PublishedArtifact, publish},
         s3::{ETag, GetError, GetOutcome, MutationOutcome, PublicationError, S3Store},
     },
 };
@@ -266,6 +272,8 @@ pub enum ScopeHeadCommitOutcome {
 pub enum ScopeAppendError {
     Publication(ScopeEventPublicationError),
     InvalidInput,
+    ProjectionBehind,
+    ProjectionUnavailable,
 }
 
 impl fmt::Display for ScopeAppendError {
@@ -273,6 +281,8 @@ impl fmt::Display for ScopeAppendError {
         formatter.write_str(match self {
             Self::Publication(_) => "scope event publication failed",
             Self::InvalidInput => "scope head transition is invalid",
+            Self::ProjectionBehind => "scope projection is behind",
+            Self::ProjectionUnavailable => "scope projection is unavailable",
         })
     }
 }
@@ -648,16 +658,9 @@ pub(crate) struct ArtifactAdmission<'a> {
 /// the envelope or the head refuses, a missing parent head, an out-of-range binding, or a
 /// sequence past what one refresh replays, and [`ScopeAppendError::Publication`] when event
 /// bytes cannot be published.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only tests call this; `expect` (not `allow`) flags this attribute for \
-                  removal if a non-test caller is added"
-    )
-)]
 pub(crate) async fn append_artifact_reference(
     store: &S3Store,
+    database: &DbHandle,
     parent: ScopeHeadParent,
     admission: ArtifactAdmission<'_>,
     event_history: &mut AttemptHistory,
@@ -714,6 +717,11 @@ pub(crate) async fn append_artifact_reference(
                 Some(record.manifest_digest().clone()),
             )
         }
+        ArtifactKind::CandidateBundle => {
+            let record = decode_candidate_bundle(record_bytes, witness.artifact_ref().digest())
+                .map_err(|_| ScopeAppendError::InvalidInput)?;
+            (record.binding().clone(), None)
+        }
     };
     if &recorded_binding != binding {
         return Err(ScopeAppendError::InvalidInput);
@@ -728,6 +736,19 @@ pub(crate) async fn append_artifact_reference(
         manifest_digest,
     )
     .map_err(|_| ScopeAppendError::InvalidInput)?;
+    match database.scope_matches_head(observed.head()).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ScopeAppendError::ProjectionBehind),
+        Err(_) => return Err(ScopeAppendError::ProjectionUnavailable),
+    }
+    match database
+        .artifact_reference_admissible(observed.head().scope(), &payload)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(ScopeAppendError::InvalidInput),
+        Err(_) => return Err(ScopeAppendError::ProjectionUnavailable),
+    }
     let event = ArtifactReferenceEvent::new(
         succeeding_envelope(&parent, operation_id, ARTIFACT_REFERENCE_PAYLOAD_TYPE)?,
         payload,
@@ -745,6 +766,136 @@ pub(crate) async fn append_artifact_reference(
         head_history,
     )
     .await
+}
+
+/// Static result category for candidate-bundle publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidatePublicationError {
+    NotAuthorized,
+    AuthorizationRejected,
+    AuthorizationUnavailable,
+    InvalidRecord,
+    ArtifactPublication,
+    Admission(ScopeAppendError),
+    DeadlineElapsed,
+}
+
+impl fmt::Display for CandidatePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotAuthorized => "candidate publication is not authorized",
+            Self::AuthorizationRejected => "candidate publication authorization was rejected",
+            Self::AuthorizationUnavailable => {
+                "candidate publication authorization is temporarily unavailable"
+            }
+            Self::InvalidRecord => "candidate publication record is invalid",
+            Self::ArtifactPublication => "candidate artifact publication failed",
+            Self::Admission(_) => "candidate artifact admission failed",
+            Self::DeadlineElapsed => "candidate publication deadline elapsed",
+        })
+    }
+}
+
+impl Error for CandidatePublicationError {}
+
+/// Publishes and admits one completed candidate under freshly proven scoped authority.
+///
+/// Construction can take longer than one controller term, so `authority` must be renewed or
+/// re-acquired after construction completes. Every async step shares one deadline ending
+/// [`STOP_MARGIN_MS`] before that term, and elapsed time is charged before authority becomes the
+/// one-shot parent boundary.
+#[allow(dead_code, reason = "production caller lands with the campaign driver")]
+pub(crate) async fn publish_candidate_bundle(
+    store: &S3Store,
+    database: &DbHandle,
+    candidate: ConstructedCandidate,
+    expected: &ExpectedGrant,
+    authority: ControllerAuthority,
+    now_ms: u64,
+    histories: [&mut AttemptHistory; 2],
+) -> Result<ScopeEventAppend, CandidatePublicationError> {
+    let [event_history, head_history] = histories;
+    if authority.must_stop(now_ms)
+        || authority.namespace() != store.namespace()
+        || authority.head().scope() != expected.identity().scope()
+        || authority.head().active_plan_digest() != Some(expected.identity().plan_digest())
+        || expected.action() != GRANT_ACTION_SANDBOX_RUN
+    {
+        return Err(CandidatePublicationError::NotAuthorized);
+    }
+    let started = tokio::time::Instant::now();
+    let deadline = started
+        + Duration::from_millis(
+            authority
+                .remaining_term_ms(now_ms)
+                .saturating_sub(STOP_MARGIN_MS),
+        );
+    let effect = tokio::time::timeout_at(
+        deadline,
+        grants::intake(store, database, expected, &authority, now_ms),
+    )
+    .await
+    .map_err(|_| CandidatePublicationError::DeadlineElapsed)
+    .and_then(publication_authority)?;
+    let binding = effect
+        .binding()
+        .map_err(|_| CandidatePublicationError::InvalidRecord)?;
+    let (record_bytes, _) = candidate
+        .bundle_record(binding.clone())
+        .stored_bytes()
+        .map_err(|_| CandidatePublicationError::InvalidRecord)?;
+    let witness = tokio::time::timeout_at(
+        deadline,
+        publish(
+            store,
+            record_bytes.clone(),
+            ArtifactKind::CandidateBundle.media_type().to_owned(),
+            binding.producer_attempt(),
+            now_ms,
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| CandidatePublicationError::DeadlineElapsed)?
+    .map_err(|_| CandidatePublicationError::ArtifactPublication)?;
+    let operation_id = format!("candidate-bundle-{}", witness.artifact_ref().digest());
+    let parent = authority
+        .into_parent(now_ms.saturating_add(elapsed_ms(started)))
+        .map_err(|_| CandidatePublicationError::NotAuthorized)?;
+    tokio::time::timeout_at(
+        deadline,
+        append_artifact_reference(
+            store,
+            database,
+            parent,
+            ArtifactAdmission {
+                kind: ArtifactKind::CandidateBundle,
+                witness: &witness,
+                binding: &binding,
+                record_bytes: &record_bytes,
+                operation_id: &operation_id,
+            },
+            event_history,
+            head_history,
+        ),
+    )
+    .await
+    .map_err(|_| CandidatePublicationError::DeadlineElapsed)?
+    .map_err(CandidatePublicationError::Admission)
+}
+
+fn publication_authority(
+    intake: GrantIntake,
+) -> Result<Box<EffectAuthority>, CandidatePublicationError> {
+    match intake {
+        GrantIntake::Accepted(effect) => Ok(effect),
+        GrantIntake::Rejected(_) => Err(CandidatePublicationError::AuthorizationRejected),
+        GrantIntake::Unavailable => Err(CandidatePublicationError::AuthorizationUnavailable),
+    }
+}
+
+fn elapsed_ms(started: tokio::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Publishes the checkpoint-certificate event and commits the head that appends it.
@@ -1374,7 +1525,10 @@ impl ReconcileChecker {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
 
     use aws_sdk_s3::{config::Region, primitives::SdkBody};
     use aws_smithy_runtime::client::http::test_util::NeverClient;
@@ -1394,6 +1548,8 @@ mod tests {
     };
 
     use super::*;
+
+    static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
     fn genesis() -> crate::scope::RootGenesis {
         root_genesis(
@@ -1441,6 +1597,118 @@ mod tests {
             .unwrap()
     }
 
+    async fn test_database(label: &str) -> (DbHandle, std::path::PathBuf) {
+        let sequence = NEXT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ravel-head-{label}-{}-{sequence}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        (DbHandle::spawn(path.clone()).await.unwrap(), path)
+    }
+
+    async fn admitting_projection(
+        genesis: &crate::scope::RootGenesis,
+        admissible: &AdmissibleProposal,
+        plan_event: &PlanAdmittedEvent,
+        binding: &InvocationBinding,
+    ) -> (DbHandle, std::path::PathBuf, ScopeHead) {
+        use crate::db::projections::{ScopeProjectionEvent, ScopeProjectionPayload};
+
+        let (database, path) = test_database("artifact").await;
+        let root = crate::scope::decode_root_event(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
+        )
+        .unwrap();
+        let root = ScopeProjectionEvent::new(
+            genesis.identity().clone(),
+            root.envelope().clone(),
+            genesis.event_ref().clone(),
+            ScopeProjectionPayload::RootGenesis {
+                objective_digest: root.payload().config_digest().clone(),
+            },
+            1,
+        )
+        .unwrap();
+        let encoded_plan = encode_plan_admitted_event(plan_event).unwrap();
+        let proposal = decode_plan(admissible.stored_bytes(), admissible.plan_digest()).unwrap();
+        let plan = ScopeProjectionEvent::new(
+            genesis.identity().clone(),
+            plan_event.envelope().clone(),
+            encoded_plan.event_ref().clone(),
+            ScopeProjectionPayload::PlanAdmitted {
+                plan_digest: admissible.plan_digest().clone(),
+                proposal: Box::new(proposal),
+            },
+            1,
+        )
+        .unwrap();
+        let activation = GrantActivatedPayload::new(
+            binding.work_id().clone(),
+            binding.work_revision().get(),
+            3,
+            binding.grant_digest().clone(),
+            binding.attempt().get(),
+            1,
+            1_700_000_060_000,
+        )
+        .unwrap();
+        let grant_event = GrantActivatedEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                3,
+                Some(encoded_plan.event_ref().clone()),
+                1,
+                "grant-op-3".into(),
+                GRANT_ACTIVATED_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            activation.clone(),
+        )
+        .unwrap();
+        let encoded_grant = encode_grant_activated_event(&grant_event).unwrap();
+        let grant = ScopeProjectionEvent::new(
+            genesis.identity().clone(),
+            grant_event.envelope().clone(),
+            encoded_grant.event_ref().clone(),
+            ScopeProjectionPayload::GrantActivated {
+                payload: activation,
+            },
+            1,
+        )
+        .unwrap();
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            genesis.head().authority().clone(),
+            1,
+            encoded_grant.event_ref().clone(),
+            Some(admissible.plan_digest().clone()),
+            grant_event.envelope().operation_id().into(),
+        )
+        .unwrap();
+        database
+            .apply_suffix(vec![root, plan, grant], &head)
+            .await
+            .unwrap();
+        (database, path, head)
+    }
+
+    #[test]
+    fn publication_keeps_unavailable_distinct_from_permanent_grant_rejection() {
+        assert!(matches!(
+            publication_authority(GrantIntake::Unavailable),
+            Err(CandidatePublicationError::AuthorizationUnavailable)
+        ));
+        assert!(matches!(
+            publication_authority(GrantIntake::Rejected(
+                crate::distributed::grants::GrantRejection::Absent
+            )),
+            Err(CandidatePublicationError::AuthorizationRejected)
+        ));
+    }
+
     /// A head one artifact append can fence against: the genesis tail with `plan` active.
     fn plan_bearing_head(genesis: &crate::scope::RootGenesis, plan: &Digest) -> ScopeHead {
         ScopeHead::new(
@@ -1470,29 +1738,31 @@ mod tests {
         };
 
         let genesis = genesis();
-        let plan = Digest::new("11".repeat(32)).unwrap();
-        let (store, client) = replay_store(vec![
-            response(200, &[], SdkBody::empty()),
-            response(
-                200,
-                &[("etag", "\"parent\"")],
-                encode_head(&plan_bearing_head(&genesis, &plan)).unwrap(),
-            ),
-            response(200, &[], SdkBody::empty()),
-            response(200, &[], SdkBody::empty()),
-        ]);
-
+        let (admissible, plan_event) = admissible_plan(&genesis);
+        let plan = admissible.plan_digest().clone();
         let grant_digest = Digest::new("ab".repeat(32)).unwrap();
         let binding = InvocationBinding::new(
             ScopeId::new(genesis.identity().scope_id().as_str().to_owned()).unwrap(),
             plan.clone(),
             WorkId::new("work-a".into()).unwrap(),
-            7,
+            1,
             3,
             grant_digest.clone(),
-            2,
+            1,
         )
         .unwrap();
+        let (database, _database_path, parent_head) =
+            admitting_projection(&genesis, &admissible, &plan_event, &binding).await;
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(&parent_head).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
         let (body, _) = invocation_manifest(&binding).stored_bytes().unwrap();
         let witness = publish(
             &store,
@@ -1510,6 +1780,7 @@ mod tests {
 
         let append = append_artifact_reference(
             &store,
+            &database,
             parent,
             ArtifactAdmission {
                 kind: ArtifactKind::InvocationManifest,
@@ -1529,8 +1800,8 @@ mod tests {
         ));
 
         // The envelope succeeds the fenced parent under the same authority epoch.
-        assert_eq!(append.envelope.sequence(), 2);
-        assert_eq!(append.envelope.parent_event(), Some(genesis.event_ref()));
+        assert_eq!(append.envelope.sequence(), 4);
+        assert_eq!(append.envelope.parent_event(), Some(parent_head.tail()));
         assert_eq!(append.envelope.writer_epoch(), genesis.head().scope_epoch());
         assert_eq!(append.envelope.operation_id(), "artifact-op-1");
 
@@ -1600,6 +1871,7 @@ mod tests {
         .unwrap();
         let kind = ArtifactKind::InvocationManifest;
         let (body, _) = invocation_manifest(&binding).stored_bytes().unwrap();
+        let (database, _database_path) = test_database("artifact-witness-refusal").await;
 
         for (case, elsewhere, media_type, producer_attempt) in [
             (
@@ -1649,6 +1921,7 @@ mod tests {
 
             let refused = append_artifact_reference(
                 &target,
+                &database,
                 parent,
                 ArtifactAdmission {
                     kind,
@@ -1712,6 +1985,7 @@ mod tests {
         );
         let manifest_bytes =
             |of: &InvocationBinding| invocation_manifest(of).stored_bytes().unwrap().0;
+        let (database, _database_path) = test_database("artifact-record-refusal").await;
 
         let foreign_scope = binding("f".repeat(64), &plan, "work-a");
         let foreign_plan = binding(
@@ -1776,6 +2050,7 @@ mod tests {
 
             let refused = append_artifact_reference(
                 &target,
+                &database,
                 parent,
                 ArtifactAdmission {
                     kind,

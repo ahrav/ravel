@@ -489,14 +489,6 @@ impl DbHandle {
     ///
     /// Returns [`ApplyError::Full`], [`ApplyError::Stopping`], or
     /// [`ApplyError::DatabaseOperationFailed`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only tests call this; `expect` (not `allow`) flags this attribute for \
-                      removal if a non-test caller is added"
-        )
-    )]
     pub(crate) async fn artifact_reference_admissible(
         &self,
         scope: &ScopeIdentity,

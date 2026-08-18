@@ -376,7 +376,7 @@ CREATE TABLE applied_scope_events (
     CHECK (attempt IS NULL OR attempt BETWEEN 1 AND 9999999999999999),
     CHECK ((payload_type = 'artifact_reference') = (artifact_kind IS NOT NULL)),
     CHECK (artifact_kind IS NULL
-        OR artifact_kind IN ('invocation_manifest', 'invocation_trace')),
+        OR artifact_kind IN ('invocation_manifest', 'invocation_trace', 'candidate_bundle')),
     CHECK ((payload_type = 'artifact_reference') = (artifact_digest IS NOT NULL)),
     CHECK (artifact_digest IS NULL OR (length(artifact_digest) = 64
         AND length(CAST(artifact_digest AS BLOB)) = 64
@@ -3094,7 +3094,7 @@ mod tests {
         grant_digest: &str,
     ) -> ArtifactReferencePayload {
         artifact_reference_payload_of(
-            crate::scope::ArtifactKind::InvocationManifest,
+            crate::scope::ArtifactKind::CandidateBundle,
             work,
             revision,
             grant_digest,

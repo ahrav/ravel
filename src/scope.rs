@@ -504,6 +504,7 @@ pub enum ArtifactKind {
     InvocationManifest,
     /// The terminal trace of one model invocation.
     InvocationTrace,
+    CandidateBundle,
 }
 
 impl ArtifactKind {
@@ -518,6 +519,7 @@ impl ArtifactKind {
         match self {
             Self::InvocationManifest => "application/vnd.ravel.invocation-manifest+cbor",
             Self::InvocationTrace => "application/vnd.ravel.invocation-trace+cbor",
+            Self::CandidateBundle => "application/vnd.ravel.candidate-bundle+cbor",
         }
     }
 
@@ -525,6 +527,7 @@ impl ArtifactKind {
         match self {
             Self::InvocationManifest => "invocation_manifest",
             Self::InvocationTrace => "invocation_trace",
+            Self::CandidateBundle => "candidate_bundle",
         }
     }
 
@@ -532,6 +535,7 @@ impl ArtifactKind {
         match value {
             "invocation_manifest" => Some(Self::InvocationManifest),
             "invocation_trace" => Some(Self::InvocationTrace),
+            "candidate_bundle" => Some(Self::CandidateBundle),
             _ => None,
         }
     }
@@ -570,7 +574,7 @@ impl ArtifactReferencePayload {
     /// could not make an unwitnessed reference unrepresentable even if it tried.
     ///
     /// `manifest_digest` is the address of the manifest a trace terminates, present exactly
-    /// when `kind` is a trace: a manifest starts an invocation and has no predecessor to name.
+    /// when `kind` is a trace and absent for every other kind.
     ///
     /// # Errors
     ///
@@ -598,6 +602,7 @@ impl ArtifactReferencePayload {
         let attempt_bound = bounded(attempt)?;
         if artifact.media_type() != kind.media_type()
             || artifact.producer_attempt() != format!("attempt-{attempt}")
+            || (kind == ArtifactKind::CandidateBundle && artifact.retention_class().is_some())
             || (kind == ArtifactKind::InvocationTrace) != manifest_digest.is_some()
         {
             return Err(ValidationError::InvalidIdentity);
@@ -638,7 +643,7 @@ impl ArtifactReferencePayload {
         self.attempt
     }
 
-    /// The manifest a trace terminates; `None` exactly when this reference is a manifest.
+    /// The manifest a trace terminates; `None` for every non-trace artifact kind.
     pub fn manifest_digest(&self) -> Option<&Digest> {
         self.manifest_digest.as_ref()
     }
@@ -2358,6 +2363,76 @@ mod codec_tests {
         );
     }
 
+    #[test]
+    fn candidate_bundle_reference_round_trips_without_a_manifest_or_retention_class() {
+        let genesis = fixture();
+        let kind = ArtifactKind::CandidateBundle;
+        let payload = ArtifactReferencePayload::new(
+            kind,
+            crate::domain::artifact::ArtifactRef::new(
+                "12".repeat(32),
+                8_192,
+                kind.media_type().into(),
+                "attempt-4".into(),
+                1_700_000_123_456,
+                None,
+            )
+            .unwrap(),
+            crate::domain::work::WorkId::new("work-b".into()).unwrap(),
+            5,
+            Digest::new("34".repeat(32)).unwrap(),
+            4,
+            None,
+        )
+        .unwrap();
+        let event = ArtifactReferenceEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "candidate-bundle-op".into(),
+                ARTIFACT_REFERENCE_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            payload,
+        )
+        .unwrap();
+        let encoded = encode_artifact_reference_event(&event).unwrap();
+        let key = scope_event_key(genesis.identity(), encoded.event_ref());
+        let decoded =
+            decode_artifact_reference_event(encoded.stored_bytes(), &key, genesis.identity())
+                .unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.payload().kind(), kind);
+        assert_eq!(
+            decoded.payload().artifact().media_type(),
+            "application/vnd.ravel.candidate-bundle+cbor"
+        );
+        assert_eq!(decoded.payload().artifact().retention_class(), None);
+        assert_eq!(decoded.payload().manifest_digest(), None);
+        assert_eq!(
+            ArtifactReferencePayload::new(
+                kind,
+                crate::domain::artifact::ArtifactRef::new(
+                    "12".repeat(32),
+                    8_192,
+                    kind.media_type().into(),
+                    "attempt-4".into(),
+                    1_700_000_123_456,
+                    Some("pilot".into()),
+                )
+                .unwrap(),
+                crate::domain::work::WorkId::new("work-b".into()).unwrap(),
+                5,
+                Digest::new("34".repeat(32)).unwrap(),
+                4,
+                None,
+            ),
+            Err(ValidationError::InvalidIdentity)
+        );
+    }
+
     /// A record kind this crate does not model is refused rather than carried. The kind is the
     /// one axis a later artifact-bearing task extends, so an unknown string reaching history
     /// would be a record no reader can interpret under a payload type they all share.
@@ -2369,7 +2444,7 @@ mod codec_tests {
         for kind in [
             Value::Text(String::new()),
             Value::Text("invocation_manifest_v2".into()),
-            Value::Text("candidate_bundle".into()),
+            Value::Text("candidate_snapshot".into()),
         ] {
             let (bytes, key) = repacked(encoded.stored_bytes(), genesis.identity(), |payload| {
                 let slot = map(payload)

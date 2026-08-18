@@ -18,7 +18,7 @@ use std::{
     io::{Read as _, Write as _},
     os::unix::{
         ffi::OsStrExt as _,
-        fs::{MetadataExt as _, PermissionsExt as _},
+        fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
         process::CommandExt as _,
     },
     path::{Path, PathBuf},
@@ -26,6 +26,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -34,9 +35,12 @@ use crate::{
         grants::{self, ExpectedGrant, GRANT_ACTION_SANDBOX_RUN, GrantIntake},
         scope_controller::ControllerAuthority,
     },
+    invocation::{
+        InvocationBinding, RecordError, WireBinding, decode_record, encode_record, verify_record,
+    },
     sandbox::{SandboxRun, digest, hash_field, hash_number},
     scope::Digest,
-    storage::s3::S3Store,
+    storage::{artifacts::MAX_ARTIFACT_BYTES, s3::S3Store},
 };
 
 const TRUSTED_REPOSITORY: &str = "https://github.com/ahrav/hyperfine.git";
@@ -55,6 +59,10 @@ const ENVIRONMENT: &str = include_str!("../pilot/e01/environment.yaml");
 const CANDIDATE_AUTHOR_NAME: &str = "Ravel Candidate";
 const CANDIDATE_AUTHOR_EMAIL: &str = "candidate@ravel.invalid";
 const CANDIDATE_DATE: &str = "2000-01-01T00:00:00Z";
+const CANDIDATE_BUNDLE_DOMAIN: &[u8] = b"ravel.candidate.bundle\0";
+const CANDIDATE_BUNDLE_CBOR_BYTES: usize = MAX_ARTIFACT_BYTES - CANDIDATE_BUNDLE_DOMAIN.len();
+const CANDIDATE_BUNDLE_RECORD_CAP: usize = MAX_ARTIFACT_BYTES;
+const PACK_HEADER_BYTES: usize = 12;
 
 static NEXT_INDEX: AtomicU64 = AtomicU64::new(0);
 
@@ -128,8 +136,13 @@ const IDENTITY: TrustedIdentity<'static> = TrustedIdentity {
 #[must_use]
 pub struct MaterializedBase {
     source_path: PathBuf,
-    #[allow(dead_code, reason = "consumed by PART 2 candidate construction")]
+    #[allow(
+        dead_code,
+        reason = "consumed by candidate construction and reconstruction"
+    )]
     repository_path: PathBuf,
+    #[allow(dead_code, reason = "consumed by candidate reconstruction")]
+    base_oid: String,
     tree_entries: Vec<u8>,
 }
 
@@ -144,6 +157,7 @@ impl MaterializedBase {
         Self {
             source_path,
             repository_path: PathBuf::new(),
+            base_oid: TRUSTED_COMMIT.to_owned(),
             tree_entries: Vec::new(),
         }
     }
@@ -292,6 +306,7 @@ fn materialize_created(
     Ok(MaterializedBase {
         source_path,
         repository_path: repository,
+        base_oid: identity.commit.to_owned(),
         tree_entries: entries,
     })
 }
@@ -636,6 +651,10 @@ impl Error for CandidateValidationError {}
 pub struct ConstructedCandidate {
     snapshot_path: PathBuf,
     identity: Digest,
+    base_oid: String,
+    result_tree_oid: String,
+    candidate_commit_oid: String,
+    bundle: Vec<u8>,
 }
 
 impl ConstructedCandidate {
@@ -648,13 +667,173 @@ impl ConstructedCandidate {
         &self.identity
     }
 
+    #[allow(dead_code, reason = "consumed by PART 2 publication")]
+    pub(crate) fn bundle_record(&self, binding: InvocationBinding) -> CandidateBundleRecord {
+        CandidateBundleRecord {
+            binding,
+            base_oid: self.base_oid.clone(),
+            result_tree_oid: self.result_tree_oid.clone(),
+            candidate_commit_oid: self.candidate_commit_oid.clone(),
+            bundle: self.bundle.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(snapshot_path: PathBuf) -> Self {
         Self {
             snapshot_path,
             identity: Digest::new("00".repeat(32)).expect("fixed test digest"),
+            base_oid: "11".repeat(20),
+            result_tree_oid: "22".repeat(20),
+            candidate_commit_oid: "33".repeat(20),
+            bundle: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct CandidateBundleRecord {
+    binding: InvocationBinding,
+    base_oid: String,
+    result_tree_oid: String,
+    candidate_commit_oid: String,
+    bundle: Vec<u8>,
+}
+
+impl fmt::Debug for CandidateBundleRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CandidateBundleRecord { .. }")
+    }
+}
+
+impl CandidateBundleRecord {
+    #[allow(dead_code, reason = "consumed by PART 2 publication")]
+    pub(crate) fn stored_bytes(&self) -> Result<(Vec<u8>, String), RecordError> {
+        encode_record(
+            CANDIDATE_BUNDLE_DOMAIN,
+            &WireCandidateBundle::from(self),
+            CANDIDATE_BUNDLE_CBOR_BYTES,
+        )
+    }
+
+    pub(crate) fn binding(&self) -> &InvocationBinding {
+        &self.binding
+    }
+
+    #[allow(dead_code, reason = "consumed by PART 2 reconstruction")]
+    pub(crate) fn base_oid(&self) -> &str {
+        &self.base_oid
+    }
+
+    #[allow(dead_code, reason = "consumed by PART 2 reconstruction")]
+    pub(crate) fn result_tree_oid(&self) -> &str {
+        &self.result_tree_oid
+    }
+
+    #[allow(dead_code, reason = "consumed by PART 2 reconstruction")]
+    pub(crate) fn candidate_commit_oid(&self) -> &str {
+        &self.candidate_commit_oid
+    }
+
+    #[allow(dead_code, reason = "consumed by PART 2 reconstruction")]
+    pub(crate) fn bundle(&self) -> &[u8] {
+        &self.bundle
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireCandidateBundle {
+    binding: WireBinding,
+    base_oid: String,
+    result_tree_oid: String,
+    candidate_commit_oid: String,
+    #[serde(with = "bundle_bytes")]
+    bundle: Vec<u8>,
+}
+
+impl From<&CandidateBundleRecord> for WireCandidateBundle {
+    fn from(record: &CandidateBundleRecord) -> Self {
+        Self {
+            binding: WireBinding::from(&record.binding),
+            base_oid: record.base_oid.clone(),
+            result_tree_oid: record.result_tree_oid.clone(),
+            candidate_commit_oid: record.candidate_commit_oid.clone(),
+            bundle: record.bundle.clone(),
+        }
+    }
+}
+
+impl WireCandidateBundle {
+    fn into_domain(self) -> Result<CandidateBundleRecord, RecordError> {
+        if !valid_oid(&self.base_oid)
+            || !valid_oid(&self.result_tree_oid)
+            || !valid_oid(&self.candidate_commit_oid)
+            || bundle_metadata(&self.bundle, &self.base_oid, &self.candidate_commit_oid).is_none()
+        {
+            return Err(RecordError::InvalidEncoding);
+        }
+        Ok(CandidateBundleRecord {
+            binding: self.binding.into_domain()?,
+            base_oid: self.base_oid,
+            result_tree_oid: self.result_tree_oid,
+            candidate_commit_oid: self.candidate_commit_oid,
+            bundle: self.bundle,
+        })
+    }
+}
+
+mod bundle_bytes {
+    use serde::{Deserializer, Serializer, de::Visitor};
+
+    pub(super) fn serialize<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(value)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct BytesVisitor;
+
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("candidate bundle bytes")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(value.to_vec())
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
+}
+
+#[allow(dead_code, reason = "consumed by PART 2 admission and reconstruction")]
+pub(crate) fn decode_candidate_bundle(
+    stored_bytes: &[u8],
+    expected_digest: &str,
+) -> Result<CandidateBundleRecord, RecordError> {
+    let wire: WireCandidateBundle = decode_record(
+        CANDIDATE_BUNDLE_DOMAIN,
+        stored_bytes,
+        CANDIDATE_BUNDLE_CBOR_BYTES,
+    )?;
+    let record = wire.into_domain()?;
+    verify_record(
+        CANDIDATE_BUNDLE_DOMAIN,
+        &WireCandidateBundle::from(&record),
+        stored_bytes,
+        expected_digest,
+        CANDIDATE_BUNDLE_CBOR_BYTES,
+    )?;
+    Ok(record)
 }
 
 impl fmt::Debug for ConstructedCandidate {
@@ -671,6 +850,7 @@ pub(crate) enum CandidateConstructionError {
     AuthorizationRejected,
     /// Ownership could not be retested because storage or projection transport failed.
     AuthorizationUnavailable,
+    BundleTooLarge,
     ConstructionFailed,
     SnapshotFailed,
     CleanupFailed,
@@ -684,6 +864,7 @@ impl fmt::Display for CandidateConstructionError {
             Self::ValidatorUnavailable => "candidate validator is unavailable",
             Self::AuthorizationRejected => "candidate authorization was rejected",
             Self::AuthorizationUnavailable => "candidate authorization is temporarily unavailable",
+            Self::BundleTooLarge => "candidate bundle exceeds the artifact size cap",
             Self::ConstructionFailed => "candidate construction failed",
             Self::SnapshotFailed => "candidate snapshot failed",
             Self::CleanupFailed => "candidate cleanup failed",
@@ -751,21 +932,29 @@ pub(crate) async fn construct_candidate(
     let retested =
         authorize_candidate(grants::intake(store, database, expected, authority, now_ms).await)?;
     let commit = commit_candidate_tree(base, &tree, TRUSTED_COMMIT, &identity, &retested)?;
+    let bundle = create_candidate_bundle(base, &retested.0, TRUSTED_COMMIT, &tree, &commit)?;
     materialize_candidate_snapshot(base, &commit, destination)?;
     Ok(ConstructedCandidate {
         snapshot_path: destination.join("src"),
         identity,
+        base_oid: TRUSTED_COMMIT.to_owned(),
+        result_tree_oid: tree,
+        candidate_commit_oid: commit,
+        bundle,
     })
 }
 
 /// `commit_candidate_tree` cannot compile unless `authorize_candidate` runs first.
-struct OwnershipRetested(());
+struct OwnershipRetested(InvocationBinding);
 
 fn authorize_candidate(
     intake: GrantIntake,
 ) -> Result<OwnershipRetested, CandidateConstructionError> {
     match intake {
-        GrantIntake::Accepted(_) => Ok(OwnershipRetested(())),
+        GrantIntake::Accepted(authority) => authority
+            .binding()
+            .map(OwnershipRetested)
+            .map_err(|_| CandidateConstructionError::ConstructionFailed),
         GrantIntake::Rejected(_) => Err(CandidateConstructionError::AuthorizationRejected),
         GrantIntake::Unavailable => Err(CandidateConstructionError::AuthorizationUnavailable),
     }
@@ -903,6 +1092,207 @@ fn commit_candidate_tree(
     parse_oid(&output)
 }
 
+struct BundleMetadata {
+    object_count: usize,
+}
+
+fn valid_oid(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn bundle_metadata(bundle: &[u8], base_oid: &str, candidate_oid: &str) -> Option<BundleMetadata> {
+    let separator = bundle.windows(2).position(|bytes| bytes == b"\n\n")?;
+    let (header, pack_with_separator) = bundle.split_at(separator);
+    let pack = pack_with_separator.get(2..)?;
+    let mut lines = header.split(|byte| *byte == b'\n');
+    if lines.next()? != b"# v2 git bundle" {
+        return None;
+    }
+    let mut prerequisites = Vec::new();
+    let mut heads = Vec::new();
+    for line in lines {
+        if let Some(prerequisite) = line.strip_prefix(b"-") {
+            prerequisites.push(bundle_line_oid(prerequisite)?);
+        } else {
+            heads.push(bundle_line_oid(line)?);
+        }
+    }
+    if prerequisites != [base_oid.as_bytes()] || heads != [candidate_oid.as_bytes()] {
+        return None;
+    }
+    if pack.get(..4)? != b"PACK" || !matches!(read_be_u32(pack.get(4..8)?)?, 2 | 3) {
+        return None;
+    }
+    let object_count = usize::try_from(read_be_u32(pack.get(8..PACK_HEADER_BYTES)?)?).ok()?;
+    Some(BundleMetadata { object_count })
+}
+
+fn bundle_line_oid(line: &[u8]) -> Option<&[u8]> {
+    let (oid, name) = line.split_at_checked(40)?;
+    if !oid
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || name.first() != Some(&b' ')
+        || name.len() == 1
+    {
+        return None;
+    }
+    Some(oid)
+}
+
+fn read_be_u32(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn required_object_count(
+    base: &MaterializedBase,
+    base_oid: &str,
+    candidate_oid: &str,
+) -> Result<usize, CandidateConstructionError> {
+    let excluded = format!("^{base_oid}");
+    let objects = run_candidate_git_output(
+        base,
+        None,
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            candidate_oid,
+            &excluded,
+        ],
+    )?;
+    if objects.is_empty() {
+        return Ok(0);
+    }
+    let lines = objects
+        .strip_suffix(b"\n")
+        .ok_or(CandidateConstructionError::ConstructionFailed)?
+        .split(|byte| *byte == b'\n');
+    let mut count = 0;
+    for oid in lines {
+        if oid.len() != 40
+            || !oid
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(CandidateConstructionError::ConstructionFailed);
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn bundle_capture_limit(
+    binding: &InvocationBinding,
+    base_oid: &str,
+    result_tree_oid: &str,
+    candidate_oid: &str,
+) -> Result<usize, CandidateConstructionError> {
+    let empty = CandidateBundleRecord {
+        binding: binding.clone(),
+        base_oid: base_oid.to_owned(),
+        result_tree_oid: result_tree_oid.to_owned(),
+        candidate_commit_oid: candidate_oid.to_owned(),
+        bundle: Vec::new(),
+    }
+    .stored_bytes()
+    .map_err(|_| CandidateConstructionError::ConstructionFailed)?
+    .0;
+    let framing = empty
+        .len()
+        .checked_add(4)
+        .ok_or(CandidateConstructionError::ConstructionFailed)?;
+    CANDIDATE_BUNDLE_RECORD_CAP
+        .checked_sub(framing)
+        .ok_or(CandidateConstructionError::ConstructionFailed)
+}
+
+fn create_candidate_bundle(
+    base: &MaterializedBase,
+    binding: &InvocationBinding,
+    base_oid: &str,
+    result_tree_oid: &str,
+    candidate_oid: &str,
+) -> Result<Vec<u8>, CandidateConstructionError> {
+    let expected_objects = required_object_count(base, base_oid, candidate_oid)?;
+    let limit = bundle_capture_limit(binding, base_oid, result_tree_oid, candidate_oid)?;
+    let reference = format!("refs/ravel/candidates/{candidate_oid}");
+    run_candidate_git_status(
+        base,
+        None,
+        &[
+            "update-ref",
+            &reference,
+            candidate_oid,
+            "0000000000000000000000000000000000000000",
+        ],
+    )?;
+    let excluded = format!("^{base_oid}");
+    let result = run_candidate_git_bounded_output(
+        base,
+        &["bundle", "create", "-", &reference, &excluded],
+        limit,
+    );
+    let cleanup =
+        run_candidate_git_status(base, None, &["update-ref", "-d", &reference, candidate_oid]);
+    let bundle = match (result, cleanup) {
+        (_, Err(_)) => return Err(CandidateConstructionError::CleanupFailed),
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(bundle), Ok(())) => bundle,
+    };
+    let metadata = bundle_metadata(&bundle, base_oid, candidate_oid)
+        .ok_or(CandidateConstructionError::ConstructionFailed)?;
+    if metadata.object_count != expected_objects {
+        return Err(CandidateConstructionError::ConstructionFailed);
+    }
+    Ok(bundle)
+}
+
+fn run_candidate_git_bounded_output(
+    base: &MaterializedBase,
+    args: &[&str],
+    limit: usize,
+) -> Result<Vec<u8>, CandidateConstructionError> {
+    let mut child = candidate_git_command(base, None)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| CandidateConstructionError::ConstructionFailed)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(CandidateConstructionError::ConstructionFailed)?;
+    let read_limit = u64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or(CandidateConstructionError::ConstructionFailed)?;
+    let mut bytes = Vec::new();
+    let read = stdout.take(read_limit).read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        return if bytes.len() > limit {
+            Err(CandidateConstructionError::BundleTooLarge)
+        } else {
+            Err(CandidateConstructionError::ConstructionFailed)
+        };
+    }
+    let status = child
+        .wait()
+        .map_err(|_| CandidateConstructionError::ConstructionFailed)?;
+    if status.success() {
+        Ok(bytes)
+    } else {
+        Err(CandidateConstructionError::ConstructionFailed)
+    }
+}
+
 fn candidate_git_command(base: &MaterializedBase, index: Option<&Path>) -> Command {
     let mut command = git_command();
     command.arg("--git-dir").arg(&base.repository_path);
@@ -1004,6 +1394,115 @@ fn verify_index_entry_count(
         Ok(())
     } else {
         Err(CandidateConstructionError::ConstructionFailed)
+    }
+}
+
+/// Imports one admitted bundle into a freshly materialized base and recreates its source tree.
+///
+/// `base` must come from [`materialize`] (or carry the identical shallow boundary) and
+/// `destination` must be an absent absolute UTF-8 path. Importing bundle objects rather than
+/// replaying accepted path entries is why `reject_collisions` needs no directory-prefix change;
+/// any future path-record reconstruction would need that guard.
+#[allow(
+    dead_code,
+    reason = "used by the ignored two-process reconstruction proof"
+)]
+pub(crate) fn reconstruct_candidate(
+    base: &MaterializedBase,
+    stored_bytes: &[u8],
+    expected_digest: &str,
+    destination: &Path,
+) -> Result<PathBuf, CandidateConstructionError> {
+    if !destination.is_absolute() || destination.to_str().is_none() || destination.exists() {
+        return Err(CandidateConstructionError::InvalidDestination);
+    }
+    let record = decode_candidate_bundle(stored_bytes, expected_digest)
+        .map_err(|_| CandidateConstructionError::ConstructionFailed)?;
+    if record.base_oid() != base.base_oid {
+        return Err(CandidateConstructionError::ConstructionFailed);
+    }
+    fs::create_dir(destination).map_err(|_| CandidateConstructionError::InvalidDestination)?;
+    let bundle_path = destination.join("candidate.bundle");
+    let result = (|| {
+        let mut bundle_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&bundle_path)
+            .map_err(|_| CandidateConstructionError::ConstructionFailed)?;
+        bundle_file
+            .write_all(record.bundle())
+            .map_err(|_| CandidateConstructionError::ConstructionFailed)?;
+        drop(bundle_file);
+        let bundle_arg = bundle_path
+            .to_str()
+            .ok_or(CandidateConstructionError::InvalidDestination)?;
+        run_candidate_git_status(base, None, &["bundle", "verify", bundle_arg])?;
+        run_candidate_git_status(base, None, &["bundle", "unbundle", bundle_arg])?;
+        // `materialize()` fetches with `--depth=1`, so `base.git/shallow` carries the production
+        // boundary. Keeping it is required: strict fsck would otherwise traverse below the exact
+        // base and reject a valid thin bundle for history the destination was never meant to hold.
+        run_candidate_git_status(
+            base,
+            None,
+            &[
+                "fsck",
+                "--strict",
+                "--no-dangling",
+                record.candidate_commit_oid(),
+            ],
+        )?;
+
+        let parents = run_candidate_git_output(
+            base,
+            None,
+            &[
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                record.candidate_commit_oid(),
+            ],
+        )?;
+        let expected_parents = format!("{} {}\n", record.candidate_commit_oid(), record.base_oid());
+        if parents != expected_parents.as_bytes() {
+            return Err(CandidateConstructionError::ConstructionFailed);
+        }
+        let tree_spec = format!("{}^{{tree}}", record.candidate_commit_oid());
+        let tree = parse_oid(&run_candidate_git_output(
+            base,
+            None,
+            &["rev-parse", "--verify", &tree_spec],
+        )?)?;
+        if tree != record.result_tree_oid() {
+            return Err(CandidateConstructionError::ConstructionFailed);
+        }
+        let metadata = bundle_metadata(
+            record.bundle(),
+            record.base_oid(),
+            record.candidate_commit_oid(),
+        )
+        .ok_or(CandidateConstructionError::ConstructionFailed)?;
+        if required_object_count(base, record.base_oid(), record.candidate_commit_oid())?
+            != metadata.object_count
+        {
+            return Err(CandidateConstructionError::ConstructionFailed);
+        }
+        let snapshot = destination.join("candidate");
+        materialize_candidate_snapshot(base, record.candidate_commit_oid(), &snapshot)?;
+        Ok(snapshot.join("src"))
+    })();
+    let removed_bundle = fs::remove_file(&bundle_path);
+    match (result, removed_bundle) {
+        (Ok(path), Ok(())) => Ok(path),
+        (Ok(_), Err(_)) => Err(CandidateConstructionError::CleanupFailed),
+        (Err(error), _) => {
+            if fs::remove_dir_all(destination).is_ok() {
+                Err(error)
+            } else {
+                Err(CandidateConstructionError::CleanupFailed)
+            }
+        }
     }
 }
 
@@ -1388,8 +1887,13 @@ mod tests {
     use std::{
         ffi::OsString,
         os::unix::ffi::OsStringExt as _,
+        process::Stdio,
         sync::atomic::{AtomicU64, Ordering},
+        thread,
+        time::{Duration, Instant},
     };
+
+    use aws_sdk_s3::primitives::SdkBody;
 
     use super::*;
 
@@ -1685,11 +2189,280 @@ mod tests {
         MaterializedBase {
             source_path: PathBuf::new(),
             repository_path: PathBuf::new(),
+            base_oid: TRUSTED_COMMIT.to_owned(),
             tree_entries: entries
                 .iter()
                 .flat_map(|(mode, path)| ls_entry(mode, "blob", path))
                 .collect(),
         }
+    }
+
+    fn invocation_binding() -> InvocationBinding {
+        InvocationBinding::new(
+            crate::scope::ScopeId::new("aa".repeat(32)).expect("scope id"),
+            Digest::new("11".repeat(32)).expect("plan digest"),
+            crate::domain::work::WorkId::new("work-a".into()).expect("work id"),
+            7,
+            3,
+            Digest::new("22".repeat(32)).expect("grant digest"),
+            2,
+        )
+        .expect("invocation binding")
+    }
+
+    struct ReconstructionFixture {
+        _repository: GitFixture,
+        _root: TempDir,
+        base: MaterializedBase,
+        record: CandidateBundleRecord,
+        stored: Vec<u8>,
+        digest: String,
+    }
+
+    fn reconstruction_fixture(label: &str) -> ReconstructionFixture {
+        reconstruction_fixture_with_binding(label, invocation_binding())
+    }
+
+    fn reconstruction_fixture_with_binding(
+        label: &str,
+        binding: InvocationBinding,
+    ) -> ReconstructionFixture {
+        let repository = GitFixture::new();
+        let root = TempDir::new(label);
+        let base = materialize_with(&root.join("base"), &repository.identity())
+            .expect("materialize shallow fixture");
+        let delta_root = TempDir::new(&format!("{label}-delta"));
+        write_delta_file(
+            &delta_root.0,
+            "src/new.rs",
+            b"pub fn reconstructed() {}\n",
+            0o644,
+        );
+        let delta = validate_delta(&base, &delta_root.0).expect("validate fixture delta");
+        let identity = candidate_identity(
+            repository.commit.as_bytes(),
+            &delta.digest,
+            &Digest::new("11".repeat(32)).expect("plan digest"),
+            7,
+            2,
+        );
+        let tree = build_candidate_tree(&base, &delta, &repository.commit).expect("build tree");
+        let retested = OwnershipRetested(binding);
+        let commit = commit_candidate_tree(&base, &tree, &repository.commit, &identity, &retested)
+            .expect("build commit");
+        let bundle =
+            create_candidate_bundle(&base, &retested.0, &repository.commit, &tree, &commit)
+                .expect("build bundle");
+        let record = CandidateBundleRecord {
+            binding: retested.0,
+            base_oid: repository.commit.clone(),
+            result_tree_oid: tree,
+            candidate_commit_oid: commit,
+            bundle,
+        };
+        let (stored, digest) = record.stored_bytes().expect("encode record");
+        ReconstructionFixture {
+            _repository: repository,
+            _root: root,
+            base,
+            record,
+            stored,
+            digest,
+        }
+    }
+
+    fn process_admission() -> (
+        crate::scope::RootGenesis,
+        crate::domain::proposal::AdmissibleProposal,
+        crate::scope::PlanAdmittedEvent,
+    ) {
+        use crate::{
+            distributed::identity::WorkspaceId,
+            domain::{
+                proposal::{
+                    ObservationFact, PlanProposal, ProposalBasis, ProposalFacts, TargetBounds,
+                    WorkSpec, validate_proposal,
+                },
+                work::WorkId,
+            },
+            scope::{
+                AdmittedCampaignConfig, CampaignId, EventEnvelope, PLAN_ADMITTED_PAYLOAD_TYPE,
+                PlanAdmittedEvent, PlanAdmittedPayload, root_genesis,
+            },
+        };
+
+        let genesis = root_genesis(
+            &AdmittedCampaignConfig::new(
+                WorkspaceId::new("workspace-a".into()).unwrap(),
+                CampaignId::new("campaign-a".into()).unwrap(),
+                b"admitted".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let scope = genesis.identity().clone();
+        let proposal = PlanProposal::new(
+            scope.scope_id().clone(),
+            genesis.config_digest().clone(),
+            None,
+            vec![ProposalBasis::Observation {
+                event: genesis.event_ref().clone(),
+            }],
+            vec![WorkSpec::new(
+                WorkId::new("work-a".into()).unwrap(),
+                Vec::new(),
+                TargetBounds::new(1, 60_000).unwrap(),
+            )],
+            0,
+        );
+        let facts = [ObservationFact::new(
+            scope.scope_id().clone(),
+            genesis.event_ref().clone(),
+            crate::scope::ROOT_GENESIS_PAYLOAD_TYPE.to_owned(),
+        )];
+        let admissible = validate_proposal(
+            &proposal,
+            &ProposalFacts::new(&scope, genesis.config_digest(), None, 1, &facts),
+        )
+        .unwrap();
+        let event = PlanAdmittedEvent::new(
+            EventEnvelope::new(
+                scope.scope_id().clone(),
+                2,
+                Some(genesis.event_ref().clone()),
+                1,
+                "admit-plan-1".into(),
+                PLAN_ADMITTED_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            PlanAdmittedPayload::new(admissible.plan_digest().clone()),
+        )
+        .unwrap();
+        (genesis, admissible, event)
+    }
+
+    async fn process_projection(
+        genesis: &crate::scope::RootGenesis,
+        admissible: &crate::domain::proposal::AdmissibleProposal,
+        plan_event: &crate::scope::PlanAdmittedEvent,
+        binding: &InvocationBinding,
+        path: &Path,
+        scope_epoch: u64,
+    ) -> (DbHandle, crate::scope::ScopeHead) {
+        use crate::{
+            db::projections::{ScopeProjectionEvent, ScopeProjectionPayload},
+            scope::{
+                EventEnvelope, GRANT_ACTIVATED_PAYLOAD_TYPE, GrantActivatedEvent,
+                GrantActivatedPayload, ScopeHead, decode_root_event, encode_grant_activated_event,
+                encode_plan_admitted_event,
+            },
+        };
+
+        let database = DbHandle::spawn(path.to_path_buf()).await.unwrap();
+        let root = decode_root_event(
+            genesis.event_bytes(),
+            genesis.event_key(),
+            genesis.identity(),
+        )
+        .unwrap();
+        let root = ScopeProjectionEvent::new(
+            genesis.identity().clone(),
+            root.envelope().clone(),
+            genesis.event_ref().clone(),
+            ScopeProjectionPayload::RootGenesis {
+                objective_digest: root.payload().config_digest().clone(),
+            },
+            scope_epoch,
+        )
+        .unwrap();
+        let encoded_plan = encode_plan_admitted_event(plan_event).unwrap();
+        let proposal = crate::domain::proposal::decode_plan(
+            admissible.stored_bytes(),
+            admissible.plan_digest(),
+        )
+        .unwrap();
+        let plan = ScopeProjectionEvent::new(
+            genesis.identity().clone(),
+            plan_event.envelope().clone(),
+            encoded_plan.event_ref().clone(),
+            ScopeProjectionPayload::PlanAdmitted {
+                plan_digest: admissible.plan_digest().clone(),
+                proposal: Box::new(proposal),
+            },
+            scope_epoch,
+        )
+        .unwrap();
+        let activation = GrantActivatedPayload::new(
+            binding.work_id().clone(),
+            binding.work_revision().get(),
+            3,
+            binding.grant_digest().clone(),
+            binding.attempt().get(),
+            1,
+            60_000,
+        )
+        .unwrap();
+        let grant_event = GrantActivatedEvent::new(
+            EventEnvelope::new(
+                genesis.identity().scope_id().clone(),
+                3,
+                Some(encoded_plan.event_ref().clone()),
+                1,
+                "grant-op-3".into(),
+                GRANT_ACTIVATED_PAYLOAD_TYPE.into(),
+            )
+            .unwrap(),
+            activation.clone(),
+        )
+        .unwrap();
+        let encoded_grant = encode_grant_activated_event(&grant_event).unwrap();
+        let grant = ScopeProjectionEvent::new(
+            genesis.identity().clone(),
+            grant_event.envelope().clone(),
+            encoded_grant.event_ref().clone(),
+            ScopeProjectionPayload::GrantActivated {
+                payload: activation,
+            },
+            scope_epoch,
+        )
+        .unwrap();
+        let head = ScopeHead::new(
+            genesis.identity().clone(),
+            genesis.head().authority().clone(),
+            scope_epoch,
+            encoded_grant.event_ref().clone(),
+            Some(admissible.plan_digest().clone()),
+            grant_event.envelope().operation_id().to_owned(),
+        )
+        .unwrap();
+        database
+            .apply_suffix(vec![root, plan, grant], &head)
+            .await
+            .unwrap();
+        (database, head)
+    }
+
+    fn hex_32(value: &str) -> Option<[u8; 32]> {
+        if value.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        Some(bytes)
+    }
+
+    fn pseudorandom_bytes(bytes: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..bytes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
     }
 
     fn write_delta_file(root: &Path, relative: &str, contents: &[u8], mode: u32) -> PathBuf {
@@ -1967,7 +2740,7 @@ mod tests {
         );
         fs::write(&config, injected).expect("inject repository-local config");
 
-        let retested = OwnershipRetested(());
+        let retested = OwnershipRetested(invocation_binding());
         let first = commit_candidate_tree(&base, &tree, &fixture.commit, &identity, &retested)
             .expect("construct first commit");
         let second = commit_candidate_tree(&base, &tree, &fixture.commit, &identity, &retested)
@@ -2029,12 +2802,81 @@ mod tests {
             b"trusted fixture\n"
         );
 
+        let bundle = create_candidate_bundle(&base, &retested.0, &fixture.commit, &tree, &first)
+            .expect("create candidate bundle");
+        let metadata = bundle_metadata(&bundle, &fixture.commit, &first).expect("bundle header");
+        assert_eq!(
+            metadata.object_count,
+            required_object_count(&base, &fixture.commit, &first).expect("required objects")
+        );
+        let reference = format!("refs/ravel/candidates/{first}");
+        assert!(
+            run_candidate_git_output(&base, None, &["show-ref", "--verify", &reference]).is_err()
+        );
+
         let snapshot = output_root.join("candidate");
         materialize_candidate_snapshot(&base, &first, &snapshot).expect("materialize candidate");
         let candidate = ConstructedCandidate {
             snapshot_path: snapshot.join("src"),
             identity: identity.clone(),
+            base_oid: fixture.commit.clone(),
+            result_tree_oid: tree.clone(),
+            candidate_commit_oid: first.clone(),
+            bundle,
         };
+        let record = candidate.bundle_record(retested.0.clone());
+        let (stored, digest) = record.stored_bytes().expect("encode candidate record");
+        assert!(stored.len() <= MAX_ARTIFACT_BYTES);
+        assert_eq!(
+            decode_candidate_bundle(&stored, &digest).expect("decode candidate record"),
+            record
+        );
+        assert_eq!(
+            decode_candidate_bundle(&stored, &"00".repeat(32)),
+            Err(RecordError::DigestMismatch)
+        );
+        let mut mismatched = record.clone();
+        mismatched.base_oid = "44".repeat(20);
+        let (mismatched_bytes, mismatched_digest) =
+            mismatched.stored_bytes().expect("encode mismatched record");
+        assert_eq!(
+            decode_candidate_bundle(&mismatched_bytes, &mismatched_digest),
+            Err(RecordError::InvalidEncoding)
+        );
+        let mut malformed_bundle = record.clone();
+        malformed_bundle.bundle[0] ^= 1;
+        let (malformed_bytes, malformed_digest) = malformed_bundle
+            .stored_bytes()
+            .expect("encode malformed bundle record");
+        assert_eq!(
+            decode_candidate_bundle(&malformed_bytes, &malformed_digest),
+            Err(RecordError::InvalidEncoding)
+        );
+        let mut trailing = stored.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_candidate_bundle(&trailing, &digest),
+            Err(RecordError::InvalidEncoding)
+        );
+        assert_eq!(
+            decode_candidate_bundle(
+                &vec![0; CANDIDATE_BUNDLE_DOMAIN.len() + CANDIDATE_BUNDLE_CBOR_BYTES + 1],
+                &digest,
+            ),
+            Err(RecordError::RecordTooLarge)
+        );
+        let capture_limit = bundle_capture_limit(&retested.0, &fixture.commit, &tree, &first)
+            .expect("compute capture limit");
+        let mut at_cap = record.clone();
+        at_cap.bundle.resize(capture_limit, 0);
+        let (at_cap_bytes, at_cap_digest) = at_cap.stored_bytes().expect("encode record at cap");
+        assert_eq!(at_cap_bytes.len(), MAX_ARTIFACT_BYTES);
+        assert_eq!(
+            decode_candidate_bundle(&at_cap_bytes, &at_cap_digest).expect("decode record at cap"),
+            at_cap
+        );
+        at_cap.bundle.push(0);
+        assert_eq!(at_cap.stored_bytes(), Err(RecordError::RecordTooLarge));
         assert_eq!(candidate.identity(), &identity);
         assert_eq!(
             fs::read(candidate.snapshot_path().join("src/new.rs")).expect("read snapshot delta"),
@@ -2056,6 +2898,679 @@ mod tests {
                 .mode()
                 & 0o777,
             0o755
+        );
+    }
+
+    #[test]
+    #[ignore = "host process-separation proof; run with ignored host tests"]
+    fn candidate_bundle_reconstruction_child() {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(separator) = args.iter().position(|arg| arg == "--") else {
+            return;
+        };
+        let values = &args[separator + 1..];
+        if values.len() != 7 {
+            return;
+        }
+        let record = fs::read(&values[0]).expect("read candidate record");
+        let archive_sha256 = hex_32(&values[5]).expect("parse archive digest");
+        let identity = TrustedIdentity {
+            repository: &values[2],
+            commit: &values[3],
+            tree: &values[4],
+            archive_sha256,
+        };
+        let root = PathBuf::from(&values[6]);
+        fs::create_dir(&root).expect("create child workspace");
+        let base = materialize_with(&root.join("base"), &identity)
+            .expect("materialize production-shaped shallow base");
+        let source = reconstruct_candidate(&base, &record, &values[1], &root.join("candidate"))
+            .expect("reconstruct committed candidate record");
+        assert_eq!(
+            fs::read(source.join("src/new.rs")).expect("read child reconstruction"),
+            b"pub fn reconstructed() {}\n"
+        );
+        println!("RAVEL_CANDIDATE_RECONSTRUCTED");
+    }
+
+    #[tokio::test]
+    #[ignore = "host process-separation proof; run with ignored host tests"]
+    async fn committed_candidate_event_reconstructs_in_a_fresh_process() {
+        use crate::{
+            dispatch::AttemptHistory,
+            domain::work::WorkId,
+            invocation::InvocationBinding,
+            scope::{
+                ArtifactKind, ScopeId, decode_artifact_reference_event, encode_head,
+                scope_event_key,
+            },
+            storage::{
+                artifacts::publish,
+                s3::test_support::{replay_store, response},
+            },
+            sync::head::{
+                ArtifactAdmission, ScopeHeadCommitOutcome, ScopeHeadParent,
+                append_artifact_reference, read,
+            },
+        };
+
+        let (genesis, admissible, plan_event) = process_admission();
+        let binding = InvocationBinding::new(
+            ScopeId::new(genesis.identity().scope_id().as_str().to_owned()).unwrap(),
+            admissible.plan_digest().clone(),
+            WorkId::new("work-a".into()).unwrap(),
+            1,
+            3,
+            Digest::new("ab".repeat(32)).unwrap(),
+            1,
+        )
+        .unwrap();
+        let fixture =
+            reconstruction_fixture_with_binding("process-reconstruction", binding.clone());
+        let database_path = fixture._root.join("projection.sqlite3");
+        let (database, parent_head) = process_projection(
+            &genesis,
+            &admissible,
+            &plan_event,
+            &binding,
+            &database_path,
+            1,
+        )
+        .await;
+        let (store, client) = replay_store(vec![
+            response(200, &[], SdkBody::empty()),
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(&parent_head).unwrap(),
+            ),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        let witness = publish(
+            &store,
+            fixture.stored.clone(),
+            ArtifactKind::CandidateBundle.media_type().to_owned(),
+            binding.producer_attempt(),
+            1_700_000_123_456,
+            None,
+        )
+        .await
+        .unwrap();
+        let parent = ScopeHeadParent::existing(Box::new(
+            read(&store, genesis.identity()).await.unwrap().unwrap(),
+        ));
+        let append = append_artifact_reference(
+            &store,
+            &database,
+            parent,
+            ArtifactAdmission {
+                kind: ArtifactKind::CandidateBundle,
+                witness: &witness,
+                binding: &binding,
+                record_bytes: &fixture.stored,
+                operation_id: "candidate-process-proof",
+            },
+            &mut AttemptHistory::default(),
+            &mut AttemptHistory::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            append.outcome,
+            ScopeHeadCommitOutcome::Committed(_)
+        ));
+        assert_eq!(
+            append.envelope.sequence(),
+            parent_head.tail().sequence() + 1
+        );
+
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        let event_bytes = requests[2].body().bytes().unwrap();
+        let event = decode_artifact_reference_event(
+            event_bytes,
+            &scope_event_key(genesis.identity(), &append.reference),
+            genesis.identity(),
+        )
+        .unwrap();
+        let committed_digest = event.payload().artifact().digest().to_owned();
+        assert_eq!(committed_digest, witness.artifact_ref().digest());
+        assert_eq!(committed_digest, fixture.digest);
+
+        let record_path = fixture._root.join("candidate-record.cbor");
+        fs::write(&record_path, &fixture.stored).expect("write child record transport");
+        let stdout_path = fixture._root.join("child.stdout");
+        let stderr_path = fixture._root.join("child.stderr");
+        let child_root = fixture._root.join("child-work");
+        let archive_digest: String = fixture
+            ._repository
+            .archive_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "materialize::tests::candidate_bundle_reconstruction_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+                "--",
+                record_path.to_str().unwrap(),
+                &committed_digest,
+                &fixture._repository.repository,
+                &fixture._repository.commit,
+                &fixture._repository.tree,
+                &archive_digest,
+                child_root.to_str().unwrap(),
+            ])
+            .env_clear()
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", "/dev/null")
+            .env("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+            .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .expect("spawn reconstruction child");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("failed to poll reconstruction child: {error}");
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("candidate reconstruction child exceeded 60 seconds");
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = fs::read_to_string(&stdout_path).unwrap();
+        let stderr = fs::read_to_string(&stderr_path).unwrap();
+        assert!(status.success(), "child failed: {stdout}\n{stderr}");
+        assert!(stdout.contains("RAVEL_CANDIDATE_RECONSTRUCTED"));
+        assert!(stdout.contains("test result: ok. 1 passed;"));
+    }
+
+    #[tokio::test]
+    async fn fresh_sandbox_intake_publishes_and_admits_one_candidate_bundle() {
+        use crate::{
+            dispatch::AttemptHistory,
+            distributed::{
+                grants::{EffectGrant, ExpectedGrant, GRANT_ACTION_SANDBOX_RUN, test_support},
+                identity::InstanceId,
+                scope_controller::{AcquireOutcome, acquire},
+            },
+            domain::work::{WorkId, WorkRef},
+            scope::{ScopeClaimIdentity, decode_artifact_reference_event, scope_event_key},
+            storage::s3::test_support::{replay_store, response},
+            sync::head::{ScopeHeadCommitOutcome, publish_candidate_bundle},
+        };
+
+        let now_ms = 1;
+        let (genesis, admissible, plan_event) = process_admission();
+        let identity = ScopeClaimIdentity::new(
+            genesis.identity().clone(),
+            admissible.plan_digest().clone(),
+            WorkRef::new(WorkId::new("work-a".into()).unwrap(), 1),
+            3,
+        )
+        .unwrap();
+        let grant = EffectGrant::new(
+            identity.clone(),
+            GRANT_ACTION_SANDBOX_RUN.into(),
+            "sandbox-policy".into(),
+            1,
+            1,
+            60_000,
+            "sandbox-op".into(),
+        )
+        .unwrap();
+        let expected = ExpectedGrant::new(
+            identity.clone(),
+            GRANT_ACTION_SANDBOX_RUN.into(),
+            "sandbox-policy".into(),
+            1,
+            1,
+            60_000,
+            "sandbox-op".into(),
+        )
+        .unwrap();
+        let (grant_bytes, grant_digest) = test_support::encoded_grant(&grant);
+        let binding = InvocationBinding::new(
+            genesis.identity().scope_id().clone(),
+            admissible.plan_digest().clone(),
+            WorkId::new("work-a".into()).unwrap(),
+            1,
+            3,
+            grant_digest,
+            1,
+        )
+        .unwrap();
+        let fixture = reconstruction_fixture_with_binding("publication", binding.clone());
+        let (_, parent_head) = process_projection(
+            &genesis,
+            &admissible,
+            &plan_event,
+            &binding,
+            &fixture._root.join("parent.sqlite3"),
+            1,
+        )
+        .await;
+        let (store, client) = replay_store(vec![
+            response(
+                200,
+                &[("etag", "\"parent\"")],
+                crate::scope::encode_head(&parent_head).unwrap(),
+            ),
+            response(200, &[("etag", "\"owned\"")], SdkBody::empty()),
+            response(200, &[("etag", "\"grant\"")], grant_bytes),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+            response(200, &[], SdkBody::empty()),
+        ]);
+        let AcquireOutcome::Acquired(authority) = acquire(
+            &store,
+            genesis.identity(),
+            &InstanceId::new("instance-a".into()).unwrap(),
+            now_ms,
+        )
+        .await
+        .unwrap() else {
+            panic!("acquire publication authority");
+        };
+        let (database, projected_head) = process_projection(
+            &genesis,
+            &admissible,
+            &plan_event,
+            &binding,
+            &fixture._root.join("publication.sqlite3"),
+            authority.scope_epoch().get(),
+        )
+        .await;
+        assert!(database.scope_matches_head(authority.head()).await.unwrap());
+        assert_eq!(projected_head.tail(), authority.head().tail());
+        database
+            .record_claim(
+                genesis.identity(),
+                identity.work().clone(),
+                identity.claim_fence(),
+                std::num::NonZeroU64::new(30_000).unwrap(),
+                now_ms,
+            )
+            .await
+            .unwrap();
+        database
+            .mark_claims_restored(genesis.identity())
+            .await
+            .unwrap();
+        let candidate = ConstructedCandidate {
+            snapshot_path: fixture._root.join("unused-snapshot"),
+            identity: Digest::new("55".repeat(32)).unwrap(),
+            base_oid: fixture.record.base_oid.clone(),
+            result_tree_oid: fixture.record.result_tree_oid.clone(),
+            candidate_commit_oid: fixture.record.candidate_commit_oid.clone(),
+            bundle: fixture.record.bundle.clone(),
+        };
+        let append = publish_candidate_bundle(
+            &store,
+            &database,
+            candidate,
+            &expected,
+            authority,
+            now_ms,
+            [
+                &mut AttemptHistory::default(),
+                &mut AttemptHistory::default(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            append.outcome,
+            ScopeHeadCommitOutcome::Committed(_)
+        ));
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 6);
+        let event = decode_artifact_reference_event(
+            requests[4].body().bytes().unwrap(),
+            &scope_event_key(genesis.identity(), &append.reference),
+            genesis.identity(),
+        )
+        .unwrap();
+        assert_eq!(
+            event.payload().kind(),
+            crate::scope::ArtifactKind::CandidateBundle
+        );
+        assert!(
+            event
+                .envelope()
+                .operation_id()
+                .starts_with("candidate-bundle-")
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_reference_rejections_never_advance_the_scope_head() {
+        use crate::{
+            dispatch::AttemptHistory,
+            scope::{ArtifactKind, ScopeHead, encode_head},
+            storage::{
+                artifacts::publish,
+                s3::test_support::{replay_store, response},
+            },
+            sync::head::{
+                ArtifactAdmission, ScopeAppendError, ScopeHeadParent, append_artifact_reference,
+                read,
+            },
+        };
+
+        let (genesis, admissible, _) = process_admission();
+        let binding = InvocationBinding::new(
+            genesis.identity().scope_id().clone(),
+            admissible.plan_digest().clone(),
+            crate::domain::work::WorkId::new("work-a".into()).unwrap(),
+            1,
+            3,
+            Digest::new("ab".repeat(32)).unwrap(),
+            1,
+        )
+        .unwrap();
+        let fixture = reconstruction_fixture_with_binding("reference-refusals", binding.clone());
+        let parent_head = ScopeHead::new(
+            genesis.identity().clone(),
+            genesis.head().authority().clone(),
+            1,
+            genesis.event_ref().clone(),
+            Some(admissible.plan_digest().clone()),
+            genesis.head().operation_id().to_owned(),
+        )
+        .unwrap();
+        let database_path = fixture._root.join("empty.sqlite3");
+        let database = DbHandle::spawn(database_path).await.unwrap();
+
+        for (label, elsewhere, kind, body, admission_binding) in [
+            (
+                "malformed",
+                false,
+                ArtifactKind::CandidateBundle,
+                b"malformed candidate record".to_vec(),
+                binding.clone(),
+            ),
+            (
+                "unsupported body for declared kind",
+                false,
+                ArtifactKind::InvocationManifest,
+                fixture.stored.clone(),
+                binding.clone(),
+            ),
+            (
+                "wrong scope",
+                false,
+                ArtifactKind::CandidateBundle,
+                fixture.stored.clone(),
+                InvocationBinding::new(
+                    crate::scope::ScopeId::new("ff".repeat(32)).unwrap(),
+                    admissible.plan_digest().clone(),
+                    crate::domain::work::WorkId::new("work-a".into()).unwrap(),
+                    1,
+                    3,
+                    Digest::new("ab".repeat(32)).unwrap(),
+                    1,
+                )
+                .unwrap(),
+            ),
+            (
+                "unpublished in target namespace",
+                true,
+                ArtifactKind::CandidateBundle,
+                fixture.stored.clone(),
+                binding.clone(),
+            ),
+        ] {
+            let head_response = response(
+                200,
+                &[("etag", "\"parent\"")],
+                encode_head(&parent_head).unwrap(),
+            );
+            let responses = if elsewhere {
+                vec![
+                    head_response,
+                    response(200, &[], SdkBody::empty()),
+                    response(200, &[], SdkBody::empty()),
+                ]
+            } else {
+                vec![
+                    response(200, &[], SdkBody::empty()),
+                    head_response,
+                    response(200, &[], SdkBody::empty()),
+                    response(200, &[], SdkBody::empty()),
+                ]
+            };
+            let (target, client) = replay_store(responses);
+            let (other, _) = replay_store(vec![response(200, &[], SdkBody::empty())]);
+            let witness = publish(
+                if elsewhere { &other } else { &target },
+                body.clone(),
+                kind.media_type().to_owned(),
+                admission_binding.producer_attempt(),
+                1_700_000_123_456,
+                None,
+            )
+            .await
+            .unwrap();
+            let parent = ScopeHeadParent::existing(Box::new(
+                read(&target, genesis.identity()).await.unwrap().unwrap(),
+            ));
+            assert!(
+                matches!(
+                    append_artifact_reference(
+                        &target,
+                        &database,
+                        parent,
+                        ArtifactAdmission {
+                            kind,
+                            witness: &witness,
+                            binding: &admission_binding,
+                            record_bytes: &body,
+                            operation_id: "candidate-refusal",
+                        },
+                        &mut AttemptHistory::default(),
+                        &mut AttemptHistory::default(),
+                    )
+                    .await,
+                    Err(ScopeAppendError::InvalidInput)
+                ),
+                "{label}"
+            );
+            assert_eq!(
+                client.actual_requests().count(),
+                if elsewhere { 1 } else { 2 },
+                "{label}: no event publication or head CAS"
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruction_uses_the_production_shallow_base_and_verifies_every_identity() {
+        let fixture = reconstruction_fixture("reconstruct-success");
+        assert_eq!(
+            fs::read_to_string(fixture.base.repository_path.join("shallow"))
+                .expect("production-shaped shallow marker")
+                .trim(),
+            fixture.record.base_oid()
+        );
+        let destination = fixture._root.join("reconstructed");
+        let source = reconstruct_candidate(
+            &fixture.base,
+            &fixture.stored,
+            &fixture.digest,
+            &destination,
+        )
+        .expect("reconstruct candidate");
+        assert_eq!(
+            fs::read(source.join("src/new.rs")).expect("read reconstructed delta"),
+            b"pub fn reconstructed() {}\n"
+        );
+        assert!(!destination.join("candidate.bundle").exists());
+    }
+
+    #[test]
+    fn reconstruction_refuses_a_missing_base_prerequisite() {
+        let fixture = reconstruction_fixture("reconstruct-missing-base");
+        fs::remove_dir_all(fixture.base.repository_path.join("objects"))
+            .expect("remove base objects");
+        fs::create_dir_all(fixture.base.repository_path.join("objects/info"))
+            .expect("restore object database shape");
+        fs::create_dir_all(fixture.base.repository_path.join("objects/pack"))
+            .expect("restore pack directory");
+        assert_eq!(
+            reconstruct_candidate(
+                &fixture.base,
+                &fixture.stored,
+                &fixture.digest,
+                &fixture._root.join("missing-base"),
+            ),
+            Err(CandidateConstructionError::ConstructionFailed)
+        );
+    }
+
+    #[test]
+    fn reconstruction_refuses_corrupt_pack_bytes_with_a_valid_outer_digest() {
+        let fixture = reconstruction_fixture("reconstruct-corrupt");
+        let mut corrupt = fixture.record.clone();
+        *corrupt.bundle.last_mut().expect("pack checksum byte") ^= 1;
+        let (stored, digest) = corrupt.stored_bytes().expect("encode corrupt record");
+        assert_eq!(
+            reconstruct_candidate(
+                &fixture.base,
+                &stored,
+                &digest,
+                &fixture._root.join("corrupt"),
+            ),
+            Err(CandidateConstructionError::ConstructionFailed)
+        );
+    }
+
+    #[test]
+    fn reconstruction_refuses_record_oids_that_disagree_with_a_valid_bundle() {
+        let fixture = reconstruction_fixture("reconstruct-mismatch");
+        let mut mismatched = fixture.record.clone();
+        mismatched.result_tree_oid = "44".repeat(20);
+        let (stored, digest) = mismatched.stored_bytes().expect("encode mismatched record");
+        assert_eq!(
+            reconstruct_candidate(
+                &fixture.base,
+                &stored,
+                &digest,
+                &fixture._root.join("mismatched"),
+            ),
+            Err(CandidateConstructionError::ConstructionFailed)
+        );
+    }
+
+    #[test]
+    fn reconstruction_refuses_an_additional_advertised_object() {
+        let fixture = reconstruction_fixture("reconstruct-extra");
+        let second_identity = Digest::new("55".repeat(32)).expect("second identity");
+        let second = commit_candidate_tree(
+            &fixture.base,
+            fixture.record.result_tree_oid(),
+            fixture.record.base_oid(),
+            &second_identity,
+            &OwnershipRetested(fixture.record.binding().clone()),
+        )
+        .expect("second commit");
+        let first_ref = format!(
+            "refs/ravel/candidates/{}",
+            fixture.record.candidate_commit_oid()
+        );
+        let second_ref = format!("refs/ravel/candidates/{second}");
+        run_candidate_git_status(
+            &fixture.base,
+            None,
+            &[
+                "update-ref",
+                &first_ref,
+                fixture.record.candidate_commit_oid(),
+            ],
+        )
+        .expect("publish first temporary ref");
+        run_candidate_git_status(&fixture.base, None, &["update-ref", &second_ref, &second])
+            .expect("publish second temporary ref");
+        let excluded = format!("^{}", fixture.record.base_oid());
+        let bundle = run_candidate_git_output(
+            &fixture.base,
+            None,
+            &["bundle", "create", "-", &first_ref, &second_ref, &excluded],
+        )
+        .expect("create two-head bundle");
+        run_candidate_git_status(&fixture.base, None, &["update-ref", "-d", &first_ref])
+            .expect("delete first temporary ref");
+        run_candidate_git_status(&fixture.base, None, &["update-ref", "-d", &second_ref])
+            .expect("delete second temporary ref");
+        let mut extra = fixture.record.clone();
+        extra.bundle = bundle;
+        let (stored, digest) = extra.stored_bytes().expect("encode extra-object record");
+        assert_eq!(
+            reconstruct_candidate(
+                &fixture.base,
+                &stored,
+                &digest,
+                &fixture._root.join("extra"),
+            ),
+            Err(CandidateConstructionError::ConstructionFailed)
+        );
+    }
+
+    #[test]
+    fn construction_refuses_a_bundle_over_the_artifact_cap() {
+        let fixture = GitFixture::new();
+        let root = TempDir::new("candidate-bundle-cap");
+        let base =
+            materialize_with(&root.join("base"), &fixture.identity()).expect("materialize fixture");
+        let delta_root = TempDir::new("candidate-bundle-cap-delta");
+        let file_bytes = usize::try_from(MAX_FILE_BYTES).expect("file cap fits usize");
+        for index in 0..12 {
+            write_delta_file(
+                &delta_root.0,
+                &format!("src/{index:02}.bin"),
+                &pseudorandom_bytes(file_bytes, index + 1),
+                0o644,
+            );
+        }
+        let delta = validate_delta(&base, &delta_root.0).expect("delta is within accepted cap");
+        let identity = candidate_identity(
+            fixture.commit.as_bytes(),
+            &delta.digest,
+            &Digest::new("11".repeat(32)).expect("plan digest"),
+            7,
+            3,
+        );
+        let tree = build_candidate_tree(&base, &delta, &fixture.commit).expect("build tree");
+        let retested = OwnershipRetested(invocation_binding());
+        let commit = commit_candidate_tree(&base, &tree, &fixture.commit, &identity, &retested)
+            .expect("create commit");
+        assert!(matches!(
+            create_candidate_bundle(&base, &retested.0, &fixture.commit, &tree, &commit),
+            Err(CandidateConstructionError::BundleTooLarge)
+        ));
+        assert!(
+            run_candidate_git_output(
+                &base,
+                None,
+                &[
+                    "show-ref",
+                    "--verify",
+                    &format!("refs/ravel/candidates/{commit}"),
+                ],
+            )
+            .is_err()
         );
     }
 
@@ -2357,6 +3872,7 @@ mod tests {
             CandidateConstructionError::ValidatorUnavailable,
             CandidateConstructionError::AuthorizationRejected,
             CandidateConstructionError::AuthorizationUnavailable,
+            CandidateConstructionError::BundleTooLarge,
             CandidateConstructionError::ConstructionFailed,
             CandidateConstructionError::SnapshotFailed,
             CandidateConstructionError::CleanupFailed,

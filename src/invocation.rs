@@ -170,7 +170,11 @@ impl GateDecisionRecord {
     /// Returns [`RecordError::RecordTooLarge`] above [`MAX_RECORD_CANONICAL_BYTES`] of CBOR,
     /// and [`RecordError::InvalidEncoding`] on serialization failure.
     pub fn stored_bytes(&self) -> Result<(Vec<u8>, String), RecordError> {
-        encode(GATE_DECISION_DOMAIN, &WireGateDecision::from(self))
+        encode_record(
+            GATE_DECISION_DOMAIN,
+            &WireGateDecision::from(self),
+            MAX_RECORD_CANONICAL_BYTES,
+        )
     }
 
     pub fn decision(&self) -> GateDecision {
@@ -505,7 +509,11 @@ impl InvocationManifest {
     /// Returns [`RecordError::RecordTooLarge`] above [`MAX_RECORD_CANONICAL_BYTES`] of CBOR,
     /// and [`RecordError::InvalidEncoding`] on a serialization failure.
     pub fn stored_bytes(&self) -> Result<(Vec<u8>, String), RecordError> {
-        encode(MANIFEST_DOMAIN, &WireManifest::from(self))
+        encode_record(
+            MANIFEST_DOMAIN,
+            &WireManifest::from(self),
+            MAX_RECORD_CANONICAL_BYTES,
+        )
     }
 
     pub fn binding(&self) -> &InvocationBinding {
@@ -577,7 +585,11 @@ impl InvocationTrace {
     /// Returns [`RecordError::RecordTooLarge`] above [`MAX_RECORD_CANONICAL_BYTES`] of CBOR,
     /// and [`RecordError::InvalidEncoding`] on a serialization failure.
     pub fn stored_bytes(&self) -> Result<(Vec<u8>, String), RecordError> {
-        encode(TRACE_DOMAIN, &WireTrace::from(self))
+        encode_record(
+            TRACE_DOMAIN,
+            &WireTrace::from(self),
+            MAX_RECORD_CANONICAL_BYTES,
+        )
     }
 
     pub fn binding(&self) -> &InvocationBinding {
@@ -585,10 +597,14 @@ impl InvocationTrace {
     }
 }
 
-fn encode<T: Serialize>(domain: &[u8], wire: &T) -> Result<(Vec<u8>, String), RecordError> {
+pub(crate) fn encode_record<T: Serialize>(
+    domain: &[u8],
+    wire: &T,
+    max_cbor_bytes: usize,
+) -> Result<(Vec<u8>, String), RecordError> {
     let mut cbor = Vec::new();
     into_writer(wire, &mut cbor).map_err(|_| RecordError::InvalidEncoding)?;
-    if cbor.len() > MAX_RECORD_CANONICAL_BYTES {
+    if cbor.len() > max_cbor_bytes {
         return Err(RecordError::RecordTooLarge);
     }
     let mut stored = Vec::with_capacity(domain.len() + cbor.len());
@@ -611,13 +627,15 @@ pub fn decode_manifest(
     stored_bytes: &[u8],
     expected_digest: &str,
 ) -> Result<InvocationManifest, RecordError> {
-    let wire: WireManifest = decode(MANIFEST_DOMAIN, stored_bytes)?;
+    let wire: WireManifest =
+        decode_record(MANIFEST_DOMAIN, stored_bytes, MAX_RECORD_CANONICAL_BYTES)?;
     let manifest = wire.into_domain()?;
-    verify(
+    verify_record(
         MANIFEST_DOMAIN,
         &WireManifest::from(&manifest),
         stored_bytes,
         expected_digest,
+        MAX_RECORD_CANONICAL_BYTES,
     )?;
     Ok(manifest)
 }
@@ -636,13 +654,18 @@ pub fn decode_gate_decision(
     expected_work: &WorkRef,
     expected_digest: &str,
 ) -> Result<GateDecisionRecord, RecordError> {
-    let wire: WireGateDecision = decode(GATE_DECISION_DOMAIN, stored_bytes)?;
+    let wire: WireGateDecision = decode_record(
+        GATE_DECISION_DOMAIN,
+        stored_bytes,
+        MAX_RECORD_CANONICAL_BYTES,
+    )?;
     let record = wire.into_domain()?;
-    verify(
+    verify_record(
         GATE_DECISION_DOMAIN,
         &WireGateDecision::from(&record),
         stored_bytes,
         expected_digest,
+        MAX_RECORD_CANONICAL_BYTES,
     )?;
     if record.binding.scope_id != *expected_scope.scope_id()
         || record.binding.work_id != *expected_work.id()
@@ -669,22 +692,28 @@ pub fn decode_trace(
     stored_bytes: &[u8],
     expected_digest: &str,
 ) -> Result<InvocationTrace, RecordError> {
-    let wire: WireTrace = decode(TRACE_DOMAIN, stored_bytes)?;
+    let wire: WireTrace = decode_record(TRACE_DOMAIN, stored_bytes, MAX_RECORD_CANONICAL_BYTES)?;
     let trace = wire.into_domain()?;
-    verify(
+    verify_record(
         TRACE_DOMAIN,
         &WireTrace::from(&trace),
         stored_bytes,
         expected_digest,
+        MAX_RECORD_CANONICAL_BYTES,
     )?;
     Ok(trace)
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(
+pub(crate) fn decode_record<T: for<'de> Deserialize<'de>>(
     domain: &[u8],
     stored_bytes: &[u8],
+    max_cbor_bytes: usize,
 ) -> Result<T, RecordError> {
-    if stored_bytes.len() > domain.len() + MAX_RECORD_CANONICAL_BYTES {
+    let max_stored_bytes = domain
+        .len()
+        .checked_add(max_cbor_bytes)
+        .ok_or(RecordError::RecordTooLarge)?;
+    if stored_bytes.len() > max_stored_bytes {
         return Err(RecordError::RecordTooLarge);
     }
     let cbor = stored_bytes
@@ -700,13 +729,14 @@ fn decode<T: for<'de> Deserialize<'de>>(
 }
 
 /// Re-encodes from the rebuilt value so no second byte string addresses one record.
-fn verify<T: Serialize>(
+pub(crate) fn verify_record<T: Serialize>(
     domain: &[u8],
     wire: &T,
     stored_bytes: &[u8],
     expected_digest: &str,
+    max_cbor_bytes: usize,
 ) -> Result<(), RecordError> {
-    let (re_encoded, digest) = encode(domain, wire)?;
+    let (re_encoded, digest) = encode_record(domain, wire, max_cbor_bytes)?;
     if re_encoded != stored_bytes {
         return Err(RecordError::InvalidEncoding);
     }
@@ -719,7 +749,7 @@ fn verify<T: Serialize>(
 /// Canonical form of one binding, in declaration order.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WireBinding {
+pub(crate) struct WireBinding {
     scope_id: String,
     plan_digest: String,
     work_id: String,
@@ -804,7 +834,7 @@ impl From<&InvocationBinding> for WireBinding {
 }
 
 impl WireBinding {
-    fn into_domain(self) -> Result<InvocationBinding, RecordError> {
+    pub(crate) fn into_domain(self) -> Result<InvocationBinding, RecordError> {
         let digest = |value: String| Digest::new(value).map_err(|_| RecordError::InvalidEncoding);
         InvocationBinding::new(
             ScopeId::new(self.scope_id).map_err(|_| RecordError::InvalidEncoding)?,

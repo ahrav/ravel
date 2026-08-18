@@ -1339,11 +1339,11 @@ mod tests {
         let handle = DbHandle::spawn(path.clone()).await.unwrap();
 
         let payload = ArtifactReferencePayload::new(
-            ArtifactKind::InvocationManifest,
+            ArtifactKind::CandidateBundle,
             ArtifactRef::new(
                 "cd".repeat(32),
                 4_096,
-                "application/vnd.ravel.invocation-manifest+cbor".into(),
+                "application/vnd.ravel.candidate-bundle+cbor".into(),
                 "attempt-1".into(),
                 1_700_000_123_456,
                 None,
@@ -2203,7 +2203,7 @@ mod tests {
         )
         .unwrap();
 
-        let kind = ArtifactKind::InvocationManifest;
+        let kind = ArtifactKind::CandidateBundle;
         let reference = encode_artifact_reference_event(
             &ArtifactReferenceEvent::new(
                 envelope(
@@ -2292,12 +2292,32 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT payload_type FROM applied_scope_events WHERE sequence = 4",
+                    "SELECT payload_type, artifact_kind, artifact_digest, work_id, \
+                     work_revision, attempt, grant_digest \
+                     FROM applied_scope_events WHERE sequence = 4",
                     [],
-                    |row| row.get::<_, String>(0)
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    },
                 )
                 .unwrap(),
-            ARTIFACT_REFERENCE_PAYLOAD_TYPE
+            (
+                ARTIFACT_REFERENCE_PAYLOAD_TYPE.to_owned(),
+                "candidate_bundle".to_owned(),
+                "cd".repeat(32),
+                "work-a".to_owned(),
+                1,
+                1,
+                grant.as_str().to_owned(),
+            )
         );
         drop(connection);
         fs::remove_file(&path).unwrap();

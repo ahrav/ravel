@@ -168,6 +168,18 @@ impl ExpectedGrant {
             operation_id,
         })
     }
+
+    pub(crate) fn identity(&self) -> &ScopeClaimIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn action(&self) -> &str {
+        &self.action
+    }
+
+    pub(crate) fn attempt(&self) -> NonZeroU64 {
+        self.attempt
+    }
 }
 
 /// Data-free category for one refused grant, or for a gate decision that was not recorded.
